@@ -5698,5 +5698,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3032710d-3fa6-4f23-a188-ccf97389caad",
     "timestamp": "2025-11-21 13:56:19.353830",
     "report_generated": false
+  },
+  {
+    "question": "Supply Invariant Cross-Module: Could minting in x/mint violate supply invariants expected by x/bank or x/staking? keeper.go:97-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d7e2f51-479a-4e63-b9c2-970cbba54364",
+    "timestamp": "2025-11-21 13:57:43.540801",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Collector Balance Increase: Does the fee collector balance increase by exactly the minted amount after AddCollectedFees? keeper.go:108-110",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca4d65c4-2bb6-4f78-ba32-0dfd7a907a4f",
+    "timestamp": "2025-11-21 13:57:56.665488",
+    "report_generated": false
+  },
+  {
+    "question": "Mint Module Balance Invariant: After minting and transferring to fee collector, does the mint module account balance return to zero? keeper.go:97-110",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95b84ccd-b74e-4b78-8371-c247c5540d7a",
+    "timestamp": "2025-11-21 13:58:10.717320",
+    "report_generated": false
+  },
+  {
+    "question": "Total Supply Tracking: Does minting through MintCoins correctly update the total supply tracked by the bank module? keeper.go:97-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_69bfebf6-d2b4-438d-be01-c062ca9c1872",
+    "timestamp": "2025-11-21 13:58:24.752609",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Block Zero Minting: Does the first block (block 0) mint tokens correctly, or is there special handling needed? abci.go:13-55",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_68a87223-229a-49d7-8b66-a618dad7a7dc",
+    "timestamp": "2025-11-21 13:58:39.586820",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis JSON Marshaling: Does DefaultGenesis produce valid, deterministic JSON output? module.go:53-55",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_12a52971-f00f-439b-8838-51641873ed35",
+    "timestamp": "2025-11-21 13:58:57.141101",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Return Value: Does InitGenesis correctly return an empty validator set, and could returning validators cause issues? module.go:142-148",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3e532e4f-928e-46cc-b020-89f0b1efa57a",
+    "timestamp": "2025-11-21 13:59:14.107708",
+    "report_generated": false
+  },
+  {
+    "question": "ExportGenesisStream Channel Safety: Is the channel in ExportGenesisStream properly closed and does it handle errors safely? module.go:157-164",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34db298e-d420-4956-8f0e-850b7c48b760",
+    "timestamp": "2025-11-21 13:59:33.314676",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Streaming Validation: Does ValidateGenesisStream properly validate each genesis chunk without state corruption? module.go:67-75",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d82a9a2c-7020-409f-a0f5-828d32622553",
+    "timestamp": "2025-11-21 13:59:54.062247",
+    "report_generated": false
+  },
+  {
+    "question": "NewGenesisState Constructor Safety: Does NewGenesisState validate inputs or can it create invalid genesis state? genesis.go:4-9",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_337722e0-69c0-4b4d-8d62-5fdf1b9fbdbb",
+    "timestamp": "2025-11-21 14:00:16.766016",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Minter Inflation Bounds: Does genesis validation check that minter inflation is within the param-defined min/max bounds? minter.go:35-41",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_05ab2b3f-041d-4b4b-ac18-e676b5f089b4",
+    "timestamp": "2025-11-21 14:00:39.351458",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Permissions Genesis: Are mint module account permissions correctly set during genesis initialization? genesis.go:10-14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_27ff443b-029b-4948-af6d-ca20a087dfda",
+    "timestamp": "2025-11-21 14:01:04.747958",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis State Invariant Violations: Can a malicious or corrupted genesis file violate supply invariants that aren't caught by validation? genesis.go:21-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1e1bd82-98c6-45f5-bd40-063ef2dc7b32",
+    "timestamp": "2025-11-21 14:01:32.090643",
+    "report_generated": false
+  },
+  {
+    "question": "InitialMinter Zero Provisions: Does InitialMinter correctly set AnnualProvisions to zero, and is this safe for first block minting? minter.go:19-24",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5abaa293-aa2d-4b57-a040-98b150263d57",
+    "timestamp": "2025-11-21 14:01:59.788175",
+    "report_generated": false
+  },
+  {
+    "question": "DefaultInitialMinter Inflation: Is the default 13% inflation rate in DefaultInitialMinter safe and reasonable? minter.go:28-32",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_14eee200-2d11-4cfe-a08d-29f7e5d6f1b8",
+    "timestamp": "2025-11-21 14:02:27.563529",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis JSON Unmarshaling: Does ValidateGenesis handle malformed JSON input safely without panicking? module.go:58-65",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_274f0b74-f21c-4e5e-bd09-ea18a41f184a",
+    "timestamp": "2025-11-21 14:02:58.379447",
+    "report_generated": false
+  },
+  {
+    "question": "ExportGenesis State Completeness: Does ExportGenesis export all necessary state, preventing data loss during state export? genesis.go:17-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e9eb3f2-7082-4578-8339-2a4bf70f1a14",
+    "timestamp": "2025-11-21 14:03:29.018045",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Import Determinism: Is genesis import deterministic across all validators, ensuring consensus from block 0? genesis.go:10-14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8fcb8ce6-eea8-47a8-bd8b-8a589143651c",
+    "timestamp": "2025-11-21 14:04:01.363779",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Genesis Setup: Does InitGenesis verify the mint module account exists before setting minter state? genesis.go:10-14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1e2cbab-ae71-4394-89ec-f0d42c5721b4",
+    "timestamp": "2025-11-21 14:04:34.198549",
+    "report_generated": false
+  },
+  {
+    "question": "DefaultGenesisState Safety: Is the default genesis state safe and consistent with the default parameters? genesis.go:12-17",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34ad598a-2be8-4053-9d06-aaa7e49cb527",
+    "timestamp": "2025-11-21 14:05:08.271809",
+    "report_generated": false
+  },
+  {
+    "question": "ValidateGenesis Params Check: Does ValidateGenesis properly validate all parameter invariants? genesis.go:21-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c6bd9be-21e2-4044-8e04-51a8824dd2aa",
+    "timestamp": "2025-11-21 14:05:43.824919",
+    "report_generated": false
+  },
+  {
+    "question": "ValidateGenesis Minter Check: Does ValidateGenesis call ValidateMinter to ensure the minter state is valid? genesis.go:21-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ac1fd15b-71a6-4b83-b27f-f57ba294db8a",
+    "timestamp": "2025-11-21 14:06:20.440554",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Params Validation: Are genesis parameters validated before being set in InitGenesis, preventing invalid chain initialization? genesis.go:10-14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7fa2245e-93c5-4595-b5d2-3e83d0a25294",
+    "timestamp": "2025-11-21 14:06:58.128318",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Minter Validation: Does InitGenesis properly validate the minter state from genesis, or can invalid minter values cause chain start failure? genesis.go:10-14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f33e7cc-6e57-4b7e-8df7-3eddb06691f3",
+    "timestamp": "2025-11-21 14:07:37.109302",
+    "report_generated": false
+  },
+  {
+    "question": "Param String Marshaling: Does the String() method for params properly handle all parameter values without panic? params.go:87-90",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd66a2e2-a261-4420-a672-abbc410f7147",
+    "timestamp": "2025-11-21 14:08:14.417108",
+    "report_generated": false
   }
 ]
