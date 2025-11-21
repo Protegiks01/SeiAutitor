@@ -2098,5 +2098,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8ad490e-e57e-457f-a268-238e78df1ae7",
     "timestamp": "2025-11-21 08:59:02.839231",
     "report_generated": false
+  },
+  {
+    "question": "Can the 'done' marker be set without actually executing the upgrade handler? keeper.go:350-356",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e2e7948c-63d1-41be-9c41-44c24fbe9bcc",
+    "timestamp": "2025-11-21 09:00:15.206744",
+    "report_generated": false
+  },
+  {
+    "question": "Does the upgrade module verify that no upgrade can be scheduled while another is pending? keeper.go:194-198",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_caf8b662-a514-44e9-9f10-831190ed5711",
+    "timestamp": "2025-11-21 09:00:28.299666",
+    "report_generated": false
+  },
+  {
+    "question": "Can the module version map become inconsistent with actual module consensus versions? keeper.go:93-116",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ce98ccf8-79a8-4f06-b98a-49891ef63dde",
+    "timestamp": "2025-11-21 09:00:42.400179",
+    "report_generated": false
+  },
+  {
+    "question": "Is there an invariant check that verifies the protocol version always increases monotonically? keeper.go:378-380",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b6536158-323f-407b-9f6a-46200ff6edb2",
+    "timestamp": "2025-11-21 09:00:58.812558",
+    "report_generated": false
+  },
+  {
+    "question": "Can the gRPC gateway expose upgrade endpoints to unauthorized external access? module.go:50-53",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d36cff45-0f81-4fd6-9a7b-bdee5b0158cd",
+    "timestamp": "2025-11-21 09:01:14.061225",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module versions query properly handle non-existent module names? grpc_query.go:63-65",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e8d16269-20bb-493f-a8d3-35d0cfe3e632",
+    "timestamp": "2025-11-21 09:01:30.793654",
+    "report_generated": false
+  },
+  {
+    "question": "Can the JSON marshaling in queries expose sensitive upgrade information? querier.go:39-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_45f8c980-8984-45a5-9059-b801daf37d8c",
+    "timestamp": "2025-11-21 09:01:48.509510",
+    "report_generated": false
+  },
+  {
+    "question": "Is the BlockchainInfo query vulnerable to DoS if the height range is manipulated? query.go:94-97",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_17c9bed6-7238-404d-bf0a-d14a5e580439",
+    "timestamp": "2025-11-21 09:02:08.584149",
+    "report_generated": false
+  },
+  {
+    "question": "Can the GetAppliedPlanCmd be used to crash nodes by querying non-existent block heights? query.go:65-114",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8d0410ce-7352-4081-a220-850ad041e594",
+    "timestamp": "2025-11-21 09:02:29.538446",
+    "report_generated": false
+  },
+  {
+    "question": "Does the REST API properly sanitize upgrade plan info before returning it? query.go:30-61",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d8da40f0-28ec-467d-81e0-182aee5a1016",
+    "timestamp": "2025-11-21 09:02:51.493616",
+    "report_generated": false
+  },
+  {
+    "question": "Can unauthenticated RPC calls to query endpoints cause state inconsistencies? grpc_query.go:14-22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_610ff360-7fcf-4ffb-a9d4-aa49885c51f2",
+    "timestamp": "2025-11-21 09:03:15.161544",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation on the ModuleName parameter to prevent SQL-like injection in store queries? grpc_query.go:57-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_94ea7e81-8396-480b-a93f-55b0ce607f11",
+    "timestamp": "2025-11-21 09:03:39.908633",
+    "report_generated": false
+  },
+  {
+    "question": "Can the queryApplied function be exploited to enumerate all completed upgrades? querier.go:47-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c8b944d2-eadb-471e-b7d7-b0dc8abadeb2",
+    "timestamp": "2025-11-21 09:04:05.405731",
+    "report_generated": false
+  },
+  {
+    "question": "Does the queryCurrent function handle nil plans gracefully without exposing internal errors? querier.go:33-45",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2e0eb4b3-803f-44e7-b85f-88b6110cb8c4",
+    "timestamp": "2025-11-21 09:04:31.890819",
+    "report_generated": false
+  },
+  {
+    "question": "Can the legacy querier return inconsistent results compared to the gRPC query? querier.go:16-31",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0892c7d8-37a3-44d5-8d05-335781bb731c",
+    "timestamp": "2025-11-21 09:04:59.369538",
+    "report_generated": false
+  },
+  {
+    "question": "Is there rate limiting on the ModuleVersions query to prevent resource exhaustion? grpc_query.go:52-72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_61f74278-4aef-49bc-8d94-1f62c6f8d6c4",
+    "timestamp": "2025-11-21 09:05:27.114188",
+    "report_generated": false
+  },
+  {
+    "question": "Can the UpgradedConsensusState query leak sensitive consensus information? grpc_query.go:37-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8431ca84-138d-41d4-88cb-23cfb90c98e6",
+    "timestamp": "2025-11-21 09:05:56.802689",
+    "report_generated": false
+  },
+  {
+    "question": "Does the AppliedPlan query properly validate the plan name to prevent injection attacks? grpc_query.go:25-35",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4afeda08-b553-4fb9-b0bd-4c40781b7917",
+    "timestamp": "2025-11-21 09:06:28.207857",
+    "report_generated": false
+  },
+  {
+    "question": "Can the CurrentPlan query endpoint be exploited for DoS by excessive requests? grpc_query.go:13-23",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fc7e47aa-4f5a-4267-9c10-2ec9fd43df25",
+    "timestamp": "2025-11-21 09:07:00.560730",
+    "report_generated": false
+  },
+  {
+    "question": "Is there proper cleanup of the upgrade-info.json file after a successful upgrade? keeper.go:449-472",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_94cb3d45-cdc0-4ae4-a303-6e4c573933fc",
+    "timestamp": "2025-11-21 09:07:33.579780",
+    "report_generated": false
+  },
+  {
+    "question": "Can the file read operation in ReadUpgradeInfoFromDisk cause a DoS if the file is extremely large? keeper.go:457-465",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_494a20f6-76f6-4c0a-a6e7-ab1209da794c",
+    "timestamp": "2025-11-21 09:08:07.848897",
+    "report_generated": false
+  },
+  {
+    "question": "Does the JSON marshaling handle all Plan fields correctly, or could some data be lost? keeper.go:421-424",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5d541bfd-d22b-4227-80dc-e7631554a94c",
+    "timestamp": "2025-11-21 09:08:43.246602",
+    "report_generated": false
+  },
+  {
+    "question": "Can multiple nodes writing to the same upgrade-info.json file cause corruption? keeper.go:426",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_965fdee1-9a5a-47e1-a6f6-87dc52e5f347",
+    "timestamp": "2025-11-21 09:09:19.260222",
+    "report_generated": false
+  },
+  {
+    "question": "Is the upgrade info file path construction vulnerable to path injection? keeper.go:437",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4111b1c7-cc2e-4ba2-ae53-a8853284cadb",
+    "timestamp": "2025-11-21 09:09:54.361033",
+    "report_generated": false
+  },
+  {
+    "question": "Can filesystem errors during upgrade info dump cause a panic that halts the chain? abci.go:104-107",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8bb0390-a8af-44b1-94b3-bbc2ccb0001f",
+    "timestamp": "2025-11-21 09:10:30.963821",
+    "report_generated": false
   }
 ]
