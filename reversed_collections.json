@@ -5098,5 +5098,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3c254775-b862-46b1-a27f-e7551085acd8",
     "timestamp": "2025-11-21 13:08:41.992791",
     "report_generated": false
+  },
+  {
+    "question": "Is the Vote message properly validated to prevent voting with invalid proposal IDs that could cause lookups to panic? msg_server.go:62-91",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5bd717e4-155f-492d-b448-596a512f761c",
+    "timestamp": "2025-11-21 13:09:53.711178",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker submit a proposal with expedited=true then immediately deposit minimal amounts to activate voting with regular thresholds? msg_server.go:29-39",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_70771992-921b-4031-a1b2-d6b2a105c74c",
+    "timestamp": "2025-11-21 13:10:08.456460",
+    "report_generated": false
+  },
+  {
+    "question": "Does the initial deposit in MsgSubmitProposal properly validate coin denominations to prevent submission with invalid tokens? msg_server.go:36-39",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6c44fa88-062e-44cf-9424-e31a935d4963",
+    "timestamp": "2025-11-21 13:10:22.959330",
+    "report_generated": false
+  },
+  {
+    "question": "Can the SubmitProposal message server function be front-run to steal proposal IDs, affecting proposal ordering? msg_server.go:27-60",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e0c5c783-acc6-4165-af6d-27578bb6cfc2",
+    "timestamp": "2025-11-21 13:10:38.189687",
+    "report_generated": false
+  },
+  {
+    "question": "Does the weighted vote validation allow zero-weight options that could affect tally computation? vote.go:21-25",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7da2dd3e-1a7b-46f6-8830-69842796f00c",
+    "timestamp": "2025-11-21 13:10:55.088242",
+    "report_generated": false
+  },
+  {
+    "question": "Is the vote key construction in VoteKey vulnerable to address collisions or prefix attacks? keys.go:105-108",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7456abe9-a393-4f4b-97cf-3e21b9b3f8c8",
+    "timestamp": "2025-11-21 13:11:14.342604",
+    "report_generated": false
+  },
+  {
+    "question": "Could setting vote.Option = types.OptionEmpty at line 82 cause consensus issues if different nodes have different legacy option behaviors? vote.go:80-83",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2bf05c5c-5288-42f0-ae69-8015627c5f8e",
+    "timestamp": "2025-11-21 13:11:33.822085",
+    "report_generated": false
+  },
+  {
+    "question": "Does the AfterProposalVote hook have gas limits, and could a malicious hook implementation cause voting to fail for all users? vote.go:31",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_683977a6-20af-47ec-9747-564fc0881ed9",
+    "timestamp": "2025-11-21 13:11:53.653082",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker flood the network with invalid vote messages that pass initial validation but fail in AddVote, causing DoS? vote.go:12-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_24fa1c3a-9941-473e-8a3b-699872c93fe8",
+    "timestamp": "2025-11-21 13:12:18.029224",
+    "report_generated": false
+  },
+  {
+    "question": "Is the vote deletion in deleteVote properly synchronized with the tally process to prevent deleted votes from being counted? vote.go:127-130",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6439e863-79fd-46c4-9399-b56085db91b4",
+    "timestamp": "2025-11-21 13:12:42.244280",
+    "report_generated": false
+  },
+  {
+    "question": "Does the populateLegacyOption function at line 134 introduce non-determinism by modifying vote data during reads? vote.go:134-138",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca1790a9-e748-4b60-b121-c333707b1ca5",
+    "timestamp": "2025-11-21 13:13:08.484857",
+    "report_generated": false
+  },
+  {
+    "question": "Could a voter submit multiple votes by exploiting race conditions between the vote check and vote storage in SetVote? vote.go:79-90",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_098022f2-05af-42f0-8836-88109e63d210",
+    "timestamp": "2025-11-21 13:13:36.693104",
+    "report_generated": false
+  },
+  {
+    "question": "Does the weighted vote option validation at lines 21-25 properly reject votes where weights don't sum to exactly 1.0? vote.go:21-25",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1de72096-fa8b-4c3a-8e62-be22c1a40d0e",
+    "timestamp": "2025-11-21 13:14:05.839611",
+    "report_generated": false
+  },
+  {
+    "question": "Can the AddVote function allow voting on proposals that are not in StatusVotingPeriod, bypassing the check at line 17? vote.go:17-19",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fb6afd9e-1fa0-46e1-8798-78812999cb8b",
+    "timestamp": "2025-11-21 13:14:36.400154",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module account balance check in the invariant properly account for deposits in-flight during block processing? invariants.go:26-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2836b86e-d5d2-4f58-8386-8cf3c5cf18b5",
+    "timestamp": "2025-11-21 13:15:08.001824",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a check to prevent depositing negative amounts or zero coins that would affect the total deposit calculation? deposit.go:121-124",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f3bcf19f-c5dc-47cc-a6f9-1c9f75ac7bda",
+    "timestamp": "2025-11-21 13:15:40.434275",
+    "report_generated": false
+  },
+  {
+    "question": "Could the AfterProposalDeposit hook in line 149 be exploited to prevent proposal activation by panicking during the callback? deposit.go:149",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8891ea89-08e8-45e8-83b2-3a97ec9fe62a",
+    "timestamp": "2025-11-21 13:16:14.330103",
+    "report_generated": false
+  },
+  {
+    "question": "Does the IterateDeposits function handle corrupted store data gracefully, or would invalid deposit data cause a panic in DeleteDeposits? deposit.go:88-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0533d3bc-cdf1-4780-b791-af83c213c5c2",
+    "timestamp": "2025-11-21 13:16:49.525022",
+    "report_generated": false
+  },
+  {
+    "question": "Can the expedited proposal deposit requirement be bypassed by first submitting as regular then upgrading to expedited after partial deposits? deposit.go:133-137",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a88d11d5-11bd-4d4b-8519-54dca53c040d",
+    "timestamp": "2025-11-21 13:17:25.756180",
+    "report_generated": false
+  },
+  {
+    "question": "Does the total deposit update at line 127 check for overflow, preventing an attacker from wrapping the deposit amount? deposit.go:127-128",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f72719f2-3b62-4135-98b6-0d29e1062344",
+    "timestamp": "2025-11-21 13:18:02.242479",
+    "report_generated": false
+  },
+  {
+    "question": "Is the deposit refund logic in RefundDeposits at line 171 vulnerable to reentrancy if the bank keeper calls back into gov hooks? deposit.go:165-179",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_66a67ec2-0524-4c8c-bb49-ceb94440691d",
+    "timestamp": "2025-11-21 13:18:39.996312",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker front-run a deposit to activate voting period before another depositor's transaction, causing them to lose their deposit? deposit.go:133-137",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d6807dfb-7b06-4394-bf2a-3302a8f892a4",
+    "timestamp": "2025-11-21 13:19:24.775212",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeleteDeposits at line 58 properly handle the case where BurnCoins fails mid-iteration, leaving some deposits burned and others not? deposit.go:54-68",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a921091b-25d3-4b7d-884f-1992042e9210",
+    "timestamp": "2025-11-21 13:20:04.760002",
+    "report_generated": false
+  },
+  {
+    "question": "Can the AddDeposit function in deposit.go allow deposits after a proposal has already transitioned to voting period, potentially changing the minimum deposit requirement? deposit.go:116-118",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_af75c38e-d277-4152-9400-4c8c0579af52",
+    "timestamp": "2025-11-21 13:20:45.483357",
+    "report_generated": false
+  },
+  {
+    "question": "Does the expedited quorum logic correctly prevent regular proposals from being tallied with expedited thresholds through status manipulation? tally.go:100-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85959612-56f7-4832-9b0c-6563a6ad708f",
+    "timestamp": "2025-11-21 13:21:26.190461",
+    "report_generated": false
   }
 ]
