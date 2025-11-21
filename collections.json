@@ -7048,5 +7048,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_77f3c211-f5f0-43ab-aeae-6ba4ed06e2e9",
     "timestamp": "2025-11-21 14:28:21.547454",
     "report_generated": false
+  },
+  {
+    "question": "In initBalances, are zero balances rejected during genesis, or can they pollute the initial state? send.go:276-294",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e33b4bc4-a29e-4433-94dc-ab4be9f5c29c",
+    "timestamp": "2025-11-21 14:29:35.694999",
+    "report_generated": false
+  },
+  {
+    "question": "Does SendCoinsWithoutAccCreation emit the same events as SendCoins, ensuring consistent event indexing? send.go:175-177",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d4fbd412-817c-4f61-96e9-6b1e9f579f0c",
+    "timestamp": "2025-11-21 14:29:48.622000",
+    "report_generated": false
+  },
+  {
+    "question": "In SubWei, can an attacker cause integer underflow by subtracting more wei than exists in the combined usei and wei balance? send.go:357-384",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_de6b5358-fd89-4c34-a9b1-2f807e067bab",
+    "timestamp": "2025-11-21 14:30:02.632974",
+    "report_generated": false
+  },
+  {
+    "question": "Does AddWei correctly handle the conversion boundary when wei balance crosses the OneUseiInWei threshold? send.go:386-412",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ec62c63b-9f71-4e86-91e7-22989329729f",
+    "timestamp": "2025-11-21 14:30:16.896550",
+    "report_generated": false
+  },
+  {
+    "question": "Can SplitUseiWeiAmount produce incorrect results when given maximum sdk.Int values, causing overflow in the quotient or remainder? send.go:448-450",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_87986151-d076-49bc-a57d-3279715ccf20",
+    "timestamp": "2025-11-21 14:30:31.884151",
+    "report_generated": false
+  },
+  {
+    "question": "In SendCoinsAndWei, does the function correctly revert all state changes if either the coin transfer or wei transfer fails? send.go:414-433",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f4b59484-a4b5-4b20-9139-47eb6d87c58a",
+    "timestamp": "2025-11-21 14:30:48.328953",
+    "report_generated": false
+  },
+  {
+    "question": "Does setWeiBalance properly delete storage entries when wei balance becomes zero to maintain storage invariants? send.go:315-327",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_930fb140-2e8d-4683-a6d6-204dccb1de04",
+    "timestamp": "2025-11-21 14:31:06.005885",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetWeiBalance panic when unmarshalling corrupted wei balance data from storage? view.go:238-250",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0f67ec22-a8e5-4044-94e6-869e00421a9a",
+    "timestamp": "2025-11-21 14:31:26.238685",
+    "report_generated": false
+  },
+  {
+    "question": "In SubWei, when converting between usei and wei, can rounding errors accumulate over multiple transactions? send.go:357-384",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8bc95810-3fa7-44e1-9d6b-a735c3e331e4",
+    "timestamp": "2025-11-21 14:31:48.255955",
+    "report_generated": false
+  },
+  {
+    "question": "Does AddWei check recipient validity before modifying wei balances, or can wei be sent to blocked addresses? send.go:386-412",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b7042a22-0f65-4ca4-a676-f90fdab74f21",
+    "timestamp": "2025-11-21 14:32:12.789672",
+    "report_generated": false
+  },
+  {
+    "question": "Can the wei balance system be exploited to bypass send-enabled checks by converting coins to wei? send.go:414-433",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_08424d11-0829-427f-aacc-50f46aad1fd1",
+    "timestamp": "2025-11-21 14:32:39.128538",
+    "report_generated": false
+  },
+  {
+    "question": "In IterateAllWeiBalances, does the iteration order remain deterministic across different nodes to prevent consensus splits? view.go:252-268",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_38d6234e-87ce-44c5-be3b-e95174712b36",
+    "timestamp": "2025-11-21 14:33:05.619912",
+    "report_generated": false
+  },
+  {
+    "question": "Does the TotalSupply invariant correctly account for both regular balances and wei balances when validating total supply? invariants.go:79-95",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c9dac2c-9fab-4d2c-83d6-c104267f4bcc",
+    "timestamp": "2025-11-21 14:33:33.831164",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the wei remainder check in the TotalSupply invariant to halt the chain by creating non-zero remainders? invariants.go:83-89",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0cd4a688-444b-4055-a0be-594d5046ff3a",
+    "timestamp": "2025-11-21 14:34:02.599412",
+    "report_generated": false
+  },
+  {
+    "question": "In SubWei, does the aggregated balance calculation correctly handle negative intermediate values that could cause panic? send.go:368-378",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6ddffa8d-8939-47b1-b73d-54e676ccca25",
+    "timestamp": "2025-11-21 14:34:32.397378",
+    "report_generated": false
+  },
+  {
+    "question": "Can SendCoinsAndWei be used to atomically transfer both coins and wei in a way that bypasses allow list restrictions? send.go:414-433",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_42568a20-79f6-463c-aa94-ae78055d76fe",
+    "timestamp": "2025-11-21 14:35:03.137817",
+    "report_generated": false
+  },
+  {
+    "question": "Does the wei balance system properly emit events for all wei operations to ensure transaction traceability? send.go:362-367",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c75a2f7-eb10-4f03-a9e1-f2894281c1d9",
+    "timestamp": "2025-11-21 14:35:34.762067",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetSupply prevent negative supply values that could break the total supply invariant? keeper.go:632-648",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a6f0a04-e4eb-4a5d-a1c8-d5abc1092146",
+    "timestamp": "2025-11-21 14:36:07.440711",
+    "report_generated": false
+  },
+  {
+    "question": "In TotalSupply invariant, can an attacker create a state where the sum of balances exceeds maximum sdk.Int, causing overflow? invariants.go:59-105",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eda295bb-f194-415a-9185-bfa13ff88d31",
+    "timestamp": "2025-11-21 14:36:41.892551",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetPaginatedTotalSupply correctly handle pagination edge cases that could cause supply values to be counted twice? keeper.go:78-102",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bd5ea748-9b7c-451e-a9e3-9c7b3ae0ee81",
+    "timestamp": "2025-11-21 14:37:17.345375",
+    "report_generated": false
+  },
+  {
+    "question": "Can the NonnegativeBalanceInvariant be bypassed by creating balances through non-standard paths that skip validation? invariants.go:25-57",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_824ffa05-eaf0-4a67-ac1c-dae7279c2755",
+    "timestamp": "2025-11-21 14:37:53.839326",
+    "report_generated": false
+  },
+  {
+    "question": "In IterateTotalSupply, does the iteration remain deterministic when the supply store is modified concurrently? keeper.go:693-719",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_053faacb-cae0-4b61-b6bf-ca7347557b93",
+    "timestamp": "2025-11-21 14:38:30.814109",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetSupply return consistent values when called multiple times within the same transaction for the same denom? keeper.go:259-282",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a0643068-cbb1-4f37-b862-3ccbd72d6e46",
+    "timestamp": "2025-11-21 14:39:08.467160",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit SetSupply to set supply for unauthorized denoms, breaking the supply tracking invariant? keeper.go:632-648",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_57a033e6-4927-446d-ac42-05867bf1f6e2",
+    "timestamp": "2025-11-21 14:39:46.730901",
+    "report_generated": false
+  },
+  {
+    "question": "Does the TotalSupply invariant correctly handle deferred balances that haven't been written to account stores yet? invariants.go:74-78",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_46e15627-a792-4816-a868-a62f40cd0943",
+    "timestamp": "2025-11-21 14:40:24.430180",
+    "report_generated": false
   }
 ]
