@@ -6448,5 +6448,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a590545-c139-4a20-8738-3af6031ae622",
     "timestamp": "2025-11-21 13:40:14.729162",
     "report_generated": false
+  },
+  {
+    "question": "MultiSig Account Authorization: Can authz be granted by multisig accounts? If so, do all required signatures get validated, or can a single multisig member grant authorizations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8a6b27c5-c636-4fb6-a5a0-18f27cef28ef",
+    "timestamp": "2025-11-21 13:41:24.245616",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Grants: Can regular accounts grant authorizations to module accounts, potentially allowing unauthorized access to module-controlled funds?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8802a141-da00-48e5-8134-363542bba505",
+    "timestamp": "2025-11-21 13:41:37.433198",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Grant Interaction: If a transaction uses both authz and fee grant (feegrant module), which account pays fees? Can this be exploited to have the granter pay fees for unauthorized actions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80e2829a-4fb6-4091-a0fe-236773b694f4",
+    "timestamp": "2025-11-21 13:41:50.764215",
+    "report_generated": false
+  },
+  {
+    "question": "Account Sequence Numbers: When executing MsgExec, are sequence numbers correctly incremented for the grantee but not the granter? Can this cause replay attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a484bbe8-898a-40a3-97ae-43ebb4b9bbe4",
+    "timestamp": "2025-11-21 13:42:04.617801",
+    "report_generated": false
+  },
+  {
+    "question": "AnteHandler Bypass via Nested Messages: In AnteHandler processing, are nested messages within MsgExec validated? Can an attacker bypass fee checks by nesting high-value messages in a low-fee MsgExec?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e8023990-0f07-4f27-8bd0-c6e9538bd9e1",
+    "timestamp": "2025-11-21 13:42:19.271992",
+    "report_generated": false
+  },
+  {
+    "question": "Signature Verification Scope: Does the AnteHandler verify signatures for nested messages in MsgExec, or only the outer message? Can this be exploited to execute unauthorized nested messages?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73ab6ab7-42e3-42e2-a32c-f505b245006a",
+    "timestamp": "2025-11-21 13:42:35.442086",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Deduction from Grantee: When executing MsgExec, fees are deducted from the grantee. Can an attacker drain the grantee's balance by submitting expensive authorized operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ab8d5549-e490-4703-840d-e820b247c66c",
+    "timestamp": "2025-11-21 13:42:52.692320",
+    "report_generated": false
+  },
+  {
+    "question": "Mempool Filtering: Does the mempool correctly estimate gas for MsgExec transactions with multiple nested messages? Can underestimated gas cause mempool DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8145022f-c260-4cee-8481-924ee4856916",
+    "timestamp": "2025-11-21 13:43:12.244640",
+    "report_generated": false
+  },
+  {
+    "question": "Tx Size Validation: Are there limits on the number of nested messages in MsgExec? Can an attacker submit transactions with thousands of nested messages to cause processing delays?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0e204e86-79dc-4604-8769-2f1e7a590bc8",
+    "timestamp": "2025-11-21 13:43:33.247741",
+    "report_generated": false
+  },
+  {
+    "question": "ValidateBasic Timing: When is MsgExec.ValidateBasic() called relative to authorization checks? Can an attacker bypass basic validation by crafting transactions that fail authorization but consume gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ea183391-e9c7-42e1-818d-986e07a2f131",
+    "timestamp": "2025-11-21 13:43:55.497578",
+    "report_generated": false
+  },
+  {
+    "question": "Nested Message ValidateBasic: Are nested messages' ValidateBasic() methods called before authorization checks? Can invalid nested messages cause unnecessary authorization lookups?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b6a1ad16-a693-4f83-bc4a-10fe89ce6964",
+    "timestamp": "2025-11-21 13:44:18.583822",
+    "report_generated": false
+  },
+  {
+    "question": "Priority Calculation: How is transaction priority calculated for MsgExec? Can authz be used to manipulate priority and front-run other transactions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c396dc89-ef05-4e66-9e68-de200a6c41fb",
+    "timestamp": "2025-11-21 13:44:44.772182",
+    "report_generated": false
+  },
+  {
+    "question": "Grants Query DoS: The Grants query in x/authz/keeper/grpc_query.go:19-81 can filter by message type. Can an attacker query all grants repeatedly to DoS the RPC endpoint?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9e999978-f7ee-4683-9683-d5b407317810",
+    "timestamp": "2025-11-21 13:45:11.820595",
+    "report_generated": false
+  },
+  {
+    "question": "GranterGrants Unbounded Results: In x/authz/keeper/grpc_query.go:84-129, GranterGrants returns all grants for a granter. Can a granter with thousands of grants cause RPC timeouts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a7d742d8-fb59-4bb3-a323-ca5feb7aa365",
+    "timestamp": "2025-11-21 13:45:40.812026",
+    "report_generated": false
+  },
+  {
+    "question": "GranteeGrants Filter Performance: In x/authz/keeper/grpc_query.go:132-178, the grantee filter checks every grant. Can this cause O(n) complexity DoS for large grant stores?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_689a812d-9ece-4ec8-8cca-88f59413aa03",
+    "timestamp": "2025-11-21 13:46:09.734436",
+    "report_generated": false
+  },
+  {
+    "question": "Query Result Caching: Are query results cached inappropriately? Can stale authorization data be returned if grants are modified in the same block?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48ee9fd2-7832-4fe7-acdf-e17e00b06a54",
+    "timestamp": "2025-11-21 13:46:40.208479",
+    "report_generated": false
+  },
+  {
+    "question": "Concurrent Query Handling: If multiple queries execute simultaneously and access GetCleanAuthorization, can this cause race conditions in grant deletion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ea74ddce-738f-46ef-aded-f6cf27a2abdc",
+    "timestamp": "2025-11-21 13:47:12.499989",
+    "report_generated": false
+  },
+  {
+    "question": "MsgTypeUrl Injection: In x/authz/keeper/grpc_query.go:35, the MsgTypeUrl is used directly. Can special characters or injection attacks manipulate query behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2d46fab0-23c8-4968-8646-55d1283ac6c0",
+    "timestamp": "2025-11-21 13:47:45.587530",
+    "report_generated": false
+  },
+  {
+    "question": "Pagination Manipulation: Can pagination parameters in queries be manipulated to skip results, return duplicates, or cause infinite loops?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7b5f9c1a-9ad4-42c5-9a3a-17637f5730c3",
+    "timestamp": "2025-11-21 13:48:20.193907",
+    "report_generated": false
+  },
+  {
+    "question": "Query Gas Limits: Are query gas limits properly enforced for expensive authorization lookups? Can queries exhaust node resources?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80024f04-755e-43b8-adbe-66acdccef8ff",
+    "timestamp": "2025-11-21 13:48:55.236769",
+    "report_generated": false
+  },
+  {
+    "question": "Empty Result Handling: When queries return empty results (no grants found), is this properly distinguished from errors? Can this be exploited to gain information about grant existence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c047cb8a-4bf3-4851-bdb9-ab51a9da13a4",
+    "timestamp": "2025-11-21 13:49:29.735581",
+    "report_generated": false
+  },
+  {
+    "question": "Address Validation in Queries: Are granter and grantee addresses validated in query endpoints? Can invalid addresses cause crashes or unexpected behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8d3be44d-a1a2-432e-a302-25869b551153",
+    "timestamp": "2025-11-21 13:50:06.683339",
+    "report_generated": false
+  },
+  {
+    "question": "Any Unpacking Errors: When unpacking google.protobuf.Any fields containing authorizations, can malformed protobuf cause crashes or return incorrect types?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ee026add-bf77-41a7-9a78-0c67488d5b67",
+    "timestamp": "2025-11-21 13:50:43.761841",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Polymorphism: The authorization field is stored as Any. Can an attacker register custom authorization types that exploit the polymorphic unpacking logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01e8b8c3-9e95-4e30-9e86-371446e78215",
+    "timestamp": "2025-11-21 13:51:20.739832",
+    "report_generated": false
+  },
+  {
+    "question": "Codec Registry Manipulation: Can custom authorization types be registered in the codec to shadow built-in types and change their behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0275b644-665b-4bb9-be74-8b41b2acca0a",
+    "timestamp": "2025-11-21 13:51:56.995670",
+    "report_generated": false
   }
 ]
