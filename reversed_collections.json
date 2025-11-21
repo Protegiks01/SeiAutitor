@@ -6448,5 +6448,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d6d9549-7594-4b76-ab3a-568a90e1c352",
     "timestamp": "2025-11-21 14:54:12.162760",
     "report_generated": false
+  },
+  {
+    "question": "Does the module basic manager validation run before or after genutil processing, affecting security checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fc6506f1-7cc6-437d-be59-b76805ff94f4",
+    "timestamp": "2025-11-21 14:55:25.690394",
+    "report_generated": false
+  },
+  {
+    "question": "Can the genesis processing order be manipulated to cause state inconsistencies between modules?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e6e2ba29-80e2-4bfb-b7e3-2babfe71c013",
+    "timestamp": "2025-11-21 14:55:39.231408",
+    "report_generated": false
+  },
+  {
+    "question": "Does the validator set update properly trigger updates to dependent modules like distribution and slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_611c64bd-65f9-4264-a5cd-d4b826717e1f",
+    "timestamp": "2025-11-21 14:55:53.317395",
+    "report_generated": false
+  },
+  {
+    "question": "Can a dependency on uninitialized module state cause DeliverGenTxs to fail or behave unexpectedly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2aad81c1-37fa-4ed6-bbfd-ff92aa060b6b",
+    "timestamp": "2025-11-21 14:56:08.873240",
+    "report_generated": false
+  },
+  {
+    "question": "Does the InitGenesis call order ensure that the staking module is initialized before gentx processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_960a51fe-9153-45db-84b1-8264c445af32",
+    "timestamp": "2025-11-21 14:56:24.065183",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker inject special characters into the memo to break the peer list format in collect.go:181?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d62871b-0c8a-4d5c-a4b1-d50affdaf766",
+    "timestamp": "2025-11-21 14:56:40.383412",
+    "report_generated": false
+  },
+  {
+    "question": "Does the peer list generation ensure uniqueness, preventing duplicate peer entries?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2ec38db9-b768-4c12-bdfa-ca39483ce12c",
+    "timestamp": "2025-11-21 14:56:58.060378",
+    "report_generated": false
+  },
+  {
+    "question": "Can the memo-based peer discovery be exploited to cause nodes to connect to attacker-controlled peers?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cf4d509e-0b4e-4e58-94e6-25ac2140553e",
+    "timestamp": "2025-11-21 14:57:17.106296",
+    "report_generated": false
+  },
+  {
+    "question": "Does the node address parsing in collect.go:130-133 properly validate IP addresses and ports?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78e6e986-84ff-4bb2-9f99-0c02c2ab35fe",
+    "timestamp": "2025-11-21 14:57:38.305790",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker manipulate the persistent peers list in collect.go:180-181 to include malicious nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dfade514-c453-4e05-a4d1-7f6e578e07d1",
+    "timestamp": "2025-11-21 14:58:04.329778",
+    "report_generated": false
+  },
+  {
+    "question": "Does the key derivation from mnemonic in utils.go:85-87 use proper KDF parameters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e979e4a1-b48f-42c7-ba19-12b572358627",
+    "timestamp": "2025-11-21 14:58:29.233227",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker provide a gentx with a validator key that matches an existing validator, causing validator collision?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3793b53e-440b-44e7-a296-a46d89c2ab44",
+    "timestamp": "2025-11-21 14:58:56.129218",
+    "report_generated": false
+  },
+  {
+    "question": "Does the validator public key validation ensure keys are on the correct curve and not weak keys in gentx.go:80-84?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f52aa6ef-26ac-48d6-99d0-9dcd09edc676",
+    "timestamp": "2025-11-21 14:59:23.467661",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker replay a gentx from another chain if signatures aren't validated against the correct chain ID?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37e6abdf-6ff2-465e-8616-bb7537129e9e",
+    "timestamp": "2025-11-21 14:59:52.820239",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeliverGenTxs verify signatures on genesis transactions, or can unsigned gentxs be included in gentx.go:96-129?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cf4b34ef-4a77-4ced-a041-443b05b478ba",
+    "timestamp": "2025-11-21 15:00:23.469566",
+    "report_generated": false
+  },
+  {
+    "question": "Does the JSON parsing limit input size to prevent DoS during genesis validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c0f2e4d7-5748-4332-9fa6-2355310c6039",
+    "timestamp": "2025-11-21 15:00:54.776513",
+    "report_generated": false
+  },
+  {
+    "question": "Can multiple gentxs with maximum-size fields collectively cause memory exhaustion during collection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa18ee11-4844-4710-98a8-1715a4469aaf",
+    "timestamp": "2025-11-21 15:01:28.541007",
+    "report_generated": false
+  },
+  {
+    "question": "Does the memo field validation in gentxs limit size to prevent resource exhaustion in collect.go:130-133?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c425164d-c124-4ee4-89b4-3e5f0cee468a",
+    "timestamp": "2025-11-21 15:02:02.963764",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker include extremely large validator descriptions in gentxs to consume excessive resources during genesis?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5cf038ac-af24-4c59-a043-aa03317c3441",
+    "timestamp": "2025-11-21 15:02:38.404916",
+    "report_generated": false
+  },
+  {
+    "question": "Does genesis transaction processing properly meter gas even though it occurs during InitGenesis, preventing unbounded computation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d03cbc39-bcc5-4f39-b8ef-6e33fa2534df",
+    "timestamp": "2025-11-21 15:03:13.717725",
+    "report_generated": false
+  },
+  {
+    "question": "Does the delegator address comparison in collect.go:148-156 properly handle case sensitivity?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7da6d5af-752c-4ee8-b50d-92e869fdfd91",
+    "timestamp": "2025-11-21 15:03:50.743237",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create a gentx with a validator address that equals a module account address, causing fund locking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ccded3cf-2c7d-4ce9-bbd8-d8e94424bd8c",
+    "timestamp": "2025-11-21 15:04:29.021842",
+    "report_generated": false
+  },
+  {
+    "question": "Does the validator address derivation in collect.go:143-146 handle address format changes across SDK versions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_571beb53-1ef4-4b6a-ab41-7cd38549b109",
+    "timestamp": "2025-11-21 15:05:07.589433",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker use address aliasing (different Bech32 encodings of the same address) to bypass balance checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1cefdc87-0020-4c1b-8553-c729f85c5210",
+    "timestamp": "2025-11-21 15:05:45.647225",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateAccountInGenesis properly validate Bech32 address formats before comparing them in collect.go:143-146?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fdf95613-4cf8-4d98-9d49-306da2b2fb20",
+    "timestamp": "2025-11-21 15:06:24.543697",
+    "report_generated": false
   }
 ]
