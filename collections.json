@@ -8848,5 +8848,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_503bbb26-1654-4c69-9dbb-7589190c8b28",
     "timestamp": "2025-11-21 16:54:05.240186",
     "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Time Source: Evidence time comes from CometBFT. Is this consistent with block time, or can discrepancies break age checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_890fec2e-c0d7-4717-b7ae-91b535527cac",
+    "timestamp": "2025-11-21 16:55:13.571152",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Height Validation: Can future-height evidence be accepted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_119d8b9c-f578-4f83-a725-221d920fbb2b",
+    "timestamp": "2025-11-21 16:55:28.284321",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Consensus Address Format: Do consensus addresses match the chain prefix? Can cross-chain or invalid addresses be submitted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd439de4-9dbc-4eb2-bffe-775fca1bddaa",
+    "timestamp": "2025-11-21 16:55:42.169748",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Deduplication: Is ABCI evidence checked against previously stored evidence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8fce48a4-f660-4252-a487-37ec80930c85",
+    "timestamp": "2025-11-21 16:55:56.348259",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker SetEvidence Panic Path: If SetEvidence panics, does the chain halt?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a4f492f7-7c41-454e-9a7b-7ae961b1a3c3",
+    "timestamp": "2025-11-21 16:56:11.451598",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker IsTombstoned Check: A validator tombstoned once may have multiple infractions ignored. Can this hide serious misbehavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ee9a70ea-e08c-4730-8c15-273c34a97b7a",
+    "timestamp": "2025-11-21 16:56:27.982235",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker ValidatorUpdateDelay Underflow: Distribution height subtracts ValidatorUpdateDelay. Can early-block evidence cause underflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c271c098-5915-49bd-a547-ad41b4b41f7d",
+    "timestamp": "2025-11-21 16:56:45.637077",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Slash-Then-Jail Ordering: Could validators unbond or escape slashing due to timing issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_da099b0c-266e-4afd-ad99-50c15927c056",
+    "timestamp": "2025-11-21 16:57:06.535675",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence GetPubkey Error Handling: If GetPubkey fails, the function returns early without error. Can attackers ensure their pubkey is absent to avoid slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_203245e4-3685-4ed8-a913-a02bb4323316",
+    "timestamp": "2025-11-21 16:57:27.564377",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Age Calculation Race: Could manipulated block headers cause incorrect age checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4575beeb-4f7e-4358-9bac-0ce71a3551e7",
+    "timestamp": "2025-11-21 16:57:50.453809",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Age Check Logic Error: The logic uses AND instead of OR. Could old evidence bypass rejection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f0c30e1-7fd0-4fcd-a3b7-7d1958f9fb5c",
+    "timestamp": "2025-11-21 16:58:13.980363",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence ConsensusParams Nil Issues: If consensus params are nil, are age checks skipped entirely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01931fb8-0cbf-4e2d-b2c8-4a05708dccf8",
+    "timestamp": "2025-11-21 16:58:38.256401",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Unbonding Check: Can validators unbond immediately after misbehavior to avoid punishment?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_47a7a0c1-b5d0-4b94-9839-893352baacb2",
+    "timestamp": "2025-11-21 16:59:05.646170",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Missing Validator Handling: Does submitting evidence for removed validators waste storage or bypass checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c38b000b-e3a4-4625-a1ff-6c2a91c66092",
+    "timestamp": "2025-11-21 16:59:32.453068",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence SigningInfo Panic: Missing signing info causes panic. Can corrupted state halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3a5bb983-97f0-49e6-952f-9f62674e969a",
+    "timestamp": "2025-11-21 16:59:59.842037",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Tombstone Timing: If tombstoning occurs before processing, does evidence get wasted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95c80389-80b2-4366-9fbd-ea4f7ba14089",
+    "timestamp": "2025-11-21 17:00:29.635794",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Slash Fraction Determinism: If fraction changes between misbehavior and processing, is slashing inconsistent?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ad290e1b-5f09-409c-9351-137e32cca535",
+    "timestamp": "2025-11-21 17:01:00.051004",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Slash with Zero Power: Could zero-power evidence cause divide-by-zero or no-op slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f59c267-9104-4e1e-96af-12d3c1235b4c",
+    "timestamp": "2025-11-21 17:01:33.524984",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Negative Distribution Height: Early blocks produce negative heights — can this break slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c72d9c35-36f1-4e40-9329-c26bfcbabf4f",
+    "timestamp": "2025-11-21 17:02:08.213168",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Jail Race Condition: Can validators avoid jailing via concurrent operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f75c0c46-bf17-493b-8107-1bec02894cac",
+    "timestamp": "2025-11-21 17:02:44.535059",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence JailUntil Timestamp: Year-9999 jail time: could this break timestamplogic elsewhere?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_26a34fe7-e565-4eb8-ac6c-a2005e1111da",
+    "timestamp": "2025-11-21 17:03:21.030393",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Tombstone Irreversibility: No override for false positives — governance gap?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a9b1e8f-5a06-4897-a475-deb338404daf",
+    "timestamp": "2025-11-21 17:03:58.762155",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Partial State Updates: Could failure during jail/tombstone/slash cause inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_63d09eec-bc45-4bd4-a7d3-1a004b943fef",
+    "timestamp": "2025-11-21 17:04:38.822930",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Slash Amount Correctness: Evidence uses historical power — mismatch with current token amounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c79d893e-a0a9-48ce-8da2-0db20788d82b",
+    "timestamp": "2025-11-21 17:05:18.860182",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Unbonding Delegation Slashing: Can timing avoid slashing unbonding delegations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_40beef27-ae5e-47b5-b5ca-13d33038c7fe",
+    "timestamp": "2025-11-21 17:05:58.796198",
+    "report_generated": false
   }
 ]
