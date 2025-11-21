@@ -2698,5 +2698,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4890b6d6-7bb4-4674-9eb9-7679d33266af",
     "timestamp": "2025-11-21 09:58:50.646358",
     "report_generated": false
+  },
+  {
+    "question": "Is there a race condition in the downgrade verification logic where SetDowngradeVerified could be called multiple times across different contexts? keeper.go:484-492",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eec6f9d1-106c-411a-bae5-5ad11a867db7",
+    "timestamp": "2025-11-21 10:00:08.143151",
+    "report_generated": false
+  },
+  {
+    "question": "Can the DowngradeVerified check be bypassed by manipulating the context or state to cause the chain to accept an incompatible binary? abci.go:31-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_51c1267f-c55e-487b-a6f5-12c2205499c1",
+    "timestamp": "2025-11-21 10:00:21.224376",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic in panicUpgradeNeeded at line 112 properly write upgrade info before halting, or could filesystem errors leave the chain in an inconsistent state? abci.go:100-113",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bebb1c06-26a7-42ed-a6db-ef878f9e1919",
+    "timestamp": "2025-11-21 10:00:35.098817",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause a chain halt by scheduling an upgrade at the current block height in BeginBlocker? abci.go:23-98",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0b49cddf-fdaf-4e32-87b7-db5d42db3110",
+    "timestamp": "2025-11-21 10:00:49.127410",
+    "report_generated": false
+  },
+  {
+    "question": "In version/ package, is version information properly validated to prevent version string injection attacks that could confuse upgrade mechanisms?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_583f5c45-a0d6-428a-bb53-acffe662266c",
+    "timestamp": "2025-11-21 10:01:03.780011",
+    "report_generated": false
+  },
+  {
+    "question": "Does the telemetry/ package properly sanitize metric labels to prevent metric label cardinality explosions that could exhaust monitoring system resources?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_180b284f-2040-4394-a755-5426e835f979",
+    "timestamp": "2025-11-21 10:01:20.043852",
+    "report_generated": false
+  },
+  {
+    "question": "In internal/conv/ package, does the UnsafeBytesToStr or UnsafeStrToBytes function usage introduce any memory safety issues that could be exploited?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3b203651-85dd-44c8-a609-b204084a554e",
+    "timestamp": "2025-11-21 10:01:37.644251",
+    "report_generated": false
+  },
+  {
+    "question": "Does the testutil/ code properly isolate test environments to prevent tests from affecting production code paths?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_423fee7f-f851-4581-8fb5-e6e42b2f1361",
+    "timestamp": "2025-11-21 10:01:56.981065",
+    "report_generated": false
+  },
+  {
+    "question": "In utils/ directory, are there any utility functions that could introduce non-determinism or security vulnerabilities when used by modules?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_efc0122f-d764-4b10-9a0d-53259c353659",
+    "timestamp": "2025-11-21 10:02:17.888831",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any deferred recover() calls that could catch panics and hide critical errors that should halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_82b5131c-c458-439f-b7d9-0f7968611c69",
+    "timestamp": "2025-11-21 10:02:40.409724",
+    "report_generated": false
+  },
+  {
+    "question": "In the multiversion store, does the WriteLatestToStore function properly handle the panic condition when estimates are found during write? store.go:418-421",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_68d48e02-46d5-432e-9908-0c3e6b966031",
+    "timestamp": "2025-11-21 10:03:04.170351",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft transactions that cause panics in custom ante handlers, bypassing transaction execution but still consuming gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0a8f2d89-c661-4554-83ab-940a083fc6b7",
+    "timestamp": "2025-11-21 10:03:29.278723",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store/cachekv/store.go implementation properly handle panics in the GetWorkingHash function, or is this panic intentional and could it be triggered maliciously? store.go:48-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2f17fbb3-d849-4096-bec4-41f4f4d7e380",
+    "timestamp": "2025-11-21 10:03:54.556364",
+    "report_generated": false
+  },
+  {
+    "question": "In BeginBlocker/EndBlocker hooks, are there unhandled panic conditions that could halt the entire chain rather than failing gracefully?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a82bbbd1-7779-43d2-a373-d04fb6bbfb9b",
+    "timestamp": "2025-11-21 10:04:21.578920",
+    "report_generated": false
+  },
+  {
+    "question": "In store/cachekv/store.go, can the event manager be accessed concurrently from multiple goroutines without proper synchronization? store.go:19-30",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ffa24fb-3bf5-4d15-a165-ab1728c3afff",
+    "timestamp": "2025-11-21 10:04:49.964244",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any goroutines spawned during transaction execution that could outlive the transaction and cause unexpected state mutations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_222a3765-3392-4537-8fbf-f3fa4b6b3325",
+    "timestamp": "2025-11-21 10:05:19.277389",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store/multiversion/store.go implementation use proper memory barriers to ensure write ordering in the multiversion map? store.go:40-60",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff695d52-e5bc-4f98-932d-2906c3635d72",
+    "timestamp": "2025-11-21 10:05:50.370020",
+    "report_generated": false
+  },
+  {
+    "question": "Can floating-point arithmetic in any module cause slightly different results across different CPU architectures, leading to consensus failure?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bd7840f8-25d9-4150-92bb-9da1aeb0a32c",
+    "timestamp": "2025-11-21 10:06:21.402281",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any places where Go's map iteration order is used in a way that could cause non-deterministic behavior across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ed66fe65-b429-4acd-acc2-eb9ace6d909c",
+    "timestamp": "2025-11-21 10:06:55.054647",
+    "report_generated": false
+  },
+  {
+    "question": "Does the codebase use time.Now() anywhere instead of block time, which could cause consensus divergence between validators with different clock skew?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5315be6e-ba89-4beb-a8bf-08662c0ee756",
+    "timestamp": "2025-11-21 10:07:28.501452",
+    "report_generated": false
+  },
+  {
+    "question": "In parallel transaction execution, can race conditions occur when multiple transactions access the event manager concurrently?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b3c5749-df4e-4efd-89ea-f28c966cba8f",
+    "timestamp": "2025-11-21 10:08:02.477333",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store/rootmulti/store.go implementation use the lastCommitInfoMtx consistently for all accesses to prevent races on commit info? store.go:48-74",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_52d77605-14ca-445e-8fd5-8a9e2acb01fb",
+    "timestamp": "2025-11-21 10:08:37.171369",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent access to the unsortedCache and sortedCache in store/cachekv/store.go cause race conditions that lead to non-deterministic state? store.go:19-30",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_177b021b-6b8b-41ab-9dea-365f36d2cea5",
+    "timestamp": "2025-11-21 10:09:12.914519",
+    "report_generated": false
+  },
+  {
+    "question": "In store/cachekv/store.go, does the use of sync.Map for the cache properly prevent data races between concurrent transaction execution? store.go:19-30",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f972aaa1-72b7-4d0b-9829-71a2d2730810",
+    "timestamp": "2025-11-21 10:09:50.198779",
+    "report_generated": false
+  },
+  {
+    "question": "In store/multiversion/mergeiterator.go, does the merge iterator properly handle the case where one source iterator is exhausted before others?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4de6a2b4-f1d7-44c3-9174-9dd897e27d06",
+    "timestamp": "2025-11-21 10:10:29.302830",
+    "report_generated": false
   }
 ]
