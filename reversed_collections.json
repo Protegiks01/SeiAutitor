@@ -1798,5 +1798,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37178d18-da31-4eea-ad69-a8377f0604dd",
     "timestamp": "2025-11-21 08:34:11.687322",
     "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft a malicious LastCommitInfo with an extremely large number of votes to cause BeginBlocker to spawn thousands of goroutines abci.go:33-50 , leading to memory exhaustion and node crashes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3629b7c6-0a90-4245-9c4d-bcb4327fa2d4",
+    "timestamp": "2025-11-21 08:35:41.878062",
+    "report_generated": false
+  },
+  {
+    "question": "Does the concurrent execution of HandleValidatorSignatureConcurrent abci.go:36-50 introduce race conditions when multiple goroutines read from the KV store simultaneously, potentially causing non-deterministic state reads?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_98c6278d-e818-4c14-bd50-a698195880e7",
+    "timestamp": "2025-11-21 08:35:56.763948",
+    "report_generated": false
+  },
+  {
+    "question": "In BeginBlocker abci.go:24-66 , can a panic in any of the concurrent goroutines (line 38-50) cause the entire chain to halt, and is there proper panic recovery to prevent consensus failure?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d0baed9c-7c2f-49ba-b01b-711a435cb193",
+    "timestamp": "2025-11-21 08:36:11.290508",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker & Consensus Safety (Questions 1-25)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7935de11-262e-40d1-9684-9648cf18a470",
+    "timestamp": "2025-11-21 08:36:26.806389",
+    "report_generated": false
+  },
+  {
+    "question": "Can the upgrade module's state be corrupted by malicious proposals that bypass standard validation? handler.go:15-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ed7322ee-8b70-482a-886e-01c5d58a699e",
+    "timestamp": "2025-11-21 08:36:43.391721",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module properly register all interfaces to prevent deserialization errors? codec.go:16-22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4cb0ee23-539c-43aa-a80b-b7fb4bbb0ba5",
+    "timestamp": "2025-11-21 08:37:01.425048",
+    "report_generated": false
+  },
+  {
+    "question": "Can the ConsensusVersion constant be mismatched with actual module behavior? module.go:143",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a236ff7-0fa8-490b-8d72-86f7aca5427d",
+    "timestamp": "2025-11-21 08:37:21.578213",
+    "report_generated": false
+  },
+  {
+    "question": "Is the module name 'upgrade' protected from conflicts with custom modules? keys.go:6-7",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78bb2145-c92c-45b2-ae04-6251d0ec7dae",
+    "timestamp": "2025-11-21 08:37:43.060013",
+    "report_generated": false
+  },
+  {
+    "question": "Can the legacy Amino codec introduce vulnerabilities when interoperating with newer protobuf serialization? codec.go:9-14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8188a150-0708-4e6a-8a0e-490d97e4c46e",
+    "timestamp": "2025-11-21 08:38:05.789462",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module properly handle InitGenesis and ExportGenesis despite being stateless? module.go:103-131",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d704f6b-8095-48d7-b0f5-07c362ad8477",
+    "timestamp": "2025-11-21 08:38:30.007269",
+    "report_generated": false
+  },
+  {
+    "question": "Can the upgrade module's BeginBlocker be called out of order, breaking dependencies with other modules? module.go:147",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c9130755-04a5-46ec-ae88-b52b6dfb8ce1",
+    "timestamp": "2025-11-21 08:38:54.629534",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that upgrade handlers don't consume excessive gas leading to block gas limit issues? keeper.go:365-374",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7cb33cdf-7bf7-4998-a99b-454af52638e7",
+    "timestamp": "2025-11-21 08:39:21.436445",
+    "report_generated": false
+  },
+  {
+    "question": "Can store migrations interfere with other modules' store operations during upgrade? storeloader.go:11-23",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_866e8c54-9e3e-4601-bbb5-75b5e0275dc8",
+    "timestamp": "2025-11-21 08:39:49.024266",
+    "report_generated": false
+  },
+  {
+    "question": "Does the upgrade module properly handle reentrancy if an upgrade handler triggers another module's hook? keeper.go:364-391",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62912f0b-f5e4-4659-96aa-aa9fa7ddca93",
+    "timestamp": "2025-11-21 08:40:18.429530",
+    "report_generated": false
+  },
+  {
+    "question": "Can the version setter interface be nil, causing a panic during upgrade execution? keeper.go:381-384",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4581f0fe-3066-4c90-9bd9-287433a2795c",
+    "timestamp": "2025-11-21 08:40:48.121178",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that upgrade handlers don't perform unbounded iterations that could DoS the chain? keeper.go:365-374",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f4c0224-1684-4fbc-854a-254b1bb7cfe4",
+    "timestamp": "2025-11-21 08:41:19.658009",
+    "report_generated": false
+  },
+  {
+    "question": "Can a malicious module register a conflicting upgrade handler after initialization? keeper.go:67-68",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_542db38c-b4ae-4d8d-b745-ed039fd09950",
+    "timestamp": "2025-11-21 08:41:52.836360",
+    "report_generated": false
+  },
+  {
+    "question": "Does the upgrade module properly coordinate with x/gov to ensure only valid proposals trigger upgrades? handler.go:14-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35493832-2a8f-49d1-b4ca-cd9c695ad480",
+    "timestamp": "2025-11-21 08:42:27.509285",
+    "report_generated": false
+  },
+  {
+    "question": "Can an upgrade handler maliciously modify other modules' state without proper authorization? keeper.go:64-69",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3d6d4c5b-aba1-47b3-944f-accb4d75c449",
+    "timestamp": "2025-11-21 08:43:02.184278",
+    "report_generated": false
+  },
+  {
+    "question": "Can validators with different binary versions execute the BeginBlocker differently before the upgrade? abci.go:31-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9213c54e-d6cb-4835-a463-3a556a48b5dc",
+    "timestamp": "2025-11-21 08:43:38.141249",
+    "report_generated": false
+  },
+  {
+    "question": "Does the error handling in upgrade execution maintain determinism across all validators? keeper.go:371-374",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f7f2b18d-6394-47fe-b3b5-19b3fa8f34cf",
+    "timestamp": "2025-11-21 08:44:15.379363",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent execution of BeginBlocker on different nodes produce different results? module.go:148-150",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_865aced2-978b-47ea-9239-069f91b61bf0",
+    "timestamp": "2025-11-21 08:44:52.015306",
+    "report_generated": false
+  },
+  {
+    "question": "Is the codec used for marshaling upgrade plans guaranteed to produce identical bytes on all nodes? keeper.go:200-201",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_19ca1915-0f69-4494-b1a7-53844968e430",
+    "timestamp": "2025-11-21 08:45:29.361197",
+    "report_generated": false
+  },
+  {
+    "question": "Can the logger output affect consensus if different nodes have different log configurations? keeper.go:332-335",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5fa767f7-9f03-43fe-a536-9bd992fe127e",
+    "timestamp": "2025-11-21 08:46:08.111317",
+    "report_generated": false
+  },
+  {
+    "question": "Does the upgrade plan comparison use deterministic equality checks? keeper.go:195",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_086e06ab-7506-4081-a168-58b2a736a4f9",
+    "timestamp": "2025-11-21 08:46:49.103314",
+    "report_generated": false
   }
 ]
