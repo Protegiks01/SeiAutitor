@@ -7798,5 +7798,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f99709ec-7517-4364-be24-2c1e7ae0de1b",
     "timestamp": "2025-11-21 16:43:48.334649",
     "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit timing between grant expiration checking and fee deduction in UseGrantedFees keeper.go:147-180?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78ab444e-39a4-427f-825c-6c567aa9aec4",
+    "timestamp": "2025-11-21 16:45:11.953056",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ante handler prevent using a grant if the granter account is frozen or has restrictions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_817e7987-29bb-47fb-bb3b-eb20e8c6b68c",
+    "timestamp": "2025-11-21 16:45:25.970377",
+    "report_generated": false
+  },
+  {
+    "question": "Can the gas consumed by UseGrantedFees cause a transaction to run out of gas before fee deduction completes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ee2a0030-bf4e-4f64-8658-b1ffda478f4c",
+    "timestamp": "2025-11-21 16:45:40.123266",
+    "report_generated": false
+  },
+  {
+    "question": "Does checkDeductFee fee.go:177-180 properly handle the case where the granter account doesn't exist?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ac3d75e3-50b9-4f30-a1d8-ab34f84f6f51",
+    "timestamp": "2025-11-21 16:45:55.336306",
+    "report_generated": false
+  },
+  {
+    "question": "Can a transaction with a fee granter but invalid messages cause a grant to be partially consumed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_779c6b76-eabb-43f7-acb9-906ff63946a3",
+    "timestamp": "2025-11-21 16:46:11.072019",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ante handler validate that the messages in the transaction match those passed to the grant's Accept method?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_123b68f3-8517-47a5-83d9-1ceceb780a3a",
+    "timestamp": "2025-11-21 16:46:27.725128",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the fact that UseGrantedFees is called before actual fee deduction to cause inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_266ee828-d3fe-4d19-bab3-a736be3fa71e",
+    "timestamp": "2025-11-21 16:46:46.039321",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ante handler properly handle zero-fee transactions with a fee granter set?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d0a42934-e080-4b00-b2a7-e55a6cdd67f0",
+    "timestamp": "2025-11-21 16:47:06.026156",
+    "report_generated": false
+  },
+  {
+    "question": "Can the grant state be updated correctly if GrantAllowance keeper.go:179 at the end of UseGrantedFees fails?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_059f5f8f-fcf7-403a-95ed-343d0a829cd9",
+    "timestamp": "2025-11-21 16:47:28.158015",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ante handler validate that the fee amount matches what's specified in the transaction before calling UseGrantedFees?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85ef7d90-3584-478e-83b6-2a591b962487",
+    "timestamp": "2025-11-21 16:47:51.470431",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker front-run a legitimate transaction that uses a fee grant to exhaust the grant first?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_978a50f8-1744-43e7-ac33-748feb744766",
+    "timestamp": "2025-11-21 16:48:16.028644",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeductFees fee.go:203-214 properly handle the case where the granter account has just enough balance but the grant has been exhausted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d6bf8d2-c391-4677-a2de-5acf953941df",
+    "timestamp": "2025-11-21 16:48:41.849773",
+    "report_generated": false
+  },
+  {
+    "question": "Can the order of operations in UseGrantedFees (Accept, then revoke, then save) keeper.go:158-179 lead to race conditions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_27fd0f4b-3b8e-4130-9e00-60b3ba3b9abb",
+    "timestamp": "2025-11-21 16:49:08.524267",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ante handler check that the feegrant keeper is initialized before attempting to use it fee.go:165-166?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9c643aaa-6bc5-4253-8269-fa5b2eed4a8b",
+    "timestamp": "2025-11-21 16:49:36.645577",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker use a grant from a blocked address to pay fees in checkDeductFee fee.go:164-175?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_14db4a6b-0ec2-4d00-9710-f291f2fa6283",
+    "timestamp": "2025-11-21 16:50:05.419543",
+    "report_generated": false
+  },
+  {
+    "question": "Does checkDeductFee fee.go:148-200 properly validate that feeGranter is not a module account?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_be1c9a30-116e-4aef-ac63-a3c5ae926da7",
+    "timestamp": "2025-11-21 16:50:35.768101",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the event emission in UseGrantedFees keeper.go:167 to cause state inconsistencies if the function panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dffa2f67-a7ea-4b14-95ce-05a5135077a4",
+    "timestamp": "2025-11-21 16:51:06.270271",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ante handler enforce that the fee parameter is non-negative before calling UseGrantedFees?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_53babd3d-97a1-497b-a81d-8f356797d977",
+    "timestamp": "2025-11-21 16:51:38.869339",
+    "report_generated": false
+  },
+  {
+    "question": "Can the error handling in line 162-165 keeper.go:160-165 cause a grant to be revoked even if fee deduction fails?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2c9eaa15-723c-46da-90aa-220dfd243cf1",
+    "timestamp": "2025-11-21 16:52:12.568509",
+    "report_generated": false
+  },
+  {
+    "question": "Does UseGrantedFees keeper.go:147-180 properly handle the case where the grant is revoked between fetching and using it?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d5b5e4d-eab4-4ccf-9c62-f692c35d7ae8",
+    "timestamp": "2025-11-21 16:52:47.478182",
+    "report_generated": false
+  },
+  {
+    "question": "Can a transaction with nested messages (e.g., via x/authz) bypass fee grant validation by not passing all messages to Accept?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_66097fc0-62bb-4068-b020-871176d6014d",
+    "timestamp": "2025-11-21 16:53:24.385926",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ante handler properly handle the case where UseGrantedFees keeper.go:147-180 revokes a grant mid-execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_195a106a-e95c-445a-b1cd-319e4fb387b8",
+    "timestamp": "2025-11-21 16:54:02.896185",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the fact that UseGrantedFees is called in the ante handler fee.go:168-171 to drain a granter's funds through repeated failed transactions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_82ec411a-e483-4e31-9893-a87d2081460d",
+    "timestamp": "2025-11-21 16:54:39.553238",
+    "report_generated": false
+  },
+  {
+    "question": "Does UseGrantedFees fee.go:168 properly validate that the granter has sufficient balance before attempting to use the grant?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8ef98e41-03cf-42bc-a85a-fe0036ac447a",
+    "timestamp": "2025-11-21 16:55:17.953912",
+    "report_generated": false
+  },
+  {
+    "question": "In DeductFeeDecorator.checkDeductFee fee.go:148-200, can an attacker set feeGranter == feePayer to bypass fee grant validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3ffeea39-7e66-468a-a406-7d592e1f0a61",
+    "timestamp": "2025-11-21 16:55:56.030553",
+    "report_generated": false
   }
 ]
