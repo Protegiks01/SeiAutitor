@@ -8248,5 +8248,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_306c0a7b-307e-4720-8074-00019140d5dc",
     "timestamp": "2025-11-21 16:06:13.666226",
     "report_generated": false
+  },
+  {
+    "question": "Zero Amount Community Spend: Can a governance proposal to spend zero coins from the community pool be used to manipulate state or gas consumption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c017fdee-d888-4761-b583-d88ffa8e93fb",
+    "timestamp": "2025-11-21 16:07:34.496092",
+    "report_generated": false
+  },
+  {
+    "question": "Community Pool Dust Accumulation: With truncation at delegation.go:164-165 , dust accumulates in the community pool. Can this become significant over time and how is it distributed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6a885c04-9726-4148-b500-08aa28c28d9f",
+    "timestamp": "2025-11-21 16:07:47.739662",
+    "report_generated": false
+  },
+  {
+    "question": "Proposal Execution Replay: If a community pool spend proposal is executed, can its execution be replayed to drain the pool multiple times?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_21c07ba9-0d64-4ca2-85e8-c6bf56b1d325",
+    "timestamp": "2025-11-21 16:08:01.196653",
+    "report_generated": false
+  },
+  {
+    "question": "Fund Community Pool from Module: Can a module account fund the community pool, and if so, can this be used to bypass normal fee collection and manipulate reward distribution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_876ac1ca-73fb-4cb1-baa1-75ef27d6608a",
+    "timestamp": "2025-11-21 16:08:15.759070",
+    "report_generated": false
+  },
+  {
+    "question": "Key Prefix Collision: The key prefixes at keys.go:46-56 are single bytes. Can any two key types collide if address lengths are manipulated?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_39416791-1019-4a16-8dad-fda0fa684b1b",
+    "timestamp": "2025-11-21 16:08:30.964690",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Address Length Manipulation: In key construction at keys.go:156-158 , address.MustLengthPrefix is used. Can an attacker provide an address with incorrect length prefix to corrupt the key space?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_623bb015-0371-4db4-9d39-49f81db37b50",
+    "timestamp": "2025-11-21 16:08:47.879312",
+    "report_generated": false
+  },
+  {
+    "question": "Period Encoding Endianness: At keys.go:176-179 , period is encoded with LittleEndian, but at keys.go:199-200 height uses BigEndian. Can this inconsistency cause iteration or key construction issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3590b9e5-64f0-47d7-bada-692d196464d2",
+    "timestamp": "2025-11-21 16:09:05.999914",
+    "report_generated": false
+  },
+  {
+    "question": "Historical Rewards Key Collision: In GetValidatorHistoricalRewardsKey at keys.go:176-180 , validator address and period are combined. Can two different (validator, period) pairs hash to the same key?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b8914ed9-f43d-45c5-98d6-0e53d60c3fb0",
+    "timestamp": "2025-11-21 16:09:25.983472",
+    "report_generated": false
+  },
+  {
+    "question": "Slash Event Key Ordering: In IterateValidatorSlashEventsBetween at store.go:334-350 , iteration uses height range. Can height encoding issues cause events to be returned out of order?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bdedf614-69ee-453a-ad9a-46382cdc9cd5",
+    "timestamp": "2025-11-21 16:09:51.162108",
+    "report_generated": false
+  },
+  {
+    "question": "Delegator Starting Info Key Construction: In GetDelegatorStartingInfoKey at keys.go:166-168 , both validator and delegator addresses are combined. Can address length manipulation cause key collisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34ff0eab-62e5-4205-b6cd-9dd027df1918",
+    "timestamp": "2025-11-21 16:10:14.261446",
+    "report_generated": false
+  },
+  {
+    "question": "Iterator Resource Exhaustion: In functions like IterateValidatorOutstandingRewards at store.go:301-313 , if the handler never returns true, will the iterator consume unbounded resources?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_07d9e99b-4e25-411d-9406-6653428664d9",
+    "timestamp": "2025-11-21 16:10:38.673285",
+    "report_generated": false
+  },
+  {
+    "question": "Store Key Determinism: Are all store keys constructed deterministically such that two nodes will always generate the same key for the same logical data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_708e2ba0-7ede-4087-a9f3-274c109e4448",
+    "timestamp": "2025-11-21 16:11:03.782182",
+    "report_generated": false
+  },
+  {
+    "question": "Prefix Iterator Range Bug: In IterateValidatorSlashEventsBetween at store.go:337-340 , the range is [startingHeight, endingHeight+1). Can off-by-one errors cause events at boundary heights to be missed or double-counted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_96fa5736-5a8d-4a3c-a44b-fc06fc5207d3",
+    "timestamp": "2025-11-21 16:11:30.511647",
+    "report_generated": false
+  },
+  {
+    "question": "Delete Without Existence Check: Functions like DeleteDelegatorStartingInfo at store.go:108-111 don't check if the key exists before deleting. Can this hide bugs where deletions are called on non-existent data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_32a34b6e-05c4-4abf-a806-1da9f875d818",
+    "timestamp": "2025-11-21 16:11:58.236496",
+    "report_generated": false
+  },
+  {
+    "question": "MustUnmarshal Panic on Corrupted Data: Multiple functions use k.cdc.MustUnmarshal which panics on invalid data. Can corrupted state due to bugs or migrations cause chain halts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9c9f3015-155a-4cf9-b095-1471e002280c",
+    "timestamp": "2025-11-21 16:12:26.531880",
+    "report_generated": false
+  },
+  {
+    "question": "ValidatorSlashEvent Period in Key: In GetValidatorSlashEventKey at keys.go:209-215 , period is appended after height. Can the same (validator, height) with different periods cause key collisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b08b9979-ce99-485a-a9c8-cd25d41bf1d9",
+    "timestamp": "2025-11-21 16:12:56.150555",
+    "report_generated": false
+  },
+  {
+    "question": "Store Iterator Not Closed: Are all iterators properly deferred with .Close() to prevent resource leaks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_18f2820f-4f96-4bde-b90a-15adfab0c098",
+    "timestamp": "2025-11-21 16:13:27.201341",
+    "report_generated": false
+  },
+  {
+    "question": "Historical Rewards Garbage Collection: In DeleteValidatorHistoricalRewards at store.go:165-172 , all historical rewards for a validator are deleted. Can this cause state bloat if not called properly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_97ea7e0c-b9b0-4fd9-b067-fedcd010ea2a",
+    "timestamp": "2025-11-21 16:13:59.673447",
+    "report_generated": false
+  },
+  {
+    "question": "Reference Count Decrement Below Zero: In decrementReferenceCount at validator.go:77-88 , it panics if count is already zero. Can concurrent operations trigger this panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b91370bb-121c-4314-b2d0-e5d05334ad3b",
+    "timestamp": "2025-11-21 16:14:32.200187",
+    "report_generated": false
+  },
+  {
+    "question": "KV Store Transaction Atomicity: If multiple store operations happen in a keeper function and one fails, are all prior operations rolled back, or can partial state updates occur?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_badee51c-09f4-4cab-a11b-492b8da8d1d5",
+    "timestamp": "2025-11-21 16:15:06.859678",
+    "report_generated": false
+  },
+  {
+    "question": "Protobuf Marshaling Determinism: Are all protobuf message marshaling operations deterministic across different Go versions and architectures to prevent consensus failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8bac8dc7-ca23-4174-a3ce-3cb77eae79c7",
+    "timestamp": "2025-11-21 16:15:42.904282",
+    "report_generated": false
+  },
+  {
+    "question": "Key Length Validation: In key parsing functions like GetValidatorOutstandingRewardsAddress at keys.go:59-69 , AssertKeyLength is used. Can malformed keys in state cause panics during iteration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7f2a4b9b-0807-4d86-83f4-5029da358764",
+    "timestamp": "2025-11-21 16:16:19.072443",
+    "report_generated": false
+  },
+  {
+    "question": "DecCoins Addition Precision Loss: When DecCoins.Add() is called repeatedly in AllocateTokens at allocation.go:105 , can accumulated rounding errors become significant?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dc8be41a-a3a5-4f09-a4f8-f1458683bfc4",
+    "timestamp": "2025-11-21 16:16:57.140528",
+    "report_generated": false
+  },
+  {
+    "question": "Reward Calculation Truncation: In calculateDelegationRewardsBetween at delegation.go:50 , MulDecTruncate is used. Can an attacker exploit this truncation to drain micro-amounts repeatedly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_039bc86b-b681-4586-9903-8610b8a1bf12",
+    "timestamp": "2025-11-21 16:17:35.397352",
+    "report_generated": false
+  },
+  {
+    "question": "Shares to Tokens Conversion: In initializeDelegation at delegation.go:25 , TokensFromSharesTruncated is used. Can this cause delegators to receive fewer rewards than entitled?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d8b0b229-42b3-4461-9ca9-8a6b7a3374c2",
+    "timestamp": "2025-11-21 16:18:14.793064",
+    "report_generated": false
   }
 ]
