@@ -2848,5 +2848,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4de6a2b4-f1d7-44c3-9174-9dd897e27d06",
     "timestamp": "2025-11-21 10:10:29.302830",
     "report_generated": false
+  },
+  {
+    "question": "Do iterators properly handle the case where a key is deleted during iteration, ensuring consistent results?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ed72e0d8-f9d5-45bd-ad96-77637b2039bf",
+    "timestamp": "2025-11-21 10:11:56.184492",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause iterator resource leaks by creating many iterators and never closing them?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_83399b64-4bb2-444c-b020-6189c22985cd",
+    "timestamp": "2025-11-21 10:12:09.876856",
+    "report_generated": false
+  },
+  {
+    "question": "In the reverse iterator implementation, is the iteration order guaranteed to be deterministic across all nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1853a633-f156-4cf0-81f3-6bf6e116d3cd",
+    "timestamp": "2025-11-21 10:12:23.379897",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store/tracekv/store.go ensure that iterator operations are deterministic even when tracing is enabled?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35b0f28e-629b-4027-8aa2-36402477624e",
+    "timestamp": "2025-11-21 10:12:37.682311",
+    "report_generated": false
+  },
+  {
+    "question": "Can iterator key/value callbacks cause mutations to the store being iterated, leading to undefined behavior or consensus failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d5d538cf-9bec-4360-aaf5-4d7f2b8ffdb3",
+    "timestamp": "2025-11-21 10:12:52.894282",
+    "report_generated": false
+  },
+  {
+    "question": "In store/prefix/store.go, do prefix iterators properly enforce boundaries to prevent reading keys outside the designated prefix?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f054289c-b6f9-416e-b8a1-9773a4599043",
+    "timestamp": "2025-11-21 10:13:10.408669",
+    "report_generated": false
+  },
+  {
+    "question": "Does the iterator logic in store/multiversion/memiterator.go properly merge results from multiple sources without introducing non-determinism?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ad17534d-4eca-4b2b-bb95-629bfb07987e",
+    "timestamp": "2025-11-21 10:13:29.392211",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create iterators with extremely wide ranges that consume excessive memory or CPU time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c666a25-0a8c-4dac-8d8f-1b3b58e26d42",
+    "timestamp": "2025-11-21 10:13:49.262392",
+    "report_generated": false
+  },
+  {
+    "question": "In store/cachekv/store.go, do iterator implementations properly handle concurrent modifications to the underlying store, or could this cause iterator invalidation panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b3c20223-8792-4010-a15c-d13f3fab8e2a",
+    "timestamp": "2025-11-21 10:14:11.164743",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any operations in hooks or middleware that bypass gas metering entirely, allowing unmetered computation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3a23ccc3-4c08-4b3b-830e-3506b40aa261",
+    "timestamp": "2025-11-21 10:14:34.056955",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gas metering handle recursive or deeply nested function calls that could cause stack overflow before gas exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8a776b1b-d337-4709-9245-1fe026f2fe7f",
+    "timestamp": "2025-11-21 10:14:57.357674",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker submit transactions that consume gas in a way that causes validators to run out of memory before running out of gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f4029a9-e939-4840-9d58-32e66d059ba7",
+    "timestamp": "2025-11-21 10:15:22.488581",
+    "report_generated": false
+  },
+  {
+    "question": "In infinite loop detection, does the gas meter properly interrupt execution before consuming all validator resources?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6a7c2ef2-bfc7-416d-b111-507f0e297b17",
+    "timestamp": "2025-11-21 10:15:48.674917",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gas configuration properly price all operations relative to their computational cost to prevent underpriced operations from being exploited?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6ea3c751-44d6-4162-955d-1efa3548c674",
+    "timestamp": "2025-11-21 10:16:15.956915",
+    "report_generated": false
+  },
+  {
+    "question": "Can gas refunds be manipulated to return more gas than was actually consumed, allowing attackers to profit from gas refunds?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a2863f64-12bb-4384-9352-348fad7dc78c",
+    "timestamp": "2025-11-21 10:16:43.934280",
+    "report_generated": false
+  },
+  {
+    "question": "In custom modules, are all expensive operations (like iteration, sorting, complex math) properly metered for gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f1dbd25b-e31e-472a-89e4-cf3487234c6a",
+    "timestamp": "2025-11-21 10:17:13.577768",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gas metering logic properly handle the case where a transaction runs out of gas in the middle of a state write, ensuring state is rolled back?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_425d81b2-c46d-46cb-b0b3-63582589cd6c",
+    "timestamp": "2025-11-21 10:17:44.734892",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft transactions that cause gas estimation to underestimate actual gas consumption, leading to out-of-gas panics during execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b94df841-ea1a-41e6-ba76-0d1c5777b300",
+    "timestamp": "2025-11-21 10:18:17.177770",
+    "report_generated": false
+  },
+  {
+    "question": "In store/gaskv/store.go, are all KV store operations properly metered, or are there code paths that allow unmetered state access?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ef58773b-9fa5-43cb-bca1-1c1008a6ff1f",
+    "timestamp": "2025-11-21 10:18:50.433117",
+    "report_generated": false
+  },
+  {
+    "question": "In types/tx_tracer.go, does the transaction tracing logic properly handle errors without causing the transaction itself to fail?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f53d088-5c4a-45e5-9883-f22463ded430",
+    "timestamp": "2025-11-21 10:19:25.259890",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft transactions that have high gas estimates but low actual gas consumption to manipulate mempool prioritization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6eb0978c-1802-44d1-bdfd-c5cdd8861ac0",
+    "timestamp": "2025-11-21 10:20:01.209314",
+    "report_generated": false
+  },
+  {
+    "question": "Does the transaction mempool properly deduplicate transactions to prevent the same transaction from being executed multiple times?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e88225f8-33e3-4018-b8f5-bff328b90399",
+    "timestamp": "2025-11-21 10:20:38.062180",
+    "report_generated": false
+  },
+  {
+    "question": "In transaction ante handlers, are nested messages properly validated to prevent bypassing ante handler checks via message wrapping?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95f9a698-b7bc-4c83-9b9e-b76d9d4c3e61",
+    "timestamp": "2025-11-21 10:21:14.012847",
+    "report_generated": false
+  },
+  {
+    "question": "Can transactions with duplicate signatures be submitted to bypass signature verification in batch processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c46ac626-da50-46a5-8745-e39e7b7620cf",
+    "timestamp": "2025-11-21 10:21:49.201888",
+    "report_generated": false
+  },
+  {
+    "question": "Does the transaction encoding/decoding logic properly validate protobuf message sizes to prevent memory exhaustion attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_584cf861-e84a-4aac-b485-3c5788e8401d",
+    "timestamp": "2025-11-21 10:22:26.112130",
+    "report_generated": false
   }
 ]
