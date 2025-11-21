@@ -2998,5 +2998,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_584cf861-e84a-4aac-b485-3c5788e8401d",
     "timestamp": "2025-11-21 10:22:26.112130",
     "report_generated": false
+  },
+  {
+    "question": "In types/tx/service.go, does the transaction simulation endpoint properly prevent abuse where attackers could use it to perform DoS via expensive simulations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bbc89ab8-bf88-408f-83f1-c64ffd41de71",
+    "timestamp": "2025-11-21 10:23:36.049227",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker submit transactions with extremely large message arrays that consume excessive memory during deserialization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d2a5037a-e05e-4f60-88f5-5e7204d9d5cd",
+    "timestamp": "2025-11-21 10:23:49.190603",
+    "report_generated": false
+  },
+  {
+    "question": "Does the transaction batching logic in types/tx_batch.go properly handle the case where some transactions in a batch fail while others succeed, ensuring atomicity?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_079c9ae1-41c7-469a-af83-d53cdcf8f944",
+    "timestamp": "2025-11-21 10:24:02.477032",
+    "report_generated": false
+  },
+  {
+    "question": "In types/tx_msg.go, are all message types properly validated before execution to prevent malformed messages from causing panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_471273c6-43cb-4a47-a665-d6c2de6b534d",
+    "timestamp": "2025-11-21 10:24:17.247993",
+    "report_generated": false
+  },
+  {
+    "question": "Does types/kv/kv.go properly distinguish between nil values and empty byte slices in key-value pairs to prevent ambiguous state representations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3eec1f27-80e8-4c6a-9ecf-dd479f8c0d48",
+    "timestamp": "2025-11-21 10:24:32.203522",
+    "report_generated": false
+  },
+  {
+    "question": "In types/query/pagination.go, does the pagination logic properly handle edge cases like zero-length pages or extremely large page sizes that could cause DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3c687647-4e89-4794-a789-f58d6d511613",
+    "timestamp": "2025-11-21 10:24:48.098229",
+    "report_generated": false
+  },
+  {
+    "question": "Can transactions manipulate the types/context.go context to execute with elevated privileges or bypass authentication checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d3081de5-4ec7-4c4b-adb5-9f2c41c51c0d",
+    "timestamp": "2025-11-21 10:25:05.169593",
+    "report_generated": false
+  },
+  {
+    "question": "Does types/invariant.go properly define and check all critical invariants, or are there state consistency checks that are missing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_75e7e5d8-bc65-4303-a06e-7e51ff0cc057",
+    "timestamp": "2025-11-21 10:25:25.265087",
+    "report_generated": false
+  },
+  {
+    "question": "In types/module/module.go, does the module manager properly order module execution to prevent circular dependencies or incorrect state transitions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2bd963ba-d775-4713-a8ff-d81094f16a2a",
+    "timestamp": "2025-11-21 10:25:47.925038",
+    "report_generated": false
+  },
+  {
+    "question": "Can the types/config.go address prefix configuration be changed at runtime to cause address validation inconsistencies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_89040cc1-1a45-46c2-874e-f7a7b8893c82",
+    "timestamp": "2025-11-21 10:26:11.736966",
+    "report_generated": false
+  },
+  {
+    "question": "In types/errors/errors.go, do error handling paths properly prevent information leakage that could reveal internal state or logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_df033af3-23e1-47b9-a1aa-72bb9bf06a4d",
+    "timestamp": "2025-11-21 10:26:37.004679",
+    "report_generated": false
+  },
+  {
+    "question": "Does types/staking.go properly validate validator power calculations to prevent validators from gaining disproportionate voting power?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bf0b93d8-7c1a-4003-9f66-bab929e41f47",
+    "timestamp": "2025-11-21 10:27:02.318376",
+    "report_generated": false
+  },
+  {
+    "question": "In types/result.go, can an attacker manipulate transaction results or logs to hide failed transactions or make them appear successful?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37022922-1197-4063-bd6d-52d8c3da7bec",
+    "timestamp": "2025-11-21 10:27:29.804222",
+    "report_generated": false
+  },
+  {
+    "question": "Can the gas limit specified in types/tx/types.go be set to MAX_UINT64 to bypass gas metering effectively?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_773f097f-c2f6-47ad-8f3d-9fbcd24d73fc",
+    "timestamp": "2025-11-21 10:27:58.504462",
+    "report_generated": false
+  },
+  {
+    "question": "In types/tx/tx.go, are transaction signatures properly verified before any state changes occur, or could certain code paths skip signature verification?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_11bb6310-f50f-4160-9715-ef5534c20a0d",
+    "timestamp": "2025-11-21 10:28:29.585576",
+    "report_generated": false
+  },
+  {
+    "question": "Does types/address.go properly validate address formats and checksums to prevent transactions from being sent to invalid or malformed addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8702269d-c443-49e5-86ff-d9ec3c1264b9",
+    "timestamp": "2025-11-21 10:29:01.871762",
+    "report_generated": false
+  },
+  {
+    "question": "In types/dec_coin.go, do decimal coin operations maintain precision correctly, or could rounding errors accumulate to cause fund loss or gain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_24786335-c47e-4d09-b732-adb69b2c5a33",
+    "timestamp": "2025-11-21 10:29:35.147024",
+    "report_generated": false
+  },
+  {
+    "question": "Does the types/coin.go implementation properly check for overflow when adding or subtracting coin amounts, or could an attacker cause integer overflow to mint tokens?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7085d40f-5f52-40ad-bb75-040615f9783b",
+    "timestamp": "2025-11-21 10:30:08.871068",
+    "report_generated": false
+  },
+  {
+    "question": "In types/context.go, can the context's event manager be manipulated to inject fake events that appear in block results but didn't actually occur?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b2414ed1-eb50-4504-a885-3c1b561749c8",
+    "timestamp": "2025-11-21 10:30:43.604161",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious clients exploit the pruning configuration flags to cause the node to prune more aggressively than intended, losing critical historical data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_461a775d-065a-4b4b-b2da-f351e0e31f35",
+    "timestamp": "2025-11-21 10:31:17.838267",
+    "report_generated": false
+  },
+  {
+    "question": "Does the server properly validate the FlagArchivalVersion parameter to prevent setting invalid archival heights that could corrupt archival data? start.go:89-92",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_02a71e0e-34f3-4b43-9a94-5d0d23f0c70d",
+    "timestamp": "2025-11-21 10:31:53.194016",
+    "report_generated": false
+  },
+  {
+    "question": "In server/config/config.go, are there any configuration parameters that could be set to insecure values that weaken the node's security posture?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3cfc5e61-fed2-46e9-ad8f-b553dd012e58",
+    "timestamp": "2025-11-21 10:32:29.385599",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause memory exhaustion by requesting very large responses from RPC query endpoints without proper pagination?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_39656c7c-8255-4fd7-a436-248fdb7d42f9",
+    "timestamp": "2025-11-21 10:33:05.168051",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gRPC-web interface properly handle CORS settings to prevent cross-origin attacks on node APIs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_da856d70-ab0e-4d54-b7e8-befaa3479eae",
+    "timestamp": "2025-11-21 10:33:40.406121",
+    "report_generated": false
+  },
+  {
+    "question": "In server/export.go, does the state export functionality properly validate that it's not being called during active consensus to prevent inconsistent state exports?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_27c7a13a-fb53-4161-a4a8-49c4b78a53bf",
+    "timestamp": "2025-11-21 10:34:16.090980",
+    "report_generated": false
   }
 ]
