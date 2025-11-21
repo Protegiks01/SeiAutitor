@@ -7648,5 +7648,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_18d5030a-2bc4-4a59-b016-a4dd7e9b7194",
     "timestamp": "2025-11-21 16:32:24.598238",
     "report_generated": false
+  },
+  {
+    "question": "Does the period reset calculation periodic_fee.go:70-73 handle leap seconds and other time anomalies deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_92f24a5f-c915-430a-bad7-5d3ba6b1047f",
+    "timestamp": "2025-11-21 16:33:39.570490",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create a PeriodicAllowance with Period set to zero or negative duration periodic_fee.go:102-104 to bypass period restrictions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b00c531-d357-4504-8ebc-938970956363",
+    "timestamp": "2025-11-21 16:33:52.902367",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBasic periodic_fee.go:77-107 check that PeriodSpendLimit <= Basic.SpendLimit to prevent invalid configurations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2f3a44c7-1611-436e-9eb3-79885f80136d",
+    "timestamp": "2025-11-21 16:34:06.208053",
+    "report_generated": false
+  },
+  {
+    "question": "Can the comparison logic at lines 62-66 periodic_fee.go:62-66 overflow when comparing large coin amounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0bf40c4d-1eee-45f2-8241-1dd2f972ebcc",
+    "timestamp": "2025-11-21 16:34:20.047662",
+    "report_generated": false
+  },
+  {
+    "question": "Does tryResetPeriod periodic_fee.go:56-74 properly handle periods longer than the allowance's total lifetime?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_00cb1820-968d-474f-9fad-ca449f178cc4",
+    "timestamp": "2025-11-21 16:34:33.351725",
+    "report_generated": false
+  },
+  {
+    "question": "Can the dual deduction from both PeriodCanSpend and Basic.SpendLimit periodic_fee.go:33-42 cause inconsistent state if one succeeds and the other fails?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6cb0b843-3c5f-4fa4-b97f-5be4b1cc6869",
+    "timestamp": "2025-11-21 16:34:49.267221",
+    "report_generated": false
+  },
+  {
+    "question": "Does the SafeSub on PeriodCanSpend periodic_fee.go:33-36 correctly handle fees exceeding the period limit?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d00af8c1-abd9-483c-87ca-ac08f35040cc",
+    "timestamp": "2025-11-21 16:35:06.703263",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the period reset logic periodic_fee.go:70-73 to reset the period early or late by manipulating block timestamps?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ab14f3fa-dffd-4c5a-bb13-6f61b361ba98",
+    "timestamp": "2025-11-21 16:35:26.169588",
+    "report_generated": false
+  },
+  {
+    "question": "Does tryResetPeriod periodic_fee.go:56-74 properly handle the case where blockTime.Before(a.PeriodReset) is false due to clock skew?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e4a02b3e-b2ea-4785-95f6-70bd4bc0c635",
+    "timestamp": "2025-11-21 16:35:47.006348",
+    "report_generated": false
+  },
+  {
+    "question": "In PeriodicAllowance.Accept periodic_fee.go:22-48, can the tryResetPeriod call at line 29 cause non-determinism by relying on wall clock time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd9aa7b2-42bc-40f5-932d-0f749b67f7e7",
+    "timestamp": "2025-11-21 16:36:08.165840",
+    "report_generated": false
+  },
+  {
+    "question": "Can the state mutation in line 31 basic_fee.go:31 cause issues if the allowance is used concurrently by multiple transactions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_52c4bc5f-6558-4ec5-95db-31d4ea3be210",
+    "timestamp": "2025-11-21 16:36:30.389470",
+    "report_generated": false
+  },
+  {
+    "question": "Does the error wrapping in Accept basic_fee.go:22 provide enough context to distinguish different failure modes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a8cb1379-a6bf-4130-888d-5c35db111821",
+    "timestamp": "2025-11-21 16:36:53.879541",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create a BasicAllowance with zero spend limit that passes validation basic_fee.go:44-46 but fails on first use?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0f72d6bd-3130-4258-b57e-a8cc16016486",
+    "timestamp": "2025-11-21 16:37:20.138537",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBasic basic_fee.go:39-54 check for duplicate denominations in the spend limit?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_866f4043-ced0-4e83-9b8c-04c67554800c",
+    "timestamp": "2025-11-21 16:37:47.216035",
+    "report_generated": false
+  },
+  {
+    "question": "Can the spend limit be set to the maximum coin amount to effectively create an unlimited allowance that bypasses intended restrictions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a521a952-bf61-4122-974f-a84dce978332",
+    "timestamp": "2025-11-21 16:38:16.566328",
+    "report_generated": false
+  },
+  {
+    "question": "Does BasicAllowance.Accept properly handle mixed positive and negative fee amounts in multi-denomination coins?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_53074b74-c210-4dbd-8e1d-0b69ee931cf0",
+    "timestamp": "2025-11-21 16:38:45.078299",
+    "report_generated": false
+  },
+  {
+    "question": "Can an unlimited BasicAllowance (SpendLimit == nil) basic_fee.go:25-35 be exploited to drain a granter's entire balance?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0c996af0-822a-46f3-863b-23ece21c055e",
+    "timestamp": "2025-11-21 16:39:14.492516",
+    "report_generated": false
+  },
+  {
+    "question": "Does the comparison a.Expiration.Before(ctx.BlockTime()) basic_fee.go:21 use deterministic block time rather than node-local time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6547f8e-f462-480f-a198-d13fe4a7ea3b",
+    "timestamp": "2025-11-21 16:39:44.460643",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the fact that Accept returns remove=true on expiration basic_fee.go:21-23 to force grant revocation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_addfa30d-d418-4ccb-9018-b9614d62927f",
+    "timestamp": "2025-11-21 16:40:16.157252",
+    "report_generated": false
+  },
+  {
+    "question": "Does BasicAllowance.Accept mutate the internal state correctly when returning remove=false and no error?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8f9a5e69-845b-49ce-95a2-b8cb1d787909",
+    "timestamp": "2025-11-21 16:40:48.441692",
+    "report_generated": false
+  },
+  {
+    "question": "Can the expiration time validation basic_fee.go:49-51 allow negative Unix timestamps that could cause overflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_87bf4efc-fc9a-4726-a0d1-c9bd3a95db29",
+    "timestamp": "2025-11-21 16:41:22.192732",
+    "report_generated": false
+  },
+  {
+    "question": "Does BasicAllowance.ValidateBasic basic_fee.go:39-54 properly reject allowances with negative amounts in all denominations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7d5d2d77-9ace-486a-8227-813da8a92163",
+    "timestamp": "2025-11-21 16:41:58.142614",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause the left.IsZero() check basic_fee.go:32 to return true prematurely by manipulating coin denominations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7149f821-e43b-4f8f-8c77-929b59443f03",
+    "timestamp": "2025-11-21 16:42:34.492161",
+    "report_generated": false
+  },
+  {
+    "question": "Does the SafeSub operation in BasicAllowance.Accept basic_fee.go:26-29 properly handle all edge cases including zero fees and multiple denominations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f24f1f52-766f-4d99-9163-50aa2e9b478f",
+    "timestamp": "2025-11-21 16:43:10.929628",
+    "report_generated": false
+  },
+  {
+    "question": "In BasicAllowance.Accept basic_fee.go:20-36, can the expiration check at line 21-23 be bypassed with a nil or malformed expiration time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f99709ec-7517-4364-be24-2c1e7ae0de1b",
+    "timestamp": "2025-11-21 16:43:48.334649",
+    "report_generated": false
   }
 ]
