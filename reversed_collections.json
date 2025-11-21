@@ -3898,5 +3898,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3b16bd6b-2d08-45f2-8e50-f5b35db6f04b",
     "timestamp": "2025-11-21 11:34:35.792437",
     "report_generated": false
+  },
+  {
+    "question": "Are KVStore iteration operations properly metered per key accessed, preventing unbounded iteration DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_036a82e3-0dcd-45a0-949f-0ca6a76224e0",
+    "timestamp": "2025-11-21 11:35:53.812050",
+    "report_generated": false
+  },
+  {
+    "question": "When invariants are checked, is gas consumption tracked, or could checking itself cause DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c850838a-ca9f-49b7-9062-76e3d1e9aaa9",
+    "timestamp": "2025-11-21 11:36:07.409827",
+    "report_generated": false
+  },
+  {
+    "question": "Similarly, are EndBlocker hooks gas-metered to prevent DoS via expensive end-block operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_da77226e-3385-4872-a825-ee247ba91c22",
+    "timestamp": "2025-11-21 11:36:20.750206",
+    "report_generated": false
+  },
+  {
+    "question": "Are BeginBlocker hooks across all modules gas-metered, or could expensive operations run unbounded?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f79a4019-b37c-425a-b906-82ab59ec1fcf",
+    "timestamp": "2025-11-21 11:36:34.863162",
+    "report_generated": false
+  },
+  {
+    "question": "If an upgrade fails, can state be rolled back safely, or could partial upgrades corrupt state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9710aab-9859-4179-84cf-f1cf1364294e",
+    "timestamp": "2025-11-21 11:36:49.638519",
+    "report_generated": false
+  },
+  {
+    "question": "Does the capability module ensure capability names are unique, preventing capability confusion attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7a35de95-036c-4891-8c33-7f2ae9a035cd",
+    "timestamp": "2025-11-21 11:37:07.483010",
+    "report_generated": false
+  },
+  {
+    "question": "Are parameter changes validated before application, preventing impossible values (e.g., negative unbonding time)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a04fe0dd-2209-4c02-97ca-e31157ea3bd4",
+    "timestamp": "2025-11-21 11:37:27.173651",
+    "report_generated": false
+  },
+  {
+    "question": "When invariants are triggered manually via crisis module, do they check all modules consistently?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_96ce937a-74c6-4d7f-8762-8832194e8869",
+    "timestamp": "2025-11-21 11:37:47.562104",
+    "report_generated": false
+  },
+  {
+    "question": "Does the mint module's inflation calculation account for bonded ratio correctly, preventing unexpected supply growth?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_45321fd8-e64f-49c0-bd43-bad97fbf16f7",
+    "timestamp": "2025-11-21 11:38:11.097695",
+    "report_generated": false
+  },
+  {
+    "question": "Does evidence processing slash exactly once per offense, never over-slashing for the same misbehavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_826d7072-0aef-4df4-8cb9-43b06de6d796",
+    "timestamp": "2025-11-21 11:38:34.889335",
+    "report_generated": false
+  },
+  {
+    "question": "When channels close, are all pending packets and acknowledgments cleaned up without token loss?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_71060388-e9b8-434b-9b31-a4363d609711",
+    "timestamp": "2025-11-21 11:38:59.784509",
+    "report_generated": false
+  },
+  {
+    "question": "Does IBC transfer escrow account balance equal the sum of all in-flight packets?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bc652314-ac3e-485b-ac81-ab280a41c973",
+    "timestamp": "2025-11-21 11:39:26.656590",
+    "report_generated": false
+  },
+  {
+    "question": "Are module account permissions enforced consistently, preventing unauthorized mints/burns?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f1af167-ccf1-4631-8355-72009764a1dc",
+    "timestamp": "2025-11-21 11:39:54.088578",
+    "report_generated": false
+  },
+  {
+    "question": "Do vesting accounts prevent spending of unvested tokens in all code paths (SendCoins, Delegate, Vote)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b4247257-8637-4254-a37d-8568660203e3",
+    "timestamp": "2025-11-21 11:40:23.260310",
+    "report_generated": false
+  },
+  {
+    "question": "When allowances reach zero, are they deleted or could zero-balance allowances persist?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cad717e9-9a19-440a-afbc-d843a97d464f",
+    "timestamp": "2025-11-21 11:40:53.324140",
+    "report_generated": false
+  },
+  {
+    "question": "Are group policy decisions enforced atomically, or could partial execution corrupt state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35a7f240-8ce7-42a5-929e-d0b870d5af0f",
+    "timestamp": "2025-11-21 11:41:24.657629",
+    "report_generated": false
+  },
+  {
+    "question": "Could recursive x/authz MsgExec calls bypass depth limits, causing stack overflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fb2398a4-9cb4-433b-96d5-68ce57f03127",
+    "timestamp": "2025-11-21 11:41:57.131620",
+    "report_generated": false
+  },
+  {
+    "question": "When grants expire, are they cleaned up deterministically at the specified time/height?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_96713c89-bb97-44cd-ade9-a4b728fc9841",
+    "timestamp": "2025-11-21 11:42:30.693190",
+    "report_generated": false
+  },
+  {
+    "question": "Does vote tallying handle delegations correctly when delegators change their stake mid-vote?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d4df7bd0-7bd5-44d0-beaa-1645bfb9b03c",
+    "timestamp": "2025-11-21 11:43:05.193653",
+    "report_generated": false
+  },
+  {
+    "question": "Are deposits refunded correctly for rejected proposals, or could edge cases cause permanent locking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e18a578b-65a5-43ec-a49c-d3baf4e2f446",
+    "timestamp": "2025-11-21 11:43:39.209991",
+    "report_generated": false
+  },
+  {
+    "question": "Do accumulated delegation rewards always sum correctly considering commission, or could rounding favor validators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_43e5bfd4-db94-4763-9d08-694e9a683a1f",
+    "timestamp": "2025-11-21 11:44:13.411732",
+    "report_generated": false
+  },
+  {
+    "question": "Once a validator is tombstoned, can this status be reversed, potentially allowing re-slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2a62d87c-5f3c-4172-957f-bbe5154ceca9",
+    "timestamp": "2025-11-21 11:44:50.092804",
+    "report_generated": false
+  },
+  {
+    "question": "When unbonding entries mature, are tokens reliably transferred back, or could they remain locked indefinitely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e471a941-eb65-41e9-8208-f13384b34b02",
+    "timestamp": "2025-11-21 11:45:28.127909",
+    "report_generated": false
+  },
+  {
+    "question": "Does bonded tokens amount always equal the sum of all delegations, or could rounding errors cause discrepancies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_94d63640-08eb-4b81-800e-6d2f9bebb94d",
+    "timestamp": "2025-11-21 11:46:07.187843",
+    "report_generated": false
+  },
+  {
+    "question": "If base denom is not set at invariants.go:90-95 but wei balances exist, could this indicate state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9a45e8bc-356d-476f-9faf-da9f37f44107",
+    "timestamp": "2025-11-21 11:46:48.869474",
+    "report_generated": false
   }
 ]
