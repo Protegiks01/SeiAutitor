@@ -3448,5 +3448,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_07a583cc-39e8-4c95-84a6-5282209f0da4",
     "timestamp": "2025-11-21 10:57:47.766686",
     "report_generated": false
+  },
+  {
+    "question": "Does the system properly track and validate access operations for transactions that make cross-module calls, or could this be exploited to hide true dependencies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_39266153-a983-4b06-9b58-109aba6af293",
+    "timestamp": "2025-11-21 10:58:59.174424",
+    "report_generated": false
+  },
+  {
+    "question": "Can the access control module handle recursive or circular dependencies between transactions, or could such patterns cause deadlocks in the parallel execution engine?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f75b99b8-bda0-4968-926c-8a911f38b52d",
+    "timestamp": "2025-11-21 10:59:12.243038",
+    "report_generated": false
+  },
+  {
+    "question": "Are access operations properly validated to ensure they reference valid resource types, or could an attacker submit transactions with invalid resource types that cause panics in the scheduler?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_94bedf16-dfa6-4481-9501-de0b8f68f430",
+    "timestamp": "2025-11-21 10:59:26.527240",
+    "report_generated": false
+  },
+  {
+    "question": "Does the access control system properly account for gas costs when scheduling parallel transactions, or could an attacker submit many low-gas transactions with conflicting access patterns to cause scheduling overhead DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9f2bd2cf-475d-4d85-b8f9-dcbec2f39700",
+    "timestamp": "2025-11-21 10:59:40.641721",
+    "report_generated": false
+  },
+  {
+    "question": "In types/accesscontrol/comparator.go, does the access operation comparison logic properly handle all edge cases, or could certain operation pairs be incorrectly classified as non-conflicting?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_884e8eed-9b4c-480c-af81-a1080c03bd25",
+    "timestamp": "2025-11-21 10:59:55.306123",
+    "report_generated": false
+  },
+  {
+    "question": "Can custom modules define access operations that conflict with system-level operations, potentially causing the scheduler to make incorrect parallelization decisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2cfbaabd-96bc-4749-b59a-2aaf4d88228c",
+    "timestamp": "2025-11-21 11:00:11.981441",
+    "report_generated": false
+  },
+  {
+    "question": "Does the IsDefaultSynchronousAccessOps function in types/accesscontrol/access_operation.go use a constant-time comparison, or could timing attacks reveal information about other transactions' access patterns? access_operation.go:18-31",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3264bd47-7683-471a-9b75-133eb93c72c5",
+    "timestamp": "2025-11-21 11:00:29.233269",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any COMMIT access type operations that could be manipulated to delay or prevent block finalization, causing temporary chain halts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d7f6cc6b-cd00-42e3-9c46-53a2c6ebe302",
+    "timestamp": "2025-11-21 11:00:48.845631",
+    "report_generated": false
+  },
+  {
+    "question": "Does the access control module properly handle wildcard resource identifiers (*), or could an attacker use wildcards to claim access to all resources and force synchronous execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a499f914-b26d-4ebf-bedc-fc82dd1df1e7",
+    "timestamp": "2025-11-21 11:01:09.946931",
+    "report_generated": false
+  },
+  {
+    "question": "Can transactions declare overlapping or contradictory access operations (e.g., both READ and WRITE on the same resource) that could confuse the scheduler and lead to non-deterministic execution order?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff094259-41a4-4b37-acab-9425038eae83",
+    "timestamp": "2025-11-21 11:01:33.865671",
+    "report_generated": false
+  },
+  {
+    "question": "In types/accesscontrol/validation.go, are access operation validations performed before transaction execution, or could an attacker submit transactions that bypass validation and execute with incorrect access declarations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f11b413-dd14-49da-91e6-52ac48799895",
+    "timestamp": "2025-11-21 11:01:57.501242",
+    "report_generated": false
+  },
+  {
+    "question": "Does the SynchronousAccessOps function correctly define all operations that must be executed synchronously, or are there edge cases where parallelizable operations could cause race conditions? access_operation.go:7-12",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48bb3810-c045-4098-872d-f28f685f5050",
+    "timestamp": "2025-11-21 11:02:21.954898",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft messages with access operations that claim to only read resources but actually write to them, bypassing the parallel execution dependency tracking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_071f7055-2eaf-4c2c-b531-5b90bc7b4ece",
+    "timestamp": "2025-11-21 11:02:47.795459",
+    "report_generated": false
+  },
+  {
+    "question": "In types/accesscontrol/access_operation.go, does the GetResourceIDTemplate function properly sanitize format string arguments to prevent format string injection that could cause panics or unexpected behavior? access_operation.go:14-16",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4f7b9935-27e2-400d-b99a-4dbb7f7677a8",
+    "timestamp": "2025-11-21 11:03:13.823103",
+    "report_generated": false
+  },
+  {
+    "question": "Does the SetEstimatedWriteset function correctly handle the transition from estimate to concrete values, or could race conditions cause some keys to remain as estimates permanently, blocking dependent transactions? store.go:180-194",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fe367696-a650-48dc-9aa8-ee73b7f02286",
+    "timestamp": "2025-11-21 11:03:43.059131",
+    "report_generated": false
+  },
+  {
+    "question": "In the multiversion store's conflict detection, are estimate values properly distinguished from actual values, or could an attacker exploit this to bypass validation and execute conflicting transactions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1353de0b-680d-4e66-b363-0513a321b415",
+    "timestamp": "2025-11-21 11:04:15.748274",
+    "report_generated": false
+  },
+  {
+    "question": "Does the CollectIteratorItems function in store/multiversion/store.go properly bound the number of items collected, or can an attacker cause OOM by creating transactions with extremely large iteration ranges? store.go:243-260",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7d2c958e-4ef9-4549-b46b-7989037f8441",
+    "timestamp": "2025-11-21 11:04:49.987771",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft transactions with overlapping readsets and writesets in a way that causes the OCC scheduler to enter an infinite retry loop, effectively halting the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_181b29cb-b184-4385-b8da-22bd5dbddba1",
+    "timestamp": "2025-11-21 11:05:25.191248",
+    "report_generated": false
+  },
+  {
+    "question": "Does the OCC implementation properly handle transaction validation when a transaction's readset contains keys that were written by transactions that were later aborted, potentially causing false conflict detection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_406b8d4b-e590-4f38-bf61-663fb3824ac3",
+    "timestamp": "2025-11-21 11:06:02.087283",
+    "report_generated": false
+  },
+  {
+    "question": "In store/multiversion/mvkv.go, does the MultiVersionValue implementation use proper locking to prevent race conditions when multiple goroutines concurrently call Set, Delete, and GetLatest on the same key?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d8a31490-b69d-4bc2-a342-86a68f146f1f",
+    "timestamp": "2025-11-21 11:06:39.270776",
+    "report_generated": false
+  },
+  {
+    "question": "Can the WriteLatestToStore function cause consensus divergence if different validators process the multiversion map entries in different orders due to non-deterministic map iteration in sync.Map? store.go:399-435",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_025a8136-acf9-4148-b05b-b0de84cc28dc",
+    "timestamp": "2025-11-21 11:07:17.949355",
+    "report_generated": false
+  },
+  {
+    "question": "Does the InvalidateWriteset function properly handle the case where a transaction's writeset contains estimate values that reference keys that have been deleted by concurrent transactions? store.go:165-177",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ea143f14-641f-4a86-a484-9d361ea0a010",
+    "timestamp": "2025-11-21 11:07:56.829164",
+    "report_generated": false
+  },
+  {
+    "question": "In the validateIterator function, does the goroutine spawned for validation properly timeout or can it hang indefinitely if the abort channel is never triggered, causing resource exhaustion? store.go:262-318",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e566f85c-636b-41bd-9b30-5cffd60b2bfc",
+    "timestamp": "2025-11-21 11:08:37.762930",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause unbounded memory growth in the multiVersionMap by repeatedly submitting transactions that write to unique keys without those keys ever being garbage collected? store.go:40-60",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76bb3314-fdde-4042-a88f-dd5f6e929b6e",
+    "timestamp": "2025-11-21 11:09:18.359150",
+    "report_generated": false
+  },
+  {
+    "question": "Does the checkReadsetAtIndex function correctly handle the case where a nil value is read from the parent store versus reading a deleted value from the multiversion store, or could this discrepancy lead to consensus failures? store.go:335-385",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f4cb8c81-158b-4b12-b155-f57b935272e0",
+    "timestamp": "2025-11-21 11:09:59.300081",
+    "report_generated": false
   }
 ]
