@@ -6148,5 +6148,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_02b96a2f-3d33-45c2-bbd1-4e7c8d42de63",
     "timestamp": "2025-11-21 13:16:24.493549",
     "report_generated": false
+  },
+  {
+    "question": "GenericAuthorization Accept Logic: In x/authz/generic_authorization.go:24-26, GenericAuthorization.Accept always returns Accept: true without limits. Can this be exploited to execute unlimited actions if granted accidentally?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ce385865-5fba-49d8-a0b5-678cef317786",
+    "timestamp": "2025-11-21 13:17:41.122246",
+    "report_generated": false
+  },
+  {
+    "question": "SendAuthorization Overflow: In x/bank/types/send_authorization.go:31, SafeSub is used to check spend limits. Can integer overflow in coin amounts bypass spend limit checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd4196d6-2bba-4297-995e-406999dc9649",
+    "timestamp": "2025-11-21 13:17:54.365971",
+    "report_generated": false
+  },
+  {
+    "question": "SendAuthorization Negative Check: In x/bank/types/send_authorization.go:32-34, negative amounts are rejected. Can this check be bypassed with custom coin denominations or specially crafted amounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ee665273-0e94-417f-a896-81981e19ba95",
+    "timestamp": "2025-11-21 13:18:09.092270",
+    "report_generated": false
+  },
+  {
+    "question": "SendAuthorization Zero Limit: In x/bank/types/send_authorization.go:35-37, if the limit reaches zero, the grant is deleted. Can an attacker front-run this deletion to execute multiple sends that cumulatively exceed the limit?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f970cdc2-f9e0-4829-931d-06693d2eaee2",
+    "timestamp": "2025-11-21 13:18:24.504265",
+    "report_generated": false
+  },
+  {
+    "question": "SendAuthorization Updated Field: In x/bank/types/send_authorization.go:39, a new SendAuthorization with updated limit is returned. Is this new authorization properly validated before storage?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e366055c-8bd2-4f4f-aed0-fe8512583aad",
+    "timestamp": "2025-11-21 13:18:40.764860",
+    "report_generated": false
+  },
+  {
+    "question": "ValidateBasic Nil Check: In x/bank/types/send_authorization.go:43-50, ValidateBasic checks for nil and negative spend limits. Can this be bypassed during authorization unpacking or cache manipulation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_996e86ca-8c4b-411f-b20a-9681ac3a957c",
+    "timestamp": "2025-11-21 13:18:59.391638",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization MsgTypeURL Consistency: In x/authz/authorizations.go:16, MsgTypeURL() must return the correct message type. Can custom authorizations return incorrect URLs to confuse the authorization matching logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b34f51c-895f-4e56-9c20-f0f05c43d700",
+    "timestamp": "2025-11-21 13:19:19.280531",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Accept Error Handling: In x/authz/authorizations.go:20, Accept returns an error. Are all possible error conditions properly handled in DispatchActions to prevent state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_13e166c8-8a66-4c69-b081-22189f2b33b4",
+    "timestamp": "2025-11-21 13:19:40.154566",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization ValidateBasic Bypass: In x/authz/authorizations.go:24, ValidateBasic performs validation. Is this called consistently before storing authorizations, or can invalid authorizations be stored during genesis import?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b87ed57-f6ec-4904-96b1-35c988ea84fe",
+    "timestamp": "2025-11-21 13:20:01.982824",
+    "report_generated": false
+  },
+  {
+    "question": "AcceptResponse Field Manipulation: In x/authz/authorizations.go:29-38, the AcceptResponse structure has three fields. Can conflicting field values (e.g., Accept=false, Delete=true, Updated!=nil) cause undefined behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9a163932-deaa-47a9-b5fd-ef95c05c7e3a",
+    "timestamp": "2025-11-21 13:20:26.376474",
+    "report_generated": false
+  },
+  {
+    "question": "MsgGrant Granter Validation: In x/authz/msgs.go:54-68, MsgGrant.ValidateBasic() checks addresses and prevents self-grants. Can address validation be bypassed with custom bech32 encodings or malformed addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5834b556-d4b1-4b05-b140-099c14885937",
+    "timestamp": "2025-11-21 13:20:51.565244",
+    "report_generated": false
+  },
+  {
+    "question": "MsgGrant Authorization Nil Check: In x/authz/keeper/msg_server.go:26-29, the handler checks if authorization is nil. Can this be bypassed by sending a MsgGrant with a non-nil but invalid Any field?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c79258f8-4f95-42f9-a805-45eb171a11ba",
+    "timestamp": "2025-11-21 13:21:19.736841",
+    "report_generated": false
+  },
+  {
+    "question": "MsgGrant Handler Check: In x/authz/keeper/msg_server.go:31-34, the code verifies the handler exists for the authorization's message type. Can this check be bypassed by granting authorizations for future message types not yet registered?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0208aadc-c33e-44b3-8f0e-1998bb28883e",
+    "timestamp": "2025-11-21 13:21:48.330772",
+    "report_generated": false
+  },
+  {
+    "question": "MsgGrant Expiration Validation: In x/authz/keeper/msg_server.go:36, SaveGrant is called with the expiration time. Is there validation that the expiration is in the future, or can expired grants be created?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_54c8406e-f21b-477a-bcf0-ca2bce742073",
+    "timestamp": "2025-11-21 13:22:17.509834",
+    "report_generated": false
+  },
+  {
+    "question": "MsgRevoke Not Found Handling: In x/authz/keeper/msg_server.go:56, DeleteGrant returns an error if not found. Can this be exploited for DoS by forcing error logging or event emission?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff1c9f7b-d5b2-4621-bcfc-d5fde9e0be7c",
+    "timestamp": "2025-11-21 13:22:48.040262",
+    "report_generated": false
+  },
+  {
+    "question": "MsgRevoke Self-Revocation: In x/authz/msgs.go:142-161, MsgRevoke.ValidateBasic() prevents self-revocation. Can this be bypassed at the handler level to allow a grantee to revoke their own authorization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d2ef0d84-7782-49c8-8728-16bff71032f1",
+    "timestamp": "2025-11-21 13:23:19.851115",
+    "report_generated": false
+  },
+  {
+    "question": "MsgRevoke Empty MsgTypeUrl: In x/authz/msgs.go:156-159, empty message type URLs are rejected. Can wildcard or pattern-matching URLs be used to revoke multiple grants simultaneously?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0c37808-b00c-4715-be5b-7d8eaf0edd11",
+    "timestamp": "2025-11-21 13:23:53.195704",
+    "report_generated": false
+  },
+  {
+    "question": "SetAuthorization Error Handling: In x/authz/msgs.go:91-102, SetAuthorization packs authorization into Any. If this fails, can the MsgGrant be partially processed, leaving inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bd15c0cd-727f-4d4c-aff4-27816906229d",
+    "timestamp": "2025-11-21 13:24:26.725163",
+    "report_generated": false
+  },
+  {
+    "question": "GetAuthorization Cache Miss: In x/authz/msgs.go:86-88, GetAuthorization retrieves from cache. If the cache is not populated, can this return nil unexpectedly during message processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_79f11436-81c9-45f3-b225-de34898adc67",
+    "timestamp": "2025-11-21 13:25:01.491341",
+    "report_generated": false
+  },
+  {
+    "question": "UnpackInterfaces Error Propagation: In x/authz/msgs.go:105-120, UnpackInterfaces unpacks Any fields. Are errors properly propagated, or can unpacking failures be silently ignored?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_11e2e1ed-614a-4769-8efa-ef5d366613cf",
+    "timestamp": "2025-11-21 13:25:38.181579",
+    "report_generated": false
+  },
+  {
+    "question": "DispatchActions Gas Consumption: In x/authz/keeper/keeper.go:76-139, DispatchActions iterates over messages. Is gas properly metered for each iteration, or can an attacker submit many messages to exhaust gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fde005be-cf38-492f-af18-69d15450b37f",
+    "timestamp": "2025-11-21 13:26:16.097831",
+    "report_generated": false
+  },
+  {
+    "question": "GetCleanAuthorization Gas: In x/authz/keeper/keeper.go:196-207, expired grants are deleted on read. Can an attacker force expensive deletions by querying expired grants repeatedly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e93b9318-8738-4457-99a6-af91fbef06fb",
+    "timestamp": "2025-11-21 13:26:54.932014",
+    "report_generated": false
+  },
+  {
+    "question": "IterateGrants Unbounded Loop: In x/authz/keeper/keeper.go:212-226, IterateGrants iterates over all grants without pagination. Can this be used in a query endpoint to cause DoS by exhausting memory or CPU?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_06af782e-19bf-4405-a9fd-6aa8fe787f9a",
+    "timestamp": "2025-11-21 13:27:35.824555",
+    "report_generated": false
+  },
+  {
+    "question": "GetAuthorizations Loop: In x/authz/keeper/keeper.go:180-191, GetAuthorizations iterates with a prefix iterator. Is this properly gas-metered to prevent DoS from accounts with many grants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd053abc-5a48-422a-bee9-84f1bff05bbb",
+    "timestamp": "2025-11-21 13:28:16.375734",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Accept Gas: Custom authorization implementations can perform expensive computations in Accept. Are there gas limits to prevent malicious authorizations from exhausting block gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_88ed3ecc-bd8e-434c-87d4-434e1cddb4ed",
+    "timestamp": "2025-11-21 13:28:56.107316",
+    "report_generated": false
   }
 ]
