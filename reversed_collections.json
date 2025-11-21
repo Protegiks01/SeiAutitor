@@ -5548,5 +5548,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_186162ae-739e-4bc5-b082-59081667e8dd",
     "timestamp": "2025-11-21 13:45:08.589329",
     "report_generated": false
+  },
+  {
+    "question": "Concurrent Query Access: Are queries safe under concurrent access to the mint store? grpc_query.go:13-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_842ae136-571d-482c-be92-a85338033a9e",
+    "timestamp": "2025-11-21 13:46:17.120751",
+    "report_generated": false
+  },
+  {
+    "question": "Query Parameter Validation: Do query endpoints validate input parameters to prevent injection or malformed requests? grpc_query.go:13-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c3dc243f-6f79-4c6b-a0e6-c8f7c38e5b03",
+    "timestamp": "2025-11-21 13:46:30.624835",
+    "report_generated": false
+  },
+  {
+    "question": "Legacy Querier Safety: Does the legacy querier handle all query types safely without panicking? module.go:130-132",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_815958af-c45e-47bd-acc2-a8237e7c4adc",
+    "timestamp": "2025-11-21 13:46:43.963447",
+    "report_generated": false
+  },
+  {
+    "question": "gRPC Gateway DoS: Can repeated gRPC gateway calls to mint queries cause performance degradation? module.go:83-85",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f59c7d71-1268-460d-9475-6593a3a426a2",
+    "timestamp": "2025-11-21 13:46:57.976749",
+    "report_generated": false
+  },
+  {
+    "question": "REST Route DoS: Can malicious REST requests to mint endpoints cause node resource exhaustion? module.go:78-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_21443f7d-c4d3-4f4a-8d74-cd861912fdee",
+    "timestamp": "2025-11-21 13:47:12.892040",
+    "report_generated": false
+  },
+  {
+    "question": "Query Context Wrapping: Does UnwrapSDKContext handle all context types safely without panic? grpc_query.go:14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0a6dbc60-4c56-49ff-98be-a9d3435dc694",
+    "timestamp": "2025-11-21 13:47:29.062452",
+    "report_generated": false
+  },
+  {
+    "question": "AnnualProvisions Query Panic: Can the AnnualProvisions query return invalid data or panic under certain conditions? grpc_query.go:29-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0cdaee3c-67a3-4d7e-a51e-cfdaebe6f12d",
+    "timestamp": "2025-11-21 13:47:46.291553",
+    "report_generated": false
+  },
+  {
+    "question": "Inflation Query Panic: Can the Inflation query panic if the minter is not yet initialized or state is corrupted? grpc_query.go:21-26",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8917949-90b5-4418-a18c-c1c2830b8ea4",
+    "timestamp": "2025-11-21 13:48:05.106258",
+    "report_generated": false
+  },
+  {
+    "question": "Params Query Panic: Can the Params gRPC query panic if called during initialization or with corrupted state? grpc_query.go:13-18",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f92ff477-a242-4068-81c6-882cad053652",
+    "timestamp": "2025-11-21 13:48:25.298767",
+    "report_generated": false
+  },
+  {
+    "question": "Bonded Ratio Staleness: Could outdated bonded ratio data cause incorrect inflation adjustments? keeper.go:91-93",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0b349b33-7f81-4c5c-97cb-b80c06ae2a9c",
+    "timestamp": "2025-11-21 13:48:46.578574",
+    "report_generated": false
+  },
+  {
+    "question": "Staking Token Supply Staleness: Could stale staking token supply data be used in minting calculations, causing inaccurate inflation? keeper.go:85-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6dc16e4b-5840-4b59-a8f8-1bfdeae77d2a",
+    "timestamp": "2025-11-21 13:49:08.848793",
+    "report_generated": false
+  },
+  {
+    "question": "AnnualProvisions Persistence: Are annual provisions stored correctly for use in subsequent block provision calculations? abci.go:24-25",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fb7fab13-542e-4401-8086-763f47a4e94c",
+    "timestamp": "2025-11-21 13:49:32.156749",
+    "report_generated": false
+  },
+  {
+    "question": "Inflation Rate Persistence: Is the calculated inflation rate properly stored before being used in next block? abci.go:23-25",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0de03d21-aeff-4db3-8d42-19384e85025f",
+    "timestamp": "2025-11-21 13:49:58.205759",
+    "report_generated": false
+  },
+  {
+    "question": "Cross-Block State Consistency: Is minter state properly persisted between blocks, preventing state loss or inconsistency? keeper.go:66-70",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ec1976a6-7cc2-48fc-a2b6-b56e60ff4a55",
+    "timestamp": "2025-11-21 13:50:23.848615",
+    "report_generated": false
+  },
+  {
+    "question": "Negative Supply Prevention: Are there safeguards to prevent negative supply through minting calculation errors? keeper.go:97-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_727bae23-94e9-4bd7-98c1-e792ac192fe7",
+    "timestamp": "2025-11-21 13:50:50.822748",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Balance Check: Could the mint module account accumulate balance over time due to failed transfers? keeper.go:108-110",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8e54f42b-1463-4e22-97e9-c899ebeddfc2",
+    "timestamp": "2025-11-21 13:51:18.322694",
+    "report_generated": false
+  },
+  {
+    "question": "SendCoinsFromModuleToModule Atomicity: Is the transfer in AddCollectedFees atomic with the minting operation? keeper.go:108-110",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_785b663d-b201-4fe4-a1b0-5827d0f039b8",
+    "timestamp": "2025-11-21 13:51:47.818945",
+    "report_generated": false
+  },
+  {
+    "question": "Supply Cap Enforcement: Is there any maximum supply cap enforced, or can minting continue indefinitely? keeper.go:97-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2da7805c-4417-40fe-9266-4de68392d044",
+    "timestamp": "2025-11-21 13:52:18.932806",
+    "report_generated": false
+  },
+  {
+    "question": "Minter State Consistency: Is the minter state (inflation, annual provisions) kept consistent with actual minting operations? abci.go:17-25",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d5b97f99-9348-4c93-b714-0e2b17aed8a1",
+    "timestamp": "2025-11-21 13:52:50.169915",
+    "report_generated": false
+  },
+  {
+    "question": "Block Provision Accuracy: Does block provision accurately divide annual provisions by blocks per year without cumulative errors? minter.go:77-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76d0c4ac-4b29-4176-b5c7-92f65984261e",
+    "timestamp": "2025-11-21 13:53:22.887941",
+    "report_generated": false
+  },
+  {
+    "question": "Annual Provisions Accuracy: Do annual provisions accurately reflect the intended yearly inflation based on current supply? minter.go:71-73",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_46df4d52-7afe-44b3-bc79-d31c2e0433c9",
+    "timestamp": "2025-11-21 13:53:56.774346",
+    "report_generated": false
+  },
+  {
+    "question": "Zero Coin Minting: When minting zero coins, does the flow skip state changes to prevent unnecessary storage operations? keeper.go:98-101",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2c8f9430-bd2f-4471-a3d4-7d875fbd97ba",
+    "timestamp": "2025-11-21 13:54:31.854784",
+    "report_generated": false
+  },
+  {
+    "question": "Mint Denom Consistency: Is the MintDenom parameter consistent with the staking bond denom, preventing incorrect token minting? params.go:46",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_954ad497-5511-4178-b65b-3d71e134dbdf",
+    "timestamp": "2025-11-21 13:55:06.560929",
+    "report_generated": false
+  },
+  {
+    "question": "Double Minting Prevention: Is there any mechanism to prevent double minting in the same block or across blocks? abci.go:13-55",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e84cbecf-b549-43aa-a516-a0e452894653",
+    "timestamp": "2025-11-21 13:55:42.513920",
+    "report_generated": false
+  },
+  {
+    "question": "Module Permissions Check: Does the mint module have the correct permissions (mint permission) in the bank keeper? keeper.go:97-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3032710d-3fa6-4f23-a188-ccf97389caad",
+    "timestamp": "2025-11-21 13:56:19.353830",
+    "report_generated": false
   }
 ]
