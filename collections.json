@@ -8548,5 +8548,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_623a58ab-6c1e-4f92-96cb-068bad602a52",
     "timestamp": "2025-11-21 16:30:11.169487",
     "report_generated": false
+  },
+  {
+    "question": "Bank Keeper Callback: When bankKeeper.SendCoinsFromModuleToAccount is called, can it trigger bank hooks that call back into distribution module?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e3f84466-0654-4927-a58a-8d3e5cc5a3c7",
+    "timestamp": "2025-11-21 16:31:33.337177",
+    "report_generated": false
+  },
+  {
+    "question": "Concurrent Withdrawal and Allocation: Can a user submit a withdrawal transaction while BeginBlocker is allocating rewards, causing inconsistent state reads?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48b9e0b7-c059-474c-8abc-6eef1c1d9c2d",
+    "timestamp": "2025-11-21 16:31:46.708048",
+    "report_generated": false
+  },
+  {
+    "question": "Staking Hook Ordering: If staking calls distribution hooks in an unexpected order, can this cause double reward allocation or missing rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2c029412-4022-44cd-849e-8aaa5412b617",
+    "timestamp": "2025-11-21 16:32:00.100293",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Period Race Condition: When multiple operations increment validator period concurrently, is there proper locking to prevent period skipping?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d560e82a-9cb1-4b8e-8da9-6392143cf021",
+    "timestamp": "2025-11-21 16:32:14.079696",
+    "report_generated": false
+  },
+  {
+    "question": "Commission Update During Allocation: Can a validator update commission rate while AllocateTokensToValidator is executing, causing incorrect commission calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4bd11722-ac27-49f3-87b6-fc8340154bfd",
+    "timestamp": "2025-11-21 16:32:30.635501",
+    "report_generated": false
+  },
+  {
+    "question": "Withdraw Address Change During Withdrawal: Can a user change their withdraw address in one transaction while withdrawing in another, causing funds to go to the wrong address?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8724def0-0fd5-4415-81a2-8b97a1b6703f",
+    "timestamp": "2025-11-21 16:32:48.756896",
+    "report_generated": false
+  },
+  {
+    "question": "Reference Count Concurrent Modification: Can concurrent delegation/undelegation operations cause reference counts at validator.go:67-88 to become incorrect?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34604825-5988-4d2b-a77f-5480c8c0af5f",
+    "timestamp": "2025-11-21 16:33:08.481766",
+    "report_generated": false
+  },
+  {
+    "question": "Store Iterator Concurrent Modification: If state is modified while an iterator is active",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3966370f-0f01-46ef-9b66-18ab3491c4f3",
+    "timestamp": "2025-11-21 16:33:30.204864",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Duplicate Submission DoS: In x/evidence/keeper/keeper.go, the SubmitEvidence function checks for duplicate evidence by hash. keeper.go:78-81 Can an attacker spam the chain by submitting the same evidence with slightly modified timestamps or fields to generate different hashes, bypassing the duplicate check while overwhelming storage?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b911a3e-315b-4b29-9266-4c8fa7dc716e",
+    "timestamp": "2025-11-21 16:33:52.313058",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Hash Collision Attack: The Hash() function in x/evidence/types/evidence.go uses SHA256 on marshaled evidence. evidence.go:36-43 Could an attacker craft two different evidence objects that produce the same hash, allowing malicious evidence to replace legitimate evidence in storage?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9ae879c0-7783-4648-a7d0-b8758b67b050",
+    "timestamp": "2025-11-21 16:34:16.856450",
+    "report_generated": false
+  },
+  {
+    "question": "MsgSubmitEvidence Submitter Validation: In x/evidence/types/msgs.go, the ValidateBasic checks if the submitter address is empty. msgs.go:46-59 Does this prevent an attacker from submitting evidence with an invalid but non-empty address that could bypass fee payment or signature verification?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0eb6a011-19fc-416d-8670-d0b73fa63b9c",
+    "timestamp": "2025-11-21 16:34:42.215204",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Handler Execution Without Gas Limit: In x/evidence/keeper/keeper.go, the SubmitEvidence method calls the handler without explicit gas metering. keeper.go:78-99 Could a custom evidence handler perform unbounded computation, causing a DoS attack during transaction processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ae001684-3169-470b-8a30-80a17b2e65ea",
+    "timestamp": "2025-11-21 16:35:08.792486",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Storage Unbounded Growth: The SetEvidence function stores evidence indefinitely in the KVStore. keeper.go:102-106 Is there a maximum limit on stored evidence? Can an attacker fill up node storage by submitting valid but numerous evidence entries?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_28330a8b-bc6a-48a8-87b8-ae8981cccaca",
+    "timestamp": "2025-11-21 16:35:35.426787",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Marshaling Panic: The MustMarshalEvidence function panics on error. keeper.go:161-168 Could malformed evidence trigger a panic during SetEvidence, halting the chain if called from SubmitEvidence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1215a963-31c8-419e-9710-1f9cb05c1620",
+    "timestamp": "2025-11-21 16:36:03.515043",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Unmarshaling Type Confusion: In x/evidence/keeper/keeper.go, UnmarshalEvidence unmarshals into an interface. keeper.go:177-180 Can an attacker submit evidence with a type that's registered in the codec but not handled by any router, causing unexpected behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_089be5ce-e018-47d8-ada7-29710c879bb2",
+    "timestamp": "2025-11-21 16:36:33.410922",
+    "report_generated": false
+  },
+  {
+    "question": "Submitter Fee Bypass via Invalid Evidence: If ValidateBasic() fails after gas is already deducted, does the submitter still pay fees? Could an attacker intentionally submit invalid evidence to drain their account of dust amounts without proper fee accounting?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_856118ba-a867-43af-85a3-e88ce1464642",
+    "timestamp": "2025-11-21 16:37:04.415509",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Route Validation: The router checks IsAlphaNumeric for route paths. router.go:59-61 Can special characters or very long route strings cause issues in route matching or storage key construction?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4e639adc-2645-4f04-b431-084004438c92",
+    "timestamp": "2025-11-21 16:37:35.410690",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Handler Registration Race Condition: The router sealing mechanism prevents adding routes after sealing. keeper.go:50-62 But can a module bypass this by calling SetRouter multiple times with different routers before sealing, causing non-deterministic handler behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a6cf801b-7212-4283-8692-79670c6c2ca7",
+    "timestamp": "2025-11-21 16:38:07.195829",
+    "report_generated": false
+  },
+  {
+    "question": "GetEvidence Return Value Ambiguity: GetEvidence returns (nil, false) if evidence doesn't exist. keeper.go:110-119 Could calling code misinterpret this and treat missing evidence as successfully retrieved nil evidence, leading to logic errors?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d1e1c262-ed7c-4133-9b04-10da20602f16",
+    "timestamp": "2025-11-21 16:38:41.056557",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Iteration Non-Determinism: The IterateEvidence function iterates over evidence in storage. keeper.go:124-136 Is the iteration order deterministic? Could non-deterministic ordering cause consensus failures if used in state transitions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ac12881b-85b3-47c1-baeb-9224a4e1b108",
+    "timestamp": "2025-11-21 16:39:16.276136",
+    "report_generated": false
+  },
+  {
+    "question": "MsgSubmitEvidence GetSigners Error Handling: The GetSigners method returns nil if address parsing fails. msgs.go:69-76 Does the SDK properly handle nil signers, or could this cause a panic in signature verification?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8d8aa963-c6ff-4a25-9352-7106dad0cde3",
+    "timestamp": "2025-11-21 16:39:53.534775",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence GetEvidence Caching Issues: In MsgSubmitEvidence, GetEvidence() accesses a cached value. msgs.go:78-84 If the cache is stale or cleared, could this return nil even for valid evidence, causing evidence rejection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_12dcf177-f44f-4a81-a3b8-91e61c427c34",
+    "timestamp": "2025-11-21 16:40:30.297606",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Any Unpacking Failure: The UnpackInterfaces method unpacks Any types. msgs.go:94-97 If unpacking fails, is the error properly propagated? Could partial unpacking cause inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_30ca38ae-fa33-4e0a-a0bf-9773967d99ff",
+    "timestamp": "2025-11-21 16:41:06.652236",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence ValidateBasic Incomplete Checks: The ValidateBasic for Equivocation checks time, height, power, and address. evidence.go:45-61 Does it validate that the consensus address format is correct for the chain's bech32 prefix? Could cross-chain evidence be submitted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7297391b-a1e8-484b-9cd8-150a462bdb52",
+    "timestamp": "2025-11-21 16:41:45.192389",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Time Validation Bypass: ValidateBasic checks e.Time.Unix() <= 0. evidence.go:47-49 Can an attacker submit evidence with a time far in the future but still > 0, causing issues with age calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b3f3bf6-d3ee-465e-b315-38278af97bf3",
+    "timestamp": "2025-11-21 16:42:24.652612",
+    "report_generated": false
   }
 ]
