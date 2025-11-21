@@ -4948,5 +4948,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3478f915-e04f-4b93-a611-f92dcc65d4f1",
     "timestamp": "2025-11-21 12:56:33.038158",
     "report_generated": false
+  },
+  {
+    "question": "Does the system validate that voting end time is always after voting start time for all proposals? proposal.go:201-210",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6360bd9-ab09-4b23-9b40-7febae30279e",
+    "timestamp": "2025-11-21 12:57:47.537378",
+    "report_generated": false
+  },
+  {
+    "question": "Could a proposal be in both active and inactive queues simultaneously due to improper queue management? proposal.go:201-210",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_efb80c95-28f9-4409-bba3-5b29fff066e0",
+    "timestamp": "2025-11-21 12:58:00.627955",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that all proposals in the active/inactive queues actually exist in the proposals store? keeper.go:133-167",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c206abe0-71fd-46ce-ac2d-e47b98c9f604",
+    "timestamp": "2025-11-21 12:58:15.986545",
+    "report_generated": false
+  },
+  {
+    "question": "Does the invariant run before or after EndBlocker, and could this ordering allow temporary invariant violations? invariants.go:26-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7aeba182-d4ab-4b9e-b843-c6e475afc84a",
+    "timestamp": "2025-11-21 12:58:29.837083",
+    "report_generated": false
+  },
+  {
+    "question": "Could the total deposit amounts exceed the module account balance if refunds are processed incorrectly? invariants.go:35-37",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d8cd39d-764c-49fa-8914-52901b9ade9a",
+    "timestamp": "2025-11-21 12:58:44.890480",
+    "report_generated": false
+  },
+  {
+    "question": "Is there an invariant that validates proposal IDs are strictly increasing and have no gaps? proposal.go:184-199",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c4ca2b1-bc42-4376-a770-e0a0dfc4853f",
+    "timestamp": "2025-11-21 12:59:01.767680",
+    "report_generated": false
+  },
+  {
+    "question": "Does the invariant check handle the case where coin burning fails but the deposit record is already deleted? invariants.go:26-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cbcfa055-4055-4f29-a394-5606d91f3a56",
+    "timestamp": "2025-11-21 12:59:19.699855",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker exploit a timing window where deposits are in the module account but not yet recorded in the store? invariants.go:28-37",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d289d785-918d-4bc0-a641-8b10a6b64494",
+    "timestamp": "2025-11-21 12:59:39.574876",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ModuleAccountInvariant account for deposits that are being processed during the same block's EndBlocker? invariants.go:26-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ce3acf2d-20ca-4f39-8127-f158b70181b5",
+    "timestamp": "2025-11-21 13:00:01.410131",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that prevents proposal IDs from being set to reserved values that could conflict with system keys? proposal.go:195-199",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c191cee7-c648-4a0a-a255-6a20de2cdf63",
+    "timestamp": "2025-11-21 13:00:25.977769",
+    "report_generated": false
+  },
+  {
+    "question": "Could prefix iteration in IterateProposals return proposals in non-deterministic order on different nodes? proposal.go:108-126",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0594c7cb-44f2-46b4-9f85-d11618a041de",
+    "timestamp": "2025-11-21 13:00:51.605963",
+    "report_generated": false
+  },
+  {
+    "question": "Does the key iterator in ActiveProposalQueueIterator properly close to prevent resource leaks during chain operation? keeper.go:170-173",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fef0be8c-62a0-44b8-8603-581fc2e4ba14",
+    "timestamp": "2025-11-21 13:01:18.210092",
+    "report_generated": false
+  },
+  {
+    "question": "Is the time parsing in splitKeyWithTime vulnerable to malformed time bytes that could cause consensus divergence? keys.go:141-151",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fec5e9ea-736c-49a3-8430-23dd01518170",
+    "timestamp": "2025-11-21 13:01:45.301828",
+    "report_generated": false
+  },
+  {
+    "question": "Could the proposal queue prefixes collide with other module prefixes if the module name is changed? keys.go:40-49",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_65c94773-ddf4-4b05-a9e4-81ab7ce288d8",
+    "timestamp": "2025-11-21 13:02:14.586957",
+    "report_generated": false
+  },
+  {
+    "question": "Does the SplitActiveProposalQueueKey function validate key length before parsing, preventing panics on corrupted data? keys.go:119-122",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_68f2f11a-f17f-4a11-9284-8356ee3c55e9",
+    "timestamp": "2025-11-21 13:02:44.751395",
+    "report_generated": false
+  },
+  {
+    "question": "Is the address length prefix in DepositKey vulnerable to manipulation, allowing access to other users' deposits? keys.go:96-98",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b0549864-cc36-416f-913c-5e29c46c0fc2",
+    "timestamp": "2025-11-21 13:03:16.864158",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker craft deposit/vote keys that collide with the prefix keys, corrupting proposal queue data? keys.go:95-108",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e4d5f1ae-bf12-420d-af53-cd73081f3461",
+    "timestamp": "2025-11-21 13:03:50.154309",
+    "report_generated": false
+  },
+  {
+    "question": "Does the time-based key encoding in ActiveProposalQueueKey handle time zone differences deterministically across validators? keys.go:75-78",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5671f702-61f8-4915-b7ec-ef5a7e3d0f81",
+    "timestamp": "2025-11-21 13:04:23.716386",
+    "report_generated": false
+  },
+  {
+    "question": "Could the proposal ID overflow in GetProposalIDBytes cause key collisions for proposals with IDs 2^64 apart? keys.go:54-58",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_412ff371-2c1d-405a-a6a7-e8de67c4de6e",
+    "timestamp": "2025-11-21 13:04:58.591726",
+    "report_generated": false
+  },
+  {
+    "question": "Is there rate limiting on proposal submission to prevent spam attacks that fill the inactive proposal queue? msg_server.go:27-60",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5ea98196-1301-4273-88a6-26dfd1447f06",
+    "timestamp": "2025-11-21 13:05:35.303268",
+    "report_generated": false
+  },
+  {
+    "question": "Could a user submit a proposal with a content type that doesn't match the registered router route, causing handler mismatch? msg_server.go:29-32",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1d61ca32-9762-4754-8ed7-64bb5a450ae1",
+    "timestamp": "2025-11-21 13:06:12.812868",
+    "report_generated": false
+  },
+  {
+    "question": "Does the event emission in message handlers leak information that could be used to front-run governance actions? msg_server.go:41-57",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f9d15b62-2b36-46ee-b5d9-bf4439a39555",
+    "timestamp": "2025-11-21 13:06:49.265525",
+    "report_generated": false
+  },
+  {
+    "question": "Are the telemetry counters thread-safe, or could concurrent proposal submissions corrupt metrics? msg_server.go:34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c45600ff-83f6-4adc-928e-bcb72b0f1636",
+    "timestamp": "2025-11-21 13:07:26.499943",
+    "report_generated": false
+  },
+  {
+    "question": "Can the Deposit message bypass the proposal status check by depositing on proposals in invalid states? msg_server.go:123-160",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7c837f72-55ab-44f4-a18b-2f37feb38b74",
+    "timestamp": "2025-11-21 13:08:03.741147",
+    "report_generated": false
+  },
+  {
+    "question": "Does the VoteWeighted function validate that the sum of option weights equals 1.0 before calling AddVote? msg_server.go:93-121",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3c254775-b862-46b1-a27f-e7551085acd8",
+    "timestamp": "2025-11-21 13:08:41.992791",
+    "report_generated": false
   }
 ]
