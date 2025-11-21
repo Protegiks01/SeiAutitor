@@ -7948,5 +7948,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f9b08012-ff06-4078-a4b6-bb0b381f9027",
     "timestamp": "2025-11-21 15:41:31.134490",
     "report_generated": false
+  },
+  {
+    "question": "Delegator Starting Info Missing: In withdrawDelegationRewards at delegation.go:141-143 , an error is returned if starting info doesn't exist. Can this be triggered to block legitimate withdrawals after chain upgrades?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d93eba83-5d67-47eb-9195-cc79330bbc96",
+    "timestamp": "2025-11-21 15:42:42.547970",
+    "report_generated": false
+  },
+  {
+    "question": "Outstanding vs Community Pool Imbalance: If an attacker can manipulate the flow such that rewards bypass SetValidatorOutstandingRewards but still get added to the community pool, can the ModuleAccountInvariant be permanently broken?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_44db61a2-0420-4ebe-8fca-7250f431b031",
+    "timestamp": "2025-11-21 15:42:56.187177",
+    "report_generated": false
+  },
+  {
+    "question": "Reward Intersection Loss: In withdrawDelegationRewards at delegation.go:148-162 , rewards.Intersect(outstanding) is used. Can this cause legitimate rewards to be lost if outstanding is miscalculated?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5db8311c-b98c-450d-ba1c-ebedca5ea1ef",
+    "timestamp": "2025-11-21 15:43:09.564396",
+    "report_generated": false
+  },
+  {
+    "question": "Same Height Delegation Edge Case: In CalculateDelegationRewards at delegation.go:59-62 , no rewards are given for same-height delegations. Can an attacker use this to game reward distribution timing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_08960a8c-4c4b-40a8-9056-da14992456cf",
+    "timestamp": "2025-11-21 15:43:23.833808",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Period Underflow: In initializeDelegation at delegation.go:14 , previousPeriod = rewards.Period - 1. Can a new validator with period 0 cause underflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fe60a389-b16c-4b89-94bb-6e5c02b4e3b7",
+    "timestamp": "2025-11-21 15:43:38.468281",
+    "report_generated": false
+  },
+  {
+    "question": "Multiple Slash Events Same Block: If multiple slashing events occur in the same block at delegation.go:79-92 , are they all properly iterated and applied to stake calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_84b32824-4302-4d36-8cd1-fde7c68be8f6",
+    "timestamp": "2025-11-21 15:43:54.668544",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Pool Not Initialized Panic: In GetFeePool at store.go:48-56 , it panics if fee pool is nil. Can this occur after a malformed genesis or migration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f2b6d54d-2954-4dc0-9bf6-bd706c51abf8",
+    "timestamp": "2025-11-21 15:44:12.280513",
+    "report_generated": false
+  },
+  {
+    "question": "Withdraw Address Validation Bypass: In SetWithdrawAddr at keeper.go:64-82 , blocked addresses are checked. Can an attacker use address derivation tricks to bypass the blockedAddrs check?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f08135a0-54d6-42ef-acf7-361012b84fb1",
+    "timestamp": "2025-11-21 15:44:32.314338",
+    "report_generated": false
+  },
+  {
+    "question": "Withdraw Address Disabled Lockout: In SetWithdrawAddr at keeper.go:69-71 , if GetWithdrawAddrEnabled is false, users cannot change withdraw addresses. Can this be exploited to permanently lock funds if a malicious address was previously set?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_71dad55a-3fca-41f6-819f-d6c0ac957309",
+    "timestamp": "2025-11-21 15:44:52.562516",
+    "report_generated": false
+  },
+  {
+    "question": "Commission Withdrawal Underflow: In WithdrawValidatorCommission at keeper.go:119-120 , outstanding rewards are reduced by commission. Can precision errors cause outstanding to become negative?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ae4c2c54-f4f2-4521-800b-e00e984ce4c5",
+    "timestamp": "2025-11-21 15:45:15.131313",
+    "report_generated": false
+  },
+  {
+    "question": "Zero Commission Edge Case: In WithdrawValidatorCommission at keeper.go:111-113 , it returns an error if commission is zero. Can an attacker repeatedly call this to waste gas and clog the mempool?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f97a2bbc-d7db-49bc-839e-e5ed9820135a",
+    "timestamp": "2025-11-21 15:45:38.017581",
+    "report_generated": false
+  },
+  {
+    "question": "Withdraw to Module Account: Can a user set their withdraw address to a module account at keeper.go:64-82 , potentially bypassing security checks in other modules that assume module accounts only receive from specific sources?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bcd03131-afe8-4a0f-b2ba-ebed1b26d11e",
+    "timestamp": "2025-11-21 15:46:02.635913",
+    "report_generated": false
+  },
+  {
+    "question": "Delegation Withdrawal Race: In WithdrawDelegationRewards at keeper.go:85-105 , the delegation is reinitialized after withdrawal. Can concurrent unbonding or redelegation operations cause rewards to be lost or double-counted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ba12bbb3-09e4-4d5c-b1f2-0878c31f2f0b",
+    "timestamp": "2025-11-21 15:46:28.749170",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Not Found Withdrawal: In WithdrawDelegationRewards at keeper.go:86-89 , if validator is nil, an error is returned. Can this block legitimate withdrawals if a validator is removed between delegation and withdrawal?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_83146f9d-8cd3-4a41-98af-f2e34c02989e",
+    "timestamp": "2025-11-21 15:46:55.097811",
+    "report_generated": false
+  },
+  {
+    "question": "Remainder to Community Pool Manipulation: In withdrawDelegationRewards at delegation.go:164-181 , remainder goes to community pool. Can attackers manipulate decimal places to maximize remainders and drain validator rewards into community pool?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9f4aca52-4444-4cb1-bb5c-8c0aa18fe6a9",
+    "timestamp": "2025-11-21 15:47:24.224739",
+    "report_generated": false
+  },
+  {
+    "question": "Withdraw After Slash Timing: If a validator is slashed at delegation.go:79-92 , can a delegator withdraw rewards before the slash event is recorded, receiving rewards for slashed stake?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa5a63e0-f282-4bc9-afeb-4783fd5716ad",
+    "timestamp": "2025-11-21 15:47:53.595212",
+    "report_generated": false
+  },
+  {
+    "question": "Commission Greater Than Rewards: In AllocateTokensToValidator at allocation.go:112-114 , can a validator set commission > 100% to cause shared = tokens.Sub(commission) to panic or result in negative values?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd09593d-a647-4a24-977d-122e93283f72",
+    "timestamp": "2025-11-21 15:48:24.780767",
+    "report_generated": false
+  },
+  {
+    "question": "Starting Info Deletion Race: In withdrawDelegationRewards at delegation.go:189 , starting info is deleted. Can concurrent operations cause this deletion to fail or happen at the wrong time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_598af953-118d-465b-bd3b-19187f86dc41",
+    "timestamp": "2025-11-21 15:48:57.495211",
+    "report_generated": false
+  },
+  {
+    "question": "Send Coins Failure After State Update: In withdrawDelegationRewards at delegation.go:168-173 , state is updated before SendCoinsFromModuleToAccount. If the send fails, is the state correctly rolled back?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_443e6b89-7179-4ee6-b7c3-994c67f3aff1",
+    "timestamp": "2025-11-21 15:49:31.040483",
+    "report_generated": false
+  },
+  {
+    "question": "Default Withdraw Address Assumption: In GetDelegatorWithdrawAddr at store.go:12-19 , if no custom address is set, delegator address is returned. Can this cause issues with smart contracts or multisig accounts expecting explicit withdraw address setup?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4051ece3-6cc7-473f-816b-e7c404c74bf8",
+    "timestamp": "2025-11-21 15:50:04.965164",
+    "report_generated": false
+  },
+  {
+    "question": "Withdraw Address Deletion Bug: In DeleteDelegatorWithdrawAddr at store.go:28-31 , the function takes a withdrawAddr parameter but doesn't use it. Can this cause incorrect addresses to remain in storage?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_88f000c5-bc9a-4d32-a77b-be917cef4666",
+    "timestamp": "2025-11-21 15:50:40.961340",
+    "report_generated": false
+  },
+  {
+    "question": "TruncateDecimal Rounding Attack: Multiple functions use TruncateDecimal() to convert DecCoins to Coins. Can an attacker repeatedly perform operations to accumulate truncation dust into a significant amount?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1dbdc113-a45d-4b15-bdd5-548d009f425e",
+    "timestamp": "2025-11-21 15:51:18.760950",
+    "report_generated": false
+  },
+  {
+    "question": "Zero Rewards Return Value: In withdrawDelegationRewards at delegation.go:191-200 , if rewards are zero, a zero coin is constructed manually. Can this cause issues with modules expecting either nil or a proper Coins object?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_991dc5ce-6fdd-43f5-b436-a1280ce4f321",
+    "timestamp": "2025-11-21 15:51:57.635158",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Commission Manipulation: Can a validator repeatedly change commission rates at allocation.go:113 between blocks to manipulate reward distribution to delegators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7c18d980-8365-44f3-9a73-87464259f052",
+    "timestamp": "2025-11-21 15:52:36.228877",
+    "report_generated": false
+  },
+  {
+    "question": "Outstanding Rewards Never Decremented: Are there code paths where SetValidatorOutstandingRewards is called to increase outstanding but the corresponding decrease is missed, causing the invariant to break over time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e3934928-ef76-4dbb-ae18-11e0acffede3",
+    "timestamp": "2025-11-21 15:53:14.517407",
+    "report_generated": false
   }
 ]
