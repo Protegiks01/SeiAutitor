@@ -3748,5 +3748,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ad72e459-ba79-4e1e-a72c-63a0e9047eca",
     "timestamp": "2025-11-20 22:55:02.002903",
     "report_generated": false
+  },
+  {
+    "question": "Can wildcard '*' from withinContractReference keeper.go:316 over-restrict parallelism?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34a42b89-ac25-44cf-8534-1d77906513ab",
+    "timestamp": "2025-11-21 07:13:19.627156",
+    "report_generated": false
+  },
+  {
+    "question": "Can JQ selector parsing in BuildSelectorOps keeper.go:311-441 panic or behave nondeterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fba441fa-09ca-4578-89ad-2dd0fad73642",
+    "timestamp": "2025-11-21 07:13:32.578057",
+    "report_generated": false
+  },
+  {
+    "question": "Can CONTRACT_REFERENCE deprecation checks be bypassed with alternate encodings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7cf78fd0-36ff-486f-bb90-1219c8e9cc72",
+    "timestamp": "2025-11-21 07:13:46.587255",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetRawWasmDependencyMapping keeper.go:127-138 handle invalid contract addresses without panicking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_de6ecb2b-3bba-4517-b21c-74c91867afad",
+    "timestamp": "2025-11-21 07:14:00.558657",
+    "report_generated": false
+  },
+  {
+    "question": "Can dependency mappings grow unbounded, causing memory exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_53f62c22-ae18-4ce0-87f6-b62c31dcd0ad",
+    "timestamp": "2025-11-21 07:14:17.707140",
+    "report_generated": false
+  },
+  {
+    "question": "Can messages match multiple ExecuteAccessOps or QueryAccessOps due to sloppy matching logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e91e279c-36ce-4fe6-8200-f118df7c2be0",
+    "timestamp": "2025-11-21 07:14:36.253302",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetWasmDependencyMapping keeper.go:443-461 validate contract existence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8ada262a-2bf7-4f70-a374-bdae7d97e56b",
+    "timestamp": "2025-11-21 07:14:55.574669",
+    "report_generated": false
+  },
+  {
+    "question": "Can ResetWasmDependencyMapping keeper.go:463-482 be abused to wipe critical mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8977b596-f4d5-43e3-ad93-dcf28a0df13e",
+    "timestamp": "2025-11-21 07:15:17.518001",
+    "report_generated": false
+  },
+  {
+    "question": "Can SynchronousWasmAccessOps be abused to force all Wasm transactions to run sequentially?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b5cf07bb-3cdd-4fd8-914b-2c1efdb3b92e",
+    "timestamp": "2025-11-21 07:15:40.687689",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateWasmDependencies keeper.go:484-496 iterate deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_92337b01-8413-4a34-abe4-9115a7094f4c",
+    "timestamp": "2025-11-21 07:16:05.202561",
+    "report_generated": false
+  },
+  {
+    "question": "Can references A→B→C→A bypass circular detection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d21135aa-ce27-4416-bc0c-644d2de4bbbc",
+    "timestamp": "2025-11-21 07:16:29.518672",
+    "report_generated": false
+  },
+  {
+    "question": "Does fallback on ErrKeyNotFound keeper.go:171-176 cause nondeterminism?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c7d0d11-fe43-44f3-8231-f99648124486",
+    "timestamp": "2025-11-21 07:16:55.633803",
+    "report_generated": false
+  },
+  {
+    "question": "Can JQ selectors produce different results across nodes due to library version differences?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_308ebb6d-9693-4e0b-a881-5447fa5700d1",
+    "timestamp": "2025-11-21 07:17:23.471792",
+    "report_generated": false
+  },
+  {
+    "question": "Does jq.Parse keeper.go:321-324 sanitize and validate expressions to prevent JQ injection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e7bb386-13ba-464d-9ce8-88b24c0a1b41",
+    "timestamp": "2025-11-21 07:17:52.667037",
+    "report_generated": false
+  },
+  {
+    "question": "Can attackers craft exponential JQ expressions that DoS op.Apply?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62339f52-c173-47e7-b4db-6be0d034a8d5",
+    "timestamp": "2025-11-21 07:18:23.068640",
+    "report_generated": false
+  },
+  {
+    "question": "Does JQ_BECH32_ADDRESS validation block malformed addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ec35a9d0-49f6-4c9f-b612-ed50db239ea6",
+    "timestamp": "2025-11-21 07:18:54.841877",
+    "report_generated": false
+  },
+  {
+    "question": "Can strings.Trim applied to JSON produce different results with escaped quotes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b2a45a07-2b4d-4600-aac8-86d68de01e79",
+    "timestamp": "2025-11-21 07:19:27.821082",
+    "report_generated": false
+  },
+  {
+    "question": "Does JQ_LENGTH_PREFIXED_ADDRESS handle prefix collisions safely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f1e79779-2d92-4345-afb3-d3b324eb53db",
+    "timestamp": "2025-11-21 07:20:02.274270",
+    "report_generated": false
+  },
+  {
+    "question": "Can JQ_MESSAGE_CONDITIONAL produce nondeterministic behavior on side-effectful selectors?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cf9e8893-0a63-4dd6-b577-9dedaf85a627",
+    "timestamp": "2025-11-21 07:20:36.756591",
+    "report_generated": false
+  },
+  {
+    "question": "Can CONSTANT_STRING_TO_HEX produce collisions via strings with identical hex encodings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8ee69df2-e25f-4b63-b4b8-4574f8410171",
+    "timestamp": "2025-11-21 07:21:12.001524",
+    "report_generated": false
+  },
+  {
+    "question": "Does CONTRACT_ADDRESS selector validate addresses strictly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_92d4ac70-2363-4d71-83bd-dad340c425be",
+    "timestamp": "2025-11-21 07:21:48.682547",
+    "report_generated": false
+  },
+  {
+    "question": "Can JQ selectors extract unintended fields and leak data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9d8e37f4-7202-4a66-84a7-11f35345aa66",
+    "timestamp": "2025-11-21 07:22:26.457006",
+    "report_generated": false
+  },
+  {
+    "question": "Can sender address selectors be spoofed inside the message context?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_943218ab-4963-4dfc-87c5-4526b74f967f",
+    "timestamp": "2025-11-21 07:23:05.431060",
+    "report_generated": false
+  },
+  {
+    "question": "Does parsing failure always fall back deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d6905a90-8ec3-46ba-8eca-1c55a197477a",
+    "timestamp": "2025-11-21 07:23:45.964883",
+    "report_generated": false
+  },
+  {
+    "question": "Can fmt.Sprintf hex encoding overflow with massive IDs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_418e5064-cf84-4cea-9bcf-d4bff8110916",
+    "timestamp": "2025-11-21 07:24:26.994029",
+    "report_generated": false
   }
 ]
