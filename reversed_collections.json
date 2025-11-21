@@ -5998,5 +5998,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3975cd63-0b77-48b1-bbf8-8e1e7c464122",
     "timestamp": "2025-11-21 14:19:42.417887",
     "report_generated": false
+  },
+  {
+    "question": "StakingTokenSupply Negative: Can StakingTokenSupply return negative or zero values, and are these handled safely in AnnualProvisions calculation? keeper.go:85-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_178409a6-64bc-4bdb-88ea-443d7daff113",
+    "timestamp": "2025-11-21 14:20:55.176846",
+    "report_generated": false
+  },
+  {
+    "question": "NewCoin Panic on Invalid Denom: Could an invalid or corrupted MintDenom parameter cause sdk.NewCoin to panic in BlockProvision? minter.go:79",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bd0de6f9-49cc-409a-879f-951d9b563bbd",
+    "timestamp": "2025-11-21 14:21:08.859054",
+    "report_generated": false
+  },
+  {
+    "question": "BlockProvision Zero Coins: Is the case where BlockProvision returns zero coins handled correctly throughout the minting flow? minter.go:77-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93e9951f-530e-41a6-a6aa-2157f34d1e40",
+    "timestamp": "2025-11-21 14:21:23.894823",
+    "report_generated": false
+  },
+  {
+    "question": "Compound Precision Errors: Over many blocks, could accumulated precision errors in minting calculations lead to significant supply discrepancies? minter.go:77-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c1fe0dfb-d005-4538-90c1-b02f2cb90604",
+    "timestamp": "2025-11-21 14:21:39.673735",
+    "report_generated": false
+  },
+  {
+    "question": "InflationMax vs InflationMin: Is the validation that InflationMax >= InflationMin enforced at all parameter change points? params.go:75-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d1b6d247-a24e-4dfa-ac05-bd1edb796409",
+    "timestamp": "2025-11-21 14:21:56.711056",
+    "report_generated": false
+  },
+  {
+    "question": "GoalBonded Validation Range: Can GoalBonded be set to values > 1.0, and does this cause unexpected behavior in inflation calculations? params.go:174-180",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7d81f807-5361-46d2-8350-d3621f53c618",
+    "timestamp": "2025-11-21 14:22:14.411351",
+    "report_generated": false
+  },
+  {
+    "question": "AnnualProvisions Negative Check: Is there validation to ensure AnnualProvisions cannot be negative after calculations? minter.go:71-73",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a27bda35-0e3b-499d-a231-1605f8d8a725",
+    "timestamp": "2025-11-21 14:22:34.455709",
+    "report_generated": false
+  },
+  {
+    "question": "Int to Dec Conversion: Are all conversions between sdk.Int and sdk.Dec types safe and don't lose precision in critical calculations? minter.go:72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7a1a96e4-e2cb-4a9e-b89e-fbfeee807900",
+    "timestamp": "2025-11-21 14:22:56.891368",
+    "report_generated": false
+  },
+  {
+    "question": "Mul and Quo Decimal Operations: Are all Mul and Quo operations on sdk.Dec values checked for overflow, underflow, or invalid results? minter.go:52-55",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_30ab5b77-2648-4d04-8946-33ad5fa8a18f",
+    "timestamp": "2025-11-21 14:23:18.684338",
+    "report_generated": false
+  },
+  {
+    "question": "Inflation Rate Manipulation: Can an attacker manipulate staking ratios to force inflation into extreme ranges that benefit them? minter.go:44-67",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8f7fbb03-59da-4cbb-bdea-25772ce4421d",
+    "timestamp": "2025-11-21 14:23:43.886171",
+    "report_generated": false
+  },
+  {
+    "question": "Zero BlocksPerYear Edge Case: Is there a lower bound on BlocksPerYear to prevent extremely high per-block minting rates? params.go:190-193",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6fb85b4a-881d-47ec-8451-4ffbd540c084",
+    "timestamp": "2025-11-21 14:24:09.262242",
+    "report_generated": false
+  },
+  {
+    "question": "Negative Coin Amount: Can BlockProvision ever return a negative coin amount due to calculation errors, and is this properly validated? minter.go:77-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3814d4a2-7b3e-484b-8135-57813d7dc79a",
+    "timestamp": "2025-11-21 14:24:34.265523",
+    "report_generated": false
+  },
+  {
+    "question": "Supply Overflow Check: When minting new coins, is there a check to ensure total supply doesn't overflow the maximum Int value? keeper.go:97-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_af352a1d-3b92-4067-a9d7-4ead1bf1d780",
+    "timestamp": "2025-11-21 14:25:00.234019",
+    "report_generated": false
+  },
+  {
+    "question": "QuoInt Division Safety: Does the QuoInt operation in BlockProvision handle all edge cases safely without panic or incorrect results? minter.go:78",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_214b703d-52a8-45c1-9809-22667660a7a1",
+    "timestamp": "2025-11-21 14:25:28.573097",
+    "report_generated": false
+  },
+  {
+    "question": "Decimal Precision Issues: Do the decimal operations in minting calculations maintain sufficient precision to prevent exploitable rounding errors? minter.go:71-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d9e5b45e-9ece-4958-9b3d-91fc81f16afe",
+    "timestamp": "2025-11-21 14:25:57.904932",
+    "report_generated": false
+  },
+  {
+    "question": "Inflation Capping Logic: Are the inflation min/max boundaries correctly enforced, and could parameter changes bypass these limits? minter.go:59-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ee460bf-e00a-4f05-97b9-2f6271755fd6",
+    "timestamp": "2025-11-21 14:26:28.262255",
+    "report_generated": false
+  },
+  {
+    "question": "InflationRateChange Negative Values: Can negative inflationRateChange values cause the inflation to decrease improperly or underflow? minter.go:52-58",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0ea743e5-3718-45c6-ad27-e8559b92d8a5",
+    "timestamp": "2025-11-21 14:27:01.446067",
+    "report_generated": false
+  },
+  {
+    "question": "BondedRatio Greater Than One: Does the code handle cases where bondedRatio > 1.0 (due to bugs or state corruption), and could this break inflation calculations? minter.go:52-54",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55796118-3da0-494e-906d-e368822e2763",
+    "timestamp": "2025-11-21 14:27:35.294477",
+    "report_generated": false
+  },
+  {
+    "question": "Negative Inflation Handling: Although validation checks for negative inflation, can state corruption cause negative inflation values to be used in calculations? minter.go:36-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a7727b4e-0abc-48a6-a575-8565614f934b",
+    "timestamp": "2025-11-21 14:28:10.294340",
+    "report_generated": false
+  },
+  {
+    "question": "TruncateInt Precision Loss: Can repeated calls to TruncateInt() in BlockProvision accumulate precision loss that could be exploited to mint incorrect amounts? minter.go:78-79",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0b750178-d1ff-4fcb-9ac4-d67e5c8f5eaf",
+    "timestamp": "2025-11-21 14:28:46.648530",
+    "report_generated": false
+  },
+  {
+    "question": "Integer Overflow in AnnualProvisions: Does NextAnnualProvisions check for integer overflow when multiplying inflation by totalSupply? minter.go:71-73",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_58b7c9ff-2eeb-413b-9482-aa9d786ce855",
+    "timestamp": "2025-11-21 14:29:23.030254",
+    "report_generated": false
+  },
+  {
+    "question": "BlocksPerYear Zero Division: Can params.BlocksPerYear be set to zero through governance, causing division by zero in NextInflationRate or BlockProvision? minter.go:55",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7849a6cf-f898-47d1-ab7f-08bc546067a1",
+    "timestamp": "2025-11-21 14:29:58.313884",
+    "report_generated": false
+  },
+  {
+    "question": "Division by Zero in InflationRate: Does NextInflationRate handle the case where params.GoalBonded is zero, which would cause division by zero? minter.go:52-54",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c070b24-58ed-4b0e-9b9b-e947ffb4e303",
+    "timestamp": "2025-11-21 14:30:34.539635",
+    "report_generated": false
+  },
+  {
+    "question": "Inflation Calculation Overflow: Can the inflation calculation in NextInflationRate overflow with extreme parameter values (e.g., very high InflationRateChange)? minter.go:44-67",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9adc0c8-27b2-42a5-afe7-9f5546f80770",
+    "timestamp": "2025-11-21 14:31:09.887272",
+    "report_generated": false
+  },
+  {
+    "question": "Module Consensus Version: Does the module's consensus version properly handle state migrations, and could an upgrade cause BeginBlocker to fail? module.go:167",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7e824bfb-d1ae-4987-bb25-24ecc8dd2e2b",
+    "timestamp": "2025-11-21 14:31:44.097540",
+    "report_generated": false
   }
 ]
