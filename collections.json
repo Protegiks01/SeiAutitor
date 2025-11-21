@@ -5098,5 +5098,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_012fb5e9-2e0a-4c4e-bbc9-e6b7c0dab45c",
     "timestamp": "2025-11-21 08:58:50.762850",
     "report_generated": false
+  },
+  {
+    "question": "Can param validation be bypassed through direct param store writes in params.go:52-61?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_692d020b-ae9e-4972-9d2e-adfa16c37161",
+    "timestamp": "2025-11-21 08:59:58.614997",
+    "report_generated": false
+  },
+  {
+    "question": "Do default parameters protect against known attacks in params.go:64-72?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_84e64da3-6958-4fa5-9438-d9188271f1ff",
+    "timestamp": "2025-11-21 09:00:11.586221",
+    "report_generated": false
+  },
+  {
+    "question": "Can AddressStoreKey create colliding keys across different addresses in keys.go:30-32?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a81fdd9e-9ec1-4b4b-9c5f-fc4789264b0e",
+    "timestamp": "2025-11-21 09:00:25.492545",
+    "report_generated": false
+  },
+  {
+    "question": "Does AddressStoreKeyPrefix prevent collisions with other module prefixes in keys.go:23?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c0aeeeab-4728-441e-992c-13e1e9eae6fd",
+    "timestamp": "2025-11-21 09:00:39.473902",
+    "report_generated": false
+  },
+  {
+    "question": "Can GlobalAccountNumberKey collide with address store keys in keys.go:26?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_930794f0-294a-4b60-b0b7-8a92b4d68ecd",
+    "timestamp": "2025-11-21 09:00:54.272116",
+    "report_generated": false
+  },
+  {
+    "question": "Does CreateAddressStoreKeyFromBech32 safely handle invalid bech32 in keys.go:34-38?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cbe98454-a320-4a3d-aed4-ae4c422ff02a",
+    "timestamp": "2025-11-21 09:01:11.724913",
+    "report_generated": false
+  },
+  {
+    "question": "Can malformed keys disrupt account iteration in account.go:80?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_43fd6421-9793-4c59-8706-36dae4dec22d",
+    "timestamp": "2025-11-21 09:01:28.768949",
+    "report_generated": false
+  },
+  {
+    "question": "Does KV prefix iterator filter keys correctly in account.go:80?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b7d82cc-a3dc-49a5-9744-ff80e8948e0a",
+    "timestamp": "2025-11-21 09:01:47.973221",
+    "report_generated": false
+  },
+  {
+    "question": "Can account store key construction create predictable patterns attackers can exploit in keeper.go:123?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f5737f29-a86e-4936-8868-a0300b2a554b",
+    "timestamp": "2025-11-21 09:02:08.675835",
+    "report_generated": false
+  },
+  {
+    "question": "Does store key design prevent attackers from manipulating iteration order via crafted addresses in keys.go:30-32?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34d49adb-88fd-4b0c-bd4a-d90fcfce8832",
+    "timestamp": "2025-11-21 09:02:30.954857",
+    "report_generated": false
+  },
+  {
+    "question": "Can FeeCollectorName be abused to generate colliding addresses with normal accounts in keys.go:15?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_12f0ec9c-7db5-4f82-aef3-0c505710e05f",
+    "timestamp": "2025-11-21 09:02:54.974783",
+    "report_generated": false
+  },
+  {
+    "question": "Does account deletion properly remove all associated state in account.go:73?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_13f7f9a8-95d1-4e5f-bddf-562204c48f1d",
+    "timestamp": "2025-11-21 09:03:19.213219",
+    "report_generated": false
+  },
+  {
+    "question": "Does SR25519BatchVerifier handle mixed signature types safely in batch_sigverify.go:32-94?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c4151bb2-a100-4572-a686-0a2708d2f2f7",
+    "timestamp": "2025-11-21 09:03:44.996775",
+    "report_generated": false
+  },
+  {
+    "question": "Can invalid transactions poison the batch verifier in batch_sigverify.go:176-186?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_64d662e0-7e85-46c3-a112-6f9b3ba241e8",
+    "timestamp": "2025-11-21 09:04:11.629055",
+    "report_generated": false
+  },
+  {
+    "question": "Does error mapping correctly assign failures to the right transactions in batch_sigverify.go:178-185?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_90c7fe46-e726-4ec0-b25e-eaa09f281656",
+    "timestamp": "2025-11-21 09:04:40.303058",
+    "report_generated": false
+  },
+  {
+    "question": "Can tx index context in BatchSigVerificationDecorator be manipulated to bypass signature verification in batch_sigverify.go:206-218?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5da77f55-aefc-48d2-a348-0116d436aa5b",
+    "timestamp": "2025-11-21 09:05:08.802156",
+    "report_generated": false
+  },
+  {
+    "question": "Does fallback to sequential verification create timing side-channel risks in batch_sigverify.go:213-215?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2a143998-eb8a-4970-9c90-ad5f2828ace4",
+    "timestamp": "2025-11-21 09:05:37.632860",
+    "report_generated": false
+  },
+  {
+    "question": "Can batch verifier public key setting modify unrelated signer accounts in batch_sigverify.go:70-86?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6a115de4-d46b-4adf-a2cc-d79ce9aac952",
+    "timestamp": "2025-11-21 09:06:08.869207",
+    "report_generated": false
+  },
+  {
+    "question": "Does multisig rejection in batch verify incorrectly reject valid multisig txs in batch_sigverify.go:164-169?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3337d6bc-f455-4c37-928e-ecf236995d5e",
+    "timestamp": "2025-11-21 09:06:42.357020",
+    "report_generated": false
+  },
+  {
+    "question": "Can Add() be exploited with malformed signatures to corrupt batch state in batch_sigverify.go:158-162?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_00b2298c-aae6-416b-b422-c2653194f054",
+    "timestamp": "2025-11-21 09:07:16.902094",
+    "report_generated": false
+  },
+  {
+    "question": "Can sequence number caching in batches cause parallel block race conditions in batch_sigverify.go:96-131?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_54b4e87c-b23e-47c9-bd02-eecef1382a38",
+    "timestamp": "2025-11-21 09:07:52.545604",
+    "report_generated": false
+  },
+  {
+    "question": "Can batch verification be bypassed during CheckTx or ReCheckTx in batch_sigverify.go:33-35?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_289f8fc1-c149-42f7-8393-acf6f6bd9c11",
+    "timestamp": "2025-11-21 09:08:29.288190",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitializeIndex in x/capability/keeper/keeper.go properly validate that the genesis index is never set to zero, and can a malicious genesis state bypass the index > 0 check? keeper.go:146-159",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_de4cb117-321e-4f49-aa4c-7e287194c1d4",
+    "timestamp": "2025-11-21 09:09:06.665946",
+    "report_generated": false
+  },
+  {
+    "question": "Can the global capability index counter overflow in NewCapability, enabling capability index collisions and forged ownership? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eb10860c-693f-4c73-b6e7-fc2a02f01875",
+    "timestamp": "2025-11-21 09:09:44.828155",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetLatestIndex correctly handle nil or empty bytes from KeyIndex, preventing a zero index from being returned? keeper.go:162-165",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d4a59c16-e648-45e7-b6a0-c6df37d96263",
+    "timestamp": "2025-11-21 09:10:23.692312",
+    "report_generated": false
   }
 ]
