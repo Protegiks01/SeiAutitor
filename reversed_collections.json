@@ -2248,5 +2248,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8bb0390-a8af-44b1-94b3-bbc2ccb0001f",
     "timestamp": "2025-11-21 09:10:30.963821",
     "report_generated": false
+  },
+  {
+    "question": "Does the deprecated DumpUpgradeInfoToDisk function leave the chain vulnerable to missing Plan.Info data? keeper.go:398-404",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_28fe0000-ce63-4235-a2d8-8901c6ae0328",
+    "timestamp": "2025-11-21 09:11:40.761370",
+    "report_generated": false
+  },
+  {
+    "question": "Can the EnsureDir call fail in a way that causes subsequent operations to panic? keeper.go:432-435",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_108aa71e-0668-495a-a9d7-9a96fd4d970e",
+    "timestamp": "2025-11-21 09:11:53.869016",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that the homePath doesn't point to a sensitive directory? keeper.go:440-443",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_58997418-ed93-4a5f-99ce-bf5b10956a93",
+    "timestamp": "2025-11-21 09:12:07.391893",
+    "report_generated": false
+  },
+  {
+    "question": "Can a malicious cosmovisor read the upgrade-info.json and execute arbitrary code? keeper.go:28-29",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b0ef4fe0-cefb-4151-ac86-269dbb666ce7",
+    "timestamp": "2025-11-21 09:12:21.277882",
+    "report_generated": false
+  },
+  {
+    "question": "Does ReadUpgradeInfoFromDisk properly validate JSON before unmarshaling to prevent injection attacks? keeper.go:449-472",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a1ee057-a4d3-457d-be28-d69cbf58c9c6",
+    "timestamp": "2025-11-21 09:12:35.895642",
+    "report_generated": false
+  },
+  {
+    "question": "Can the GetUpgradeInfoPath function be exploited with directory traversal attacks? keeper.go:429-438",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_405150cb-01e3-4598-a669-861a995d651e",
+    "timestamp": "2025-11-21 09:12:52.090847",
+    "report_generated": false
+  },
+  {
+    "question": "Is the file permission 0o600 sufficient to prevent unauthorized access to upgrade-info.json? keeper.go:426",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_791b6628-5fb6-4e45-a5c3-862e1d6b1da3",
+    "timestamp": "2025-11-21 09:13:10.137365",
+    "report_generated": false
+  },
+  {
+    "question": "Does DumpUpgradeInfoToDisk properly handle write failures that could leave a partially written file? keeper.go:410-427",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6acdac28-4981-4389-a525-865d10109891",
+    "timestamp": "2025-11-21 09:13:29.280141",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker manipulate the filesystem to inject a malicious upgrade-info.json file? keeper.go:402-427",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_68ed49c0-7f72-4adf-b3ca-e8701c7b5e1c",
+    "timestamp": "2025-11-21 09:13:50.110988",
+    "report_generated": false
+  },
+  {
+    "question": "Can the sorting of module names in SetModuleVersionMap fail non-deterministically on certain inputs? keeper.go:101-106",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e4099b1-ddec-4b92-8b15-26ff70684a29",
+    "timestamp": "2025-11-21 09:14:12.582984",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetClosestUpgrade return deterministic results when multiple upgrades exist at similar heights? keeper.go:292-310",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2fd24c3a-bbd0-44cc-8509-4641727736de",
+    "timestamp": "2025-11-21 09:14:36.321243",
+    "report_generated": false
+  },
+  {
+    "question": "Can the module version comparison logic be exploited to skip necessary migrations? keeper.go:156-170",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_21d2efbe-1342-442e-931e-da4466c331b4",
+    "timestamp": "2025-11-21 09:15:00.954994",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a race condition between SetUpgradedConsensusState and GetUpgradedConsensusState? keeper.go:232-249",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4ea5d795-b216-4b4e-bdb2-5faa05663979",
+    "timestamp": "2025-11-21 09:15:27.068137",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetUpgradedClient return stale or incorrect data if the store is corrupted? keeper.go:221-230",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c897d3cd-b7fc-4797-8e58-fa9ee590b559",
+    "timestamp": "2025-11-21 09:15:53.147644",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetUpgradedClient validate the byte slice to prevent storing malformed client state? keeper.go:214-219",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fdc1b060-29d0-4815-97b7-306a06acd037",
+    "timestamp": "2025-11-21 09:16:21.776055",
+    "report_generated": false
+  },
+  {
+    "question": "Can the IBC state clearing in ClearIBCState fail silently, leaving orphaned data? keeper.go:312-318",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8f989f8a-4434-4ee7-a799-7532a67fed05",
+    "timestamp": "2025-11-21 09:16:51.050566",
+    "report_generated": false
+  },
+  {
+    "question": "Is the string formatting in UpgradedClientKey vulnerable to injection attacks if height is manipulated? keys.go:50-52",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ede23408-64d4-49ff-bf30-e1846eb04d38",
+    "timestamp": "2025-11-21 09:17:21.620220",
+    "report_generated": false
+  },
+  {
+    "question": "Can the UpgradedClientKey or UpgradedConsStateKey be manipulated to inject malicious IBC state? keys.go:47-59",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bb8f4cd6-fdfc-4e89-a046-ac7438f4ca99",
+    "timestamp": "2025-11-21 09:17:53.087988",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store key isolation prevent other modules from accidentally or maliciously modifying upgrade state? keeper.go:40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55f0da57-58c2-42fc-8f78-96f583d1acc9",
+    "timestamp": "2025-11-21 09:18:25.513141",
+    "report_generated": false
+  },
+  {
+    "question": "Can the setProtocolVersion function overflow the uint64 if incremented too many times? keeper.go:379-380",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7b3386d2-22a8-4fd3-9dde-3cd8503eebaa",
+    "timestamp": "2025-11-21 09:19:00.228609",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation to prevent setting a protocol version that is lower than the current version (downgrade)? keeper.go:71-77",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8084f879-b167-49bf-b1d3-4e1efbb97e96",
+    "timestamp": "2025-11-21 09:19:35.991077",
+    "report_generated": false
+  },
+  {
+    "question": "Can the reverse prefix iterator cause non-deterministic results if the underlying store implementation changes? keeper.go:253",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2e03ba7c-c6c5-4aa2-9992-baa9d4253241",
+    "timestamp": "2025-11-21 09:20:13.091416",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetLastCompletedUpgrade handle edge cases where multiple upgrades have the same height? keeper.go:251-270",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_982c7ab9-b7bd-4621-a4fc-d3ac73380817",
+    "timestamp": "2025-11-21 09:20:47.834957",
+    "report_generated": false
+  },
+  {
+    "question": "Can the GetDoneHeight function return incorrect results if the done byte prefix is corrupted? keeper.go:281-290",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6c8086dd-d756-479e-9dd6-5e3b988b54c5",
+    "timestamp": "2025-11-21 09:21:23.405593",
+    "report_generated": false
+  },
+  {
+    "question": "Is the key parsing in parseDoneKey vulnerable to buffer overflows or panics with malformed keys? keeper.go:272-279",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd20d46f-6ce1-40fc-a1a9-2bff0bc7a554",
+    "timestamp": "2025-11-21 09:22:01.461833",
+    "report_generated": false
   }
 ]
