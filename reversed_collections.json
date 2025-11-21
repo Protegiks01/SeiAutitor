@@ -6298,5 +6298,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9846211f-58de-46d8-a471-ca7110e74a7b",
     "timestamp": "2025-11-21 14:43:03.902505",
     "report_generated": false
+  },
+  {
+    "question": "Does the legacy code properly validate state before and after migration to prevent inconsistencies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_21bdec9b-5f50-4146-99c8-d7c05787f1ed",
+    "timestamp": "2025-11-21 14:44:14.151132",
+    "report_generated": false
+  },
+  {
+    "question": "Can legacy genesis formats bypass modern validation when processed through migration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a43e1fec-6008-4e1f-8eb0-9c4386b0b998",
+    "timestamp": "2025-11-21 14:44:27.862293",
+    "report_generated": false
+  },
+  {
+    "question": "Does the migration map properly handle unknown source versions without causing errors?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3f8a9113-9be1-478b-87b7-22e723f33161",
+    "timestamp": "2025-11-21 14:44:42.979733",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit deprecated migration logic to corrupt state during upgrade?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d3f60f4e-9f36-400e-85a6-dcdc210014c7",
+    "timestamp": "2025-11-21 14:44:56.965807",
+    "report_generated": false
+  },
+  {
+    "question": "Do legacy migration paths in x/genutil/legacy/ introduce vulnerabilities when migrating from old versions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a8dc462-c7d3-4029-94d6-b21f29e9aa7a",
+    "timestamp": "2025-11-21 14:45:12.042460",
+    "report_generated": false
+  },
+  {
+    "question": "Does the default state properly initialize all required fields?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_36f4361a-7454-4a55-a3c0-977163e075a6",
+    "timestamp": "2025-11-21 14:45:28.544076",
+    "report_generated": false
+  },
+  {
+    "question": "Can module default genesis states conflict with genutil requirements?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_203754e4-b5ea-44dd-a1bf-b58cbe737fa7",
+    "timestamp": "2025-11-21 14:45:46.410895",
+    "report_generated": false
+  },
+  {
+    "question": "Does the default genesis prevent chains from being initialized in insecure states?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aa83cb44-d776-4aa5-bb16-6ab86f31f535",
+    "timestamp": "2025-11-21 14:46:06.130248",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the empty gentxs array in default genesis to launch a chain without validators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f6707cf2-5fc8-49bc-8c08-9ae39552b9fe",
+    "timestamp": "2025-11-21 14:46:26.074007",
+    "report_generated": false
+  },
+  {
+    "question": "Does DefaultGenesisState in genesis_state.go:27-32 provide a secure default configuration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8809d78a-98f4-4b30-856b-3624a1bdacd7",
+    "timestamp": "2025-11-21 14:46:47.527585",
+    "report_generated": false
+  },
+  {
+    "question": "Does the genesis balances iterator interface prevent malicious implementations from corrupting state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34b5c548-35b6-4daa-87bc-68afce8138d8",
+    "timestamp": "2025-11-21 14:47:09.620544",
+    "report_generated": false
+  },
+  {
+    "question": "Can the account keeper operations be called with nil context or invalid parameters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_84cd93f8-7084-4d39-9ad8-86637dc6c8d6",
+    "timestamp": "2025-11-21 14:47:33.475840",
+    "report_generated": false
+  },
+  {
+    "question": "Does the staking keeper interface in expected_keepers.go:14-16 properly validate all operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a6d40347-6b62-48a5-a830-7f70d38e1433",
+    "timestamp": "2025-11-21 14:48:00.207858",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker provide a transaction that doesn't implement expected interfaces to bypass validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ceabdcd0-605c-4735-a2f4-118600df6a83",
+    "timestamp": "2025-11-21 14:48:25.524543",
+    "report_generated": false
+  },
+  {
+    "question": "Does the TxWithMemo interface assertion in collect.go:126-129 handle all transaction types safely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a39505a5-9d50-4fb4-bd5e-9db4521cd227",
+    "timestamp": "2025-11-21 14:48:52.389592",
+    "report_generated": false
+  },
+  {
+    "question": "Does the migration preserve chain ID correctly in migrate.go:114-117?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_357732c5-5ad1-4f2d-b6a8-df2b832cdb00",
+    "timestamp": "2025-11-21 14:49:20.011654",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create a gentx for one chain ID but include it in another chain's genesis?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7265e33e-46b3-4e33-b799-bb6ce10ea4ef",
+    "timestamp": "2025-11-21 14:49:49.362688",
+    "report_generated": false
+  },
+  {
+    "question": "Does the chain ID remain consistent across all gentxs, or can mixed chain IDs cause issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cc9722f9-ae42-44bf-80a5-dfddb9508595",
+    "timestamp": "2025-11-21 14:50:19.093515",
+    "report_generated": false
+  },
+  {
+    "question": "Can the random chain ID generation in init.go:82 create collisions with existing chains?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bb0b55b9-4e4b-4d48-a4f3-d770ca26c82d",
+    "timestamp": "2025-11-21 14:50:50.074004",
+    "report_generated": false
+  },
+  {
+    "question": "Does the chain ID validation prevent an attacker from initializing a chain with an easily-confused chain ID?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e4b5773a-6048-4d33-bade-cf10329c62a9",
+    "timestamp": "2025-11-21 14:51:20.696610",
+    "report_generated": false
+  },
+  {
+    "question": "Does the export properly handle concurrent access during block processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0f0bd5f6-eedd-4c5c-8470-27983f3b730c",
+    "timestamp": "2025-11-21 14:51:52.317683",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the genesis export API to extract sensitive validator information?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_117168c8-202f-4737-81f0-9a27625ae810",
+    "timestamp": "2025-11-21 14:52:23.981723",
+    "report_generated": false
+  },
+  {
+    "question": "Does the exported genesis maintain all necessary state for chain restarts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d9c9e0a-aa2b-4b2f-92f4-3079a438ebcd",
+    "timestamp": "2025-11-21 14:52:59.786971",
+    "report_generated": false
+  },
+  {
+    "question": "Can the genesis export streaming in module.go:122-129 cause deadlocks if the channel isn't properly consumed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cbb4b72f-3d4e-43ed-b1c1-c40254ecae7e",
+    "timestamp": "2025-11-21 14:53:35.457426",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesis in module.go:118-120 properly export the current state, or does it return default genesis?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d6d9549-7594-4b76-ab3a-568a90e1c352",
+    "timestamp": "2025-11-21 14:54:12.162760",
+    "report_generated": false
   }
 ]
