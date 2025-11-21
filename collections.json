@@ -8098,5 +8098,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e3934928-ef76-4dbb-ae18-11e0acffede3",
     "timestamp": "2025-11-21 15:53:14.517407",
     "report_generated": false
+  },
+  {
+    "question": "AfterValidatorCreated Hook Panic: In AfterValidatorCreated at hooks.go:20-23 , if initializeValidator panics, will the entire validator creation transaction fail and potentially halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_189dd71a-f036-469a-ac69-ba57b9df0b9d",
+    "timestamp": "2025-11-21 15:54:45.088835",
+    "report_generated": false
+  },
+  {
+    "question": "AfterValidatorRemoved Outstanding Check: In AfterValidatorRemoved at hooks.go:26-76 , outstanding rewards and commission are force-withdrawn. Can this be exploited to bypass normal withdrawal restrictions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3479ee61-149e-4a51-b5db-acbc567d62c7",
+    "timestamp": "2025-11-21 15:54:58.452637",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Removal Dust to Community Pool: In AfterValidatorRemoved at hooks.go:58-60 , remaining outstanding goes to community pool. Can an attacker create many validators with dust amounts to drain the reward pool?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_741e5ee1-087e-4d9c-958b-19af3b06cea9",
+    "timestamp": "2025-11-21 15:55:12.619260",
+    "report_generated": false
+  },
+  {
+    "question": "Commission Withdrawal Panic on Remove: In AfterValidatorRemoved at hooks.go:49-51 , SendCoinsFromModuleToAccount panics on error. Can an attacker cause this to panic by manipulating the validator's withdraw address?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4f8a1773-8662-4a99-ab1b-ebd5f539969b",
+    "timestamp": "2025-11-21 15:55:26.697473",
+    "report_generated": false
+  },
+  {
+    "question": "BeforeDelegationCreated Period Increment: In BeforeDelegationCreated at hooks.go:79-82 , the validator period is incremented. Can rapid delegation creation cause period numbers to overflow or skip?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9d4b245f-84f2-4531-bbee-cd2582fafc5a",
+    "timestamp": "2025-11-21 15:55:41.739605",
+    "report_generated": false
+  },
+  {
+    "question": "BeforeDelegationSharesModified Panic: In BeforeDelegationSharesModified at hooks.go:85-92 , withdrawal panics on error. Can this be triggered to halt the chain during normal staking operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93316efc-8cf4-4e2b-b89a-05a7f5adbc21",
+    "timestamp": "2025-11-21 15:56:00.108734",
+    "report_generated": false
+  },
+  {
+    "question": "AfterDelegationModified Reinitialization: In AfterDelegationModified at hooks.go:95-97 , delegation is reinitialized. Can this be exploited to reset reward tracking and steal rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a50b274d-4f7f-47da-91a3-a84b0c3131d4",
+    "timestamp": "2025-11-21 15:56:19.898390",
+    "report_generated": false
+  },
+  {
+    "question": "BeforeValidatorSlashed Fraction Validation: In updateValidatorSlashFraction at validator.go:91-93 , it panics if fraction is > 1 or negative. Can a malicious slashing event bypass this check?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4c3cebf6-3eaa-4b91-8955-3770297c93a1",
+    "timestamp": "2025-11-21 15:56:42.030710",
+    "report_generated": false
+  },
+  {
+    "question": "Hook Ordering Dependency: If staking hooks are called in a different order or a hook is missed, can this cause distribution state to become inconsistent with staking state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aa176ca1-6d6e-4e3b-ad8f-2028f5461c23",
+    "timestamp": "2025-11-21 15:57:03.824961",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Historical Rewards Cleanup: In AfterValidatorRemoved at hooks.go:71-72 , historical rewards are deleted. Can this cause issues if there are still outstanding delegations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_be8be576-b60b-43a9-a210-80190731b7ee",
+    "timestamp": "2025-11-21 15:57:28.078027",
+    "report_generated": false
+  },
+  {
+    "question": "Cross-Module Panic Propagation: When distribution hooks panic, are these panics properly caught by the staking module, or can they bypass error handling and halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ab7eac58-1e8e-4dea-9d27-79dd331ca9b2",
+    "timestamp": "2025-11-21 15:57:53.846057",
+    "report_generated": false
+  },
+  {
+    "question": "Withdraw During Hook Execution: In BeforeDelegationSharesModified at hooks.go:89-91 , rewards are withdrawn automatically. Can reentrancy or recursive calls cause double withdrawal?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6c5768e9-1f78-480e-b3c5-ac5c67b7e4a2",
+    "timestamp": "2025-11-21 15:58:19.362795",
+    "report_generated": false
+  },
+  {
+    "question": "Slash Event Recording Race: In BeforeValidatorSlashed at hooks.go:100-102 , the slash event is recorded. Can concurrent slashing events for the same validator cause incorrect period tracking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a45c2766-ee18-414e-8d8a-69a7b5bc8524",
+    "timestamp": "2025-11-21 15:58:48.821594",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Period and Delegation Period Desync: Can the validator period at validator.go:28-63 get out of sync with delegation starting periods, causing reward calculation errors?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_629f058d-0c96-4595-a5f6-6b848c9ce5f8",
+    "timestamp": "2025-11-21 15:59:19.639205",
+    "report_generated": false
+  },
+  {
+    "question": "Bank Keeper Send Failure Handling: When bankKeeper.SendCoinsFromModuleToAccount is called in hooks, if it fails, is the error properly propagated or does it cause silent failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8834156d-8c4d-4b19-ae77-5b3809dc6fb4",
+    "timestamp": "2025-11-21 15:59:51.304327",
+    "report_generated": false
+  },
+  {
+    "question": "Staking Keeper State Inconsistency: If the staking keeper returns stale or inconsistent validator/delegation information to distribution hooks, can this corrupt reward calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cf2dd5e8-8863-4347-bbad-27058e092abb",
+    "timestamp": "2025-11-21 16:00:23.974591",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Balance Mismatch: Can direct transfers to/from the distribution module account outside of the keeper's control cause the module account balance to diverge from expected outstanding rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48f80ac3-6c6b-4207-bb6e-a258703adc90",
+    "timestamp": "2025-11-21 16:00:58.804764",
+    "report_generated": false
+  },
+  {
+    "question": "Community Pool Spend Blocked Address: In HandleCommunityPoolSpendProposal at proposal_handler.go:11-13 , blocked addresses are checked. Can address derivation or bech32 encoding tricks bypass this check?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d5a5e100-13ce-4359-b312-6ada9c410048",
+    "timestamp": "2025-11-21 16:01:34.047415",
+    "report_generated": false
+  },
+  {
+    "question": "Community Pool Negative Balance: In DistributeFromFeePool at fee_pool.go:16-19 , SafeSub prevents negative balance. Can multiple concurrent proposals approved in the same block drain the pool below zero?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fad684f7-3261-430c-a811-70c981188bcb",
+    "timestamp": "2025-11-21 16:02:10.701005",
+    "report_generated": false
+  },
+  {
+    "question": "Fund Community Pool Overflow: In FundCommunityPool at keeper.go:157-166 , coins are added to the community pool. Can repeated funding cause DecCoins overflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3a406444-9b42-4df7-8d37-5a4558abaa03",
+    "timestamp": "2025-11-21 16:02:49.814798",
+    "report_generated": false
+  },
+  {
+    "question": "Community Pool Distribution Order: If multiple community pool spend proposals are executed in the same block, is the execution order deterministic and does it respect the available balance?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca4cf2d0-35d3-4a1f-97dc-7ab1c35ddc89",
+    "timestamp": "2025-11-21 16:03:28.614775",
+    "report_generated": false
+  },
+  {
+    "question": "Proposal Recipient Validation: In HandleCommunityPoolSpendProposal at proposal_handler.go:15-18 , the recipient address is validated. Can an invalid bech32 address cause the proposal handler to panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_97c30413-b1c3-4e36-bb1b-02d9c40a6ce6",
+    "timestamp": "2025-11-21 16:04:08.219049",
+    "report_generated": false
+  },
+  {
+    "question": "Community Pool Module Account Mismatch: The community pool is tracked separately from the module account balance. Can this tracking diverge such that the community pool claims more coins than the module account holds?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_82518a24-a9fc-49d9-9e51-c8d209349f27",
+    "timestamp": "2025-11-21 16:04:49.596278",
+    "report_generated": false
+  },
+  {
+    "question": "DistributeFromFeePool State Ordering: In DistributeFromFeePool at fee_pool.go:10-29 , pool is updated after send. If send succeeds but SetFeePool fails, what happens?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_475f9e7d-213a-4657-8993-fb34f1452da1",
+    "timestamp": "2025-11-21 16:05:30.911897",
+    "report_generated": false
+  },
+  {
+    "question": "Governance Spam Attack: Can an attacker submit many community pool spend proposals to spam governance and force validators to vote repeatedly, causing operational DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_306c0a7b-307e-4720-8074-00019140d5dc",
+    "timestamp": "2025-11-21 16:06:13.666226",
+    "report_generated": false
   }
 ]
