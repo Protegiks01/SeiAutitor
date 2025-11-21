@@ -9298,5 +9298,47 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2bc24a38-7d8b-4193-b08d-cf133f6b0b91",
     "timestamp": "2025-11-21 17:30:03.096297",
     "report_generated": false
+  },
+  {
+    "question": "Genesis JSON Issues: Can Any cause malformed JSON?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_06b8c741-4e6d-4be8-8d7d-a36483ba207a",
+    "timestamp": "2025-11-21 17:31:08.823523",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Stream Validation Ordering Issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4a46a47c-27ec-4b13-bfd4-581be03049d8",
+    "timestamp": "2025-11-21 17:31:23.373530",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Export Stream Race Issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ecd24cec-f137-4279-b197-7ae643eb4660",
+    "timestamp": "2025-11-21 17:31:37.723402",
+    "report_generated": false
+  },
+  {
+    "question": "Query Evidence Nil Request: Non-nil invalid request?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_655114e4-5758-469b-8677-cbff54bae1d4",
+    "timestamp": "2025-11-21 17:31:54.496235",
+    "report_generated": false
+  },
+  {
+    "question": "Query Evidence Hash Validation: Empty but non-nil hash?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1fa51fb6-9246-4b28-bd10-8bd0ade31ec1",
+    "timestamp": "2025-11-21 17:32:12.131334",
+    "report_generated": false
+  },
+  {
+    "question": "Query Evidence Not Found Enumeration: Can attackers brute force hashes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6861e29-7719-4721-b4ef-d69983b23258",
+    "timestamp": "2025-11-21 17:32:28.290971",
+    "report_generated": false
+  },
+  {
+    "question": "Query Evidence Marshal Error Leakage?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6537463a-3343-4375-85b5-56c457ca0322",
+    "timestamp": "2025-11-21 17:32:45.812905",
+    "report_generated": false
   }
 ]
