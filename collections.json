@@ -7348,5 +7348,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f6e2ca91-c00b-4ba2-9f64-63d471fe615d",
     "timestamp": "2025-11-21 14:52:31.406375",
     "report_generated": false
+  },
+  {
+    "question": "Does BurnCoins properly update supply even if the SubUnlockedCoins call fails partway through? keeper.go:619-622",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1234c513-e14a-44f0-9512-01898485875d",
+    "timestamp": "2025-11-21 14:54:05.703712",
+    "report_generated": false
+  },
+  {
+    "question": "Can module accounts without proper permissions trigger panics in MintCoins that halt the chain? keeper.go:537-544",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f70e1317-d2d7-4aa7-84e5-98f01d294864",
+    "timestamp": "2025-11-21 14:54:18.923197",
+    "report_generated": false
+  },
+  {
+    "question": "In DeferredSendCoinsFromAccountToModule, can deducting coins fail while deferred cache update succeeds, causing balance mismatch? keeper.go:404-432",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d92913a5-3b9e-4768-a189-a54793c0e80d",
+    "timestamp": "2025-11-21 14:54:33.068490",
+    "report_generated": false
+  },
+  {
+    "question": "Does WriteDeferredBalances maintain deterministic write order across all nodes to prevent consensus failures? keeper.go:435-483",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3c4cdd12-1f6b-40c5-a66f-008472f5ddf2",
+    "timestamp": "2025-11-21 14:54:47.208981",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft transactions with high tx indices to overflow the deferred cache key generation? deferred_cache.go:23-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e23e0a89-1fcd-49b9-b271-c335aa37ba13",
+    "timestamp": "2025-11-21 14:55:02.283625",
+    "report_generated": false
+  },
+  {
+    "question": "In UpsertBalances, can concurrent upserts from the same transaction cause race conditions in the cache? deferred_cache.go:73-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5da86838-f14d-454a-ad96-bca8f048dbb5",
+    "timestamp": "2025-11-21 14:55:18.091038",
+    "report_generated": false
+  },
+  {
+    "question": "Does Clear in deferred cache properly delete all entries or can orphaned entries remain causing memory leaks? deferred_cache.go:116-126",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f5dd4871-75d1-478e-822d-fd7e274a0c0c",
+    "timestamp": "2025-11-21 14:55:36.105302",
+    "report_generated": false
+  },
+  {
+    "question": "Can IterateDeferredBalances panic when encountering corrupted keys or values in the deferred store? deferred_cache.go:95-114",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_42e5b90a-893c-4bd3-b8c3-be53d5bc0b9e",
+    "timestamp": "2025-11-21 14:55:56.178623",
+    "report_generated": false
+  },
+  {
+    "question": "In WriteDeferredBalances, does the module address map iteration use deterministic ordering to prevent consensus divergence? keeper.go:442-463",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_516b6eb6-0c0e-4990-9416-da2b0f1915fc",
+    "timestamp": "2025-11-21 14:56:17.730100",
+    "report_generated": false
+  },
+  {
+    "question": "Can deferred balances be written to non-existent module accounts, causing permanent fund loss? keeper.go:466-478",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d946dfdd-be5f-4986-a092-630235a19429",
+    "timestamp": "2025-11-21 14:56:39.836623",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeferredSendCoinsFromAccountToModule check if the recipient module is valid before deducting sender balance? keeper.go:419-423",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d9ca50a-c2f4-4fad-8465-d9a55f1926a8",
+    "timestamp": "2025-11-21 14:57:03.906010",
+    "report_generated": false
+  },
+  {
+    "question": "In upsertBalance, can adding coins cause overflow when the current balance plus new balance exceeds max Int? deferred_cache.go:62-71",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bf403015-b91a-4f38-8883-e87e47b1e8ec",
+    "timestamp": "2025-11-21 14:57:29.005386",
+    "report_generated": false
+  },
+  {
+    "question": "Does the deferred cache properly handle the case where WriteDeferredBalances is never called before block end? keeper.go:435-483",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c1140f37-0568-4221-96c8-9ddda6e4d5be",
+    "timestamp": "2025-11-21 14:57:55.827078",
+    "report_generated": false
+  },
+  {
+    "question": "Can setBalance in deferred cache accept zero balances, violating the bank invariant about not storing zeros? deferred_cache.go:44-59",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8bd4ae15-c5bc-40eb-8557-9185056371d5",
+    "timestamp": "2025-11-21 14:58:24.997324",
+    "report_generated": false
+  },
+  {
+    "question": "In WriteDeferredBalances, does the panic on AddCoins failure leave the deferred cache in an inconsistent state? keeper.go:473-477",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_32c796d9-faa4-4c16-9dc3-452f0679c766",
+    "timestamp": "2025-11-21 14:58:55.822618",
+    "report_generated": false
+  },
+  {
+    "question": "Can multiple transactions in the same block targeting the same module account cause deferred cache corruption? deferred_cache.go:73-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2bd7cf7e-230f-489b-8733-175a08985837",
+    "timestamp": "2025-11-21 14:59:27.423991",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateDeferredBalances include deferred balances in the TotalSupply invariant calculation correctly? invariants.go:74-78",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ad0c58f0-b5dd-40ff-850c-ea6fee411468",
+    "timestamp": "2025-11-21 15:00:00.091850",
+    "report_generated": false
+  },
+  {
+    "question": "In DelegateCoins, can an attacker delegate more coins than they have by exploiting the vesting account tracking? keeper.go:179-225",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bce82955-26a3-4728-b434-6bade856e779",
+    "timestamp": "2025-11-21 15:00:33.570236",
+    "report_generated": false
+  },
+  {
+    "question": "Does UndelegateCoins correctly revert delegation tracking for vesting accounts when undelegating? keeper.go:232-257",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e0c8c19f-a91b-4771-860c-285899e71da1",
+    "timestamp": "2025-11-21 15:01:08.174372",
+    "report_generated": false
+  },
+  {
+    "question": "Can trackDelegation be bypassed for non-vesting accounts, creating inconsistent delegation state? keeper.go:650-665",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8e107c5-9e51-4b9a-99c9-7dd14bd51939",
+    "timestamp": "2025-11-21 15:01:45.650380",
+    "report_generated": false
+  },
+  {
+    "question": "In DelegateCoinsFromAccountToModule, does the function verify the module has Staking permission before allowing delegation? keeper.go:496-510",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_abda3949-6951-42c2-97fc-e92efed56122",
+    "timestamp": "2025-11-21 15:02:23.751837",
+    "report_generated": false
+  },
+  {
+    "question": "Does UndelegateCoinsFromModuleToAccount check that the module has sufficient balance before undelegating? keeper.go:512-529",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_333b32a1-da28-4860-829a-797185b1d5a7",
+    "timestamp": "2025-11-21 15:03:03.746045",
+    "report_generated": false
+  },
+  {
+    "question": "Can DelegateCoins be called with invalid coin amounts causing state corruption in vesting account tracking? keeper.go:190-192",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c4daa699-cb5c-40fd-895c-86d5142fd3c4",
+    "timestamp": "2025-11-21 15:03:44.772795",
+    "report_generated": false
+  },
+  {
+    "question": "In trackDelegation, does calling TrackDelegation on vesting accounts use block time consistently across nodes? keeper.go:658-661",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e5cb9e99-ce52-4853-8e89-01250bff28b2",
+    "timestamp": "2025-11-21 15:04:27.294268",
+    "report_generated": false
+  },
+  {
+    "question": "Does UndelegateCoins emit appropriate events even if tracking undelegation fails for vesting accounts? keeper.go:242-257",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_10fd685d-cd7b-4224-b64d-50f516f1b37b",
+    "timestamp": "2025-11-21 15:05:10.645772",
+    "report_generated": false
   }
 ]
