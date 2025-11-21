@@ -7348,5 +7348,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6d9138b-82ec-426e-b25c-2979555f46d5",
     "timestamp": "2025-11-21 16:08:36.808155",
     "report_generated": false
+  },
+  {
+    "question": "Does the message server validate that the transaction signer matches the granter before granting an allowance?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_df051eb3-c400-4754-a927-69330963e04e",
+    "timestamp": "2025-11-21 16:09:59.157195",
+    "report_generated": false
+  },
+  {
+    "question": "Can the error handling in msgServer.GrantAllowance msg_server.go:45-53 leak information about other users' grants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_00e18ba8-0d24-4492-a9db-7b5fa36232db",
+    "timestamp": "2025-11-21 16:10:12.673619",
+    "report_generated": false
+  },
+  {
+    "question": "Does RevokeAllowance msg_server.go:59-78 properly handle the case where the grant was already used in the same block?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_db372ffc-a7e6-47b9-a247-99dc6cc72f80",
+    "timestamp": "2025-11-21 16:10:26.241135",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the ordering of validation and execution in GrantAllowance to bypass checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a84b96e7-e9dd-4af0-8963-cb2cf88027e7",
+    "timestamp": "2025-11-21 16:10:41.768811",
+    "report_generated": false
+  },
+  {
+    "question": "In msgServer.GrantAllowance msg_server.go:27-56, does the duplicate entry check at lines 41-43 prevent all race conditions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55d5b6bd-f61d-4cd1-9016-a4452387a635",
+    "timestamp": "2025-11-21 16:10:57.161153",
+    "report_generated": false
+  },
+  {
+    "question": "Can the GetSignBytes method msgs.go:79-81 produce non-deterministic output if the allowance contains maps or floats?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_66026b68-1963-443b-9692-12da553089c9",
+    "timestamp": "2025-11-21 16:11:13.617954",
+    "report_generated": false
+  },
+  {
+    "question": "Does the message validation ensure that granter and grantee are not contract addresses in chains with CosmWasm?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d0610309-287c-49fe-91ad-0812a99e1d93",
+    "timestamp": "2025-11-21 16:11:31.721204",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker spam the network with invalid MsgGrantAllowance messages that pass basic validation but fail in execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e341ef42-4add-49fd-8ce6-be7c80fc7969",
+    "timestamp": "2025-11-21 16:11:51.796223",
+    "report_generated": false
+  },
+  {
+    "question": "Does MsgRevokeAllowance validation prevent revoking grants during their active use?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a688dd9e-7953-4598-939e-3e22f1495966",
+    "timestamp": "2025-11-21 16:12:13.600414",
+    "report_generated": false
+  },
+  {
+    "question": "Can the NewMsgGrantAllowance constructor msgs.go:22-37 fail to properly pack the allowance into an Any?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e7e149c3-662c-446f-ad0c-daef0374ddd6",
+    "timestamp": "2025-11-21 16:12:37.140224",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module prevent granting allowances to zero addresses or other reserved addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f3803c0f-9c5b-4326-94fb-603b1b50a688",
+    "timestamp": "2025-11-21 16:13:00.834763",
+    "report_generated": false
+  },
+  {
+    "question": "Can the address validation in lines 41-46 msgs.go:41-46 be bypassed with malformed bech32 addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd586fcf-7873-47ed-a176-c14443537774",
+    "timestamp": "2025-11-21 16:13:26.008742",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBasic call the underlying allowance's validation msgs.go:56 to catch invalid configurations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_02cb3898-fc5c-40fe-b8f0-375e850f2200",
+    "timestamp": "2025-11-21 16:13:51.962192",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create a MsgGrantAllowance with an extremely large serialized allowance to cause DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d67e99de-6022-43dd-9b6e-2d3a39ef0921",
+    "timestamp": "2025-11-21 16:14:19.939563",
+    "report_generated": false
+  },
+  {
+    "question": "Does the message validation prevent creating grants with module accounts as grantees?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_33f24639-d2f1-4317-a00e-752a2cc4aabf",
+    "timestamp": "2025-11-21 16:14:48.679623",
+    "report_generated": false
+  },
+  {
+    "question": "Can the GetSigners method msgs.go:60-66 panic if the address parsing fails?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_805e3e85-8f1c-4fdd-90f4-86c01ac7d990",
+    "timestamp": "2025-11-21 16:15:19.306131",
+    "report_generated": false
+  },
+  {
+    "question": "Does MsgRevokeAllowance.ValidateBasic msgs.go:107-119 prevent revoking non-existent grants that could cause state inconsistencies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_de7f8f9c-dd78-4ba7-8dac-c3e70b00f0ca",
+    "timestamp": "2025-11-21 16:15:50.259162",
+    "report_generated": false
+  },
+  {
+    "question": "Can the UnpackInterfaces method msgs.go:94-97 fail to unpack nested allowances in AllowedMsgAllowance?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_362150f9-3291-47f5-bb93-ad1617ed82e7",
+    "timestamp": "2025-11-21 16:16:22.447450",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetFeeAllowanceI msgs.go:84-91 properly handle the case where the cached value is nil?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4e412773-bb30-41e9-96e6-a7b23aeb9ac0",
+    "timestamp": "2025-11-21 16:16:57.014227",
+    "report_generated": false
+  },
+  {
+    "question": "In MsgGrantAllowance.ValidateBasic msgs.go:40-57, can the self-grant check msgs.go:47-49 be bypassed with equivalent but non-identical address representations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8e61a261-f456-4c52-bbd3-0cc7139c99c8",
+    "timestamp": "2025-11-21 16:17:31.678749",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module prevent creating AllowedMsgAllowances that wrap other AllowedMsgAllowances to avoid gas bombs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_25436e39-90be-408c-809f-8baf446d4c3b",
+    "timestamp": "2025-11-21 16:18:07.687473",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit differences between sdk.MsgTypeURL(msg) implementations across different message types?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7e46302d-599d-4efb-9b49-068ee5bdffa3",
+    "timestamp": "2025-11-21 16:18:45.930424",
+    "report_generated": false
+  },
+  {
+    "question": "Does Accept validate that all messages in the transaction are checked, not just a subset?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ae4bd372-fa46-4d7d-b952-e0547fb50daf",
+    "timestamp": "2025-11-21 16:19:24.229329",
+    "report_generated": false
+  },
+  {
+    "question": "Can the proto Any unpacking in GetAllowance filtered_fee.go:45-48 fail silently and return a partially initialized allowance?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8f971c96-8095-4cf3-b091-7fd3de000439",
+    "timestamp": "2025-11-21 16:20:02.983847",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gas metering account for the cost of unmarshaling the cached allowance value?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f370757-e128-459f-9c77-336ce2281249",
+    "timestamp": "2025-11-21 16:20:42.245417",
+    "report_generated": false
   }
 ]
