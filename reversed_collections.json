@@ -2548,5 +2548,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f16c172c-aeb6-4c4b-9cb6-893823cf70c4",
     "timestamp": "2025-11-21 09:46:51.592531",
     "report_generated": false
+  },
+  {
+    "question": "Is there rate limiting on upgrade proposal submissions to prevent governance spam? tx.go:29-82",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2a777b6b-70ad-45dc-a2f8-aa9ed2fcf786",
+    "timestamp": "2025-11-21 09:48:23.553929",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker submit multiple cancel proposals to repeatedly clear legitimate upgrade plans? handler.go:33-36",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_023c3c51-ba33-4a23-a4b2-2671373f06da",
+    "timestamp": "2025-11-21 09:48:36.657779",
+    "report_generated": false
+  },
+  {
+    "question": "Does ScheduleUpgrade validate that the plan name is not empty before scheduling? plan.go:28-30",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dbf53e4d-2794-464f-9abb-dc6ec334faaf",
+    "timestamp": "2025-11-21 09:48:50.797309",
+    "report_generated": false
+  },
+  {
+    "question": "Can the handleSoftwareUpgradeProposal function be called with a nil Plan, causing a panic? handler.go:29-31",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8c63742a-e6f5-4e7e-9b11-7df525e51c26",
+    "timestamp": "2025-11-21 09:49:05.029728",
+    "report_generated": false
+  },
+  {
+    "question": "Can an upgrade be scheduled for the same block in BeginBlocker as mentioned in the comment, and would this create a consensus split? keeper.go:182-186",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff94e360-2791-434f-a123-3c110a283826",
+    "timestamp": "2025-11-21 09:49:21.718465",
+    "report_generated": false
+  },
+  {
+    "question": "Is the upgrade height comparison vulnerable to integer overflow when checking plan.Height <= ctx.BlockHeight()? plan.go:40-41",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95c6ea60-c3e3-47bb-8c40-8bda57330720",
+    "timestamp": "2025-11-21 09:49:39.668397",
+    "report_generated": false
+  },
+  {
+    "question": "Can minor upgrade detection be bypassed by malformed JSON in the Plan.Info field? plan.go:57-69",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d4fdb80-be4f-439d-b83d-d6ea57932df9",
+    "timestamp": "2025-11-21 09:49:59.424496",
+    "report_generated": false
+  },
+  {
+    "question": "Does the upgrade execution clear all pending state properly, or could remnants cause issues in future upgrades? keeper.go:386-391",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b84c902-bd24-4b82-a5ba-54796b0471e7",
+    "timestamp": "2025-11-21 09:50:21.149670",
+    "report_generated": false
+  },
+  {
+    "question": "Can the DueAt string formatting be manipulated to cause confusion about when an upgrade will execute? plan.go:46-49",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d55c7f98-0be1-45e1-91a1-5f62293c62e4",
+    "timestamp": "2025-11-21 09:50:42.454170",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that prevents scheduling an upgrade at height 0 or negative heights? plan.go:31-33",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d18decd5-59c0-43c9-83d8-927c4bb1a22a",
+    "timestamp": "2025-11-21 09:51:05.824429",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause a DoS by scheduling multiple upgrades at the same height through rapid governance proposals? keeper.go:177-212",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_babdf6b9-b905-4ccc-b11f-7e49c6bca2f9",
+    "timestamp": "2025-11-21 09:51:30.143587",
+    "report_generated": false
+  },
+  {
+    "question": "Does the BeginBlocker registration order guarantee that upgrade checks happen before other modules that might depend on upgraded state? module.go:145-150",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6017819c-19f8-4e0e-992d-27a76a3522ff",
+    "timestamp": "2025-11-21 09:51:55.098106",
+    "report_generated": false
+  },
+  {
+    "question": "Can validator nodes with different skipUpgradeHeights configurations cause consensus failure? keeper.go:393-396",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_88275d08-33b5-4ec0-8550-68ab23161ed2",
+    "timestamp": "2025-11-21 09:52:21.882804",
+    "report_generated": false
+  },
+  {
+    "question": "Is the protocol version increment atomic and properly persisted before the upgrade handler executes? keeper.go:378-384",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73bb098e-2135-4afd-8878-223a27e63627",
+    "timestamp": "2025-11-21 09:52:49.934901",
+    "report_generated": false
+  },
+  {
+    "question": "Can the upgrade handler map be modified concurrently during upgrade execution leading to undefined behavior? keeper.go:42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6aeaf221-6cd2-4fe6-b41d-61f8bdb33cc7",
+    "timestamp": "2025-11-21 09:53:19.230368",
+    "report_generated": false
+  },
+  {
+    "question": "Does the HasHandler check prevent execution of upgrades with nil handlers, or could a race condition allow nil handler execution? keeper.go:358-362",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1dff1b4a-d599-41cc-9c39-cd80e065ef32",
+    "timestamp": "2025-11-21 09:53:48.607420",
+    "report_generated": false
+  },
+  {
+    "question": "Can an upgrade handler panic without being caught, causing the entire chain to halt? keeper.go:365-374",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1c90a70-fc46-4a14-8c7f-f4d89c93e721",
+    "timestamp": "2025-11-21 09:54:18.560470",
+    "report_generated": false
+  },
+  {
+    "question": "Is there proper validation that plan.ShouldExecute(ctx) returns deterministic results across all validators? plan.go:38-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d50634e2-f4d8-4371-a2f5-2406e10bb60d",
+    "timestamp": "2025-11-21 09:54:48.769716",
+    "report_generated": false
+  },
+  {
+    "question": "Can the telemetry gauge updates cause non-deterministic behavior if different nodes have different telemetry configurations? abci.go:50-57",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_67f9204f-83c9-4693-894b-cb7279cbb697",
+    "timestamp": "2025-11-21 09:55:21.185058",
+    "report_generated": false
+  },
+  {
+    "question": "Does ApplyUpgrade properly handle errors from upgrade handlers, or could a failing handler leave the chain in an inconsistent state? keeper.go:364-391",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_294ecdb4-a1d8-406e-8188-24df8ee54420",
+    "timestamp": "2025-11-21 09:55:54.246095",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious upgrade handlers registered in SetUpgradeHandler execute arbitrary code during BeginBlock without proper validation? keeper.go:64-69",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f1f7a8e-5c17-4bef-a575-4cf1b2b69e8c",
+    "timestamp": "2025-11-21 09:56:27.917135",
+    "report_generated": false
+  },
+  {
+    "question": "Is the IsTracing check at line 24 properly secured, or could an attacker manipulate tracing to bypass upgrade execution? abci.go:24-26",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bb6db4e8-89f8-491b-a78f-355a7df5d1fc",
+    "timestamp": "2025-11-21 09:57:02.614161",
+    "report_generated": false
+  },
+  {
+    "question": "Can the skip upgrade mechanism be abused to permanently skip critical security upgrades by adding heights to the skipUpgradeHeights map? abci.go:62-66",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01e3e37c-21bb-4c10-889c-8686b1c36e14",
+    "timestamp": "2025-11-21 09:57:39.150835",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic message at line 96 reveal sensitive information about the chain's internal state that could be exploited? abci.go:92-97",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_418ed841-0be0-45bd-9298-762f57346c60",
+    "timestamp": "2025-11-21 09:58:15.535715",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the minor release logic to force an early upgrade before the scheduled height by registering a handler prematurely? abci.go:80-90",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4890b6d6-7bb4-4674-9eb9-7679d33266af",
+    "timestamp": "2025-11-21 09:58:50.646358",
+    "report_generated": false
   }
 ]
