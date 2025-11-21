@@ -3298,5 +3298,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3da3f92d-bcd5-4181-a6f3-8432f4c6f7f4",
     "timestamp": "2025-11-21 10:45:50.316055",
     "report_generated": false
+  },
+  {
+    "question": "In snapshots/chunk.go, does the chunk validation logic properly verify chunk hashes to prevent an attacker from injecting malicious data during state sync?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff99bd27-2095-45a8-8d8b-2f0ae95816fe",
+    "timestamp": "2025-11-21 10:47:13.221282",
+    "report_generated": false
+  },
+  {
+    "question": "Does the snapshot creation process in snapshots/manager.go properly handle the case where state changes occur during snapshot generation, or could this lead to inconsistent snapshots? manager.go:66-84",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_75e1861e-b191-4988-9f9f-93e8c13cc6d9",
+    "timestamp": "2025-11-21 10:47:26.631929",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker submit malformed snapshot chunks that pass initial validation but cause panics or state corruption during the restore process in snapshots/manager.go?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f9ff9b7e-c963-413b-8b90-ffe06f4fcdf9",
+    "timestamp": "2025-11-21 10:47:41.082580",
+    "report_generated": false
+  },
+  {
+    "question": "In snapshots/manager.go, does the Manager struct properly synchronize access to the operation field to prevent concurrent snapshot/restore operations that could corrupt state? manager.go:52-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f1f244b-b408-4f5b-9af3-b298ee1f22e2",
+    "timestamp": "2025-11-21 10:47:55.491372",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store layer enforce maximum key/value size limits consistently across all store types, or could certain store implementations allow oversized entries that cause issues later?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_11e271b2-af03-4803-969f-87cb0a3c1a90",
+    "timestamp": "2025-11-21 10:48:10.839637",
+    "report_generated": false
+  },
+  {
+    "question": "In store/listenkv/store.go, can listeners cause transactions to fail or panic if the listener itself encounters an error during state update notifications?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d22115f7-ef35-48bd-867f-a098345eae2a",
+    "timestamp": "2025-11-21 10:48:27.258306",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store properly handle very deep key prefixes or nested stores that could cause stack overflow during recursive operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e0a16513-38a9-434a-a26e-202a08f56c7a",
+    "timestamp": "2025-11-21 10:48:45.046364",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any race conditions in the store commit process where a validator could commit a different state root than what was computed during block execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_856f1733-ec69-4f68-bdd3-abfe19eb26e0",
+    "timestamp": "2025-11-21 10:49:04.862955",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store/tracekv/store.go implementation properly sanitize keys and values before writing to the trace output, or could malicious data injection in trace logs cause downstream issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2e7dca02-0197-46ca-a38b-6d641d353e03",
+    "timestamp": "2025-11-21 10:49:26.186402",
+    "report_generated": false
+  },
+  {
+    "question": "In store/transient/store.go, does the transient store properly reset between blocks, or could state leak across block boundaries?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6310f270-adf4-49c7-b888-d767a295a3c4",
+    "timestamp": "2025-11-21 10:49:48.050691",
+    "report_generated": false
+  },
+  {
+    "question": "Can transactions create circular references in the store cache that prevent garbage collection, causing memory leaks over time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e16c2d4d-4921-4e11-89c2-f0df5f1d863f",
+    "timestamp": "2025-11-21 10:50:11.139026",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store layer properly handle concurrent iterator creation and invalidation, or could an attacker create many iterators to exhaust memory?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_50133d68-a4d9-4c87-af09-89a57b3550ad",
+    "timestamp": "2025-11-21 10:50:36.156092",
+    "report_generated": false
+  },
+  {
+    "question": "In store/gaskv/store.go, are all store operations properly metered for gas consumption, or are there operations that bypass gas metering and allow unmetered state access?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8089017c-f139-41b4-a55f-8cee55f26d9c",
+    "timestamp": "2025-11-21 10:51:02.421250",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store/prefix/store.go implementation ensure that prefix operations cannot escape their designated namespace and access keys from other prefixes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cee19acb-8d4f-4d1c-acde-8cac05f99e38",
+    "timestamp": "2025-11-21 10:51:29.436429",
+    "report_generated": false
+  },
+  {
+    "question": "Are store keys properly namespaced to prevent collisions between different modules, or could a malicious module write to keys owned by other modules?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_42066706-6840-4efa-8de1-2bdd2a88819a",
+    "timestamp": "2025-11-21 10:51:58.281124",
+    "report_generated": false
+  },
+  {
+    "question": "In store/iavl/store.go, does the tree properly handle key deletion and rebalancing to prevent excessive disk I/O that could slow down block production?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0f076f0-a562-4745-9036-769fd470e669",
+    "timestamp": "2025-11-21 10:52:27.882949",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause the IAVL tree to become unbalanced by carefully crafting transaction patterns, leading to degraded query performance and potential DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7403634c-2723-427e-b0fd-d83984ad1f85",
+    "timestamp": "2025-11-21 10:52:59.141381",
+    "report_generated": false
+  },
+  {
+    "question": "Does the interBlockCache in store/rootmulti/store.go properly invalidate cached entries when the underlying state changes, or could stale cache entries lead to transactions reading outdated data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cc846016-ebcd-4720-bce4-15cb67916443",
+    "timestamp": "2025-11-21 10:53:30.902009",
+    "report_generated": false
+  },
+  {
+    "question": "In the store layer, are there any operations that bypass the trace writer, potentially allowing an attacker to hide malicious state modifications from monitoring systems?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bbaa0a8a-3bc2-4c3d-ad8c-a7db9d073adc",
+    "timestamp": "2025-11-21 10:54:04.264681",
+    "report_generated": false
+  },
+  {
+    "question": "Does the keysForStoreKeyMap function in store/rootmulti/store.go produce deterministic output across different Go runtime versions, or could sort order changes cause consensus divergence? store.go:82-92",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b1f65b9b-3478-4aba-b5c3-6c49841a8873",
+    "timestamp": "2025-11-21 10:54:37.952496",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker manipulate the pruneHeights slice in store/rootmulti/store.go to cause the pruning logic to delete critical historical state, potentially enabling long-range attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_82d96e07-6055-4853-8fe3-f7f78e15a60f",
+    "timestamp": "2025-11-21 10:55:14.233116",
+    "report_generated": false
+  },
+  {
+    "question": "In store/rootmulti/store.go, does the store properly handle the case where lastCommitInfo is accessed concurrently by multiple goroutines, or could races in the lastCommitInfoMtx lead to reading inconsistent commit information? store.go:48-74",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2bf622e6-c191-4738-b021-ce5ef11d0015",
+    "timestamp": "2025-11-21 10:55:56.378781",
+    "report_generated": false
+  },
+  {
+    "question": "Does the Set function in store/cachekv/store.go properly validate key and value sizes using AssertValidKey and AssertValidValue, or could oversized keys/values bypass these checks and cause memory exhaustion? store.go:82-86",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01b6da82-c323-4c4d-9ffb-2ca4797779d1",
+    "timestamp": "2025-11-21 10:56:33.406037",
+    "report_generated": false
+  },
+  {
+    "question": "In store/cachekv/store.go, does the getFromCache function properly synchronize access to the sync.Map cache, or could concurrent reads and writes cause data races? store.go:68-73",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8603862b-496a-4539-82fa-72b359578741",
+    "timestamp": "2025-11-21 10:57:10.489500",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any access operation types that bypass gas metering, potentially allowing unmetered computation in parallel execution contexts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_07a583cc-39e8-4c95-84a6-5282209f0da4",
+    "timestamp": "2025-11-21 10:57:47.766686",
+    "report_generated": false
   }
 ]
