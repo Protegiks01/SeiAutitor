@@ -1048,5 +1048,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a27859c3-6267-4b54-b367-bb129d9e6c58",
     "timestamp": "2025-11-21 07:23:04.880734",
     "report_generated": false
+  },
+  {
+    "question": "Can the MaxValidators check in the expected keeper interface expected_keepers.go:54 be used to validate slashing doesn't reduce the validator set below operational minimums?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_26fb72b7-c7d7-43b2-bef8-2cf7cf7676de",
+    "timestamp": "2025-11-21 07:24:11.063188",
+    "report_generated": false
+  },
+  {
+    "question": "Does the staking module's Delegation method unjail.go:18 correctly filter by self-delegation, or could other delegations be mistakenly used?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5627e617-1a7f-42ac-89cd-c470ade90b1d",
+    "timestamp": "2025-11-21 07:24:24.304665",
+    "report_generated": false
+  },
+  {
+    "question": "Can a validator manipulate their bonding status to avoid having signing info created hooks.go:14-25 , making them immune to slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_29e8f2bb-7df8-4d8a-b6dd-aaa429e42275",
+    "timestamp": "2025-11-21 07:24:37.782293",
+    "report_generated": false
+  },
+  {
+    "question": "Does the slashing module handle the case where the staking module returns a nil validator from ValidatorByConsAddr infractions.go:97 gracefully?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7d1ad911-1555-4816-8efd-3dc49cc1b126",
+    "timestamp": "2025-11-21 07:24:51.687685",
+    "report_generated": false
+  },
+  {
+    "question": "Can hook execution in BeginBlocker cause state changes that conflict with concurrent transaction execution in the same block?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0fb8c01a-a391-43f8-9502-1796e88321ff",
+    "timestamp": "2025-11-21 07:25:06.439837",
+    "report_generated": false
+  },
+  {
+    "question": "Is there proper error handling when k.sk.Jail() or k.sk.Unjail() keeper.go:91 fail in the staking module?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9434d279-5fb0-48b1-b2ff-7ee207282562",
+    "timestamp": "2025-11-21 07:25:22.555877",
+    "report_generated": false
+  },
+  {
+    "question": "Can k.sk.Slash() keeper.go:78 be called with invalid parameters that cause panics in the staking module?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f962e728-4bff-4be3-9908-34d2850fe369",
+    "timestamp": "2025-11-21 07:25:40.365419",
+    "report_generated": false
+  },
+  {
+    "question": "Does the slashing module verify that the staking keeper interface methods expected_keepers.go:36-55 are properly implemented to prevent nil pointer dereferences?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fba97788-a3f0-4866-9cab-51492a20d5aa",
+    "timestamp": "2025-11-21 07:25:59.937681",
+    "report_generated": false
+  },
+  {
+    "question": "Can the timing of hook execution create race conditions where a validator is slashed before their AfterValidatorBonded hook completes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e3b40fdd-8f59-4247-9455-49695e74d6c1",
+    "timestamp": "2025-11-21 07:26:20.012011",
+    "report_generated": false
+  },
+  {
+    "question": "Does AfterValidatorBonded correctly handle re-bonding of a previously jailed validator, ensuring signing info is reset appropriately hooks.go:14-25 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ac3d69bc-5f80-4b1e-94fc-a5dc9e3600d4",
+    "timestamp": "2025-11-21 07:26:41.674602",
+    "report_generated": false
+  },
+  {
+    "question": "Is the ConsPubKey() call at line 31 hooks.go:31-33 safe from returning nil or invalid keys that would corrupt the pubkey mapping?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a7d213f-2e72-4ff9-9230-1bde5fc0cc16",
+    "timestamp": "2025-11-21 07:27:05.820863",
+    "report_generated": false
+  },
+  {
+    "question": "Can hooks be called during genesis initialization in an order that causes signing info to be created before the validator exists?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_72cccd9e-a72c-498f-8090-e5a46d617929",
+    "timestamp": "2025-11-21 07:27:30.504461",
+    "report_generated": false
+  },
+  {
+    "question": "Does the hook at line 30 hooks.go:30 (k.sk.Validator) return nil for a just-created validator due to state not being flushed, causing panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d43301a3-2742-4aaa-9513-c6755ef04a11",
+    "timestamp": "2025-11-21 07:27:57.436162",
+    "report_generated": false
+  },
+  {
+    "question": "Can the staking module call slashing hooks with invalid/nil validator references, causing panics in the hook handlers hooks.go:12-43 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ee596cc8-c510-4611-8370-d868eb39521b",
+    "timestamp": "2025-11-21 07:28:24.487719",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a check to ensure hooks execute in the correct order (create → bond → remove) to maintain state consistency?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_adf6a43c-2cf8-4f4c-b270-271e63cc5519",
+    "timestamp": "2025-11-21 07:28:53.667400",
+    "report_generated": false
+  },
+  {
+    "question": "Can AfterValidatorRemoved hooks.go:41-43 be called multiple times for the same validator, causing errors or panics in deleteAddrPubkeyRelation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bb73a413-2998-4043-acbc-7c7671141628",
+    "timestamp": "2025-11-21 07:29:23.071767",
+    "report_generated": false
+  },
+  {
+    "question": "Does AfterValidatorCreated hooks.go:29-38 properly handle errors from AddPubkey at line 35, or could failures be silently ignored leading to missing pubkey mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cb55e2e2-3fdd-4d71-b57e-7802f6529757",
+    "timestamp": "2025-11-21 07:29:54.544182",
+    "report_generated": false
+  },
+  {
+    "question": "In AfterValidatorBonded hooks.go:12-26 , can a validator be bonded multiple times without corresponding signing info creation, causing subsequent slashing logic to panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2d47da65-e775-4261-a498-493591494043",
+    "timestamp": "2025-11-21 07:30:26.940009",
+    "report_generated": false
+  },
+  {
+    "question": "Hooks & Cross-Module Interactions (Questions 106-125)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d07f4f79-a8c5-4dbb-85b5-91358f1c6cb6",
+    "timestamp": "2025-11-21 07:30:58.552364",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker manipulate the KV store directly through other modules to corrupt slashing state if proper key prefixing isn't enforced?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0dc89c72-8bb5-427c-ab99-1c1457185ade",
+    "timestamp": "2025-11-21 07:31:31.040883",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module properly handle store migrations when upgrading from versions with different key encoding schemes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cd530f33-a015-488b-9cea-97683686468f",
+    "timestamp": "2025-11-21 07:32:05.658846",
+    "report_generated": false
+  },
+  {
+    "question": "Is the signing info protobuf encoding signing_info.go:36 guaranteed to be deterministic, or could field ordering differences cause state divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f407e4bf-8ec9-48af-a587-8b9e7d9d520c",
+    "timestamp": "2025-11-21 07:32:41.113486",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent reads and writes to the same validator's signing info cause data races or torn reads during BeginBlocker execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_14d3c55f-5947-4100-b809-637e186e8b93",
+    "timestamp": "2025-11-21 07:33:17.933057",
+    "report_generated": false
+  },
+  {
+    "question": "Does the store key design prevent prefix collisions when validator addresses have common prefixes keys.go:38-40 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95cc8e86-65e8-43d5-943a-d3f559f7d623",
+    "timestamp": "2025-11-21 07:33:54.499759",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any invariants checking that every validator with signing info has corresponding staking module data, and vice versa?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9272fd4a-865e-4e5a-8cba-f951c20f34fc",
+    "timestamp": "2025-11-21 07:34:31.970103",
+    "report_generated": false
   }
 ]
