@@ -1498,5 +1498,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dc12cc85-0883-4dfa-8047-048e637d8fe7",
     "timestamp": "2025-11-21 08:10:40.661426",
     "report_generated": false
+  },
+  {
+    "question": "Can a validator unjail themselves immediately after being jailed for downtime if the JailedUntil time hasn't been set correctly unjail.go:56-58 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_130edace-9529-48cc-9e0c-20764fef777c",
+    "timestamp": "2025-11-21 08:12:10.442341",
+    "report_generated": false
+  },
+  {
+    "question": "Does MsgUnjail.ValidateBasic() msg.go:40-46 perform adequate validation, or can empty/malformed validator addresses pass through and cause panics in the handler?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a4496bcc-26e8-446b-810c-bdf009c22f47",
+    "timestamp": "2025-11-21 08:12:23.516687",
+    "report_generated": false
+  },
+  {
+    "question": "Is the tombstoned check at line 51 unjail.go:51-52 sufficient to prevent tombstoned validators from ever being unjailed, or could state manipulation bypass this?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_acf10b56-84d0-40a7-9ec0-ecf093c9cb3c",
+    "timestamp": "2025-11-21 08:12:37.476018",
+    "report_generated": false
+  },
+  {
+    "question": "Can the TokensFromShares calculation at line 23 unjail.go:23 overflow or return incorrect values for extremely large share amounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_232a1fff-0159-45c1-9e17-e5056f94cec5",
+    "timestamp": "2025-11-21 08:12:51.300900",
+    "report_generated": false
+  },
+  {
+    "question": "Does the self-delegation check at lines 18-29 unjail.go:18-29 use the correct delegation state, or could a validator unjail after removing their self-delegation but before the state is committed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f3f3af26-f13f-4c85-aede-80dd005c0899",
+    "timestamp": "2025-11-21 08:13:06.534254",
+    "report_generated": false
+  },
+  {
+    "question": "In Unjail unjail.go:11-63 , can a validator submit multiple unjail transactions in rapid succession to bypass the JailedUntil time check at line 56?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff26d780-876a-4da1-8892-adf8d934046e",
+    "timestamp": "2025-11-21 08:13:22.932811",
+    "report_generated": false
+  },
+  {
+    "question": "Unjailing & Message Validation (Questions 46-65)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a000eb30-9ef3-4e10-989c-754c8f116377",
+    "timestamp": "2025-11-21 08:13:42.795246",
+    "report_generated": false
+  },
+  {
+    "question": "Can the copy operations in ResizeMissedBlockArray infractions.go:164-168 cause partial copies if the source and destination overlap, corrupting the bit array?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_faf95ccd-c743-4037-9c3c-e50d80794505",
+    "timestamp": "2025-11-21 08:14:02.959352",
+    "report_generated": false
+  },
+  {
+    "question": "Does the missed block tracking handle the case where a validator is removed and re-added, ensuring old missed block data doesn't incorrectly persist?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1880a114-dfac-47ab-adb0-8720b3ad2f42",
+    "timestamp": "2025-11-21 08:14:23.448291",
+    "report_generated": false
+  },
+  {
+    "question": "Is the UINT_64_NUM_BITS constant signing_info.go:10 correctly used across all bit operations, or could bit operations assume different word sizes on different platforms?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ec8ed6be-f855-4f8b-bea5-87b3d6fe706d",
+    "timestamp": "2025-11-21 08:14:46.359670",
+    "report_generated": false
+  },
+  {
+    "question": "Can the bit group array be manipulated directly through raw store access to reset a validator's missed blocks without proper validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_494e8454-f673-4d88-942a-109ec7177e52",
+    "timestamp": "2025-11-21 08:15:09.562398",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetValidatorMissedBlocks signing_info.go:58-68 handle the case where the stored bit array size doesn't match the current window size, preventing panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a1bf893f-8814-4a44-a0b1-0c8b832c3077",
+    "timestamp": "2025-11-21 08:15:35.035235",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent modifications to the bit array from multiple BeginBlocker executions (in fork scenarios) cause state corruption before consensus is reached?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e146244-625b-4763-94ff-ec6dc67cda25",
+    "timestamp": "2025-11-21 08:16:01.339973",
+    "report_generated": false
+  },
+  {
+    "question": "In the window resizing at line 177 infractions.go:177 , does setting IndexOffset to 0 create a discrepancy where the validator's actual position in the window is lost?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b5d6b19-1357-4964-bee0-2afd6eda24ff",
+    "timestamp": "2025-11-21 08:16:28.788947",
+    "report_generated": false
+  },
+  {
+    "question": "Is there proper validation in validateSignedBlocksWindow params.go:72-83 to prevent setting the window to excessively large values (e.g., > 1 million blocks)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e317927-349e-4ae3-ab1d-387b50f2d30d",
+    "timestamp": "2025-11-21 08:16:57.148389",
+    "report_generated": false
+  },
+  {
+    "question": "Can the missed blocks bit array grow unbounded if SignedBlocksWindow is set to an extremely large value params.go:13 , causing state bloat and node storage exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_26ed884a-66af-42cb-8eb7-f8c343a199da",
+    "timestamp": "2025-11-21 08:17:25.976362",
+    "report_generated": false
+  },
+  {
+    "question": "Does the bit array storage signing_info.go:71-75 use a deterministic encoding that prevents state divergence across nodes with different architectures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3e11e5a7-6bf1-41db-ae65-a552839bd2a8",
+    "timestamp": "2025-11-21 08:17:57.109290",
+    "report_generated": false
+  },
+  {
+    "question": "Can the IndexOffset modulo operation at line 70 infractions.go:70 cause division by zero if window is set to 0 through a governance attack?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cc76e251-7f3b-4d6d-85d8-8dd700a6fcf9",
+    "timestamp": "2025-11-21 08:18:27.551379",
+    "report_generated": false
+  },
+  {
+    "question": "In HandleValidatorSignatureConcurrent, does the missed block counter increment/decrement logic (lines 59-66) infractions.go:59-66 correctly handle edge cases where the same index is updated twice?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c5051ee1-b646-49d7-a94f-cef918cfea9a",
+    "timestamp": "2025-11-21 08:18:59.090516",
+    "report_generated": false
+  },
+  {
+    "question": "Is the calculation (len(boolArray) + UINT_64_NUM_BITS - 1) / UINT_64_NUM_BITS at line 119 signing_info.go:119 safe from integer overflow for very large windows?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e9c35841-feaa-436f-85a2-37eff88211d9",
+    "timestamp": "2025-11-21 08:19:32.235352",
+    "report_generated": false
+  },
+  {
+    "question": "Can the ParseBoolArrayToBitGroups function signing_info.go:118-127 handle extremely large window values (e.g., millions of blocks) without causing memory exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_af7a8b5c-8e7e-44fd-8b28-fd03d805c0fb",
+    "timestamp": "2025-11-21 08:20:06.887772",
+    "report_generated": false
+  },
+  {
+    "question": "Does the array expansion logic (lines 160-169) infractions.go:160-169 correctly preserve the circular buffer semantics when inserting zeros, or could it corrupt the missed blocks history?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5350bb03-8b3d-45ae-9e82-d779a9442558",
+    "timestamp": "2025-11-21 08:20:42.651674",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker propose a governance parameter change to rapidly oscillate the SignedBlocksWindow size infractions.go:52-54 , causing repeated expensive resizing operations and DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2350697e-bc1c-4be0-ba1e-04a4295745d0",
+    "timestamp": "2025-11-21 08:21:18.503485",
+    "report_generated": false
+  },
+  {
+    "question": "In ResizeMissedBlockArray infractions.go:157-181 , when the window shrinks (line 171), does clearing all missed blocks and resetting the counter unfairly benefit validators who were close to being slashed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3f7a0ddf-c95c-4b24-b8ed-80e6c0509715",
+    "timestamp": "2025-11-21 08:21:52.775378",
+    "report_generated": false
+  },
+  {
+    "question": "Can the bit manipulation operations at lines 98-103 signing_info.go:98-103 cause integer overflow if indexShift is >= 64, leading to incorrect bit masking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_25e0d8e0-5db3-4d26-be83-dae54f1ce349",
+    "timestamp": "2025-11-21 08:22:28.421617",
+    "report_generated": false
   }
 ]
