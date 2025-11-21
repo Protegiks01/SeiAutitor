@@ -7948,5 +7948,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3ffeea39-7e66-468a-a406-7d592e1f0a61",
     "timestamp": "2025-11-21 16:55:56.030553",
     "report_generated": false
+  },
+  {
+    "question": "Can an attacker create grants with far-future expiration dates that remain in state indefinitely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e05204e-3f7b-485e-9166-6568b598cf01",
+    "timestamp": "2025-11-21 16:57:09.023153",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module enforce that grant expiration times are deterministically calculated using block time rather than wall clock time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d674d281-56a8-4418-9298-62172b000bf2",
+    "timestamp": "2025-11-21 16:57:22.588548",
+    "report_generated": false
+  },
+  {
+    "question": "Can the NewGrant function grant.go:17-33 fail in ways that leave partial state in the keeper?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d09c42d3-00fb-4964-b43b-62637f673497",
+    "timestamp": "2025-11-21 16:57:35.973169",
+    "report_generated": false
+  },
+  {
+    "question": "Does the keeper validate that the feeAllowance parameter in GrantAllowance is not nil before using it keeper.go:51-54?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3ea183df-56ba-4588-b7af-0aee57f9aba9",
+    "timestamp": "2025-11-21 16:57:49.977860",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the event emission in GrantAllowance keeper.go:63-69 to cause excessive gas consumption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_14a10c10-44c0-4157-84ee-1e4fc2c300aa",
+    "timestamp": "2025-11-21 16:58:05.113461",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateAllFeeAllowances keeper.go:124-144 properly close the iterator on all code paths to prevent resource leaks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff374bd9-1762-47ae-817b-7670c0d48b6e",
+    "timestamp": "2025-11-21 16:58:21.404561",
+    "report_generated": false
+  },
+  {
+    "question": "Can the length-prefixed address encoding in FeeAllowanceKey key.go:30-32 handle edge cases where address length exceeds 255 bytes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_652c52ca-ae12-4405-8526-8d407d96d066",
+    "timestamp": "2025-11-21 16:58:39.262348",
+    "report_generated": false
+  },
+  {
+    "question": "Does the storage layout in key.go:24-26 use a deterministic prefix that prevents collisions with other module stores?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1ac87e8-bc4e-45a3-b472-ea9eaf6055ab",
+    "timestamp": "2025-11-21 16:58:59.920389",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent calls to GrantAllowance and revokeAllowance for the same granter-grantee pair cause race conditions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_711f3303-8978-4cd3-bdad-71baddda66fd",
+    "timestamp": "2025-11-21 16:59:21.163410",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module properly handle the case where a granter account is deleted while active grants exist?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1db68839-7311-4d2b-846e-f0e8746773a5",
+    "timestamp": "2025-11-21 16:59:44.764301",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create grants with zero or negative spend limits that bypass validation in GrantAllowance keeper.go:40-72?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5acc79ac-5c67-4592-aeeb-b00a8a97b963",
+    "timestamp": "2025-11-21 17:00:07.692994",
+    "report_generated": false
+  },
+  {
+    "question": "Does the keeper enforce an upper limit on the number of grants per granter or grantee to prevent storage bloat?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6d0b9344-2979-4f02-9ad3-0da57eb63285",
+    "timestamp": "2025-11-21 17:00:33.244896",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a risk of state corruption if the codec in getGrant keeper.go:117-119 fails to unmarshal but doesn't return an error?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a6b34b4a-f3b4-4330-beb9-2ae83b0e0f20",
+    "timestamp": "2025-11-21 17:01:03.094026",
+    "report_generated": false
+  },
+  {
+    "question": "Can the getGrant function keeper.go:108-122 be exploited with crafted keys to return grants for unintended accounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b477d675-9934-4ed9-a1ea-3d31318fc9ff",
+    "timestamp": "2025-11-21 17:01:31.387278",
+    "report_generated": false
+  },
+  {
+    "question": "Does the keeper properly validate that granter and grantee addresses are valid before storing in GrantAllowance keeper.go:40-72?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cc981e11-5925-4856-9417-ef8cd8c12be6",
+    "timestamp": "2025-11-21 17:02:00.701759",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the fact that GrantAllowance creates accounts keeper.go:43-47 to spam the account store with invalid addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e64f41d9-90ea-4041-98f0-7cfd4651a8c1",
+    "timestamp": "2025-11-21 17:02:31.768059",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesis keeper.go:218-229 handle extremely large grant sets without running out of memory or exceeding block gas limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e2f1ba70-9ca7-4913-ae02-986efc1eb956",
+    "timestamp": "2025-11-21 17:03:03.370064",
+    "report_generated": false
+  },
+  {
+    "question": "In InitGenesis keeper.go:193-215, can malicious genesis state with duplicate grants cause inconsistent state or chain halt?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd530167-7e16-433f-89da-3f404e3a4339",
+    "timestamp": "2025-11-21 17:03:35.857010",
+    "report_generated": false
+  },
+  {
+    "question": "Does the revokeAllowance function keeper.go:75-93 properly clean up all associated state, or can orphaned data accumulate over time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2d336654-70c0-4388-85ca-69a845dd7bf8",
+    "timestamp": "2025-11-21 17:04:10.254998",
+    "report_generated": false
+  },
+  {
+    "question": "Can the store.Set(key, bz) operation in GrantAllowance keeper.go:61 consume unbounded gas if the marshaled grant is extremely large?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e0d0bc3-adc2-4395-aaca-2cba8fdc84e4",
+    "timestamp": "2025-11-21 17:04:45.189341",
+    "report_generated": false
+  },
+  {
+    "question": "Does the keeper's IterateAllFeeAllowances function keeper.go:124-144 have proper gas metering to prevent DoS when iterating over a large number of grants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_74e293c9-a93b-4932-ae1e-2d0c043848d2",
+    "timestamp": "2025-11-21 17:05:22.218621",
+    "report_generated": false
+  },
+  {
+    "question": "In GrantAllowance keeper.go:40-72, can an attacker create multiple grants with the same granter-grantee pair by exploiting race conditions in concurrent transactions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_272af650-70be-4c08-a53e-a617a35c0a1a",
+    "timestamp": "2025-11-21 17:06:00.143312",
+    "report_generated": false
+  },
+  {
+    "question": "Does ParseAddressesFromFeeAllowanceKey in key.go:39-51 correctly handle malformed keys that could cause out-of-bounds reads or panics during iteration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c249de87-7d2a-41f8-a08a-f76242faef16",
+    "timestamp": "2025-11-21 17:06:39.108785",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft addresses that produce overlapping storage keys in FeeAllowancePrefixByGrantee key.go:35-37, causing one grant to overwrite another?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0b8e5003-be69-45d1-8633-30e508f8c05d",
+    "timestamp": "2025-11-21 17:07:20.216304",
+    "report_generated": false
+  },
+  {
+    "question": "Does the FeeAllowanceKey function in key.go:30-32 properly prevent key collisions when granter and grantee addresses have different lengths or contain special byte sequences?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa19a2cc-9ded-454c-81dd-beff6237ceb9",
+    "timestamp": "2025-11-21 17:07:59.191636",
+    "report_generated": false
   }
 ]
