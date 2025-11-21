@@ -7498,5 +7498,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f370757-e128-459f-9c77-336ce2281249",
     "timestamp": "2025-11-21 16:20:42.245417",
     "report_generated": false
+  },
+  {
+    "question": "Can an attacker create an AllowedMsgAllowance with an empty allowance list to cause validation failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b431446a-4b06-4126-8cb3-670d8abab518",
+    "timestamp": "2025-11-21 16:21:58.646609",
+    "report_generated": false
+  },
+  {
+    "question": "Does Accept properly handle the case where the underlying allowance returns remove=true filtered_fee.go:75-78?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_31d8cbde-a4dc-444c-8e1e-a8a1dbbbfa37",
+    "timestamp": "2025-11-21 16:22:12.389766",
+    "report_generated": false
+  },
+  {
+    "question": "Can the cache of allowed messages be manipulated to bypass authorization checks in allMsgTypesAllowed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_925587ad-9224-4ae5-8a4b-ce753c585cdc",
+    "timestamp": "2025-11-21 16:22:26.058764",
+    "report_generated": false
+  },
+  {
+    "question": "Does the message type URL comparison filtered_fee.go:103 handle all edge cases including empty strings and special characters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c14c140b-053b-413c-8d59-68b3a7c0a304",
+    "timestamp": "2025-11-21 16:22:40.287210",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker specify message types that don't exist or are malformed in AllowedMessages filtered_fee.go:116-118?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ab6c7631-1f6e-427e-81cb-5f55e2ce6295",
+    "timestamp": "2025-11-21 16:22:55.805893",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBasic filtered_fee.go:112-126 recursively validate wrapped AllowedMsgAllowances to prevent infinite nesting?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3483b03c-359e-4d39-a655-bc6662ed2cf9",
+    "timestamp": "2025-11-21 16:23:12.306722",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the fact that the allowance is updated after Accept filtered_fee.go:80-83 to cause state inconsistencies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2a74b0a7-5c37-4012-92bc-27f012a20b03",
+    "timestamp": "2025-11-21 16:23:30.035990",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetAllowance filtered_fee.go:54-62 properly validate the new allowance before updating?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_04479b98-dd85-40db-884e-5a44b64c8fa6",
+    "timestamp": "2025-11-21 16:23:49.725079",
+    "report_generated": false
+  },
+  {
+    "question": "Can the underlying allowance in GetAllowance filtered_fee.go:44-51 be nil or invalid after unpacking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8e13e62d-bed5-46f3-9791-9fcc6b6dfe55",
+    "timestamp": "2025-11-21 16:24:11.450318",
+    "report_generated": false
+  },
+  {
+    "question": "Does allowedMsgsToMap filtered_fee.go:88-96 use a deterministic iteration order when building the map?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_60a27eef-09e8-437a-957c-f3829d40487c",
+    "timestamp": "2025-11-21 16:24:34.294862",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create an AllowedMsgAllowance with duplicate message types in the allowed list to inflate gas costs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_40e7cb79-4eee-41fd-b91a-3dfc0bf224a9",
+    "timestamp": "2025-11-21 16:24:58.247477",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gasCostPerIteration constant filtered_fee.go:14 accurately reflect the cost of message type checking to prevent underpricing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e761716-cb31-4d22-a3ec-8b24a963e1b4",
+    "timestamp": "2025-11-21 16:25:24.472230",
+    "report_generated": false
+  },
+  {
+    "question": "Can the gas metering at line 91 and 102 filtered_fee.go:91 be exploited to cause DoS with a very large AllowedMessages list?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e98f6bb-eeee-41c3-8e4b-3212053af9bb",
+    "timestamp": "2025-11-21 16:25:50.753057",
+    "report_generated": false
+  },
+  {
+    "question": "Does allMsgTypesAllowed filtered_fee.go:98-109 properly handle nested messages or only check top-level message types?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4e47318f-7014-4a23-874a-e814a43cc730",
+    "timestamp": "2025-11-21 16:26:17.973405",
+    "report_generated": false
+  },
+  {
+    "question": "In AllowedMsgAllowance.Accept filtered_fee.go:65-86, can the message filtering be bypassed by wrapping messages in x/authz MsgExec?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b858bb0a-ce80-4074-976d-bb5d1275e491",
+    "timestamp": "2025-11-21 16:26:46.452002",
+    "report_generated": false
+  },
+  {
+    "question": "Does the initialization of PeriodReset get validated to ensure it's not in the far past or future?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f6487f92-bec8-41f3-a77e-540589d09d44",
+    "timestamp": "2025-11-21 16:27:16.151832",
+    "report_generated": false
+  },
+  {
+    "question": "Can the expiration check periodic_fee.go:25-27 be bypassed by setting the expiration to exactly the block time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_56aaff82-56dc-48cd-9faa-6db8ae67f063",
+    "timestamp": "2025-11-21 16:27:47.754232",
+    "report_generated": false
+  },
+  {
+    "question": "Does Accept return the correct remove value when the absolute limit is exhausted but the period limit is not periodic_fee.go:44?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2fbeff45-2348-4952-9e86-19857abc0770",
+    "timestamp": "2025-11-21 16:28:19.143277",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create a PeriodicAllowance where PeriodSpendLimit and Basic.SpendLimit have different denominations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a857fbbc-133c-4f88-b436-8840ac94f13e",
+    "timestamp": "2025-11-21 16:28:51.878788",
+    "report_generated": false
+  },
+  {
+    "question": "Does the validation check at lines 97-99 periodic_fee.go:97-99 properly handle all denomination subsets?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_96936787-1bab-4cbb-9ba5-b18a35b88fa3",
+    "timestamp": "2025-11-21 16:29:24.965138",
+    "report_generated": false
+  },
+  {
+    "question": "Can the state mutation of both PeriodCanSpend and PeriodReset in tryResetPeriod cause reentrancy issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3293bc46-24d4-4123-88c9-d3a094cc7a5f",
+    "timestamp": "2025-11-21 16:29:59.820885",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBasic periodic_fee.go:88-94 properly validate that PeriodCanSpend is never greater than PeriodSpendLimit?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01eb8ee7-f67c-4821-8c12-b61d474b6a24",
+    "timestamp": "2025-11-21 16:30:35.531536",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the fact that periods can be skipped periodic_fee.go:71-73 if no transactions occur for multiple periods?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b696f35f-9047-489c-97cb-9b43c9129e6f",
+    "timestamp": "2025-11-21 16:31:11.369224",
+    "report_generated": false
+  },
+  {
+    "question": "Does Accept properly synchronize period resets when multiple transactions arrive in the same block?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eb9b16b4-c4f4-4adc-9ad7-4aa99d659ec4",
+    "timestamp": "2025-11-21 16:31:47.187574",
+    "report_generated": false
+  },
+  {
+    "question": "Can the PeriodReset.Add(a.Period) operation periodic_fee.go:70 cause integer overflow with very large period durations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_18d5030a-2bc4-4a59-b016-a4dd7e9b7194",
+    "timestamp": "2025-11-21 16:32:24.598238",
+    "report_generated": false
   }
 ]
