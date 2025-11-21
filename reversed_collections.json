@@ -3598,5 +3598,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f4cb8c81-158b-4b12-b155-f57b935272e0",
     "timestamp": "2025-11-21 11:09:59.300081",
     "report_generated": false
+  },
+  {
+    "question": "In store/multiversion/store.go, can the removeOldWriteset function be exploited to cause memory leaks by creating transactions with extremely large writesets that are never properly cleaned up? store.go:112-138",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_42c44127-a0c7-4eca-b6ff-5ed27a298657",
+    "timestamp": "2025-11-21 11:11:25.982503",
+    "report_generated": false
+  },
+  {
+    "question": "Does the SetWriteset function in store/multiversion/store.go properly validate that the incarnation number is monotonically increasing, or could an attacker submit transactions that manipulate incarnation numbers to bypass conflict detection? store.go:142-162",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9941ce09-bd8e-4258-975f-bf2e68621a9b",
+    "timestamp": "2025-11-21 11:11:39.386107",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft a transaction that causes the ValidateTransactionState function to always return false positives for conflicts, forcing unnecessary re-executions and causing a DoS by degrading chain throughput? store.go:388-397",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ab43218b-fb65-49ef-8612-450d70d340b3",
+    "timestamp": "2025-11-21 11:11:52.910311",
+    "report_generated": false
+  },
+  {
+    "question": "In store/multiversion/store.go, does the GetLatestBeforeIndex function properly handle race conditions when multiple transactions concurrently read the same key, potentially allowing a transaction to read stale or inconsistent data that could lead to double-spending? store.go:82-97",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_689205af-40bd-4ca0-83f8-1b0f86e01879",
+    "timestamp": "2025-11-21 11:12:06.838140",
+    "report_generated": false
+  },
+  {
+    "question": "Are RPC query pagination parameters validated to prevent requesting millions of records in one query, causing node crashes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_742838dd-ec6a-4805-a0f8-8dcd69558460",
+    "timestamp": "2025-11-21 11:12:21.788582",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker fill the mempool with high-fee transactions, preventing legitimate transactions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b84916d9-e478-4ed2-8885-c4e7ffb819fa",
+    "timestamp": "2025-11-21 11:12:40.344006",
+    "report_generated": false
+  },
+  {
+    "question": "Are transaction size limits enforced before parsing, preventing memory exhaustion from huge transactions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_61a5f8a9-e00c-4743-b080-7c05ee7c7543",
+    "timestamp": "2025-11-21 11:13:00.722095",
+    "report_generated": false
+  },
+  {
+    "question": "Could deeply nested messages bypass execution depth limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4ea16c53-ccdd-4ac7-9ffa-2e20dd6e5941",
+    "timestamp": "2025-11-21 11:13:22.266699",
+    "report_generated": false
+  },
+  {
+    "question": "When exporting state, is iteration order deterministic across all nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ecbc328f-88ad-44de-8e74-376701cfb61a",
+    "timestamp": "2025-11-21 11:13:44.904389",
+    "report_generated": false
+  },
+  {
+    "question": "Could extremely large genesis states cause memory exhaustion during chain initialization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8437d48d-bccf-4735-b8a1-eae83e2d00ae",
+    "timestamp": "2025-11-21 11:14:10.288358",
+    "report_generated": false
+  },
+  {
+    "question": "If state is pruned, are IBC proofs that reference pruned heights handled gracefully?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d7fae41-ab76-444e-a006-11b49eb79ba4",
+    "timestamp": "2025-11-21 11:14:35.237117",
+    "report_generated": false
+  },
+  {
+    "question": "When iterating with prefixes, are bounds checked to prevent reading into adjacent modules' state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_74ffb12c-72fb-4e61-b45b-332456c534ca",
+    "timestamp": "2025-11-21 11:15:01.785073",
+    "report_generated": false
+  },
+  {
+    "question": "Are all store keys generated deterministically from inputs, or could randomness cause consensus divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f485e94b-59d5-4548-9999-22ff01d0bb35",
+    "timestamp": "2025-11-21 11:15:30.380445",
+    "report_generated": false
+  },
+  {
+    "question": "Could different modules use overlapping key prefixes, causing state collision and corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bf42e8cc-127a-4219-956d-786202edbd18",
+    "timestamp": "2025-11-21 11:15:59.462625",
+    "report_generated": false
+  },
+  {
+    "question": "Are packet data payloads validated for maximum size and structure before processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f95d76d3-958a-4cc3-b24c-92cb9f1ea296",
+    "timestamp": "2025-11-21 11:16:29.613703",
+    "report_generated": false
+  },
+  {
+    "question": "When upgrading channel versions, is state migration atomic and reversible if upgrade fails?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_999cdc7a-44c8-43ed-89ee-60f4d9d0cd39",
+    "timestamp": "2025-11-21 11:17:01.027729",
+    "report_generated": false
+  },
+  {
+    "question": "If packets traverse multiple chains, are source/destination tracking properly maintained?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_30a17003-0407-409c-acc9-c341dadee18b",
+    "timestamp": "2025-11-21 11:17:34.160956",
+    "report_generated": false
+  },
+  {
+    "question": "Could missing packet sequences cause permanent channel closure or loss of in-flight funds?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1b368c26-0862-470c-98de-6db9c154ede5",
+    "timestamp": "2025-11-21 11:18:07.781544",
+    "report_generated": false
+  },
+  {
+    "question": "When updating light clients, are validator set changes validated against voting power thresholds?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7dc7a7d0-34b0-4e7e-a00e-414a4595aba2",
+    "timestamp": "2025-11-21 11:18:43.000545",
+    "report_generated": false
+  },
+  {
+    "question": "Are IBC denomination traces validated to prevent arbitrarily long denom strings that exceed storage limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fb9e9d3b-c2b3-4ad2-836a-bba71d46f407",
+    "timestamp": "2025-11-21 11:19:19.099295",
+    "report_generated": false
+  },
+  {
+    "question": "If multiple middleware wrap IBC applications, is message routing deterministic and panic-safe?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_730a932d-4287-4877-b94c-61fe64b0fbbc",
+    "timestamp": "2025-11-21 11:19:54.593389",
+    "report_generated": false
+  },
+  {
+    "question": "When channels close, are all state entries (packets, acks, commitments) cleaned up atomically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8aaf8307-2490-4a9d-9658-eeb1ca6a2d28",
+    "timestamp": "2025-11-21 11:20:29.854692",
+    "report_generated": false
+  },
+  {
+    "question": "When creating connections, are client state proofs properly validated against known validator sets?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_daa69ba0-3d18-4331-8e7d-f843c1944e2f",
+    "timestamp": "2025-11-21 11:21:05.366795",
+    "report_generated": false
+  },
+  {
+    "question": "Are IBC escrow accounts properly segregated per port/channel, preventing cross-contamination?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a2ded518-4f88-4e15-91e9-075ae156dc8a",
+    "timestamp": "2025-11-21 11:21:43.801762",
+    "report_generated": false
+  },
+  {
+    "question": "Could callbacks from packet acknowledgment or timeout re-enter the IBC module, causing reentrancy issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e657a6a4-7639-4b90-b8a0-6afc6b25d523",
+    "timestamp": "2025-11-21 11:22:23.572188",
+    "report_generated": false
   }
 ]
