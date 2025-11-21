@@ -5398,5 +5398,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_46c1e9b4-c0bc-4a7e-abbd-c0d272448cf3",
     "timestamp": "2025-11-21 09:22:19.698459",
     "report_generated": false
+  },
+  {
+    "question": "Does RevCapabilityKey correctly isolate same-name capabilities in different modules? keys.go:35-37",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a918745f-46b3-4eaf-9057-f37a28bd19eb",
+    "timestamp": "2025-11-21 09:23:29.244161",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetCapabilityName return empty strings that are misinterpreted as valid names? keeper.go:392-399",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35e8cd51-56b0-4eed-82fc-1ed3da58c38b",
+    "timestamp": "2025-11-21 09:23:42.908699",
+    "report_generated": false
+  },
+  {
+    "question": "Does ClaimCapability prevent two modules from binding the same port during InitGenesis, preventing port hijacking? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0f8da6f5-840e-4759-bc4a-bc37d8ce4e06",
+    "timestamp": "2025-11-21 09:23:57.435847",
+    "report_generated": false
+  },
+  {
+    "question": "Can unclaimed capabilities from failed IBC handshake initialization be reused in later transactions? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0de96e61-ba2a-4f40-b810-bf7385066258",
+    "timestamp": "2025-11-21 09:24:11.421506",
+    "report_generated": false
+  },
+  {
+    "question": "Can pointer arithmetic attacks forge IBC packet-sending capabilities by bypassing AuthenticateCapability? keeper.go:275-280",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d49e874c-be1a-47ef-be18-7fde554df9a3",
+    "timestamp": "2025-11-21 09:24:26.373736",
+    "report_generated": false
+  },
+  {
+    "question": "Can releasing an IBC channel capability while callbacks still reference it create use-after-free bugs? keeper.go:319-356",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b5a71a95-a1f9-42ba-b5f3-1a7746237c42",
+    "timestamp": "2025-11-21 09:24:42.891988",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious relayers exploit timing between ReleaseCapability and capMap deletion? keeper.go:345-349",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cdfa9343-d0b7-4018-96d0-fe7e94eb70e1",
+    "timestamp": "2025-11-21 09:25:00.906291",
+    "report_generated": false
+  },
+  {
+    "question": "Can partial releases of multi-owner capabilities corrupt the persistent owner set? keeper.go:339-353",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_90fd0ef0-9760-4986-8d0e-444edbb413ba",
+    "timestamp": "2025-11-21 09:25:20.324612",
+    "report_generated": false
+  },
+  {
+    "question": "Can middleware modules illegally co-own capabilities by intercepting claims? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a7eca6a1-cedf-42e6-8366-7122999576cb",
+    "timestamp": "2025-11-21 09:25:42.478578",
+    "report_generated": false
+  },
+  {
+    "question": "Can CapabilityOwners.Remove leave dangling owner entries due to slice manipulation bugs? types.go:63-73",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c6e82d1-058e-4851-99a9-e0748620443f",
+    "timestamp": "2025-11-21 09:26:04.644617",
+    "report_generated": false
+  },
+  {
+    "question": "Can race conditions in addOwner allow two modules to co-claim the same capability? keeper.go:453-467",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_de40112c-277a-4d4c-a4a1-86943acd7547",
+    "timestamp": "2025-11-21 09:26:27.904258",
+    "report_generated": false
+  },
+  {
+    "question": "Can LookupModules return owners in non-deterministic order, breaking IBC consensus? keeper.go:431-451",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6c806ec-55c3-46ca-86c4-9b0c9109d768",
+    "timestamp": "2025-11-21 09:26:52.219710",
+    "report_generated": false
+  },
+  {
+    "question": "Does reopening IBC channels reuse old capability indices, enabling replay or capability confusion? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80945a31-1821-4780-8d70-e4e9c022c749",
+    "timestamp": "2025-11-21 09:27:17.826226",
+    "report_generated": false
+  },
+  {
+    "question": "Can capability index prediction lead to pre-claiming via race conditions? keeper.go:245-246",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ce212922-9f03-43e3-bab9-415a883258aa",
+    "timestamp": "2025-11-21 09:27:44.869142",
+    "report_generated": false
+  },
+  {
+    "question": "Do IBC callbacks panics occur if accessing capabilities deleted from capMap? keeper.go:345-349",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff7e4aad-1bce-4cde-bc82-057a00018b24",
+    "timestamp": "2025-11-21 09:28:13.989987",
+    "report_generated": false
+  },
+  {
+    "question": "Can modules authenticate capabilities owned by others due to insufficient ownership checks? keeper.go:275-280",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_26523402-790d-4931-878e-23a0533ef732",
+    "timestamp": "2025-11-21 09:28:43.542297",
+    "report_generated": false
+  },
+  {
+    "question": "Can cloning capability structs bypass authentication since capability identity relies on pointer address? types.go:14-16",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b30bd25a-1b6b-4703-b1d4-54bb748055bc",
+    "timestamp": "2025-11-21 09:29:14.491142",
+    "report_generated": false
+  },
+  {
+    "question": "Can differing genesis imports lead to mismatched capability indices across nodes during IBC handshake? genesis.go:25-46",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6bc9eb74-2b1c-4f85-be2c-15664c0cba51",
+    "timestamp": "2025-11-21 09:29:46.334182",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitGenesis prevent imported indices from overlapping with existing ones? genesis.go:11-22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c78b6c27-ad20-4152-a231-d66847b86d9c",
+    "timestamp": "2025-11-21 09:30:19.345245",
+    "report_generated": false
+  },
+  {
+    "question": "Can ExportGenesis skip indices greater than the current global index producing inconsistent state? genesis.go:25-46",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a73b579-839f-4be0-a095-cee7b35f8807",
+    "timestamp": "2025-11-21 09:30:53.385902",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious genesis states assign different owner sets to the same index across nodes? genesis.go:11-22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6943130a-c30a-4167-8aac-5c00f2c6eb5f",
+    "timestamp": "2025-11-21 09:31:26.869244",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module correctly handle capability migration during IBC upgrades? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_398ae9c5-fb4d-4e3c-9c53-3cd51106ad25",
+    "timestamp": "2025-11-21 09:32:00.124615",
+    "report_generated": false
+  },
+  {
+    "question": "Can leaked capability pointers allow other modules to steal capabilities via ClaimCapability? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_823c0d7d-6b02-44d4-b2c3-61356b43d41b",
+    "timestamp": "2025-11-21 09:32:34.645964",
+    "report_generated": false
+  },
+  {
+    "question": "Can passing capabilities through middleware layers allow accidental double-claiming? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0ced941c-dd4b-4db2-8947-0306f8a2a389",
+    "timestamp": "2025-11-21 09:33:09.703298",
+    "report_generated": false
+  },
+  {
+    "question": "Can AuthenticateCapability validate names across namespaces incorrectly? keeper.go:275-280",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e4d7769c-4350-4773-b5dc-ecae9e935e9b",
+    "timestamp": "2025-11-21 09:33:44.679566",
+    "report_generated": false
   }
 ]
