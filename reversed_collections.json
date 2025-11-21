@@ -6748,5 +6748,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_267a472a-baa3-423d-9f4f-d7b3f82c3c5e",
     "timestamp": "2025-11-21 15:19:13.478027",
     "report_generated": false
+  },
+  {
+    "question": "Does the tx config's encoder handle nil transactions safely in gentx.go:246-249?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a90e303c-5264-485c-bbbe-af30231eb629",
+    "timestamp": "2025-11-21 15:20:28.604320",
+    "report_generated": false
+  },
+  {
+    "question": "Can the transaction hash computed in gentx.go:113 differ across nodes due to non-deterministic encoding?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b373ca3-6af0-4559-a974-c30043a6b955",
+    "timestamp": "2025-11-21 15:20:41.807716",
+    "report_generated": false
+  },
+  {
+    "question": "Does TxJSONDecoder properly validate transaction structure before returning in collect.go:116-118?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c664f00c-abb6-4d49-9a15-9d3b17b4ba53",
+    "timestamp": "2025-11-21 15:20:55.218153",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit differences in transaction decoding between JSON and protobuf to cause consensus divergence in gentx.go:103-106?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f1afcfef-c955-416d-89fa-cc0b405c94d3",
+    "timestamp": "2025-11-21 15:21:09.208397",
+    "report_generated": false
+  },
+  {
+    "question": "Does the transaction encoder in gentx.go:28-31 ensure deterministic byte representation across different SDK versions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f35c0091-c959-4cb9-8723-48ce88684a72",
+    "timestamp": "2025-11-21 15:21:24.181534",
+    "report_generated": false
+  },
+  {
+    "question": "Can malformed UTF-8 in genesis JSON cause parsing errors that differ across nodes in genesis_state.go:73-75?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b7e64366-808b-45c8-b392-d2bdbee5c055",
+    "timestamp": "2025-11-21 15:21:40.087897",
+    "report_generated": false
+  },
+  {
+    "question": "Does MustUnmarshalJSON in genesis_state.go:52 provide proper error context before panicking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_27b9793f-5444-4658-ace5-693a292cd3ad",
+    "timestamp": "2025-11-21 15:21:57.776690",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft a genesis state JSON with duplicate keys to cause non-deterministic parsing in collect.go:78-80?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_41fa6fbb-24f8-4760-91a0-1ecb6013fc4d",
+    "timestamp": "2025-11-21 15:22:17.430298",
+    "report_generated": false
+  },
+  {
+    "question": "Does the JSON decoder in gentx.go:28-31 properly handle extremely large JSON inputs that could cause memory exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_168e3cbe-8bc5-4902-a5c1-b8d151d23eed",
+    "timestamp": "2025-11-21 15:22:37.993962",
+    "report_generated": false
+  },
+  {
+    "question": "Can UnmarshalJSON operations in module.go:49-51 be exploited with deeply nested JSON to cause stack overflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a7d2cc87-f1a6-4601-8b22-f7fd58c34147",
+    "timestamp": "2025-11-21 15:23:00.274670",
+    "report_generated": false
+  },
+  {
+    "question": "Does the validator set initialization properly respect max validator limits from consensus parameters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_193b1b23-feb3-46d7-b2d9-21336952b1dc",
+    "timestamp": "2025-11-21 15:23:23.521978",
+    "report_generated": false
+  },
+  {
+    "question": "Can the genesis doc's ConsensusParams be manipulated to bypass security checks in other modules during initialization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3848a696-9acc-4847-aa7b-979e6773776c",
+    "timestamp": "2025-11-21 15:23:48.280080",
+    "report_generated": false
+  },
+  {
+    "question": "Does the evidence max bytes warning in migrate.go:78-82 properly alert operators to potentially dangerous configurations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3f7a53c3-52d5-4635-a856-b55c48e7af53",
+    "timestamp": "2025-11-21 15:24:14.371254",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker include malicious consensus parameters in the genesis doc that cause chain performance degradation or DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_98c96851-1b51-4588-8d70-de1773e265c3",
+    "timestamp": "2025-11-21 15:24:41.230933",
+    "report_generated": false
+  },
+  {
+    "question": "Does the genesis validation check consensus parameters for reasonable values in ValidateAndComplete, preventing chain halt from misconfigured parameters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bdd00951-bec7-4f84-b72f-61fb41f9a339",
+    "timestamp": "2025-11-21 15:25:09.552376",
+    "report_generated": false
+  },
+  {
+    "question": "Does the public key extraction in utils.go:89-97 properly handle errors from the validator key file, preventing nil pointer dereferences?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9576118e-3b84-42e3-b683-3d84c6c88244",
+    "timestamp": "2025-11-21 15:25:39.355156",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the file PV loading in utils.go:82-87 to reuse validator keys across multiple nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9b24157a-e34b-4b19-b9d9-bc1d582674df",
+    "timestamp": "2025-11-21 15:26:09.648815",
+    "report_generated": false
+  },
+  {
+    "question": "Does LoadOrGenNodeKeyID ensure that node keys are generated with sufficient entropy, preventing predictable node IDs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_527b7def-4931-490d-91be-0919072f832d",
+    "timestamp": "2025-11-21 15:26:41.636751",
+    "report_generated": false
+  },
+  {
+    "question": "Can the private key generation from mnemonic in utils.go:85-87 be exploited by providing a weak or predictable mnemonic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f498d00a-f8d1-4e1c-9ccf-78025b32e9ea",
+    "timestamp": "2025-11-21 15:27:13.843852",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitializeNodeValidatorFiles in utils.go:53-55 properly check for existing validator keys before overwriting them?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a5bea961-f22a-4704-b6f9-75d6697949b1",
+    "timestamp": "2025-11-21 15:27:46.231511",
+    "report_generated": false
+  },
+  {
+    "question": "Can the migration map in migrate.go:26-29 be manipulated by an attacker to inject malicious migration logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0110d5f5-75bf-4122-8ba0-7912b6d8c054",
+    "timestamp": "2025-11-21 15:28:19.840975",
+    "report_generated": false
+  },
+  {
+    "question": "Does the JSON sorting in migrate.go:124-127 ensure deterministic output across different node implementations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9b7c1723-cbfe-4bfa-b173-a2739b269ec1",
+    "timestamp": "2025-11-21 15:28:54.430349",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause the migration to fail silently by providing a genesis file that partially migrates in migrate.go:84-87?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_25e31628-2c59-45ec-96fc-b9e3f03a0d09",
+    "timestamp": "2025-11-21 15:29:29.110536",
+    "report_generated": false
+  },
+  {
+    "question": "Does the genesis time override in migrate.go:102-112 properly validate that the new time is sensible, preventing backdating or future-dating attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d858e52e-d06c-43e3-a319-f4e3f60adcc3",
+    "timestamp": "2025-11-21 15:30:04.652077",
+    "report_generated": false
+  },
+  {
+    "question": "Can the migration callback in migrate.go:89-95 be exploited if a custom migration function introduces non-deterministic state changes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b364614f-4b15-4ee8-9e73-882c39c1106d",
+    "timestamp": "2025-11-21 15:30:40.786235",
+    "report_generated": false
   }
 ]
