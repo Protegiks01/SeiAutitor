@@ -7798,5 +7798,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a82a11ec-3e3f-42d5-bb41-9cbc8b73a5d3",
     "timestamp": "2025-11-21 15:29:55.393478",
     "report_generated": false
+  },
+  {
+    "question": "Vote Power Calculation Overflow: In BeginBlocker at abci.go:19-25 , the previousTotalPower and sumPreviousPrecommitPower are accumulated using int64. Can an attacker submit vote information that causes integer overflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aa267fc5-0db5-4d7b-af6b-213d5cbff402",
+    "timestamp": "2025-11-21 15:31:13.854199",
+    "report_generated": false
+  },
+  {
+    "question": "Proposer Address Validation: In BeginBlocker at abci.go:35-36 , the proposer address from req.Header.ProposerAddress is stored without validation. Can a malformed ABCI message inject an invalid proposer address?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1988f2d-1d12-4efc-9f54-8c991bf50d8f",
+    "timestamp": "2025-11-21 15:31:27.083562",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Transfer Panic: In AllocateTokens at allocation.go:30-33 , the SendCoinsFromModuleToModule call panics on error. Can an attacker create conditions (e.g., insufficient module balance) that trigger this panic and halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7a4b6a3b-3509-4b51-894b-0e67f4406a63",
+    "timestamp": "2025-11-21 15:31:41.237204",
+    "report_generated": false
+  },
+  {
+    "question": "Reward Calculation Precision Loss: In AllocateTokens at allocation.go:45-51 , the proposer reward uses MulDecTruncate. Can repeated truncation over many blocks lead to significant reward loss for proposers?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_faa4da93-2a7b-4881-80c9-ae45ce18fcce",
+    "timestamp": "2025-11-21 15:31:55.244398",
+    "report_generated": false
+  },
+  {
+    "question": "Vote Multiplier Negative Result: In AllocateTokens at allocation.go:82-84 , voteMultiplier = OneDec - proposerMultiplier - communityTax. If parameters are misconfigured, can this result go negative, causing a panic in subsequent operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0ea6bc38-807e-4db1-99d1-08a03f0d45d5",
+    "timestamp": "2025-11-21 15:32:10.315307",
+    "report_generated": false
+  },
+  {
+    "question": "Unbounded Vote Loop DoS: In AllocateTokens at allocation.go:91-102 , the loop over bondedVotes has no gas metering comment. Can an attacker flood the validator set to make this loop computationally expensive and slow block processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b2b7a737-d1f7-49db-96d8-1e1c25602e1a",
+    "timestamp": "2025-11-21 15:32:26.261683",
+    "report_generated": false
+  },
+  {
+    "question": "Reward Remainder Accumulation: In AllocateTokens at allocation.go:104-106 , remaining fees after allocation go to the community pool. Can attackers manipulate the remaining value to systematically drain validator rewards into the community pool?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_18e9867e-d6d9-441a-9796-dc800a317acb",
+    "timestamp": "2025-11-21 15:32:44.052795",
+    "report_generated": false
+  },
+  {
+    "question": "Previous Proposer Not Set Panic: In GetPreviousProposerConsAddr at store.go:67-76 , it panics if the previous proposer is not set. Can this panic be triggered in the first block after genesis or chain restart?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_92d6b5e6-373b-4f8b-8a54-0fccd2e9a44d",
+    "timestamp": "2025-11-21 15:33:03.594660",
+    "report_generated": false
+  },
+  {
+    "question": "Validator Not Found in Loop: In AllocateTokens at allocation.go:91-100 , if ValidatorByConsAddr returns nil for a vote, the code continues silently. Can this lead to vote power not being rewarded, breaking the invariant that all voting power receives rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a52735f4-08df-4fa0-848a-fa5b024cdab4",
+    "timestamp": "2025-11-21 15:33:24.817773",
+    "report_generated": false
+  },
+  {
+    "question": "Commission Calculation Overflow: In AllocateTokensToValidator at allocation.go:111-146 , commission is calculated as tokens.MulDec(val.GetCommission()). Can a validator with 100% commission rate cause the shared tokens to become zero or negative?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_46a9d962-ec14-4b53-a0d9-9febec930aa1",
+    "timestamp": "2025-11-21 15:33:46.588104",
+    "report_generated": false
+  },
+  {
+    "question": "Block Height Check Bypass: In BeginBlocker at abci.go:29-32 , allocation only happens if ctx.BlockHeight() > 1. Can this be exploited to skip reward distribution in specific edge cases (e.g., chain fork at height 1)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7111b394-d3e7-4b64-8a40-cf1aa9ed2e70",
+    "timestamp": "2025-11-21 15:34:09.605396",
+    "report_generated": false
+  },
+  {
+    "question": "Outstanding Rewards Overflow: In AllocateTokensToValidator at allocation.go:143-145 , outstanding rewards are added without checking for overflow. Can an attacker repeatedly trigger reward allocation to overflow outstanding.Rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6c0cb8d6-bed9-4aad-ba85-94cb0c0f7ad3",
+    "timestamp": "2025-11-21 15:34:33.753762",
+    "report_generated": false
+  },
+  {
+    "question": "NonNegativeOutstandingInvariant Bypass: The NonNegativeOutstandingInvariant at invariants.go:43-62 checks for negative outstanding rewards. Can an attacker craft a sequence of withdrawals and slashing events that temporarily make outstanding rewards negative between blocks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ae62c28f-ccf7-46c0-99a6-d4a026433858",
+    "timestamp": "2025-11-21 15:34:59.132633",
+    "report_generated": false
+  },
+  {
+    "question": "ModuleAccountInvariant Mismatch: The ModuleAccountInvariant at invariants.go:138-162 checks that module balance equals outstanding rewards plus community pool. Can an attacker send coins directly to the distribution module account to break this invariant?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd005ac8-e186-45e0-a401-ea8c4c6f8641",
+    "timestamp": "2025-11-21 15:35:25.586410",
+    "report_generated": false
+  },
+  {
+    "question": "CanWithdrawInvariant Cache Pollution: In CanWithdrawInvariant at invariants.go:65-104 , a cache context is used. Can the withdrawal simulation in this invariant have side effects that affect the actual state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1b4d0eb8-38b2-4d14-a932-51ca99967ec0",
+    "timestamp": "2025-11-21 15:35:54.249583",
+    "report_generated": false
+  },
+  {
+    "question": "ReferenceCountInvariant Desync: The ReferenceCountInvariant at invariants.go:107-134 expects valCount + len(dels) + slashCount historical records. Can creating/deleting delegations rapidly cause this count to desync?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_39540634-e725-4103-b6a7-2d83418e5d0f",
+    "timestamp": "2025-11-21 15:36:23.145752",
+    "report_generated": false
+  },
+  {
+    "question": "Negative Remainder After Withdrawal: In CanWithdrawInvariant at invariants.go:92-102 , if remaining[0].Amount.IsNegative(), the invariant breaks. Can specific slash event timing cause this during normal operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8465f62f-1dbf-4321-b98b-6c1796297c8e",
+    "timestamp": "2025-11-21 15:36:53.310198",
+    "report_generated": false
+  },
+  {
+    "question": "Outstanding Rewards Underflow: In withdrawDelegationRewards at delegation.go:178 , outstanding rewards are reduced with Sub(rewards). Can precision errors cause outstanding to become smaller than rewards, leading to underflow panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5e9f4843-3cc4-4a63-bac5-c1d0361d2b1f",
+    "timestamp": "2025-11-21 15:37:24.616089",
+    "report_generated": false
+  },
+  {
+    "question": "Community Pool Negative Balance: In DistributeFromFeePool at fee_pool.go:11-21 , SafeSub is used to prevent negative community pool. But can multiple concurrent governance proposals drain the pool faster than checks can prevent?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01e52bc6-164e-4a8d-890f-e5bc46873125",
+    "timestamp": "2025-11-21 15:37:57.861159",
+    "report_generated": false
+  },
+  {
+    "question": "Historical Rewards Reference Count Leak: In incrementReferenceCount at validator.go:67-74 , it panics if ReferenceCount > 2. Can a bug in delegation/undelegation logic cause reference counts to leak and eventually trigger this panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_14773354-5a8d-4086-8b47-7b0b83caafad",
+    "timestamp": "2025-11-21 15:38:31.282629",
+    "report_generated": false
+  },
+  {
+    "question": "Slash Event Missing: In CalculateDelegationRewards at delegation.go:79-92 , slash events are iterated between heights. Can a validator be slashed without a corresponding slash event being recorded, causing incorrect reward calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a571e8ff-4854-431d-b841-41985d8f7d1d",
+    "timestamp": "2025-11-21 15:39:06.166590",
+    "report_generated": false
+  },
+  {
+    "question": "Stake Calculation Inconsistency: In CalculateDelegationRewards at delegation.go:101-130 , there's a margin of error check for stake calculations. Can an attacker exploit rounding to withdraw more rewards than entitled?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c72e2716-8c0a-4c9c-93a3-c3cf0635c341",
+    "timestamp": "2025-11-21 15:39:41.619685",
+    "report_generated": false
+  },
+  {
+    "question": "Zero Token Validator Edge Case: In IncrementValidatorPeriod at validator.go:34-45 , when validator has zero tokens, rewards go to community pool. Can an attacker repeatedly manipulate validator token count to drain rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4068322f-98ee-4627-a1ee-c2ce616d4d85",
+    "timestamp": "2025-11-21 15:40:19.163497",
+    "report_generated": false
+  },
+  {
+    "question": "Period Increment Race: In IncrementValidatorPeriod at validator.go:28-63 , the period is incremented. Can concurrent transactions cause period increments to be missed or duplicated?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_031619ac-8965-4075-b963-1bc073d73b27",
+    "timestamp": "2025-11-21 15:40:54.509542",
+    "report_generated": false
+  },
+  {
+    "question": "Cumulative Reward Ratio Negative: In calculateDelegationRewardsBetween at delegation.go:43-48 , it panics on negative rewards. Can historical reward manipulation cause this panic during normal withdrawals?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f9b08012-ff06-4078-a4b6-bb0b381f9027",
+    "timestamp": "2025-11-21 15:41:31.134490",
+    "report_generated": false
   }
 ]
