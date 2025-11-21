@@ -4198,5 +4198,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_19928aa5-8c6a-4d21-b9bd-b3ce9bb00993",
     "timestamp": "2025-11-21 11:58:56.757586",
     "report_generated": false
+  },
+  {
+    "question": "Is the validator set hash computed deterministically across all nodes, or could map iteration order cause hash mismatches?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a254b380-ce45-47a6-b1bf-01f3cf0ac77b",
+    "timestamp": "2025-11-21 12:00:11.412261",
+    "report_generated": false
+  },
+  {
+    "question": "Could non-sequential block heights (gaps or decrements) bypass validation and corrupt the block index?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e76bc1ef-785d-46d2-a8c8-d94d7b6f477d",
+    "timestamp": "2025-11-21 12:00:24.810704",
+    "report_generated": false
+  },
+  {
+    "question": "Does the LastCommitInfo processing verify all commit signatures against the validator set, or could forged signatures be accepted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c3ab1b2-0af5-4bd0-a12c-03f5387bc08e",
+    "timestamp": "2025-11-21 12:00:38.865403",
+    "report_generated": false
+  },
+  {
+    "question": "If the chain implements CometBFT vote extensions, are they properly validated in BeginBlock to prevent malicious validators from including arbitrary data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_79b97388-e594-4f20-acef-bab5cdc3a981",
+    "timestamp": "2025-11-21 12:00:53.298162",
+    "report_generated": false
+  },
+  {
+    "question": "When operations return errors in simulation, they're logged but execution continues - could this hide cascading failures that would halt production chains?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_33dde4f4-6dd7-4a40-9b30-921174b1fe93",
+    "timestamp": "2025-11-21 12:01:09.042967",
+    "report_generated": false
+  },
+  {
+    "question": "If the DummyLogWriter at log.go:71-78 is used in production (testingmode=false), could critical errors be silently ignored?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ec8725e-8689-4c0e-8e9a-f66fcb1db4da",
+    "timestamp": "2025-11-21 12:01:26.438087",
+    "report_generated": false
+  },
+  {
+    "question": "When params are exported at a specific height in simulate.go:223-225, could mid-block exports capture inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9036499d-c090-4f74-8b3b-82ac99107848",
+    "timestamp": "2025-11-21 12:01:43.946490",
+    "report_generated": false
+  },
+  {
+    "question": "The ValidatorUpdates from FinalizeBlock at simulate.go:193-220 are applied - are these updates validated for correctness (e.g., power limits, key format)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b6438190-154c-4cd1-b7d0-f90d13f06b40",
+    "timestamp": "2025-11-21 12:02:03.300463",
+    "report_generated": false
+  },
+  {
+    "question": "The initial liveness weightings in params.go:83 use random values - could extreme weightings (e.g., all validators offline) prevent chain start?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5973a11b-1ee2-4e22-bcef-df9849b27366",
+    "timestamp": "2025-11-21 12:02:25.823478",
+    "report_generated": false
+  },
+  {
+    "question": "If two simulations use the same seed but different block parameters, could state diverge in unexpected ways that aren't caught by determinism tests?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4dc0c787-fd88-40dd-9256-24d399533c28",
+    "timestamp": "2025-11-21 12:02:48.272690",
+    "report_generated": false
+  },
+  {
+    "question": "Could weighted operations with weight=0 in operation.go:146-154 cause division by zero or infinite loops in operation selection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1392a73d-169d-4e8c-ac83-e74a00a0af88",
+    "timestamp": "2025-11-21 12:03:12.800568",
+    "report_generated": false
+  },
+  {
+    "question": "The time increments at simulate.go:195-199 use random values - is this randomness properly seeded to ensure determinism across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6cda62f7-3408-4f98-b157-056faafad22d",
+    "timestamp": "2025-11-21 12:03:36.858335",
+    "report_generated": false
+  },
+  {
+    "question": "In mock_tendermint.go:193-196, TotalVotingPower is summed - could this sum overflow with extremely high validator counts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b7ccb0d4-c4df-4134-8a19-0b39110ae047",
+    "timestamp": "2025-11-21 12:04:02.168997",
+    "report_generated": false
+  },
+  {
+    "question": "The check at simulate.go:207-211 stops simulation if proposer is nil - could production chains also halt if all validators unbond simultaneously?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8a730a90-d024-489d-812c-fc9ad7defef3",
+    "timestamp": "2025-11-21 12:04:29.406736",
+    "report_generated": false
+  },
+  {
+    "question": "In mock_tendermint.go:129-164, the voteInfos slice is pre-allocated - could mismatched lengths between validators and votes cause panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5939f329-47ae-4555-b3bc-b9c219e73e37",
+    "timestamp": "2025-11-21 12:04:56.752669",
+    "report_generated": false
+  },
+  {
+    "question": "The Order field in operation.go:23 is int64 - could integer overflow in long-running chains corrupt the operation sequence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_43290fb7-0747-4f82-9d29-446d3067673e",
+    "timestamp": "2025-11-21 12:05:26.326391",
+    "report_generated": false
+  },
+  {
+    "question": "The conditional app.Commit() at simulate.go:203-205 depends on config.Commit - could partial commits during simulation mask consensus bugs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_74726d1e-bf21-43cd-9b06-7d1b614a7b7f",
+    "timestamp": "2025-11-21 12:05:56.878383",
+    "report_generated": false
+  },
+  {
+    "question": "When updating validators in mock_tendermint.go:90-112, power=0 removes validators - could rapid power oscillations cause validator set instability?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cbba962e-e957-487b-92bb-7795cea080b8",
+    "timestamp": "2025-11-21 12:06:27.684762",
+    "report_generated": false
+  },
+  {
+    "question": "The pastVoteInfos array in simulate.go:168-169 grows unbounded - could this cause memory exhaustion in long-running simulations or production chains storing vote history?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a023e385-ef93-4de0-ba84-8de375951be7",
+    "timestamp": "2025-11-21 12:06:59.574775",
+    "report_generated": false
+  },
+  {
+    "question": "The header in simulate.go:108-113 is manually constructed - could incorrect ChainID, Height, or Time values bypass validation in real chains?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cc1fca93-ed56-491b-bf84-25fb12e43d90",
+    "timestamp": "2025-11-21 12:07:33.826512",
+    "report_generated": false
+  },
+  {
+    "question": "Operation messages include a Comment field - could excessively long comments in operation.go:21-25 cause memory exhaustion when logged?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0e48dd1-dc1b-4216-964d-c6ee10df750f",
+    "timestamp": "2025-11-21 12:08:09.332575",
+    "report_generated": false
+  },
+  {
+    "question": "Does the SpendableCoins call in util.go:83 account for locked, vesting, or delegated coins correctly, or could simulation allow spending of locked funds?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c306cb6a-e09c-4c9c-82e0-e3be100c6897",
+    "timestamp": "2025-11-21 12:08:45.379356",
+    "report_generated": false
+  },
+  {
+    "question": "The AccountKeeper interface in expected_keepers.go:8-11 only requires GetAccount - could this minimal interface miss validation that production keepers perform?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_08104210-b116-4754-8bba-337dda89fa97",
+    "timestamp": "2025-11-21 12:09:23.778995",
+    "report_generated": false
+  },
+  {
+    "question": "The GenAndDeliverTx at util.go:101-125 returns NoOpMsg on error - could suppressing errors hide critical bugs that should halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_14570c7e-64ff-4fa4-b43a-15da5747f1fc",
+    "timestamp": "2025-11-21 12:10:00.865848",
+    "report_generated": false
+  },
+  {
+    "question": "In util.go:81-98, does the SafeSub operation properly handle all overflow scenarios, or could crafted CoinsSpentInMsg cause negative balances?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c616c225-6f47-410c-aa37-88b033f07880",
+    "timestamp": "2025-11-21 12:10:39.931193",
+    "report_generated": false
   }
 ]
