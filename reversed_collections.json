@@ -5848,5 +5848,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd66a2e2-a261-4420-a672-abbc410f7147",
     "timestamp": "2025-11-21 14:08:14.417108",
     "report_generated": false
+  },
+  {
+    "question": "InflationRateChange Zero: Can InflationRateChange be set to exactly zero, freezing inflation at current rate permanently? params.go:120-134",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_10f4e190-3b9d-49e4-a186-f8b73f5eb519",
+    "timestamp": "2025-11-21 14:09:21.138575",
+    "report_generated": false
+  },
+  {
+    "question": "Param Validation Type Safety: Are all param validation functions type-safe and cannot panic on unexpected input types? params.go:104-195",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_29f12ea3-7758-47ea-904f-e3d0a09bf47f",
+    "timestamp": "2025-11-21 14:09:34.645093",
+    "report_generated": false
+  },
+  {
+    "question": "Cross-Module Param Dependencies: Do parameter changes in x/mint consider dependencies with x/staking, x/bank, and x/distribution? params.go:29-41",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cdc76608-730f-4e6c-a60b-b33363ba3587",
+    "timestamp": "2025-11-21 14:09:49.158288",
+    "report_generated": false
+  },
+  {
+    "question": "Parameter Reversion Attack: Can an attacker rapidly change and revert parameters to exploit calculation inconsistencies? keeper.go:78-81",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f78848c-b6a0-4b00-bc23-593b8fa04a17",
+    "timestamp": "2025-11-21 14:10:03.381154",
+    "report_generated": false
+  },
+  {
+    "question": "MintDenom Change Impact: If MintDenom is changed via governance, does this properly handle existing minter state and supply tracking? params.go:104-117",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9f4cd834-4c73-41bf-9e50-f92dd9461db1",
+    "timestamp": "2025-11-21 14:10:18.428501",
+    "report_generated": false
+  },
+  {
+    "question": "Governance Proposal Spam: Can an attacker spam parameter change proposals to cause state bloat or validator processing overhead? params.go:93-102",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c3e33ef8-78b3-47f0-91da-b8e0d497fe9e",
+    "timestamp": "2025-11-21 14:10:34.825182",
+    "report_generated": false
+  },
+  {
+    "question": "DefaultParams Safety: Are the default parameters safe against all known attack vectors and edge cases? params.go:44-53",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9f0b798a-e338-467a-a476-317b1c9c765a",
+    "timestamp": "2025-11-21 14:10:52.351657",
+    "report_generated": false
+  },
+  {
+    "question": "SetParams Without Validation: Does SetParams enforce validation, or can invalid parameters be set directly through keeper access? keeper.go:78-81",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9e03190a-52fe-4325-8f80-543df5e066ea",
+    "timestamp": "2025-11-21 14:11:11.918359",
+    "report_generated": false
+  },
+  {
+    "question": "Subspace GetParamSet Safety: Is GetParamSet safe against concurrent access or state corruption during BeginBlocker? keeper.go:73-76",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1fe2468b-e5f6-49b1-8a6a-53ecea924d93",
+    "timestamp": "2025-11-21 14:11:32.587567",
+    "report_generated": false
+  },
+  {
+    "question": "Invalid Param Type Cast: Can an attacker submit a governance proposal with incorrectly typed parameters that bypass validation? params.go:104-117",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e58f2a58-5655-4d89-8cf6-49472a476ca9",
+    "timestamp": "2025-11-21 14:11:55.541888",
+    "report_generated": false
+  },
+  {
+    "question": "Params.Validate Edge Case: Does Params.Validate() check all necessary invariants, or are there parameter combinations that pass validation but break functionality? params.go:56-83",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_10666835-e05e-4785-be7c-d8f44506d9fb",
+    "timestamp": "2025-11-21 14:12:19.836172",
+    "report_generated": false
+  },
+  {
+    "question": "ParamSetPairs Validation Bypass: Do all param changes go through the validation functions, or is there a path to bypass validation? params.go:93-102",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a42d4529-36c0-4ed2-a648-d23ff86e173c",
+    "timestamp": "2025-11-21 14:12:45.258438",
+    "report_generated": false
+  },
+  {
+    "question": "Param Change Race Conditions: Can rapid parameter changes through governance create inconsistent state in minting calculations? keeper.go:78-81",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f6767859-4739-4d38-9f05-80a246ddee35",
+    "timestamp": "2025-11-21 14:13:12.632692",
+    "report_generated": false
+  },
+  {
+    "question": "BlocksPerYear Extremely High: Can extremely high BlocksPerYear values cause per-block minting to become negligible or zero? params.go:190-193",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5b817ae9-a0f2-487a-9e8d-c02d6e5d05a0",
+    "timestamp": "2025-11-21 14:13:41.362193",
+    "report_generated": false
+  },
+  {
+    "question": "BlocksPerYear Extremely Low: Can BlocksPerYear be set to very low values (e.g., 1) causing excessive per-block minting? params.go:190-193",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_60bfcd24-2b26-42f7-94f4-22b1013417e9",
+    "timestamp": "2025-11-21 14:14:10.307389",
+    "report_generated": false
+  },
+  {
+    "question": "BlocksPerYear Zero: Is BlocksPerYear validation sufficient to prevent zero values that would cause division errors? params.go:190-193",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9a505c1-4b86-40b5-ae36-6813ea40d7a8",
+    "timestamp": "2025-11-21 14:14:40.455329",
+    "report_generated": false
+  },
+  {
+    "question": "GoalBonded Above One: Is GoalBonded properly limited to values ≤ 1.0, or could values > 1 cause unexpected inflation behavior? params.go:177-179",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3fa8e588-326a-4e1e-b30b-71baf284b780",
+    "timestamp": "2025-11-21 14:15:10.869446",
+    "report_generated": false
+  },
+  {
+    "question": "GoalBonded Zero or Negative: Can GoalBonded be set to zero or negative, causing division by zero in inflation calculations? params.go:174-176",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_088b7a2b-dfcb-4ce7-af96-548c7887a268",
+    "timestamp": "2025-11-21 14:15:42.491920",
+    "report_generated": false
+  },
+  {
+    "question": "InflationMin Negative Values: Can InflationMin be set to negative values through state corruption or governance bypass? params.go:157-163",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f7d4f190-f214-4d89-976d-9c1007f2498d",
+    "timestamp": "2025-11-21 14:16:15.876270",
+    "report_generated": false
+  },
+  {
+    "question": "InflationMax Greater Than One: Does validation prevent InflationMax from being set above 100% (1.0), which would mint excessive tokens? params.go:142-148",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_70516131-0098-459b-8aea-215615d94e5d",
+    "timestamp": "2025-11-21 14:16:49.021390",
+    "report_generated": false
+  },
+  {
+    "question": "Negative InflationRateChange: Although checked, can a governance proposal bypass validation and set negative InflationRateChange? params.go:126-128",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_44100f78-0ec6-4bfb-b609-7e8ccd00613f",
+    "timestamp": "2025-11-21 14:17:22.998264",
+    "report_generated": false
+  },
+  {
+    "question": "InflationRateChange Greater Than One: Is there proper validation that InflationRateChange cannot exceed 1.0, preventing excessive inflation swings? params.go:126-131",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4c09e994-1225-4a1c-830b-8c9671d85601",
+    "timestamp": "2025-11-21 14:17:58.069119",
+    "report_generated": false
+  },
+  {
+    "question": "MintDenom Invalid Characters: Does the denom validation properly reject invalid characters that could cause issues in other modules? params.go:113-115",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_64a5208f-d5ba-4111-bb80-9e8e5b8ebcfc",
+    "timestamp": "2025-11-21 14:18:32.583740",
+    "report_generated": false
+  },
+  {
+    "question": "MintDenom Empty String: Can the MintDenom parameter be set to an empty string through governance, bypassing validation? params.go:110-117",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_216f4c09-d546-4ca8-9ce5-6d7070153aec",
+    "timestamp": "2025-11-21 14:19:08.225089",
+    "report_generated": false
+  },
+  {
+    "question": "BondedRatio Calculation Consistency: Is the BondedRatio calculation in the staking keeper deterministic and consistent across all validators? keeper.go:91-93",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3975cd63-0b77-48b1-bbf8-8e1e7c464122",
+    "timestamp": "2025-11-21 14:19:42.417887",
+    "report_generated": false
   }
 ]
