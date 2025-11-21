@@ -6148,5 +6148,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7e824bfb-d1ae-4987-bb25-24ecc8dd2e2b",
     "timestamp": "2025-11-21 14:31:44.097540",
     "report_generated": false
+  },
+  {
+    "question": "Staking Keeper Nil Check: Is the stakingKeeper properly validated, and could it be nil when BeginBlocker calls StakingTokenSupply or BondedRatio? keeper.go:17",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_11c3d3a1-c310-4cbf-b528-1d8c14e7fd1a",
+    "timestamp": "2025-11-21 14:33:04.154506",
+    "report_generated": false
+  },
+  {
+    "question": "Bank Keeper Nil Check: Is the bankKeeper properly validated during initialization, and could a nil bankKeeper cause BeginBlocker to panic? keeper.go:18",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9cb57f2-cb6b-4df4-b085-dcefc94900ea",
+    "timestamp": "2025-11-21 14:33:17.242299",
+    "report_generated": false
+  },
+  {
+    "question": "Param Space Uninitialized: Can BeginBlocker execute if the param space hasn't been initialized with a KeyTable, and what happens? keeper.go:34-36",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b2f6b63-d5cc-40ea-8966-10b2a2a25ee6",
+    "timestamp": "2025-11-21 14:33:31.099170",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Determinism: Is the entire BeginBlocker execution deterministic across all validators, or could differences in validator state cause consensus failures? abci.go:13-55",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_124d8bac-8907-4ac9-96fb-d54860258bee",
+    "timestamp": "2025-11-21 14:33:44.985469",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Collector Name Validation: Is the feeCollectorName validated during keeper initialization to prevent sending minted coins to an invalid or malicious module? keeper.go:19",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73a71056-2364-4f13-aae9-94a2188fe6a1",
+    "timestamp": "2025-11-21 14:33:59.568624",
+    "report_generated": false
+  },
+  {
+    "question": "Time.Now() Non-determinism: Does the BeginBlocker use time.Now() anywhere for telemetry or calculations that could cause consensus non-determinism? abci.go:4",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_377cb73a-eb0e-4491-bfe3-b8879a969b83",
+    "timestamp": "2025-11-21 14:34:16.836412",
+    "report_generated": false
+  },
+  {
+    "question": "Codec Unmarshaling Panic: Can a corrupted KV store value cause MustUnmarshal in GetMinter to panic during BeginBlocker? keeper.go:61",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_273d6a70-7e8b-4782-9b22-36c06262b7c6",
+    "timestamp": "2025-11-21 14:34:34.659589",
+    "report_generated": false
+  },
+  {
+    "question": "Store Key Collision: Is the MinterKey unique and collision-free with other module storage keys, preventing state corruption? keys.go:4",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_af3a571c-c309-4d11-9beb-411cdb643e17",
+    "timestamp": "2025-11-21 14:34:53.785518",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Missing Panic: Does the keeper initialization properly verify the mint module account exists, and could a missing account cause BeginBlocker to panic? keeper.go:28-31",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9ec1441b-e770-4b01-9c3d-dab73613eba0",
+    "timestamp": "2025-11-21 14:35:14.592019",
+    "report_generated": false
+  },
+  {
+    "question": "BlockProvision Truncation Issues: Does the BlockProvision calculation's truncation to integer cause accumulated precision loss that could be exploited over time? minter.go:77-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6824aa2a-ed28-4840-bc78-1d565851e231",
+    "timestamp": "2025-11-21 14:35:36.923959",
+    "report_generated": false
+  },
+  {
+    "question": "NextAnnualProvisions Overflow: Can the NextAnnualProvisions calculation overflow with very large totalStakingSupply values, causing BeginBlocker to panic? abci.go:24",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8de13ba7-0b90-454c-9441-5a9b65d2ebf7",
+    "timestamp": "2025-11-21 14:36:00.555414",
+    "report_generated": false
+  },
+  {
+    "question": "NextInflationRate Panic: Does the NextInflationRate calculation handle edge cases (e.g., zero GoalBonded, extreme bondedRatio values) without panicking? abci.go:23",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1198ce80-38a0-4a78-ad73-560bb63a6d45",
+    "timestamp": "2025-11-21 14:36:25.745702",
+    "report_generated": false
+  },
+  {
+    "question": "Params Retrieval Panic: Can the GetParams call in BeginBlocker panic if the param subspace is corrupted or uninitialized? abci.go:18",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4f5142ff-ea47-4b27-8d14-cb9eaab2a1be",
+    "timestamp": "2025-11-21 14:36:51.156490",
+    "report_generated": false
+  },
+  {
+    "question": "SetMinter Storage Corruption: Does the SetMinter function properly serialize the minter state, and could a corrupted minter state cause BeginBlocker to fail? keeper.go:66-70",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_36873e1e-b780-474d-bd27-f075d8c0abd0",
+    "timestamp": "2025-11-21 14:37:17.503647",
+    "report_generated": false
+  },
+  {
+    "question": "Event Emission State Corruption: Can malicious parameter values cause the event emission in BeginBlocker to corrupt state or consume excessive gas? abci.go:46-54",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7e2a6b26-0a11-47dd-812d-7c65d4869574",
+    "timestamp": "2025-11-21 14:37:44.308728",
+    "report_generated": false
+  },
+  {
+    "question": "Telemetry Int64 Overflow: Can the telemetry gauge setting cause issues if mintedCoin.Amount exceeds Int64 maximum, and could this be exploited? abci.go:42-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_806de597-7c8a-442d-8696-d57799d7d391",
+    "timestamp": "2025-11-21 14:38:13.570990",
+    "report_generated": false
+  },
+  {
+    "question": "AddCollectedFees Module Transfer Failure: What happens if the fee collector module doesn't exist or the module-to-module transfer in AddCollectedFees fails during BeginBlocker? keeper.go:108-110",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_38338cc9-073a-4265-87c4-5038e4ddd2fc",
+    "timestamp": "2025-11-21 14:38:42.773539",
+    "report_generated": false
+  },
+  {
+    "question": "Empty Coins Skip Logic: Does the MintCoins function correctly skip minting when coins are empty, and could an attacker manipulate parameters to force unnecessary minting operations? keeper.go:97-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5b94330c-ebc4-4d25-a294-a59d3c2ca5e9",
+    "timestamp": "2025-11-21 14:39:11.755545",
+    "report_generated": false
+  },
+  {
+    "question": "MintCoins Panic on Invalid Coins: If minter.BlockProvision(params) returns invalid or negative coin amounts, will k.MintCoins() panic in BeginBlocker causing chain halt? abci.go:28-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_51eda82b-a73a-4e88-a7a1-199b84a8a7bc",
+    "timestamp": "2025-11-21 14:39:41.724640",
+    "report_generated": false
+  },
+  {
+    "question": "BondedRatio Division by Zero: Does the BondedRatio() calculation in BeginBlocker handle the case where total staking supply is zero, which could cause a division by zero panic? abci.go:22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d11530f-db13-424d-b4c6-8dffc032b70a",
+    "timestamp": "2025-11-21 14:40:13.679838",
+    "report_generated": false
+  },
+  {
+    "question": "StakingTokenSupply Panic: Can the StakingTokenSupply call in BeginBlocker panic or return an error that isn't properly handled, leading to chain halt? abci.go:21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_771d1ca0-a9eb-4862-a36c-90911d3cebbe",
+    "timestamp": "2025-11-21 14:40:46.806164",
+    "report_generated": false
+  },
+  {
+    "question": "Unbounded Computation in BeginBlocker: Does the inflation calculation in BeginBlocker have any unbounded loops or computationally expensive operations that could be exploited to slow down block production? abci.go:13-25",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_902d628e-b97b-489a-aa31-7cbc261aeaf8",
+    "timestamp": "2025-11-21 14:41:21.164599",
+    "report_generated": false
+  },
+  {
+    "question": "Panic on Nil Minter: Can the GetMinter function in x/mint/keeper/keeper.go panic during BeginBlocker execution if the minter state is corrupted or missing, causing a chain halt? keeper.go:54-62",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_28e84b9d-118d-4b6d-a9bb-6944bcc02fba",
+    "timestamp": "2025-11-21 14:41:54.286364",
+    "report_generated": false
+  },
+  {
+    "question": "Chain Halt via Panic in BeginBlocker: Does the BeginBlocker function in x/mint/abci.go handle all error cases from k.MintCoins() and k.AddCollectedFees() without causing an unrecoverable panic that would halt the chain? abci.go:31-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f26c46ad-a801-4e6c-943a-c32d9a1597a7",
+    "timestamp": "2025-11-21 14:42:28.600635",
+    "report_generated": false
+  },
+  {
+    "question": "Staking Keeper Nil Check: Is the stakingKeeper properly validated, and could it be nil when BeginBlocker calls StakingTokenSupply or BondedRatio? keeper.go:17",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9846211f-58de-46d8-a471-ca7110e74a7b",
+    "timestamp": "2025-11-21 14:43:03.902505",
+    "report_generated": false
   }
 ]
