@@ -6598,5 +6598,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0275b644-665b-4bb9-be74-8b41b2acca0a",
     "timestamp": "2025-11-21 13:51:56.995670",
     "report_generated": false
+  },
+  {
+    "question": "JSON Marshaling Consistency: When marshaling authorizations to JSON for RPC responses, is the output deterministic? Can different nodes return different JSON for the same authorization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a43d4688-fe7f-416d-a691-6d0a83f39893",
+    "timestamp": "2025-11-21 13:53:04.039547",
+    "report_generated": false
+  },
+  {
+    "question": "Protobuf Version Mismatch: If authorization protobufs are updated, can old grants become unparseable, causing state access failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9088d28f-dc41-461a-92e2-36071aaf7b41",
+    "timestamp": "2025-11-21 13:53:17.104983",
+    "report_generated": false
+  },
+  {
+    "question": "Legacy Amino Support: In x/authz/msgs.go:20-23, legacy amino support is declared. Can amino encoding/decoding introduce vulnerabilities not present in protobuf?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_816b7f96-8d21-49a3-8d88-c34f4582179c",
+    "timestamp": "2025-11-21 13:53:30.609929",
+    "report_generated": false
+  },
+  {
+    "question": "UnpackInterfaces Cache: The UnpackInterfaces method caches unpacked values. Can cache poisoning cause incorrect authorizations to be used?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_faf3e735-104c-46b4-84db-34d0432565e0",
+    "timestamp": "2025-11-21 13:53:44.445192",
+    "report_generated": false
+  },
+  {
+    "question": "GetCachedValue Manipulation: When retrieving cached authorization values, can the cache be bypassed or modified to execute unauthorized messages?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a4721bd7-538e-4609-8d23-228fc1045d49",
+    "timestamp": "2025-11-21 13:53:59.229288",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Import Panic: In x/authz/keeper/keeper.go:252, genesis import can panic on invalid authorizations. Can a malicious genesis file halt chain initialization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a3737117-d082-4f40-8d48-bdc3d7ab790e",
+    "timestamp": "2025-11-21 13:54:15.311667",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Authorization Validation: Are all genesis authorizations validated for expiration, proper types, and consistency before import? Can invalid genesis state be imported?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c89ce755-0f86-4993-a5c5-398316d281ed",
+    "timestamp": "2025-11-21 13:54:32.612713",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Grant Duplication: Can the genesis file contain duplicate grants that are all imported, causing state inconsistency?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_167937ad-0cf6-44ce-ae46-0d7e17930fa5",
+    "timestamp": "2025-11-21 13:54:52.429837",
+    "report_generated": false
+  },
+  {
+    "question": "Upgrade Handler Migration: When upgrading the authz module, are existing grants properly migrated? Can the upgrade leave orphaned or corrupted grants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_14834524-2de9-4d70-8711-3099dff07f54",
+    "timestamp": "2025-11-21 13:55:13.996706",
+    "report_generated": false
+  },
+  {
+    "question": "Consensus Version Mismatch: In x/authz/module/module.go:173, consensus version is 1. If this changes, are old authorizations still compatible?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_60842208-3a11-4433-a564-40275533f53b",
+    "timestamp": "2025-11-21 13:55:37.337663",
+    "report_generated": false
+  },
+  {
+    "question": "State Export Determinism: In x/authz/keeper/keeper.go:229-243, grants are exported by iterating. Is the iteration order deterministic, or can different nodes export different genesis files?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bde95e57-ef5b-4b20-a51c-8a3f4273c612",
+    "timestamp": "2025-11-21 13:56:01.064970",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Expiration at Genesis: If genesis contains expired grants, are they immediately cleaned up or do they persist until first access?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e92f2d07-a9c3-40e3-9bed-a474ae201dbb",
+    "timestamp": "2025-11-21 13:56:25.566372",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Creation: Does the authz module create any module accounts at genesis? If so, are they properly initialized and protected?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85cadd89-5205-4ef3-bb20-68171c806166",
+    "timestamp": "2025-11-21 13:56:52.025092",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Creation Atomicity: When creating a grant in SaveGrant, if event emission fails after storage, is the transaction rolled back or does the grant persist without an event?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b28082b7-4388-448d-a80d-c0fd615b7de2",
+    "timestamp": "2025-11-21 13:57:20.203665",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Revocation by Granter: Can a granter revoke a grant while a grantee is executing it in the same block? What happens to the in-flight execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_82472dd2-6554-4b7d-8d7a-1d8bb62b64e5",
+    "timestamp": "2025-11-21 13:57:48.027006",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Expiration During Execution: If a grant expires between when it's checked and when it's executed (in the same transaction), does execution fail gracefully or cause state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a58fb5ee-451c-40b7-88cb-360103ba15b0",
+    "timestamp": "2025-11-21 13:58:17.866802",
+    "report_generated": false
+  },
+  {
+    "question": "Automatic Cleanup of Expired Grants: Expired grants are only deleted when accessed via GetCleanAuthorization. Can this lead to unbounded storage growth if grants are never accessed after expiration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_db2fa6ff-5e4d-4ffb-b4ab-5bb95448fd57",
+    "timestamp": "2025-11-21 13:58:49.609318",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Renewal Atomicity: If a granter revokes and immediately re-grants the same authorization, can race conditions cause both or neither to take effect?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_165e3d12-3a53-4886-ab33-2ee13247cc75",
+    "timestamp": "2025-11-21 13:59:21.068740",
+    "report_generated": false
+  },
+  {
+    "question": "Partial Grant Execution: If MsgExec contains multiple messages and one fails, are earlier messages' effects rolled back or do they persist?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1b52f0f7-f1b4-447a-ae77-0b3baaf355dc",
+    "timestamp": "2025-11-21 13:59:53.886752",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Update Validation: When an authorization's Accept method returns Updated, is the updated authorization validated before storage? Can invalid updated authorizations corrupt state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_31745ea8-4240-4126-807f-c9078e843899",
+    "timestamp": "2025-11-21 14:00:28.005574",
+    "report_generated": false
+  },
+  {
+    "question": "Delete Flag with Updated Field: If an authorization's Accept returns both Delete=true and Updated!=nil, which takes precedence? Can this cause undefined behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ed08408b-60c0-4c1d-a8c1-8224749f3b04",
+    "timestamp": "2025-11-21 14:01:03.553588",
+    "report_generated": false
+  },
+  {
+    "question": "KV Store Key Collisions: Can the key construction in grantStoreKey produce collisions for different (grantee, granter, msgType) tuples due to length prefix encoding?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d23b81d-3153-47bd-9ac7-b3ff01f1f494",
+    "timestamp": "2025-11-21 14:01:40.649423",
+    "report_generated": false
+  },
+  {
+    "question": "Store Iteration Consistency: When iterating grants, can concurrent modifications cause skipped or duplicate entries?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cf5bd8c7-12cb-4988-bd12-0257c92c441f",
+    "timestamp": "2025-11-21 14:02:16.976243",
+    "report_generated": false
+  },
+  {
+    "question": "Store Prefix Overlap: Can the grant key prefix overlap with keys from other modules, causing cross-module state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cfc8fad2-856f-44fd-9608-78c8f86f18dc",
+    "timestamp": "2025-11-21 14:02:54.715159",
+    "report_generated": false
+  },
+  {
+    "question": "Store Transaction Rollback: If a transaction is rolled back after modifying grants, is the grant state correctly reverted or can partial updates persist?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4fd63e08-f32f-4079-8fb5-4b70a6e3663a",
+    "timestamp": "2025-11-21 14:03:31.943761",
+    "report_generated": false
   }
 ]
