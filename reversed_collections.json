@@ -4498,5 +4498,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0ea145f6-06d9-4398-9cd6-168eff418df5",
     "timestamp": "2025-11-21 12:22:26.634751",
     "report_generated": false
+  },
+  {
+    "question": "The randomConsensusParams function in params.go:153-182 generates random consensus parameters - could malicious parameters (e.g., MaxBytes, MaxGas, EvidenceParams) be set during genesis that later cause chain halts or state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_626c71f8-6bdb-427e-b048-359b394905b8",
+    "timestamp": "2025-11-21 12:23:42.499454",
+    "report_generated": false
+  },
+  {
+    "question": "Does SimulateFromSeed in simulate.go:195-199 use only block time for all time-based operations, or could any time.Now() calls introduce non-determinism during actual chain execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c748ec62-bbe1-471c-9121-67e0848a4b13",
+    "timestamp": "2025-11-21 12:23:55.473401",
+    "report_generated": false
+  },
+  {
+    "question": "In simulate.go:74, the single PRNG is mutated throughout simulation - could an attacker craft transactions that cause different PRNG state evolution on different nodes, leading to divergent block proposals?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cacfe25d-06af-44ab-90be-cfedb8ff197e",
+    "timestamp": "2025-11-21 12:24:08.836831",
+    "report_generated": false
+  },
+  {
+    "question": "Does SimulateFromSeed in simulate.go:59-69 guarantee deterministic execution across different architectures when using the same seed, or could floating-point operations or map iteration introduce non-determinism that causes consensus splits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1d4b03d-fabb-4604-9918-82d51d003468",
+    "timestamp": "2025-11-21 12:24:23.630671",
+    "report_generated": false
+  },
+  {
+    "question": "Is there any use of goroutines or concurrency in gov module that could cause non-deterministic behavior? keeper.go:1-179",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_72a86f70-1c20-484b-871e-c9a82df7ab75",
+    "timestamp": "2025-11-21 12:24:38.667594",
+    "report_generated": false
+  },
+  {
+    "question": "Could SDK version differences affect Dec precision in tally calculations across the network? tally.go:13-125",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_548e1bb5-44c1-40f1-bd11-028af6872075",
+    "timestamp": "2025-11-21 12:24:55.836142",
+    "report_generated": false
+  },
+  {
+    "question": "Are store iterators deterministically ordered, or could database backend differences cause issues? keeper.go:133-173",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_febffc02-ba59-4d14-9b60-934fddb190a9",
+    "timestamp": "2025-11-21 12:25:13.320574",
+    "report_generated": false
+  },
+  {
+    "question": "Does the time formatting in queue keys remain consistent across different OS/architectures? keys.go:71-88",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f49bbe1f-0c4d-49e4-b81b-315087cfd802",
+    "timestamp": "2025-11-21 12:25:32.506586",
+    "report_generated": false
+  },
+  {
+    "question": "Could the cached context in proposal execution produce different results on different validators? abci.go:69-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cccfdc3a-5baa-455a-9420-b870bf2ef515",
+    "timestamp": "2025-11-21 12:25:53.864653",
+    "report_generated": false
+  },
+  {
+    "question": "Are proposal IDs assigned deterministically, or could concurrent submissions cause ID conflicts? proposal.go:42-57",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_60cce92d-a8ea-4009-a725-953ad36b40ce",
+    "timestamp": "2025-11-21 12:26:16.503357",
+    "report_generated": false
+  },
+  {
+    "question": "Does the event emission order remain deterministic across all nodes during EndBlocker? abci.go:27-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_476e0210-7e98-4f08-bdb9-be29bf64289f",
+    "timestamp": "2025-11-21 12:26:41.947084",
+    "report_generated": false
+  },
+  {
+    "question": "Could validator iteration order differ between nodes due to map iteration in tally? tally.go:74-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_02f26efa-e4bf-4e2f-88cf-f81d8f2bacb6",
+    "timestamp": "2025-11-21 12:27:06.547567",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any floating-point operations in tally computation that could cause consensus divergence? tally.go:13-125",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73cf5264-f5f1-4d19-8e36-2b10f1ba4d6b",
+    "timestamp": "2025-11-21 12:27:32.814673",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proposal queue iteration use block time consistently, or could time.Now() be used anywhere? abci.go:20-48",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f3bf1b1e-9a08-48f7-9e33-cc38b067bfee",
+    "timestamp": "2025-11-21 12:27:59.763820",
+    "report_generated": false
+  },
+  {
+    "question": "Are all store operations in the keeper properly gas-metered through the SDK's KVStore wrapper? keeper.go:1-179",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1d885cef-99e6-4827-9b9f-ee6dc9739b50",
+    "timestamp": "2025-11-21 12:28:28.410975",
+    "report_generated": false
+  },
+  {
+    "question": "Does the pagination in GetProposalsFiltered properly limit result size to prevent memory exhaustion? proposal.go:173-178",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1887504b-640d-4793-b98c-9c3726ab7a41",
+    "timestamp": "2025-11-21 12:28:58.500907",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a limit on proposal content size to prevent storage and processing DoS? proposal.go:13-70",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d0130585-a331-490b-8283-7f29259e8302",
+    "timestamp": "2025-11-21 12:29:28.916583",
+    "report_generated": false
+  },
+  {
+    "question": "Could weighted vote validation consume excessive gas with many vote options? vote.go:21-25",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0e445e18-1572-41cc-adb8-b0c65cd9f37d",
+    "timestamp": "2025-11-21 12:29:59.930019",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proposal handler execution count toward the transaction gas limit or block gas limit? abci.go:74",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_468521e3-6908-41fc-a898-813127cb9e36",
+    "timestamp": "2025-11-21 12:30:29.907837",
+    "report_generated": false
+  },
+  {
+    "question": "Is the validator iteration in IterateBondedValidatorsByPower bounded to prevent excessive gas consumption? tally.go:24-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_edd3a82c-2001-42c7-8017-65ee72098f3d",
+    "timestamp": "2025-11-21 12:31:00.797467",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker create many proposals that all expire in the same block, causing EndBlocker timeout? abci.go:20-45",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cd80ba03-13b3-49af-a1d2-aad3ae602ec2",
+    "timestamp": "2025-11-21 12:31:33.628063",
+    "report_generated": false
+  },
+  {
+    "question": "Are deposit iterations gas-metered to prevent DoS attacks through mass small deposits? deposit.go:88-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f4bfea6-d78e-42c2-b123-f3cf2326c07c",
+    "timestamp": "2025-11-21 12:32:07.050708",
+    "report_generated": false
+  },
+  {
+    "question": "Does the vote iteration in Tally have gas limits, or could processing thousands of votes cause DoS? tally.go:36-71",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e62eb07c-1a65-47fb-94fb-e6b6d8237525",
+    "timestamp": "2025-11-21 12:32:41.377653",
+    "report_generated": false
+  },
+  {
+    "question": "Is the proposal iteration in GetProposalsFiltered gas-metered to prevent DoS from filtering large proposal sets? proposal.go:146-181",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_58ed5eab-3355-4801-aa7c-13262baec5ec",
+    "timestamp": "2025-11-21 12:33:15.288636",
+    "report_generated": false
+  },
+  {
+    "question": "Can parameter proposals modify x/gov's own parameters while validation is in progress? proposal.go:23-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1943493d-27c0-4f32-aa2f-747d62bb68e6",
+    "timestamp": "2025-11-21 12:33:50.491663",
+    "report_generated": false
   }
 ]
