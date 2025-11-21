@@ -3898,5 +3898,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_418e5064-cf84-4cea-9bcf-d4bff8110916",
     "timestamp": "2025-11-21 07:24:26.994029",
     "report_generated": false
+  },
+  {
+    "question": "Can withinContractReference incorrectly force wildcard mode?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e05f0439-a374-4af2-95d0-c06cea7ad8a8",
+    "timestamp": "2025-11-21 07:25:41.928697",
+    "report_generated": false
+  },
+  {
+    "question": "Does JQ handle unordered JSON keys deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_84e9a27f-04fe-41ee-99f1-3c72cfe1359f",
+    "timestamp": "2025-11-21 07:25:55.633506",
+    "report_generated": false
+  },
+  {
+    "question": "Can UpdateResourceDependencyMappingProposal modify critical dependency mappings to introduce vulnerabilities?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e7549969-808b-4652-a9a4-2d8ac8e9eab0",
+    "timestamp": "2025-11-21 07:26:09.078450",
+    "report_generated": false
+  },
+  {
+    "question": "Does proposal handler validate all mappings atomically to avoid partial inconsistent application?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c116a5c7-9290-4170-8e49-1f15d40b5568",
+    "timestamp": "2025-11-21 07:26:23.241407",
+    "report_generated": false
+  },
+  {
+    "question": "Can proposals disable dynamic dependencies to intentionally degrade parallelism?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_02c0dbc5-fabf-4d92-885a-899ccbca0b28",
+    "timestamp": "2025-11-21 07:26:38.521881",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateAbstract gov.go:42-45 prevent malicious dependency mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca5dd1e6-6f6c-42ba-b007-2bc11757660d",
+    "timestamp": "2025-11-21 07:26:54.770597",
+    "report_generated": false
+  },
+  {
+    "question": "Does NewMsgUpdateWasmDependencyMappingProposal verify contract existence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bdf22315-1c6a-4e22-9c06-2493b800fe01",
+    "timestamp": "2025-11-21 07:27:12.798861",
+    "report_generated": false
+  },
+  {
+    "question": "Can conflicting governance proposals race and apply in different orders across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1dc4d691-10f2-418a-af2a-6bd4e3e49481",
+    "timestamp": "2025-11-21 07:27:32.591515",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBasic gov.go:79-82 detect malformed dependency mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bdd606bd-abb2-449d-9383-ab585578cb31",
+    "timestamp": "2025-11-21 07:27:54.240636",
+    "report_generated": false
+  },
+  {
+    "question": "Can proposals set empty dependency mappings causing all transactions for that type to fail?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a5e0b18-856d-4fc8-a063-21fa795d8feb",
+    "timestamp": "2025-11-21 07:28:17.067175",
+    "report_generated": false
+  },
+  {
+    "question": "Does proposal registration prevent duplicate type registration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa5bd926-3828-40a1-94a4-165f17451a5a",
+    "timestamp": "2025-11-21 07:28:40.615617",
+    "report_generated": false
+  },
+  {
+    "question": "Can extremely large mappings cause state bloat or slow loading?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_94e3d768-c280-4df1-a420-fd572667c111",
+    "timestamp": "2025-11-21 07:29:05.503926",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetResourceDependencyMapping keeper.go:91-104 enforce strict auth control?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c2b6eda1-b1e0-4308-bafa-de74efbe13cb",
+    "timestamp": "2025-11-21 07:29:31.578229",
+    "report_generated": false
+  },
+  {
+    "question": "Can proposal execution leave state partially updated on error?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bd49c1d0-afc6-4125-980f-ba8d4ebe6cbd",
+    "timestamp": "2025-11-21 07:30:00.866575",
+    "report_generated": false
+  },
+  {
+    "question": "Can proposals inject artificial dependencies forcing serialization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bcc5538c-cbea-43ed-8898-1cd0e8b93524",
+    "timestamp": "2025-11-21 07:30:31.260667",
+    "report_generated": false
+  },
+  {
+    "question": "Does MsgRegisterWasmDependency ValidateBasic check sender authority?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bf84becd-1167-41e7-98f9-57b52835dda4",
+    "timestamp": "2025-11-21 07:31:03.263435",
+    "report_generated": false
+  },
+  {
+    "question": "Can String() representations differ across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0e1eb938-2a22-48bb-a286-e7b4112834a6",
+    "timestamp": "2025-11-21 07:31:35.466019",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetResourceDependencyKey keys.go:30-32 generate collisions for different message keys?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_89d5cd96-f1b3-45ed-b579-6c2336ef603c",
+    "timestamp": "2025-11-21 07:32:09.557533",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetWasmContractAddressKey prefix encoding prevent collisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d94163b7-92aa-4a0e-b45f-b61ca35be7be",
+    "timestamp": "2025-11-21 07:32:45.530655",
+    "report_generated": false
+  },
+  {
+    "question": "Can 0x01 prefix in keys.go:10 collide with other modules lacking namespace isolation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_331c7df3-bbdd-4f6d-b34c-eb0d8dfe6c7f",
+    "timestamp": "2025-11-21 07:33:22.455460",
+    "report_generated": false
+  },
+  {
+    "question": "Is 0x02 prefix in GetWasmMappingKey sufficiently isolated?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_49bfcf2a-ab0e-438c-97b5-e269f280fa71",
+    "timestamp": "2025-11-21 07:33:58.965161",
+    "report_generated": false
+  },
+  {
+    "question": "Can attacker-crafted message keys cause KV key collisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b0a57586-afc4-47c9-8c1d-21f962132d24",
+    "timestamp": "2025-11-21 07:34:38.076610",
+    "report_generated": false
+  },
+  {
+    "question": "Does key construction handle unicode safely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01c70a3a-a967-4a2e-904b-31f9b8a0e3bb",
+    "timestamp": "2025-11-21 07:35:18.239333",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateResourceKeys provide deterministic iteration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_91020d4a-b349-4546-8f2f-abad37c38994",
+    "timestamp": "2025-11-21 07:35:59.745940",
+    "report_generated": false
+  },
+  {
+    "question": "Does StoreKey 'acl'+ModuleName risk name collisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a52d7596-7d3f-4199-95be-6c845394cfc5",
+    "timestamp": "2025-11-21 07:36:41.776784",
+    "report_generated": false
   }
 ]
