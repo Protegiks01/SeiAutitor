@@ -7198,5 +7198,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_46e15627-a792-4816-a868-a62f40cd0943",
     "timestamp": "2025-11-21 14:40:24.430180",
     "report_generated": false
+  },
+  {
+    "question": "In InitGenesis, can a mismatch between supplied genesis supply and calculated supply be exploited to create hidden inflation? genesis.go:48-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d2d7ae06-a2c7-44be-be40-4eb2dd60cf60",
+    "timestamp": "2025-11-21 14:41:34.421016",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesis accurately capture all supply including deferred and wei balances for state export? genesis.go:61-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_41e54277-50f4-4de3-be0b-73e7486d3888",
+    "timestamp": "2025-11-21 14:41:47.959709",
+    "report_generated": false
+  },
+  {
+    "question": "Can HasSupply return false positives or false negatives when supply is exactly zero? keeper.go:284-289",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e68f4727-6303-49f0-b24d-ff785cfeedd8",
+    "timestamp": "2025-11-21 14:42:01.468952",
+    "report_generated": false
+  },
+  {
+    "question": "In the TotalSupply invariant, does the iteration over deferred balances complete even if the deferred cache is corrupted? invariants.go:74-78",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f86d45c6-bda5-475d-84ac-4ce2b94c0262",
+    "timestamp": "2025-11-21 14:42:15.468917",
+    "report_generated": false
+  },
+  {
+    "question": "Can negative balances be created through arithmetic underflow in balance operations, violating the NonnegativeBalanceInvariant? invariants.go:32-47",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fc82e30e-a41a-4c0f-ad3c-2bf118e62688",
+    "timestamp": "2025-11-21 14:42:30.556755",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetSupply properly remove supply entries for denoms with zero supply to prevent storage bloat? keeper.go:642-647",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4c5b4ca0-3098-4683-be98-b4982b5f2fc2",
+    "timestamp": "2025-11-21 14:42:47.204402",
+    "report_generated": false
+  },
+  {
+    "question": "In GetPaginatedTotalSupply, can the pagination add zero-value coins to supply, violating the non-zero supply invariant? keeper.go:92-94",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_07e00077-98ba-4926-a462-0bb1fede6bc0",
+    "timestamp": "2025-11-21 14:43:06.681262",
+    "report_generated": false
+  },
+  {
+    "question": "Does the TotalSupply invariant panic or return an error when supply query fails, potentially halting invariant checks? invariants.go:63-68",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_77004b04-a892-4118-b4cf-47a4db39c8bf",
+    "timestamp": "2025-11-21 14:43:26.341194",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause the TotalSupply invariant to loop indefinitely by creating circular balance references? invariants.go:70-82",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_98949874-279c-44ac-a381-76f72a64f700",
+    "timestamp": "2025-11-21 14:43:47.017757",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateTotalSupply correctly unmarshal supply amounts, or can corrupted data cause panics? keeper.go:704-708",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f567430-e51e-4225-aa98-8bfe53b2f243",
+    "timestamp": "2025-11-21 14:44:09.376783",
+    "report_generated": false
+  },
+  {
+    "question": "In GetSupply, does unmarshaling panic on invalid data, potentially causing query DoS? keeper.go:272-276",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b23a1645-50eb-4cb0-8426-79042b241c5f",
+    "timestamp": "2025-11-21 14:44:33.562192",
+    "report_generated": false
+  },
+  {
+    "question": "Can the invariant checking be triggered repeatedly by an attacker to cause resource exhaustion through expensive iteration? invariants.go:59-105",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ee5d820-8ed1-4e89-b4b7-ef4235258217",
+    "timestamp": "2025-11-21 14:44:58.450972",
+    "report_generated": false
+  },
+  {
+    "question": "In MintCoins, does the minting restriction function correctly prevent unauthorized modules from minting coins? keeper.go:531-536",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4be82c5f-145c-4ebf-b00a-c80bb716c108",
+    "timestamp": "2025-11-21 14:45:25.301605",
+    "report_generated": false
+  },
+  {
+    "question": "Can BurnCoins be called with negative amounts to effectively mint coins instead of burning them? keeper.go:616-630",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_150d671f-62af-479e-a9db-6f0801442ddc",
+    "timestamp": "2025-11-21 14:45:52.480351",
+    "report_generated": false
+  },
+  {
+    "question": "Does createCoins properly verify that the module account has Minter permission before allowing coin creation? keeper.go:541-544",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e78c1daf-51aa-463d-95b4-d8fed8e58227",
+    "timestamp": "2025-11-21 14:46:20.579238",
+    "report_generated": false
+  },
+  {
+    "question": "In destroyCoins, can burning coins cause supply to become negative if burn amount exceeds current supply? keeper.go:600-604",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_974265cf-30f6-4ff3-bb82-ac468a53cc47",
+    "timestamp": "2025-11-21 14:46:50.813310",
+    "report_generated": false
+  },
+  {
+    "question": "Does MintCoins correctly update supply before adding coins to the module account to maintain invariants atomically? keeper.go:550-554",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62c96889-3ee8-4cdc-b2a6-6e1ad6215291",
+    "timestamp": "2025-11-21 14:47:24.221826",
+    "report_generated": false
+  },
+  {
+    "question": "Can BurnCoins be exploited by a module to burn coins from module accounts lacking proper Burner permissions? keeper.go:590-593",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_72b94cb4-0e45-4945-afb0-be16eb75d587",
+    "timestamp": "2025-11-21 14:47:57.302934",
+    "report_generated": false
+  },
+  {
+    "question": "In WithMintCoinsRestriction, can nested restriction functions be crafted to allow bypassing all minting restrictions? keeper.go:158-177",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6461b300-1db9-4644-a0cb-5f9d687bc0fb",
+    "timestamp": "2025-11-21 14:48:31.680452",
+    "report_generated": false
+  },
+  {
+    "question": "Does MintCoins emit mint events before state changes, creating timing vulnerabilities for event listeners? keeper.go:559-562",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2669e156-358e-4a64-87e2-ad2ce84c8b8f",
+    "timestamp": "2025-11-21 14:49:08.185179",
+    "report_generated": false
+  },
+  {
+    "question": "Can BurnCoins burn from non-existent module accounts, causing supply accounting errors? keeper.go:586-589",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e0f679db-70e6-44eb-a6ed-f70473ff8b26",
+    "timestamp": "2025-11-21 14:49:45.626706",
+    "report_generated": false
+  },
+  {
+    "question": "In createCoins, does the function properly handle minting multiple denoms atomically or can partial mints occur? keeper.go:550-554",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2c54ebee-7227-427e-b0de-89594128bd25",
+    "timestamp": "2025-11-21 14:50:29.888346",
+    "report_generated": false
+  },
+  {
+    "question": "Does destroyCoins correctly handle the case where a module account has insufficient balance for burning? keeper.go:595-598",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_07c94930-1416-48d7-9f51-74005ef69349",
+    "timestamp": "2025-11-21 14:51:08.661569",
+    "report_generated": false
+  },
+  {
+    "question": "Can MintCoins be called with empty coin amounts to trigger unnecessary state updates or events? keeper.go:567-583",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37edb22d-86b6-4333-a294-6ab764df1ab3",
+    "timestamp": "2025-11-21 14:51:49.385699",
+    "report_generated": false
+  },
+  {
+    "question": "In the minting restriction function, can returning no error be exploited to mint unlimited amounts? keeper.go:129",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f6e2ca91-c00b-4ba2-9f64-63d471fe615d",
+    "timestamp": "2025-11-21 14:52:31.406375",
+    "report_generated": false
   }
 ]
