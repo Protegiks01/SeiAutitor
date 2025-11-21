@@ -1348,5 +1348,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e611b201-5be1-4a59-a4da-d07fca9f255c",
     "timestamp": "2025-11-21 07:59:02.247787",
     "report_generated": false
+  },
+  {
+    "question": "Is there a check to prevent MinSignedPerWindow from being set to 0 params.go:85-99 , which would make all validators slashable immediately?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_18e428ac-2f40-496e-bc9a-a453b19290b0",
+    "timestamp": "2025-11-21 08:00:14.499711",
+    "report_generated": false
+  },
+  {
+    "question": "Can the maxMissed calculation at line 93 infractions.go:93 underflow if minSignedPerWindow > window, causing validators to be immediately slashed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0535b585-4918-4eea-88d4-ce4033413da3",
+    "timestamp": "2025-11-21 08:00:27.988623",
+    "report_generated": false
+  },
+  {
+    "question": "Does the check height > minHeight at line 96 infractions.go:96 correctly prevent slashing during the initial window period, or could off-by-one errors cause premature slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_766de732-218e-4117-a50b-7b9b85ec8614",
+    "timestamp": "2025-11-21 08:00:41.334168",
+    "report_generated": false
+  },
+  {
+    "question": "Can a validator avoid slashing by unbonding all their tokens immediately before downtime exceeds the threshold infractions.go:96-98 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ebe937cf-5f29-47df-905c-1ec7bae7f34f",
+    "timestamp": "2025-11-21 08:00:55.391543",
+    "report_generated": false
+  },
+  {
+    "question": "Does the double-sign slashing attribution keeper.go:74 correctly identify the infraction reason, or could downtime slashing be misattributed as double-signing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b9fcde0-d66c-4918-8f78-bd1fb78ba652",
+    "timestamp": "2025-11-21 08:01:10.338768",
+    "report_generated": false
+  },
+  {
+    "question": "Is the SlashFractionDowntime validation at lines 130-143 params.go:130-143 sufficient to prevent malicious governance proposals from setting extreme slashing penalties?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aaa5afc8-dec5-42bc-8776-a51d2a0105a6",
+    "timestamp": "2025-11-21 08:01:26.724278",
+    "report_generated": false
+  },
+  {
+    "question": "Can the slashing fraction parameters params.go:20-21 be set to values > 1.0 through governance, causing over-slashing and integer underflow in token amounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95d894c8-b8bb-4a1d-a03d-92ed21fab398",
+    "timestamp": "2025-11-21 08:01:44.448508",
+    "report_generated": false
+  },
+  {
+    "question": "Does the Jail function keeper.go:83-92 prevent double-jailing, or could a validator be jailed twice in the same block through different code paths?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_41ba9b2a-72e8-4b29-ba08-51c2b2f949da",
+    "timestamp": "2025-11-21 08:02:04.310242",
+    "report_generated": false
+  },
+  {
+    "question": "Can the distributionHeight calculation at line 106 infractions.go:106 result in a negative value for early blocks, and does the staking module handle negative distribution heights correctly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cc0be02d-97ad-4585-bc54-ca28242f5f1e",
+    "timestamp": "2025-11-21 08:02:25.623555",
+    "report_generated": false
+  },
+  {
+    "question": "In the Slash function keeper.go:68-79 , does delegating to k.sk.Slash() at line 78 correctly propagate all parameters, or could incorrect distribution height cause slashing of wrong delegators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff017e99-c213-4686-99b4-ebcb0fa5f624",
+    "timestamp": "2025-11-21 08:02:48.595081",
+    "report_generated": false
+  },
+  {
+    "question": "Slashing & Jailing Logic (Questions 66-85)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9825257-2d7e-4abd-8bc4-edcc7215268d",
+    "timestamp": "2025-11-21 08:03:12.375771",
+    "report_generated": false
+  },
+  {
+    "question": "Does the unjail flow prevent validators from unjailing during an active chain upgrade or halt scenario?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4f07d855-5006-440e-81a1-0fb8dc9aa205",
+    "timestamp": "2025-11-21 08:03:37.520529",
+    "report_generated": false
+  },
+  {
+    "question": "Is the validator address correctly extracted from the message at line 28 msg_server.go:28-31 , or could bech32 decoding errors be silently ignored?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_574d57d2-8e84-41de-a31b-913d092a2447",
+    "timestamp": "2025-11-21 08:04:03.238582",
+    "report_generated": false
+  },
+  {
+    "question": "Can the signer validation in GetSigners() msg.go:25-31 panic if the validator address is malformed, causing transaction processing to fail?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bc9c53c1-421b-4fd4-ae7f-dcbf5fe206d5",
+    "timestamp": "2025-11-21 08:04:31.661457",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBasic() msg.go:40-46 check for address format validity beyond empty string, preventing malformed bech32 addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7b3612a7-a5d3-410d-85bb-ba869626f26a",
+    "timestamp": "2025-11-21 08:05:00.174623",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker submit thousands of invalid unjail messages to DoS the mempool and prevent legitimate unjail attempts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3d5e8f4c-87eb-458f-bf49-1fe4f50d86b6",
+    "timestamp": "2025-11-21 08:05:30.284668",
+    "report_generated": false
+  },
+  {
+    "question": "Does the error ErrSelfDelegationTooLowToUnjail at line 26 unjail.go:26-28 leak information that could help an attacker determine validator self-delegation amounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ba92514f-33b3-4c69-8670-c41aeac2b0b3",
+    "timestamp": "2025-11-21 08:06:01.641594",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a race condition where a validator can be simultaneously jailed and unjailed in the same block through different code paths?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c941fee5-bb89-4a85-af5f-5fada3c7998b",
+    "timestamp": "2025-11-21 08:06:33.169319",
+    "report_generated": false
+  },
+  {
+    "question": "Can the GetMinSelfDelegation() check at lines 24-28 unjail.go:24-28 be bypassed if the minimum self-delegation parameter is changed via governance between jailing and unjailing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_282430f8-91c6-4eb1-a13f-3da3ad19741f",
+    "timestamp": "2025-11-21 08:07:06.507784",
+    "report_generated": false
+  },
+  {
+    "question": "Does k.sk.Unjail() at line 61 unjail.go:61 properly update staking module state, or could inconsistencies arise between slashing and staking states?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9ca8e878-11aa-4c3a-b65e-0cadb025fd57",
+    "timestamp": "2025-11-21 08:07:40.828528",
+    "report_generated": false
+  },
+  {
+    "question": "Can a validator exploit the time comparison at line 56 unjail.go:56-58 by submitting unjail transactions with future block timestamps to bypass jail duration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4202da38-a318-4625-9e84-4b325526c58a",
+    "timestamp": "2025-11-21 08:08:17.168781",
+    "report_generated": false
+  },
+  {
+    "question": "Does the unjail logic handle the case where ValidatorSigningInfo doesn't exist for bonded validators unjail.go:48-49 , as mentioned in the comment at line 44-47?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ca6851c-d063-4085-9f8a-9f9ccb892551",
+    "timestamp": "2025-11-21 08:08:52.616660",
+    "report_generated": false
+  },
+  {
+    "question": "Is the GetConsAddr() call at line 36 unjail.go:36-39 safe from panics if the validator's consensus pubkey is corrupted or invalid?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_de3516dc-7b69-46e8-a497-e588ebcc5fbd",
+    "timestamp": "2025-11-21 08:09:27.262364",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker front-run a validator's unjail transaction by slashing them again, causing the unjail to fail and leaving the validator permanently jailed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7f00d550-d026-4d9b-9cca-bae572d5637c",
+    "timestamp": "2025-11-21 08:10:03.077851",
+    "report_generated": false
+  },
+  {
+    "question": "Does the check at line 32 unjail.go:32-34 (!validator.IsJailed()) prevent double-unjailing, or could concurrent unjail messages bypass this check?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dc12cc85-0883-4dfa-8047-048e637d8fe7",
+    "timestamp": "2025-11-21 08:10:40.661426",
+    "report_generated": false
   }
 ]
