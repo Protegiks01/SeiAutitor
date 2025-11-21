@@ -4048,5 +4048,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a52d7596-7d3f-4199-95be-6c845394cfc5",
     "timestamp": "2025-11-21 07:36:41.776784",
     "report_generated": false
+  },
+  {
+    "question": "Can length prefix overflow with oversized contract addresses?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_41aa33a7-700f-4d3a-ba55-57df6846a232",
+    "timestamp": "2025-11-21 07:37:56.889074",
+    "report_generated": false
+  },
+  {
+    "question": "Are bounds checks enforced when concatenating key prefixes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e7b89f8b-cd89-4570-8fea-0ec06d123134",
+    "timestamp": "2025-11-21 07:38:10.307511",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetResourceDependencyMapping handle nil store entries safely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c756c7f3-8526-4d9e-9bbe-38fc5247eb7d",
+    "timestamp": "2025-11-21 07:38:24.752456",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent writes corrupt dependency mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3f538cb0-7162-4567-be3f-0171349c0f5c",
+    "timestamp": "2025-11-21 07:38:42.075192",
+    "report_generated": false
+  },
+  {
+    "question": "Does MustMarshal in SetResourceDependencyMapping safely reject malformed data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a64f8534-158a-4921-88ee-c26d4257130a",
+    "timestamp": "2025-11-21 07:39:00.234690",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateWasmDependencies ensure iterator closure?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_58cbf0c7-49b8-462a-bac3-ada829377d41",
+    "timestamp": "2025-11-21 07:39:19.210725",
+    "report_generated": false
+  },
+  {
+    "question": "Can prefix overlap cause collisions between Wasm and resource mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_228f2c5f-2947-4e15-89db-bfbfc8bf0703",
+    "timestamp": "2025-11-21 07:39:40.038221",
+    "report_generated": false
+  },
+  {
+    "question": "Can completion-signal channels deadlock if signals arrive in unexpected order?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cb81034f-cff9-4f3d-9872-21995c393741",
+    "timestamp": "2025-11-21 07:40:03.249687",
+    "report_generated": false
+  },
+  {
+    "question": "Does UpdateWritesetsWithAccessOps safely handle concurrent map writes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_464bce6c-8623-455e-a102-cf272f3b5ce0",
+    "timestamp": "2025-11-21 07:40:27.196845",
+    "report_generated": false
+  },
+  {
+    "question": "Can CompletionSignalingMap or BlockingSignalsMap race without mutex protection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_965de531-bd19-4a2a-ae5f-3a95e6397765",
+    "timestamp": "2025-11-21 07:40:52.846181",
+    "report_generated": false
+  },
+  {
+    "question": "Can storeKeyMap in GenerateEstimatedWritesets race between readers and writers?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cb5fe450-ada7-4b4c-a02b-2c5d87585bc2",
+    "timestamp": "2025-11-21 07:41:19.645969",
+    "report_generated": false
+  },
+  {
+    "question": "Can CompletionSignal channel size=1 cause blocking under concurrent execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b226a755-c9fd-4094-a6d8-da1e159679ee",
+    "timestamp": "2025-11-21 07:41:48.267034",
+    "report_generated": false
+  },
+  {
+    "question": "Can DAG.NodeMap be mutated concurrently during execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eda654b1-42c0-4920-8737-903a567c4f63",
+    "timestamp": "2025-11-21 07:42:17.412676",
+    "report_generated": false
+  },
+  {
+    "question": "Can a transaction complete before its dependencies start, causing race?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_649a9058-ad6d-4c94-95f0-fa05eaa4421e",
+    "timestamp": "2025-11-21 07:42:47.927695",
+    "report_generated": false
+  },
+  {
+    "question": "Does AddCompletionSignal synchronize map access safely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6ecd2e7c-03e7-42f0-9735-6f278f804a43",
+    "timestamp": "2025-11-21 07:43:19.261708",
+    "report_generated": false
+  },
+  {
+    "question": "Can nondeterministic access-ops produce divergent estimated writesets?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f297baac-4156-4d35-81f9-6a944781cfab",
+    "timestamp": "2025-11-21 07:43:51.181424",
+    "report_generated": false
+  },
+  {
+    "question": "Can dependency bugs allow conflicting ops to execute out of order?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85fff74a-cdea-4a4b-97cf-29bfd6d5c22c",
+    "timestamp": "2025-11-21 07:44:25.384729",
+    "report_generated": false
+  },
+  {
+    "question": "Does TxIndexMap prevent concurrent overwrites?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_07138cd2-3e47-4bba-a255-5570ecdf69a8",
+    "timestamp": "2025-11-21 07:45:00.794144",
+    "report_generated": false
+  },
+  {
+    "question": "Can ResourceAccessMap be corrupted by concurrent inserts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_db82117a-8929-409a-8b1c-a7914f5716f5",
+    "timestamp": "2025-11-21 07:45:36.660156",
+    "report_generated": false
+  },
+  {
+    "question": "Can edges be added before nodes initialize?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa335782-cd6c-442e-8478-5459865d9496",
+    "timestamp": "2025-11-21 07:46:13.179105",
+    "report_generated": false
+  },
+  {
+    "question": "Does Merge handle concurrent ops safely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ac316ede-8ad1-4b4a-947c-58ef93ee6699",
+    "timestamp": "2025-11-21 07:46:50.392242",
+    "report_generated": false
+  },
+  {
+    "question": "Can closing completion channels cause panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76fbbf09-9c9a-46ff-ab8f-56fef15e335a",
+    "timestamp": "2025-11-21 07:47:28.901088",
+    "report_generated": false
+  },
+  {
+    "question": "Is DAG construction work gas-metered to prevent DoS with huge blocks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ecc5c8e0-dbf8-4d44-88f4-e51d261cd470",
+    "timestamp": "2025-11-21 07:48:07.819359",
+    "report_generated": false
+  },
+  {
+    "question": "Is JQ selector parsing gas-metered to prevent expensive expressions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c36558e5-2b0c-4fdd-99ea-37d6ff6e1f90",
+    "timestamp": "2025-11-21 07:48:47.713225",
+    "report_generated": false
+  },
+  {
+    "question": "Can ImportContractReferences recursion consume unmetered gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c50893f-1aec-4753-aad5-fb85cc28509e",
+    "timestamp": "2025-11-21 07:49:29.357234",
+    "report_generated": false
   }
 ]
