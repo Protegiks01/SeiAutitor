@@ -4798,5 +4798,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5464e6c9-c148-41fa-9888-a09fdfc32194",
     "timestamp": "2025-11-21 12:45:09.663467",
     "report_generated": false
+  },
+  {
+    "question": "Does the expedited quorum validation ensure it's always higher than regular quorum as required at line 172? params.go:172-174",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_829fc920-6a93-40b8-b16a-1b4194e9a2c1",
+    "timestamp": "2025-11-21 12:46:28.151862",
+    "report_generated": false
+  },
+  {
+    "question": "Can the voting period be set to zero or negative values, causing proposals to immediately expire? params.go:232-251",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e16f4d64-f186-4f3f-9803-b5fa1ee46ccf",
+    "timestamp": "2025-11-21 12:46:41.335100",
+    "report_generated": false
+  },
+  {
+    "question": "Does the tally parameter validation prevent setting quorum or threshold values that make proposals impossible to pass? params.go:154-198",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b18a27d1-8c3e-4ac7-8470-2104599c9df5",
+    "timestamp": "2025-11-21 12:46:54.723514",
+    "report_generated": false
+  },
+  {
+    "question": "Could the expedited deposit minimum be set lower than the regular minimum through parameter updates? params.go:97-99",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c710315d-5786-4726-b5c6-1ba10fbd2fb4",
+    "timestamp": "2025-11-21 12:47:08.765927",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a maximum limit on the number of routes that can be registered to prevent memory exhaustion? router.go:44-58",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_97c0988e-0328-43d7-bc0b-309227cb4e08",
+    "timestamp": "2025-11-21 12:47:23.500726",
+    "report_generated": false
+  },
+  {
+    "question": "Could a proposal submit content for a route that exists but points to a deprecated handler? proposal.go:19-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_879e9911-9d00-472b-be3c-e38e3b665bc1",
+    "timestamp": "2025-11-21 12:47:40.566290",
+    "report_generated": false
+  },
+  {
+    "question": "Does the router.Seal() function in keeper initialization prevent race conditions with concurrent route additions? keeper.go:61",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0829c9e5-f555-4cb1-a4f5-8098b6b0d304",
+    "timestamp": "2025-11-21 12:47:58.260056",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that all registered handlers are actually callable and won't panic on execution? router.go:44-58",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_36b14ea1-db4c-40af-ab81-c94ac1e2701d",
+    "timestamp": "2025-11-21 12:48:17.722801",
+    "report_generated": false
+  },
+  {
+    "question": "Could the router map be modified directly through reflection or unsafe pointer manipulation? router.go:21-24",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_28ad1947-7dad-420a-b498-61a5ba4245fa",
+    "timestamp": "2025-11-21 12:48:38.705246",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetRoute handle the case where a route is removed after registration, causing nil pointer panics? router.go:66-72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eb9d154e-78aa-4e4f-8db5-a05b0eac2409",
+    "timestamp": "2025-11-21 12:49:01.186645",
+    "report_generated": false
+  },
+  {
+    "question": "Is the alphanumeric check in AddRoute sufficient to prevent route injection attacks? router.go:49-51",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1b4d71d2-dcd9-4733-8148-730c9bb9fd59",
+    "timestamp": "2025-11-21 12:49:24.555944",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker register multiple handlers for the same route before the router is sealed? router.go:52-54",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d1fe264-f7a4-47ea-8ab0-2af76b3e4dd3",
+    "timestamp": "2025-11-21 12:49:48.871852",
+    "report_generated": false
+  },
+  {
+    "question": "Does the AddRoute function prevent registration of handlers for system-reserved routes? router.go:44-58",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_821fd213-352f-4e90-adff-42e8434de026",
+    "timestamp": "2025-11-21 12:50:14.656350",
+    "report_generated": false
+  },
+  {
+    "question": "Can the router be unsealed after initialization, allowing runtime modification of proposal handlers? router.go:35-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85a3ca1b-c912-4d86-99bc-06ce4364f51c",
+    "timestamp": "2025-11-21 12:50:42.374980",
+    "report_generated": false
+  },
+  {
+    "question": "Can external modules set hooks after the keeper is initialized, potentially bypassing security checks? keeper.go:76-84",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_08efbcf5-494c-4719-aa6b-41b7a5beb4bc",
+    "timestamp": "2025-11-21 12:51:11.321614",
+    "report_generated": false
+  },
+  {
+    "question": "Does the hook nil check prevent all potential panics, or could a partially initialized hook cause issues? hooks.go:13-15",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4bdae485-a619-41fe-a631-7a59c6ce91d9",
+    "timestamp": "2025-11-21 12:51:41.490629",
+    "report_generated": false
+  },
+  {
+    "question": "Are there any reentrancy guards to prevent hooks from calling back into gov keeper functions? hooks.go:12-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8fd99f7c-7ffd-4db2-8ed1-c2f81b1274ac",
+    "timestamp": "2025-11-21 12:52:12.264088",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker register a hook that logs sensitive proposal content before it's encrypted or secured? hooks.go:12-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c410dfce-befe-43aa-9794-e85fe4df0786",
+    "timestamp": "2025-11-21 12:52:43.234773",
+    "report_generated": false
+  },
+  {
+    "question": "Does the AfterProposalVotingPeriodEnded hook have access to the proposal's execution result? hooks.go:40-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55cb9500-2ee6-4add-b412-4dffcff393d5",
+    "timestamp": "2025-11-21 12:53:14.391947",
+    "report_generated": false
+  },
+  {
+    "question": "Can hooks modify the proposal state during callbacks in ways that conflict with the main execution flow? hooks.go:12-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f83d2f1a-b05c-4a96-86dd-d81d29bd6d70",
+    "timestamp": "2025-11-21 12:53:46.116200",
+    "report_generated": false
+  },
+  {
+    "question": "Is the SetHooks function called multiple times to bypass the double-set panic check? keeper.go:76-84",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fe6618a1-d29f-469b-b66c-a5a94d094bc2",
+    "timestamp": "2025-11-21 12:54:18.089020",
+    "report_generated": false
+  },
+  {
+    "question": "Could reentrancy through hooks allow state modifications during proposal execution that violate invariants? hooks.go:12-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ddd83033-7f07-4197-9d26-f43524e7a9e8",
+    "timestamp": "2025-11-21 12:54:51.678513",
+    "report_generated": false
+  },
+  {
+    "question": "Does the hook system properly isolate gas consumption, or could a hook consume all block gas? hooks.go:1-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bb60f9d5-074e-4383-881c-430bf3e08976",
+    "timestamp": "2025-11-21 12:55:25.697245",
+    "report_generated": false
+  },
+  {
+    "question": "Can a malicious hook implementation in AfterProposalSubmission panic to prevent all proposal submissions? hooks.go:12-16",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f06755f4-76f4-4d5c-8e48-c881fd1ea165",
+    "timestamp": "2025-11-21 12:55:59.050377",
+    "report_generated": false
+  },
+  {
+    "question": "Are there checks to ensure deposit end time doesn't exceed reasonable bounds, preventing storage bloat? proposal.go:47-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3478f915-e04f-4b93-a611-f92dcc65d4f1",
+    "timestamp": "2025-11-21 12:56:33.038158",
+    "report_generated": false
   }
 ]
