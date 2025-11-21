@@ -7648,5 +7648,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e8b0ab7-f4ff-4b88-8595-0937ff72e78a",
     "timestamp": "2025-11-21 15:17:25.678595",
     "report_generated": false
+  },
+  {
+    "question": "Does SendCoinsFromModuleToAccount allow transfers even when the recipient is a module account? keeper.go:348-364",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b3927afd-d712-4f5d-bcc9-9392d3fa3241",
+    "timestamp": "2025-11-21 15:18:39.850224",
+    "report_generated": false
+  },
+  {
+    "question": "Can SendCoinsFromAccountToModule be used to burn coins by sending to non-existent modules? keeper.go:391-402",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_64474d6d-30d6-4c95-af67-26c74449b6bf",
+    "timestamp": "2025-11-21 15:18:53.309755",
+    "report_generated": false
+  },
+  {
+    "question": "In InitGenesis, does the function correctly validate that total wei balance doesn't have a non-zero remainder? genesis.go:35-38",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c8261891-f80a-4f5e-a5b8-b146325b3330",
+    "timestamp": "2025-11-21 15:19:06.866481",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitGenesis be exploited by providing genesis balances that exceed the stated total supply? genesis.go:48-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8a5dc70b-83bf-4803-90e1-3b1729cbe385",
+    "timestamp": "2025-11-21 15:19:21.017028",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesis capture all wei balances in the exported state for accurate chain export? genesis.go:67-71",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1014dbaa-7812-4211-8705-cba0f7d9b140",
+    "timestamp": "2025-11-21 15:19:37.307030",
+    "report_generated": false
+  },
+  {
+    "question": "In InitGenesis, can an attacker provide duplicate balance entries for the same address causing state corruption? genesis.go:18-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_044c62c3-2e68-4beb-8948-2865b5e36800",
+    "timestamp": "2025-11-21 15:19:55.500796",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitGenesis properly sanitize genesis balances before applying them to prevent malformed state? genesis.go:18",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_05f6e02b-0919-458a-837f-921d5f1d9d46",
+    "timestamp": "2025-11-21 15:20:15.467004",
+    "report_generated": false
+  },
+  {
+    "question": "Can ExportGenesis fail to paginate correctly, missing supply denoms in the exported genesis? genesis.go:63-66",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f079a130-3909-4f7b-abf7-077c27fd49df",
+    "timestamp": "2025-11-21 15:20:37.124380",
+    "report_generated": false
+  },
+  {
+    "question": "In InitGenesis, does adding wei balances use the correct event-emitting path to ensure consistent event logs? genesis.go:28-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d3bbb277-9672-41f6-a3c3-4e9e17429473",
+    "timestamp": "2025-11-21 15:21:00.574593",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitGenesis panic if base denom is not registered but wei balances exist in genesis? genesis.go:39-46",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_63288f2e-db16-4641-b180-3c314e3b2bfb",
+    "timestamp": "2025-11-21 15:21:24.582917",
+    "report_generated": false
+  },
+  {
+    "question": "Can metadata in InitGenesis be set for denoms that don't exist in the genesis supply? genesis.go:56-58",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6eda16c0-d37c-4916-8a92-d1b7be284deb",
+    "timestamp": "2025-11-21 15:21:49.996429",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesis export in deterministic order ensuring reproducible genesis files? genesis.go:61-80",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9e30afc-36e3-463e-b975-c0bc05224f89",
+    "timestamp": "2025-11-21 15:22:16.638209",
+    "report_generated": false
+  },
+  {
+    "question": "In IsInDenomAllowList, can an attacker bypass allow list checks by using denoms without the token factory prefix? send.go:475-498",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c70ca677-a324-41bc-a471-6351aaa761dd",
+    "timestamp": "2025-11-21 15:22:44.573068",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetDenomAllowList validate that addresses in the allow list are valid before storing them? send.go:452-458",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_24929794-4388-4c72-ba66-061d01a02fe2",
+    "timestamp": "2025-11-21 15:23:14.096392",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetDenomAllowList return stale cached allow lists when the allow list is updated mid-transaction? send.go:460-473",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9b52c12e-0ba1-4e88-ad27-1d5ef1f9fd94",
+    "timestamp": "2025-11-21 15:23:44.169222",
+    "report_generated": false
+  },
+  {
+    "question": "In IsInDenomAllowList, does the cache prevent proper validation across multiple denoms in a single transaction? send.go:500-509",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35b97f7e-ed70-44a0-b233-8051593bebff",
+    "timestamp": "2025-11-21 15:24:15.803871",
+    "report_generated": false
+  },
+  {
+    "question": "Does buildAllowedAddressesMap handle duplicate addresses in the allow list correctly? send.go:520-530",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8048a63d-d300-4256-91ce-c8939d620ffd",
+    "timestamp": "2025-11-21 15:24:47.707845",
+    "report_generated": false
+  },
+  {
+    "question": "Can an empty allow list be distinguished from a missing allow list, affecting access control logic? send.go:487-491",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78dc945b-c725-4c47-8024-2739ce81fa92",
+    "timestamp": "2025-11-21 15:25:21.613451",
+    "report_generated": false
+  },
+  {
+    "question": "In the message server's Send, does the allow list cache get shared between sender and recipient checks? msg_server.go:42-49",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3607d25b-ae29-4157-bb36-4530676a110e",
+    "timestamp": "2025-11-21 15:25:57.106675",
+    "report_generated": false
+  },
+  {
+    "question": "Does IsInDenomAllowList properly check all coins in a multi-denom transfer, or can one coin bypass checks? send.go:481-497",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e76bb4c2-3304-454b-8eca-bd21f925ab49",
+    "timestamp": "2025-11-21 15:26:33.377962",
+    "report_generated": false
+  },
+  {
+    "question": "Can SetDenomAllowList be called by unauthorized actors to modify allow lists for existing token factory denoms? send.go:452-458",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b166ecb5-667b-49f9-86a0-54443b4c6c9b",
+    "timestamp": "2025-11-21 15:27:11.350112",
+    "report_generated": false
+  },
+  {
+    "question": "In getAllowedAddresses, does caching empty allow lists prevent legitimate updates from taking effect? send.go:500-509",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_66d57e60-a46e-4a76-bae6-b63ff7cacc08",
+    "timestamp": "2025-11-21 15:27:50.278274",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Panic Risk: In BeginBlocker at abci.go:15-37 , if k.AllocateTokens panics (line 31), will the entire chain halt? What specific conditions in AllocateTokens could trigger a panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d07eea8d-6b7a-4b71-a96a-201bb353404c",
+    "timestamp": "2025-11-21 15:28:30.705653",
+    "report_generated": false
+  },
+  {
+    "question": "Zero Total Power Edge Case: In AllocateTokens at allocation.go:38-42 , when totalPreviousPower == 0, all fees go to the community pool. Can an attacker manipulate validator power to trigger this condition and drain fees into the community pool indefinitely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b28ca88-0100-45fd-ba4e-1eab40ab1172",
+    "timestamp": "2025-11-21 15:29:13.174811",
+    "report_generated": false
+  },
+  {
+    "question": "Missing Proposer Reward Loss: In AllocateTokens at allocation.go:68-79 , when the previous proposer is unknown, rewards are not allocated. Can an attacker exploit the unbonding timing (1-block period) to systematically steal proposer rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a82a11ec-3e3f-42d5-bb41-9cbc8b73a5d3",
+    "timestamp": "2025-11-21 15:29:55.393478",
+    "report_generated": false
   }
 ]
