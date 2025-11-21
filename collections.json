@@ -7498,5 +7498,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_10fd685d-cd7b-4224-b64d-50f516f1b37b",
     "timestamp": "2025-11-21 15:05:10.645772",
     "report_generated": false
+  },
+  {
+    "question": "Can delegating to a module account without the account existing cause permanent fund loss? keeper.go:185-188",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8a288554-e318-47b3-bf62-169daa570d46",
+    "timestamp": "2025-11-21 15:06:29.640822",
+    "report_generated": false
+  },
+  {
+    "question": "In trackUndelegation, can the function be called multiple times for the same undelegation causing double-counting? keeper.go:667-682",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_332f00ff-f1c0-4fce-9ec8-349d4a8bd906",
+    "timestamp": "2025-11-21 15:06:43.216309",
+    "report_generated": false
+  },
+  {
+    "question": "In InputOutputCoins, does ValidateInputsOutputs prevent inputs and outputs from being unbalanced? send.go:98-103",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e7e55239-7503-499f-8957-ef626803a689",
+    "timestamp": "2025-11-21 15:06:56.642958",
+    "report_generated": false
+  },
+  {
+    "question": "Can InputOutputCoins be exploited by having overlapping addresses in inputs and outputs to create loops? send.go:104-150",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3a2eca0b-c9b9-4fc8-81df-394b81bf8be4",
+    "timestamp": "2025-11-21 15:07:10.684612",
+    "report_generated": false
+  },
+  {
+    "question": "Does MultiSend in the message server check allow lists for all input and output addresses atomically? msg_server.go:78-113",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d9a2f506-8766-4722-8bdd-155b6fac870d",
+    "timestamp": "2025-11-21 15:07:25.891038",
+    "report_generated": false
+  },
+  {
+    "question": "In InputOutputCoins, does account creation happen deterministically for all output addresses? send.go:142-150",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eb5e0fad-49a2-4ea5-b43e-3f65b49c56b7",
+    "timestamp": "2025-11-21 15:07:42.322543",
+    "report_generated": false
+  },
+  {
+    "question": "Can ValidateInputsOutputs be bypassed by crafting inputs with very small amounts that round to zero? send.go:101-103",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3022305f-0586-4229-9941-c88b9dc79855",
+    "timestamp": "2025-11-21 15:07:59.971997",
+    "report_generated": false
+  },
+  {
+    "question": "Does MultiSend correctly cache allow list checks to prevent redundant storage reads or can the cache be poisoned? msg_server.go:80-90",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8cacb26d-1bc2-48b3-b3ef-3dfce227328f",
+    "timestamp": "2025-11-21 15:08:19.938520",
+    "report_generated": false
+  },
+  {
+    "question": "In InputOutputCoins, are events emitted in deterministic order for all inputs and outputs? send.go:115-140",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b129e982-1d33-41f3-bf9a-be20260f6d89",
+    "timestamp": "2025-11-21 15:08:41.156594",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause DoS by creating MultiSend messages with thousands of inputs and outputs? send.go:95-153",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_20d172e3-8883-4810-9d8e-1c0ca022347a",
+    "timestamp": "2025-11-21 15:09:03.967744",
+    "report_generated": false
+  },
+  {
+    "question": "Does InputOutputCoins revert all state changes if any single transfer fails partway through execution? send.go:104-132",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8088d3eb-a0f6-431f-9353-4cdd449e6086",
+    "timestamp": "2025-11-21 15:09:27.159127",
+    "report_generated": false
+  },
+  {
+    "question": "In the message server's MultiSend, are blocked addresses checked for both inputs and outputs? msg_server.go:92-98",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80764650-4484-4a52-990d-7e0ef99ddb89",
+    "timestamp": "2025-11-21 15:09:52.373675",
+    "report_generated": false
+  },
+  {
+    "question": "Does SendCoinsFromModuleToAccount prevent sending to blocked addresses even when sender is a module? keeper.go:348-364",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_94fe6a15-f406-4b35-b3d4-933c97863fea",
+    "timestamp": "2025-11-21 15:10:18.733647",
+    "report_generated": false
+  },
+  {
+    "question": "In SendCoinsFromModuleToModule, can non-existent module accounts cause panics halting the chain? keeper.go:368-389",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a8a2c3f8-1665-418b-9d5a-47570f280611",
+    "timestamp": "2025-11-21 15:10:46.072615",
+    "report_generated": false
+  },
+  {
+    "question": "Does SendCoinsFromAccountToModule validate that the module account exists before transferring coins? keeper.go:391-402",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa8f39dd-1c3f-49b2-9bba-adc65cf8c11d",
+    "timestamp": "2025-11-21 15:11:14.537196",
+    "report_generated": false
+  },
+  {
+    "question": "Can SendCoinsFromModuleToAccount be used to bypass send-enabled restrictions for certain denoms? keeper.go:348-364",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1239fc5c-2375-4cc1-9b62-a3c1065a6918",
+    "timestamp": "2025-11-21 15:11:44.099166",
+    "report_generated": false
+  },
+  {
+    "question": "In SendCoinsFromModuleToModule, does the function log sensitive information about module balances? keeper.go:386",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8d9e0bfb-55c7-4821-8ea6-4e3607823a50",
+    "timestamp": "2025-11-21 15:12:16.639589",
+    "report_generated": false
+  },
+  {
+    "question": "Does SendCoinsFromModuleToAccount panic if the module address is nil, allowing unhandled errors? keeper.go:355-358",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e8da0720-6536-4fe4-9464-15e2ed6eb4a6",
+    "timestamp": "2025-11-21 15:12:50.000152",
+    "report_generated": false
+  },
+  {
+    "question": "Can module-to-module transfers bypass deferred cache mechanisms when they should be deferred? keeper.go:368-389",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bcd51869-fd31-478b-9cb3-2f9410531ad1",
+    "timestamp": "2025-11-21 15:13:25.153620",
+    "report_generated": false
+  },
+  {
+    "question": "In SendCoinsFromAccountToModule, does the function emit events consistently with regular send operations? keeper.go:391-402",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c03ed390-0c22-4be3-876d-7fc514bd83d2",
+    "timestamp": "2025-11-21 15:14:01.018806",
+    "report_generated": false
+  },
+  {
+    "question": "Does SendCoinsFromModuleToModule handle zero-amount transfers correctly or does it perform unnecessary operations? keeper.go:382-384",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95f4360e-9626-4761-b3b6-d5601376b697",
+    "timestamp": "2025-11-21 15:14:39.057037",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit logging in module transfers to cause log spam DoS attacks? keeper.go:386",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e80d0b87-4522-43f1-98cc-9e6da39774b1",
+    "timestamp": "2025-11-21 15:15:19.145741",
+    "report_generated": false
+  },
+  {
+    "question": "In DelegateCoinsFromAccountToModule, does the function verify the module has both Staking permission and exists? keeper.go:500-507",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_781be0aa-b8e8-4559-b026-a0069c80b1a3",
+    "timestamp": "2025-11-21 15:16:01.262496",
+    "report_generated": false
+  },
+  {
+    "question": "Does UndelegateCoinsFromModuleToAccount properly check module permissions before undelegating? keeper.go:519-526",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a6a16a5-f660-4a43-9536-793152b6e8e6",
+    "timestamp": "2025-11-21 15:16:44.027776",
+    "report_generated": false
+  },
+  {
+    "question": "Can module account permissions be checked consistently across all module interaction functions? keeper.go:348-529",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e8b0ab7-f4ff-4b88-8595-0937ff72e78a",
+    "timestamp": "2025-11-21 15:17:25.678595",
+    "report_generated": false
   }
 ]
