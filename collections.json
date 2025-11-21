@@ -4498,5 +4498,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_509170d5-95b3-4072-be8b-fd5e2689ff9c",
     "timestamp": "2025-11-21 08:12:55.771762",
     "report_generated": false
+  },
+  {
+    "question": "Can sequence number checks be bypassed when disable-seqno parameter is true, enabling replay attacks in sigverify.go:270-278?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d2fe54f8-3151-48dc-80a7-874e942f70d0",
+    "timestamp": "2025-11-21 08:14:05.431705",
+    "report_generated": false
+  },
+  {
+    "question": "Does OnlyLegacyAminoSigners correctly identify amino signers or can mixed-mode signatures bypass validation in sigverify.go:221-235?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e9dc6d26-8952-428e-8705-0b553b85d821",
+    "timestamp": "2025-11-21 08:14:18.954578",
+    "report_generated": false
+  },
+  {
+    "question": "Can ED25519 keys exploited in DefaultSigVerificationGasConsumer still consume gas while always failing in sigverify.go:417-419?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e551e3e2-1e67-4f51-9d66-90b33fb1e26e",
+    "timestamp": "2025-11-21 08:14:32.375723",
+    "report_generated": false
+  },
+  {
+    "question": "Does multisig gas verification validate bit array size against actual signatures in ConsumeMultisignatureVerificationGas sigverify.go:446-471?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1910fc92-6484-4aed-871f-73dc14a194f9",
+    "timestamp": "2025-11-21 08:14:46.261884",
+    "report_generated": false
+  },
+  {
+    "question": "Can mismatched signer count and signature count bypass validation in sigverify.go:252-255?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_294f2a92-1eb2-453f-bd10-203bc4a2a5cc",
+    "timestamp": "2025-11-21 08:15:01.108352",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetSignerAcc correctly handle non-existent accounts without creating accounts with arbitrary properties in sigverify.go:475-481?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_357d2297-8cd4-4fbd-8606-723d1bd19235",
+    "timestamp": "2025-11-21 08:15:17.490967",
+    "report_generated": false
+  },
+  {
+    "question": "Can CountSubKeys on deeply nested multisig keys cause stack overflow or excessive gas usage in sigverify.go:484-496?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6be806bf-f512-4a5f-af13-2272b335d517",
+    "timestamp": "2025-11-21 08:15:34.664507",
+    "report_generated": false
+  },
+  {
+    "question": "Does signature verification skip at block height 0 create vulnerabilities during genesis in sigverify.go:281-286?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_74e926d0-b2b3-4a0b-ad39-50e798416bd2",
+    "timestamp": "2025-11-21 08:15:53.850358",
+    "report_generated": false
+  },
+  {
+    "question": "Can malformed signatureData crash signatureDataToBz causing indexing errors in sigverify.go:502-535?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_44382e61-aa5b-4f7b-91cf-8e3f84c59020",
+    "timestamp": "2025-11-21 08:16:15.393986",
+    "report_generated": false
+  },
+  {
+    "question": "Do pubkey-setting events emitted during verification leak metadata usable for transaction tracking attacks in sigverify.go:109-126?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d15fcfde-2651-4ff5-8ff5-309ddd6dc0ce",
+    "timestamp": "2025-11-21 08:16:37.580249",
+    "report_generated": false
+  },
+  {
+    "question": "Can invalid signature data underconsume gas in SigGasConsumeDecorator in sigverify.go:151-196?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_66ab856d-7fee-438a-8361-75a93c5fc16f",
+    "timestamp": "2025-11-21 08:17:01.140502",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateSigCountDecorator enforce TxSigLimit correctly including nested multisig in sigverify.go:385-407?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9a22f66b-aabd-4815-b84c-7af84abf2093",
+    "timestamp": "2025-11-21 08:17:24.661283",
+    "report_generated": false
+  },
+  {
+    "question": "Can account number being zero at genesis cause verification inconsistencies in sigverify.go:283-286?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9dbeaf0d-1bc3-4cda-ab88-4572f37ff2ef",
+    "timestamp": "2025-11-21 08:17:50.618446",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic in IncrementSequenceDecorator correctly handle sequence overflow in sigverify.go:360-363?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37a66671-55ff-45bd-981b-743cc5220a99",
+    "timestamp": "2025-11-21 08:18:17.640820",
+    "report_generated": false
+  },
+  {
+    "question": "Is SR25519 public key type sufficiently validated or can it slip through with nil error in sigverify.go:420-422?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ceab9352-b81a-4651-9046-c483f216ceed",
+    "timestamp": "2025-11-21 08:18:46.161157",
+    "report_generated": false
+  },
+  {
+    "question": "Is secp256r1 signature cost correct or underpriced allowing DoS in sigverify.go:426-428?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_00126a16-4fa6-49f1-9c11-1594e42a7cd9",
+    "timestamp": "2025-11-21 08:19:15.993106",
+    "report_generated": false
+  },
+  {
+    "question": "Can simulation-mode pubkey initialization cause nondeterministic gas estimation in sigverify.go:34-39?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6a71951b-c9cb-4a3c-9457-86bebb5ed5ed",
+    "timestamp": "2025-11-21 08:19:46.814441",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeductFeeDecorator.validateFeePayer ensure the fee payer exists before deduction in fee.go:177-180?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4dbaefb1-4173-42fb-b34d-ff995b492423",
+    "timestamp": "2025-11-21 08:20:18.720977",
+    "report_generated": false
+  },
+  {
+    "question": "Can the fee granter mechanism be abused to drain granter funds without authorization in fee.go:164-175?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6196cea6-6b33-4413-a3a1-4484ef373f71",
+    "timestamp": "2025-11-21 08:20:51.692552",
+    "report_generated": false
+  },
+  {
+    "question": "Does feeGranter.Equals(feePayer) prevent self-granting bypass cases in fee.go:167?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_84e97993-1e16-4f1d-8af5-c610d48d054a",
+    "timestamp": "2025-11-21 08:21:26.020474",
+    "report_generated": false
+  },
+  {
+    "question": "Can DeductFees be exploited with invalid fee coins leading to state corruption in fee.go:203-213?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3fcc9e05-1c01-47aa-8a12-eeb0ef56a1e5",
+    "timestamp": "2025-11-21 08:22:00.918507",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeferredSendCoinsFromAccountToModule handle insufficient funds without partial deduction in fee.go:208-211?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_02a02c29-f3ff-4670-a863-a18e907e7d8b",
+    "timestamp": "2025-11-21 08:22:34.281752",
+    "report_generated": false
+  },
+  {
+    "question": "Can a nil fee collector module account cause a chain-halting panic in fee.go:154-156?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_69caa9ca-7b1d-4d9f-8d46-faf7cc5fae5e",
+    "timestamp": "2025-11-21 08:23:09.673937",
+    "report_generated": false
+  },
+  {
+    "question": "Does CheckTxFeeWithValidatorMinGasPrices prevent zero-amount fee bypass in validator_tx_fee.go:23?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_757d660a-33ac-45d6-b6e6-7895cbf277fb",
+    "timestamp": "2025-11-21 08:23:45.004491",
+    "report_generated": false
+  },
+  {
+    "question": "Can setting gas=0 bypass priority calculation in validator_tx_fee.go:49-53?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_586e0c18-7fd9-4e20-88e3-829879e3125e",
+    "timestamp": "2025-11-21 08:24:20.697654",
+    "report_generated": false
   }
 ]
