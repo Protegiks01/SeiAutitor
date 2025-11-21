@@ -8698,5 +8698,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b3f3bf6-d3ee-465e-b315-38278af97bf3",
     "timestamp": "2025-11-21 16:42:24.652612",
     "report_generated": false
+  },
+  {
+    "question": "Evidence Power Validation Insufficient: The power check only verifies Power < 1. evidence.go:53-55 Could an attacker submit evidence with an impossibly high power value (e.g., MaxInt64) that causes overflow in calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1add1baa-e21a-4502-bf0d-2d747b975550",
+    "timestamp": "2025-11-21 16:43:38.629382",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence ConsensusAddress Bech32 Parsing Error Silencing: GetConsensusAddress ignores the error from ConsAddressFromBech32. evidence.go:65-68 Does this silently return an empty address that could match unexpected validators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3c0ab853-6f96-42df-aa5d-c4a7749ac2fe",
+    "timestamp": "2025-11-21 16:43:51.969590",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Handler Error Wrapping: Handler errors are wrapped with ErrInvalidEvidence. keeper.go:86-89 Does this obscure the original error type, preventing proper error handling by calling code?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_058bb7ce-7df3-436d-94e8-ce56621020da",
+    "timestamp": "2025-11-21 16:44:05.407571",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Submission Event Emission Before Storage: Events are emitted before calling SetEvidence. keeper.go:91-98 If SetEvidence panics (from MustMarshalEvidence), are events still visible, creating inconsistency between events and state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e90b6d66-cdfb-4660-8b36-a8969999aefa",
+    "timestamp": "2025-11-21 16:44:19.290582",
+    "report_generated": false
+  },
+  {
+    "question": "MsgServer Evidence Submission Double Event: The SubmitEvidence msg server emits events, and so does Keeper.SubmitEvidence. msg_server.go:23-41 Are events duplicated? Could this cause off-chain systems to double-count evidence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5d5984a1-ab35-4d22-b204-c95f60ccd94e",
+    "timestamp": "2025-11-21 16:44:34.258925",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Handler Registration Order Dependency: If handlers are registered in different orders on different nodes, does the sealed router guarantee deterministic behavior? Could this cause consensus splits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e03c5003-72bd-44ee-82aa-0d512943db59",
+    "timestamp": "2025-11-21 16:44:50.456094",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Submission Gas Metering for Storage: When SetEvidence writes to the KVStore, is gas properly metered for the size of the marshaled evidence? Could large evidence objects cause OOM or undercharged gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fdc790eb-55b5-4869-a518-b640d641727f",
+    "timestamp": "2025-11-21 16:45:07.915619",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Route Lookup Panic: GetRoute panics if the route doesn't exist. router.go:76-81 Is HasRoute always checked before GetRoute? Could a race condition or logic error cause a panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2e5ff967-49dc-46dc-8709-86d1e479714c",
+    "timestamp": "2025-11-21 16:45:27.628548",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Byzantine Validator Processing Panic: In BeginBlocker, evidence is processed for each Byzantine validator. abci.go:16-30 If HandleEquivocationEvidence panics, does it halt the entire chain since it's in BeginBlocker?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_336700e1-0903-4894-8082-ded92a783edf",
+    "timestamp": "2025-11-21 16:45:48.671575",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Type Switch Non-Exhaustive: The switch statement only handles DUPLICATE_VOTE and LIGHT_CLIENT_ATTACK. abci.go:20-28 If CometBFT introduces a new misbehavior type, would it be silently ignored, allowing misbehavior to go unpunished?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_16194317-dd96-4c02-92f0-f476746839f9",
+    "timestamp": "2025-11-21 16:46:10.946835",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker FromABCIEvidence Panic: FromABCIEvidence can panic if Bech32 conversion fails. evidence.go:91-104 Could malformed ABCI evidence from CometBFT cause a chain halt in BeginBlocker?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8260d443-1031-4bfa-a4e9-bee7afb7f650",
+    "timestamp": "2025-11-21 16:46:34.249314",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker HandleEquivocationEvidence Type Assertion: The code type-asserts evidence.(*types.Equivocation). abci.go:24-25 If FromABCIEvidence returns a different type, would this panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_10996ff8-b53e-4cb0-a441-5d29287b2865",
+    "timestamp": "2025-11-21 16:46:59.521363",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Processing Order Determinism: Is req.ByzantineValidators ordering guaranteed deterministic across all nodes? Could differences cause consensus splits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_075f698b-2562-4e50-b549-9f4cf4fcc0ec",
+    "timestamp": "2025-11-21 16:47:24.479054",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Telemetry Measurement Failure: Telemetry measurement is deferred. abci.go:17 If telemetry causes a panic, does it halt evidence processing or the entire block?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_23c6a5fe-0abf-4a49-bb82-ed92dbd122df",
+    "timestamp": "2025-11-21 16:47:51.102200",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Unknown Evidence Type Logging: Unknown evidence types are logged but not stored. abci.go:28 Can attackers submit unknown evidence types to avoid accountability?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2fb41388-dd21-439a-803b-788b96af16bd",
+    "timestamp": "2025-11-21 16:48:18.247391",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Age Check Timing: Age checks happen in HandleEquivocationEvidence, not BeginBlocker. Could CometBFT submit very old evidence that wastes gas and is silently discarded?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b569486-72db-4252-80c5-2dce5e49f2c2",
+    "timestamp": "2025-11-21 16:48:47.759943",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Multiple Evidence for Same Validator: If multiple evidence entries exist for the same validator in one block, are all processed? Could this trigger repeated slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d1f6abde-56c5-4f4b-8ef8-04fb4c453f50",
+    "timestamp": "2025-11-21 16:49:18.810812",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Handling Order Side Effects: If handling evidence A affects handling of evidence B, can order differences cause consensus mismatch?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3c6d1df4-1875-4ffc-b091-4733bd1eb4cd",
+    "timestamp": "2025-11-21 16:49:50.480949",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Gas Limit Enforcement: If many validators are Byzantine, could evidence processing exceed BeginBlocker gas limit and halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a971409b-087d-4b9d-b509-bde5ec491033",
+    "timestamp": "2025-11-21 16:50:23.714997",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Handler Reentrancy: Can handler execution reenter the evidence keeper, causing inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d6601b1f-0c90-4170-9455-f77ebcf955ff",
+    "timestamp": "2025-11-21 16:50:57.757206",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker CometBFT Evidence Validation: Does the module fully validate ABCI-provided evidence, or does it trust CometBFT too much?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fed902d1-acdd-4b86-b37f-d8e024c9a75a",
+    "timestamp": "2025-11-21 16:51:33.639424",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Submission vs ABCI Race: Could MsgSubmitEvidence and ABCI evidence handling conflict, causing double processing or missed evidence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_511145ed-6454-414d-9bb2-a83d8968a1f1",
+    "timestamp": "2025-11-21 16:52:10.650915",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Module Ordering Dependencies: Does evidence run before/after slashing and staking in BeginBlocker? Could wrong ordering break invariants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_983db8af-b176-4312-847d-9a09f3e70071",
+    "timestamp": "2025-11-21 16:52:48.263053",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Evidence Processing Failure Logging: Are silent failures possible? Could attacks be hidden?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b3de576-5b1d-46d1-acec-838c571d9c78",
+    "timestamp": "2025-11-21 16:53:27.263688",
+    "report_generated": false
+  },
+  {
+    "question": "BeginBlocker Validator Power Mismatch: Evidence includes power at infraction time. If current power differs, is slashing correct?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_503bbb26-1654-4c69-9dbb-7589190c8b28",
+    "timestamp": "2025-11-21 16:54:05.240186",
+    "report_generated": false
   }
 ]
