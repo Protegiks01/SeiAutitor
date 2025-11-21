@@ -4348,5 +4348,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c616c225-6f47-410c-aa37-88b033f07880",
     "timestamp": "2025-11-21 12:10:39.931193",
     "report_generated": false
+  },
+  {
+    "question": "The random evidence fraction in params.go:80-82 ranges from 0 to 1 - could a value of 1.0 create so much evidence that processing halts the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_267cd2df-aee3-494c-9f19-16e60b0ff5fb",
+    "timestamp": "2025-11-21 12:12:05.892516",
+    "report_generated": false
+  },
+  {
+    "question": "In params.go:78-87, numKeys ranges from 2 to 2500 - could chains with >2500 accounts during genesis expose bugs not caught by simulation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5dabf9d8-0817-4a65-b337-5f44ebf11943",
+    "timestamp": "2025-11-21 12:12:19.135056",
+    "report_generated": false
+  },
+  {
+    "question": "The EventStats.Tally in event_stats.go:20-32 modifies nested maps - is this safe for concurrent access during parallel operations, or could race conditions corrupt statistics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_67a64b11-2b1f-40a1-bb6b-2fc6538f7a5b",
+    "timestamp": "2025-11-21 12:12:32.928597",
+    "report_generated": false
+  },
+  {
+    "question": "In createLogFile at log.go:50-69, file creation uses time.Now() for the filename - could concurrent simulations overwrite each other's logs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1304d072-cd92-4687-8f3e-e7aaec7d7cf2",
+    "timestamp": "2025-11-21 12:12:48.313795",
+    "report_generated": false
+  },
+  {
+    "question": "The GetMemberOfInitialState in transition_matrix.go:61-80 should never reach line 79 - could incorrect weight arrays cause out-of-bounds access?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8c8234f0-01e1-4720-94cc-4d63153fd5c9",
+    "timestamp": "2025-11-21 12:13:04.814276",
+    "report_generated": false
+  },
+  {
+    "question": "In CreateTransitionMatrix at transition_matrix.go:24-42, are negative weights properly validated, or could they cause undefined behavior in state transitions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48ed72fd-0f22-4bc8-bdef-42a95dc2403a",
+    "timestamp": "2025-11-21 12:13:20.654662",
+    "report_generated": false
+  },
+  {
+    "question": "The NextState function in transition_matrix.go:46-57 should never reach line 56 - have all edge cases been tested to ensure this assertion holds?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_556a9f24-bdf3-4409-9e35-c0714aa7c614",
+    "timestamp": "2025-11-21 12:13:38.169493",
+    "report_generated": false
+  },
+  {
+    "question": "The MustMarshal in operation.go:57-65 panics on error - could malformed operations during simulation cause unrecoverable panics in production?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c5f089cd-df2b-40b4-b912-4f53c59769cc",
+    "timestamp": "2025-11-21 12:13:57.680743",
+    "report_generated": false
+  },
+  {
+    "question": "Does the BeginBlockEntry at operation.go:38-40 accurately reflect the actual BeginBlock execution, or could logging mismatches hide timing bugs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f630141-fe24-472e-8d16-6ca328bbb80f",
+    "timestamp": "2025-11-21 12:14:19.270457",
+    "report_generated": false
+  },
+  {
+    "question": "In simulate.go:172-173 and simulate.go:193, FinalizeBlock is called twice per block - could this double execution cause state inconsistencies in modules expecting single calls?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fcc24f17-79ec-4c5a-8855-11945cc555ac",
+    "timestamp": "2025-11-21 12:14:41.308458",
+    "report_generated": false
+  },
+  {
+    "question": "The goroutine at simulate.go:120-125 handles SIGTERM - could signal handling during production cause non-deterministic state if not all nodes receive signals simultaneously?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95f4f665-76a3-4f44-8367-7b3b388bb39d",
+    "timestamp": "2025-11-21 12:15:04.380804",
+    "report_generated": false
+  },
+  {
+    "question": "In simulate.go:96-105, module accounts are filtered from simulation accounts - could this filtering logic differ from real chain logic, allowing unauthorized access to module accounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_40242869-ac00-4c7d-be68-f72e87594834",
+    "timestamp": "2025-11-21 12:15:28.546964",
+    "report_generated": false
+  },
+  {
+    "question": "In mock_tendermint.go:64-67, nil is returned for empty validator sets - could this cause nil pointer panics in block proposal logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_43ea51cb-b87f-4508-81ab-831b38cddee3",
+    "timestamp": "2025-11-21 12:15:55.081259",
+    "report_generated": false
+  },
+  {
+    "question": "The randomProposer in mock_tendermint.go:62-78 randomly selects proposers - does this match CometBFT's deterministic selection, or could it mask round-robin bugs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_15196da2-ee43-495f-af8f-6112e71a4c23",
+    "timestamp": "2025-11-21 12:16:20.587185",
+    "report_generated": false
+  },
+  {
+    "question": "In initChain at simulate.go:27-54, the genesis timestamp is set - could an attacker provide timestamps in the far past/future that break time-dependent module logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_17770b64-e0d5-4490-8a28-d9977d9cb52f",
+    "timestamp": "2025-11-21 12:16:47.444592",
+    "report_generated": false
+  },
+  {
+    "question": "In simulate.go:149-157, panics are recovered in testing mode - could production chains lack similar recovery, allowing simulation-discovered panics to halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b1f18116-15b5-47bc-a29a-cb25b434d889",
+    "timestamp": "2025-11-21 12:17:15.958874",
+    "report_generated": false
+  },
+  {
+    "question": "The getSelectOpFn in operation.go:143-158 uses weighted random selection - could zero or negative weights cause panics or infinite loops?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_308c9fe5-5287-480c-b81e-d320c01a253b",
+    "timestamp": "2025-11-21 12:17:46.317627",
+    "report_generated": false
+  },
+  {
+    "question": "In queueOperations at operation.go:76-106, operations are queued by BlockHeight or BlockTime - could an attacker create operations that never execute, creating memory leaks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f182fef-2ef1-459e-82dc-5a05194d6e94",
+    "timestamp": "2025-11-21 12:18:17.910020",
+    "report_generated": false
+  },
+  {
+    "question": "The runQueuedTimeOperations in simulate.go:361-390 uses currentTime.After() - is this comparison deterministic across all nodes, or could time skew cause different execution orders?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7a2a42a7-47da-4ab9-acd6-412100a04ddc",
+    "timestamp": "2025-11-21 12:18:49.706691",
+    "report_generated": false
+  },
+  {
+    "question": "In runQueuedOperations at simulate.go:328-359, queued operations are executed without re-checking gas limits - could this bypass AnteHandler gas checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_43a4ca69-4e64-40a4-b132-55b3200054c0",
+    "timestamp": "2025-11-21 12:19:24.481662",
+    "report_generated": false
+  },
+  {
+    "question": "The OperationQueue in operation.go:68-73 is a map[int][]Operation - could an attacker queue unlimited future operations at specific block heights, causing memory exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_442e0588-b1ff-4228-b758-87b356381c6b",
+    "timestamp": "2025-11-21 12:19:59.894829",
+    "report_generated": false
+  },
+  {
+    "question": "In mock_tendermint.go:178-209, evidence is randomly generated - could this miss edge cases where malformed evidence crashes the evidence module?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a445d11f-e4ce-4a47-a651-66a144990775",
+    "timestamp": "2025-11-21 12:20:34.572968",
+    "report_generated": false
+  },
+  {
+    "question": "The RandomRequestBeginBlock in mock_tendermint.go:119-218 simulates validator signing - could incorrect liveness simulation mask real slashing bugs that would halt production chains?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_23534723-45b2-4f96-b47b-68e1aa20f539",
+    "timestamp": "2025-11-21 12:21:10.981882",
+    "report_generated": false
+  },
+  {
+    "question": "In updateValidators at mock_tendermint.go:80-115, does the validator set update logic match CometBFT's exact behavior, or could discrepancies cause real chain state divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_53106352-856a-462e-87df-5d4620e4e654",
+    "timestamp": "2025-11-21 12:21:48.683954",
+    "report_generated": false
+  },
+  {
+    "question": "The getBlockSize function in util.go:36-53 uses a transition matrix - could an attacker manipulate this to create oversized blocks that exceed resource limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0ea145f6-06d9-4398-9cd6-168eff418df5",
+    "timestamp": "2025-11-21 12:22:26.634751",
+    "report_generated": false
   }
 ]
