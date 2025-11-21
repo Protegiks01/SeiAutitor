@@ -5548,5 +5548,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e4d7769c-4350-4773-b5dc-ecae9e935e9b",
     "timestamp": "2025-11-21 09:33:44.679566",
     "report_generated": false
+  },
+  {
+    "question": "Can forged capability pointers pass FwdCapabilityKey authentication? keys.go:41-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a98edb46-7745-4be9-9d27-c0634f7b094c",
+    "timestamp": "2025-11-21 12:30:19.812697",
+    "report_generated": false
+  },
+  {
+    "question": "Do IBC callbacks allow calling with capabilities not owned by the module? keeper.go:275-280",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1ab84bfb-a697-4a33-80b8-367b4cba14bd",
+    "timestamp": "2025-11-21 12:30:32.874745",
+    "report_generated": false
+  },
+  {
+    "question": "Does KeyPrefixIndexCapability avoid collisions with other module prefixes? keys.go:20-31",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_afbfd2c5-b567-4251-82f0-731e9694f870",
+    "timestamp": "2025-11-21 12:30:47.072167",
+    "report_generated": false
+  },
+  {
+    "question": "Can IndexToKey create indices that collide with reserved keys such as KeyIndex? keys.go:53-55",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1b7211ef-ad99-4f64-9b35-28c16d4fbfbc",
+    "timestamp": "2025-11-21 12:31:01.229434",
+    "report_generated": false
+  },
+  {
+    "question": "Does prefix isolation in the store prevent capability index collisions with unrelated module data? keeper.go:169-174",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eac7e9f4-b90e-4c55-b00d-96d42c84068f",
+    "timestamp": "2025-11-21 12:31:17.674809",
+    "report_generated": false
+  },
+  {
+    "question": "Can module names containing '/fwd/' collide with forward keys? keys.go:35-37",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4e7b0ef9-e097-4645-a9d2-d3e3cb3e3faa",
+    "timestamp": "2025-11-21 12:31:33.882350",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitMemStore iterate owners deterministically across all nodes? keeper.go:117-129",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3822f598-9789-4adf-8d8f-1ebc094495cb",
+    "timestamp": "2025-11-21 12:31:54.106931",
+    "report_generated": false
+  },
+  {
+    "question": "Can persistent store updates succeed while memory updates fail, causing inconsistent GetOwners vs GetCapability results? keeper.go:177-189",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c9d58619-214d-42ff-84eb-f8a5bfa82220",
+    "timestamp": "2025-11-21 12:32:15.274652",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetCapability's TODO indicate stale capMap entries after failed txs leading to memory leaks? keeper.go:371-380",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c726eaf-71ea-46bd-884c-a0724ecdde17",
+    "timestamp": "2025-11-21 12:32:37.306925",
+    "report_generated": false
+  },
+  {
+    "question": "Can repeated create-revert loops exploit the memory leak in capMap for DoS? keeper.go:371-377",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_03d798ea-ee3d-4a70-935a-7a80e018d160",
+    "timestamp": "2025-11-21 12:33:01.698849",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitializeCapability enter a partially initialized state if reverse key writes fail? keeper.go:194-214",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1899f2d-57f8-4ecb-bedf-35e88f450b3a",
+    "timestamp": "2025-11-21 12:33:28.177647",
+    "report_generated": false
+  },
+  {
+    "question": "Can mismatched memory/persistent stores cause divergence on restart? keeper.go:107-135",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d336e58-0cd6-448d-a6d2-336f2ab2469c",
+    "timestamp": "2025-11-21 12:33:54.877183",
+    "report_generated": false
+  },
+  {
+    "question": "Can replacing memStore with non-memory type cause panic in BeginBlocker? keeper.go:107-112",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_955593a0-36d4-45dc-b16f-1fbdb56541a8",
+    "timestamp": "2025-11-21 12:34:21.503367",
+    "report_generated": false
+  },
+  {
+    "question": "Can repeated store type checks degrade performance or be bypassed via store key manipulation? keeper.go:107-112",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9223dd68-0676-405d-bd80-530a6697cd76",
+    "timestamp": "2025-11-21 12:34:50.908542",
+    "report_generated": false
+  },
+  {
+    "question": "Can misconfigured store keys during app startup bypass type safety checks and corrupt state? keeper.go:109-112",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_08f9e425-ccbd-4c0c-9802-235fb5796147",
+    "timestamp": "2025-11-21 12:35:21.785329",
+    "report_generated": false
+  },
+  {
+    "question": "Can differences between IAVL and memory stores cause nondeterminism? keeper.go:107-135",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ac78369f-d710-4b3e-a912-8464ddb7b213",
+    "timestamp": "2025-11-21 12:35:53.791292",
+    "report_generated": false
+  },
+  {
+    "question": "Does NewKeeper ensure storeKey and memKey cannot collide? keeper.go:55-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d7dfa55-98a6-4147-9d6c-825f8e177cc4",
+    "timestamp": "2025-11-21 12:36:26.311131",
+    "report_generated": false
+  },
+  {
+    "question": "Can MustMarshal panic on malformed CapabilityOwners data? keeper.go:168-174",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8d9febd1-46e5-45fa-9fdd-58faf48c5785",
+    "timestamp": "2025-11-21 12:37:00.784132",
+    "report_generated": false
+  },
+  {
+    "question": "Does MustUnmarshal panic on corrupted protobufs from genesis or state sync, halting the node? keeper.go:125-128",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eb0efdf4-a9a3-42f1-9909-b6d9cec783e5",
+    "timestamp": "2025-11-21 12:37:36.049080",
+    "report_generated": false
+  },
+  {
+    "question": "Can protobuf encoding differences cause consensus splits? keeper.go:168-174",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a285cf93-41c9-4089-8f68-b0cb676f830a",
+    "timestamp": "2025-11-21 12:38:11.442881",
+    "report_generated": false
+  },
+  {
+    "question": "Are empty Module or Name fields in Owner structs validated? genesis.go:37-45",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e16879a6-b5e7-48aa-801f-d4efc5b30e89",
+    "timestamp": "2025-11-21 12:38:46.907186",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitGenesis enter inconsistent state if protobuf decode fails after validation? genesis.go:21-49",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff584530-f6f6-4156-a881-b4184a3f933f",
+    "timestamp": "2025-11-21 12:39:21.830665",
+    "report_generated": false
+  },
+  {
+    "question": "Is FwdCapabilityKey pointer formatting deterministic across platforms and Go versions? keys.go:41-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_83252538-019e-4297-990b-0bbcb5afbae0",
+    "timestamp": "2025-11-21 12:39:58.447112",
+    "report_generated": false
+  },
+  {
+    "question": "Can GC or memory relocation cause pointer changes that break capability mapping? keys.go:41-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_af1d3507-29a7-46da-acd9-d1353180580d",
+    "timestamp": "2025-11-21 12:40:34.614572",
+    "report_generated": false
+  },
+  {
+    "question": "Does any iteration over capMap rely on deterministic order? keeper.go:60-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f42733c0-2668-4458-b483-8f32ff83829f",
+    "timestamp": "2025-11-21 12:41:12.025852",
+    "report_generated": false
   }
 ]
