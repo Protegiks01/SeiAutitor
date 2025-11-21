@@ -8098,5 +8098,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa19a2cc-9ded-454c-81dd-beff6237ceb9",
     "timestamp": "2025-11-21 17:07:59.191636",
     "report_generated": false
+  },
+  {
+    "question": "Consensus Param Changes Mid-Processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c7a61d4-bcf8-4af8-8694-8aa97b94a87a",
+    "timestamp": "2025-11-21 17:09:10.579101",
+    "report_generated": false
+  },
+  {
+    "question": "Keeper Interface Assumption Violations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_128ce427-f2b4-412a-a3b9-9c55d13d625f",
+    "timestamp": "2025-11-21 17:09:24.266326",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Handler Arbitrary State Modification?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fa33d8cf-0b27-4ad0-a435-b5d6a9f4f36b",
+    "timestamp": "2025-11-21 17:09:37.824469",
+    "report_generated": false
+  },
+  {
+    "question": "Router Handler Panic Safety?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55f9746a-69f9-4685-9a3f-e1fbc36250f2",
+    "timestamp": "2025-11-21 17:09:52.016657",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Module Missing Invariants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6823e4be-1e99-4ca6-9843-711f0a23fc54",
+    "timestamp": "2025-11-21 17:10:06.917177",
+    "report_generated": false
+  },
+  {
+    "question": "Slash Fraction Governance Change Mid-Processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fc369393-b83c-4cbd-a11d-961615fde963",
+    "timestamp": "2025-11-21 17:10:23.722022",
+    "report_generated": false
+  },
+  {
+    "question": "Slashing Keeper Jail/Tombstone Race?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e0a80e0-da00-4398-b91b-3b048ae85ba4",
+    "timestamp": "2025-11-21 17:10:41.328746",
+    "report_generated": false
+  },
+  {
+    "question": "Slashing Keeper Pubkey Mismatch?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_66c15e18-8847-4f40-9209-de3cbaacde6c",
+    "timestamp": "2025-11-21 17:11:01.062756",
+    "report_generated": false
+  },
+  {
+    "question": "Staking Keeper Validator Lookup Race?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d3aeaaf8-58a1-409a-8523-fb2202df6f3e",
+    "timestamp": "2025-11-21 17:11:22.377582",
+    "report_generated": false
+  },
+  {
+    "question": "REST Handler Auth Issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_09cd37a4-a1da-49e8-9727-e65af927ace0",
+    "timestamp": "2025-11-21 17:11:45.400819",
+    "report_generated": false
+  },
+  {
+    "question": "Legacy Querier Differences?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eaad3d1e-7c18-4a1d-9757-46573df9fe7d",
+    "timestamp": "2025-11-21 17:12:09.713307",
+    "report_generated": false
+  },
+  {
+    "question": "RPC Response Size DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b660c84-f77c-471f-a131-27ca01a28040",
+    "timestamp": "2025-11-21 17:12:35.575502",
+    "report_generated": false
+  },
+  {
+    "question": "RPC Rate Limiting Missing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ea666d9a-e258-4548-876d-e898105f3a1f",
+    "timestamp": "2025-11-21 17:13:02.606810",
+    "report_generated": false
+  },
+  {
+    "question": "RPC Query Authentication Weakness?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80ed3c86-9c0c-4589-ad22-ca0e708979dc",
+    "timestamp": "2025-11-21 17:13:31.615245",
+    "report_generated": false
+  },
+  {
+    "question": "Historical Height Query Limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8708c7f-ce8f-4cbd-af73-8907490b562c",
+    "timestamp": "2025-11-21 17:14:02.396101",
+    "report_generated": false
+  },
+  {
+    "question": "Query Context Unwrap Issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9f6490f8-93a0-4f69-b504-c8034e0fccb7",
+    "timestamp": "2025-11-21 17:14:33.155952",
+    "report_generated": false
+  },
+  {
+    "question": "CLI Execution Context Blocking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9940aa75-c6b6-4322-b939-d250fac4b0a9",
+    "timestamp": "2025-11-21 17:15:04.863575",
+    "report_generated": false
+  },
+  {
+    "question": "CLI Pagination Validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a422bbe-da32-4436-a19a-0b409ba8876b",
+    "timestamp": "2025-11-21 17:15:37.657662",
+    "report_generated": false
+  },
+  {
+    "question": "CLI Evidence Hex Parsing: Malformed hex?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1266cacf-75ee-4c3b-a3a0-513306a366e8",
+    "timestamp": "2025-11-21 17:16:11.267026",
+    "report_generated": false
+  },
+  {
+    "question": "Query AllEvidence Empty Response Confusion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0bd47989-062f-46a4-ae24-b5733ed8b1c4",
+    "timestamp": "2025-11-21 17:16:45.675569",
+    "report_generated": false
+  },
+  {
+    "question": "Query AllEvidence Repeated Marshal DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_750bb8ce-e39b-49b5-b32f-a25cf54c3e12",
+    "timestamp": "2025-11-21 17:17:22.924196",
+    "report_generated": false
+  },
+  {
+    "question": "Query AllEvidence Unmarshal Error?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f1c0ba8-af2a-4c13-8e29-3702d3c6a8eb",
+    "timestamp": "2025-11-21 17:18:02.492821",
+    "report_generated": false
+  },
+  {
+    "question": "Query AllEvidence Pagination Bypass?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_60cee2e7-2352-49de-9696-1a27009d3d98",
+    "timestamp": "2025-11-21 17:18:42.697547",
+    "report_generated": false
+  },
+  {
+    "question": "Query AllEvidence Calls GetAllEvidence but ignores result — dead code?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b69289db-7603-4d07-9471-dc843ebec565",
+    "timestamp": "2025-11-21 17:19:24.168522",
+    "report_generated": false
+  },
+  {
+    "question": "Query AllEvidence Nil Request Behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_90939862-c290-4960-a6ca-ae48cd6b9cfa",
+    "timestamp": "2025-11-21 17:20:07.540368",
+    "report_generated": false
   }
 ]
