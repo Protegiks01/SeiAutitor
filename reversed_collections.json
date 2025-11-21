@@ -7198,5 +7198,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_75948fe0-cabc-4cad-a474-7a4c3ed67c1f",
     "timestamp": "2025-11-21 15:55:38.453444",
     "report_generated": false
+  },
+  {
+    "question": "Can a chain upgrade that modifies the feegrant module break existing grants or leave orphaned state that cannot be cleaned up?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c8a2f1af-3d95-4e6f-8ce8-57733a05170a",
+    "timestamp": "2025-11-21 15:56:49.277229",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module define invariants to check that all grants reference valid accounts and have internally consistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a27d85ae-1003-44ae-b7f3-115db937fcc5",
+    "timestamp": "2025-11-21 15:57:03.726902",
+    "report_generated": false
+  },
+  {
+    "question": "Can the ExportGenesis function keeper.go:218-229 produce non-deterministic output if grants are iterated in different orders?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c1f5e59-3776-483d-8a66-30c391409608",
+    "timestamp": "2025-11-21 15:57:19.823152",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateGenesis genesis.go:17-29 check for duplicate grants that could corrupt state on chain initialization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9cba7fea-2139-40b0-8e53-7e08d4704cc9",
+    "timestamp": "2025-11-21 15:57:35.258827",
+    "report_generated": false
+  },
+  {
+    "question": "In InitGenesis keeper.go:193-215, can malformed genesis grants cause the chain to fail to start?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fb59c976-ff6a-492b-b807-d927ff1b6cb2",
+    "timestamp": "2025-11-21 15:57:51.873060",
+    "report_generated": false
+  },
+  {
+    "question": "Does the query server properly validate input parameters to prevent injection attacks or crashes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a9083c15-2faa-441e-a680-dd483cf6e81d",
+    "timestamp": "2025-11-21 15:58:12.140401",
+    "report_generated": false
+  },
+  {
+    "question": "Can the grant iteration in queries cause non-deterministic results if grants are modified during iteration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e6c8f291-c67b-481a-a907-0d3b92333338",
+    "timestamp": "2025-11-21 15:58:32.867099",
+    "report_generated": false
+  },
+  {
+    "question": "Does the pagination logic prevent an attacker from using negative page numbers or extremely large page sizes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a47c3d5-7fbd-4926-b0bb-245358c40d01",
+    "timestamp": "2025-11-21 15:58:55.993775",
+    "report_generated": false
+  },
+  {
+    "question": "Can the query endpoints leak information about private grants between accounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e01e022b-12fa-4270-a5c8-6eed5dfd586e",
+    "timestamp": "2025-11-21 15:59:19.400881",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proto marshaling at lines 42-50 grpc_query.go:42-50 handle all edge cases including nil allowances?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5bea1705-3ecb-49c5-8dbb-1d9a10f78f88",
+    "timestamp": "2025-11-21 15:59:45.510977",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause the query server to consume excessive memory by requesting grants with very large allowance objects?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ef06ee6c-8206-4f70-92d3-538c73a778c4",
+    "timestamp": "2025-11-21 16:00:12.158133",
+    "report_generated": false
+  },
+  {
+    "question": "Does the filtered pagination in AllowancesByGranter grpc_query.go:114-130 properly meter gas for each iteration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48abf9dc-f54c-4fcd-8a16-c8cad35fecf2",
+    "timestamp": "2025-11-21 16:00:39.954631",
+    "report_generated": false
+  },
+  {
+    "question": "Can the AllowancesByGranter query grpc_query.go:98-137 be exploited to enumerate all grants for a specific address?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cc5cd9fc-8b59-4b25-a5ab-22ce381812ec",
+    "timestamp": "2025-11-21 16:01:08.807326",
+    "report_generated": false
+  },
+  {
+    "question": "Does the Allowances query grpc_query.go:62-95 properly handle pagination to prevent returning unbounded results?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9b2e0033-e8e3-4c1e-881d-8ce6f673fc65",
+    "timestamp": "2025-11-21 16:01:40.512715",
+    "report_generated": false
+  },
+  {
+    "question": "In Keeper.Allowance query grpc_query.go:20-59, can an attacker cause DoS by querying non-existent grants repeatedly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_06ff0bc0-5220-441c-805e-fdb88e76f479",
+    "timestamp": "2025-11-21 16:02:11.455801",
+    "report_generated": false
+  },
+  {
+    "question": "Does the message server properly handle the case where the granter or grantee account is deleted during grant execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_01d640a1-8f99-45a6-9ae9-73db5468f29a",
+    "timestamp": "2025-11-21 16:02:44.946046",
+    "report_generated": false
+  },
+  {
+    "question": "Can the state transitions in the message server cause consensus splits if nodes process messages in different orders?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_68149717-de28-444a-8d2f-76fb671e332b",
+    "timestamp": "2025-11-21 16:03:19.897690",
+    "report_generated": false
+  },
+  {
+    "question": "Does the message server validate that grant parameters are within reasonable bounds (e.g., expiration not too far in the future)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e3397a72-7db9-4d17-a7a7-debab96400f7",
+    "timestamp": "2025-11-21 16:03:58.205834",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause a denial of service by creating and revoking grants repeatedly in the same transaction?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4819e4f4-b887-48dc-8fdf-b6a059763e32",
+    "timestamp": "2025-11-21 16:04:36.920588",
+    "report_generated": false
+  },
+  {
+    "question": "Does the execution flow properly emit events on all success and failure paths?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd375ba2-a9ab-4e35-9fc7-4598a4503e1a",
+    "timestamp": "2025-11-21 16:05:17.675709",
+    "report_generated": false
+  },
+  {
+    "question": "Can the message server be exploited to create grants for frozen or sanctioned accounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f549a969-c05d-49b7-884b-907b9f68b5a6",
+    "timestamp": "2025-11-21 16:05:58.086505",
+    "report_generated": false
+  },
+  {
+    "question": "Does RevokeAllowance validate that the grant exists before attempting to revoke it msg_server.go:72?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93a4d163-7bc0-4357-9979-fd02a79ae964",
+    "timestamp": "2025-11-21 16:06:37.202644",
+    "report_generated": false
+  },
+  {
+    "question": "Can the grant creation in GrantAllowance msg_server.go:50-53 consume unbounded gas with malicious allowance configurations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dd737173-8999-41dd-947c-e1d9abd854e9",
+    "timestamp": "2025-11-21 16:07:16.411378",
+    "report_generated": false
+  },
+  {
+    "question": "Does the message server enforce rate limits on grant creation to prevent spam?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0645986-fdda-488d-a342-b1a710d0effb",
+    "timestamp": "2025-11-21 16:07:55.853814",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker front-run a revocation with a grant usage to drain funds before the revoke takes effect?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6d9138b-82ec-426e-b25c-2979555f46d5",
+    "timestamp": "2025-11-21 16:08:36.808155",
+    "report_generated": false
   }
 ]
