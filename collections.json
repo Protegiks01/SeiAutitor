@@ -5698,5 +5698,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f42733c0-2668-4458-b483-8f32ff83829f",
     "timestamp": "2025-11-21 12:41:12.025852",
     "report_generated": false
+  },
+  {
+    "question": "Does KV iteration in InitMemStore guarantee deterministic ordering across nodes? keeper.go:117-129",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b6db254d-fd32-4324-b749-a902cb5fdf01",
+    "timestamp": "2025-11-21 12:42:30.381901",
+    "report_generated": false
+  },
+  {
+    "question": "Can binary search in CapabilityOwners.Get produce inconsistent results if ordering is violated? types.go:78-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2d1cfa32-b366-4c67-97c3-f7df3fe12b14",
+    "timestamp": "2025-11-21 12:42:43.563698",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitMemStore panic in BeginBlocker halt the chain? abci.go:17-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3515e85d-9167-40d0-a0e2-dbb8bd9d8356",
+    "timestamp": "2025-11-21 12:42:57.044710",
+    "report_generated": false
+  },
+  {
+    "question": "Can extremely large capability sets cause BeginBlocker timeout violations? keeper.go:107-135",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_148f8784-3ae0-4303-9d86-825e6c14ec6e",
+    "timestamp": "2025-11-21 12:43:11.185630",
+    "report_generated": false
+  },
+  {
+    "question": "Can telemetry in BeginBlocker be used for DoS via capability spam? abci.go:17-19",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_675a93e5-feb5-4ce7-a543-8692fd68b1ef",
+    "timestamp": "2025-11-21 12:43:26.080936",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious validators propose blocks skipping BeginBlocker? abci.go:17-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0b12f2e6-f483-4081-b0b8-54709f8afe9f",
+    "timestamp": "2025-11-21 12:43:42.784459",
+    "report_generated": false
+  },
+  {
+    "question": "Does any EndBlocker contain unbounded loops or panic scenarios? module.go:1-194",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d488de64-93f6-4b3f-a5b7-37c0e6b7783b",
+    "timestamp": "2025-11-21 12:44:00.317387",
+    "report_generated": false
+  },
+  {
+    "question": "Can partial writes in NewCapability leave index counters inconsistent after tx reversal? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9a38d995-9174-4b22-b9b3-00678ea753f3",
+    "timestamp": "2025-11-21 12:44:19.947208",
+    "report_generated": false
+  },
+  {
+    "question": "Can persistent store and memory store updates become inconsistent if ClaimCapability crashes mid-operation? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_933f15bb-82f4-418c-902e-7a99ac031f68",
+    "timestamp": "2025-11-21 12:44:41.857252",
+    "report_generated": false
+  },
+  {
+    "question": "Can ReleaseCapability delete in-memory state while persistent delete fails, creating mismatches? keeper.go:319-356",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f9cbf1fa-a520-4474-97c7-1023d1ddafce",
+    "timestamp": "2025-11-21 12:45:04.797505",
+    "report_generated": false
+  },
+  {
+    "question": "Can multiple capability operations within a single tx race via shared capMap? keeper.go:60-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f164ba93-53d4-49c7-b7fa-5ad1059ff4c5",
+    "timestamp": "2025-11-21 12:45:27.956685",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitGenesis leave partial capability state if node crashes mid-initialization? genesis.go:11-22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5fa14abc-cca8-4598-bda4-23dae26131b3",
+    "timestamp": "2025-11-21 12:45:52.119340",
+    "report_generated": false
+  },
+  {
+    "question": "Can nodes permanently fork if validators disagree on capability indices from genesis imports? genesis.go:11-22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8bd90cc-14d0-464e-a161-435f8cb46fd4",
+    "timestamp": "2025-11-21 12:46:18.971611",
+    "report_generated": false
+  },
+  {
+    "question": "Does capability creation order affect state root and cause nondeterminism under replay? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bcec340d-7ab6-4cd6-ad78-341aba63956d",
+    "timestamp": "2025-11-21 12:46:45.465723",
+    "report_generated": false
+  },
+  {
+    "question": "Can timing differences in BeginBlocker cause different KeyMemInitialized flag states? keeper.go:115-134",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_75900d99-4e6c-4176-9ca4-69b0bb2f06c9",
+    "timestamp": "2025-11-21 12:47:13.101380",
+    "report_generated": false
+  },
+  {
+    "question": "Can version mismatch during upgrade cause failure in capability authentication? module.go:160-161",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7594b6b0-1212-460f-8858-a2b4ceeb0ca7",
+    "timestamp": "2025-11-21 12:47:43.053231",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module provide correct migration logic for capability indices during hard forks? genesis.go:11-22",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_018d0679-4326-4221-878b-e56ec8725000",
+    "timestamp": "2025-11-21 12:48:14.807003",
+    "report_generated": false
+  },
+  {
+    "question": "Does NewCapability meter gas for index increment and store writes? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_79c8b1b9-4cc4-4488-8430-225117e1e623",
+    "timestamp": "2025-11-21 12:48:46.568215",
+    "report_generated": false
+  },
+  {
+    "question": "Can attackers spam capability creation to exhaust block gas due to underpriced operations? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aa487286-1376-4e16-88dc-e7403ea9e8f2",
+    "timestamp": "2025-11-21 12:49:18.559498",
+    "report_generated": false
+  },
+  {
+    "question": "Does ClaimCapability charge gas proportional to number of owners? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9dc59080-711c-4a6d-8e2b-ad340b161e90",
+    "timestamp": "2025-11-21 12:49:49.558593",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitMemStore meter gas for iteration over all capability entries? keeper.go:107-135",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0c9837ac-601c-4f88-8bd9-48865bdd9ce8",
+    "timestamp": "2025-11-21 12:50:24.084907",
+    "report_generated": false
+  },
+  {
+    "question": "Can binary search on large owner sets enable gas-related DoS attacks? types.go:78-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a0ddc0e0-afb6-425f-9e03-fc15e94a55f3",
+    "timestamp": "2025-11-21 12:50:57.914208",
+    "report_generated": false
+  },
+  {
+    "question": "Can attackers exhaust node memory by creating millions of capabilities and filling capMap? keeper.go:60-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aea77545-9a2c-4f79-9157-8a338adf3c8b",
+    "timestamp": "2025-11-21 12:51:31.874134",
+    "report_generated": false
+  },
+  {
+    "question": "Does TODO leak stale pointers from reverted txs, enabling memory exhaustion? keeper.go:371-377",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85560a8d-83ab-47ef-9720-5bff35674f02",
+    "timestamp": "2025-11-21 12:52:06.212722",
+    "report_generated": false
+  },
+  {
+    "question": "Can initializing millions of owners during genesis cause memory spikes? keeper.go:194-214",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1349eddd-42b5-499f-9c3f-4a0f9881079b",
+    "timestamp": "2025-11-21 12:52:42.720601",
+    "report_generated": false
   }
 ]
