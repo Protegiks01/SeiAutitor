@@ -2398,5 +2398,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd20d46f-6ce1-40fc-a1a9-2bff0bc7a554",
     "timestamp": "2025-11-21 09:22:01.461833",
     "report_generated": false
+  },
+  {
+    "question": "Can the iterator in GetModuleVersions leak memory if not properly closed in error cases? keeper.go:137-154",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7b4f3cc1-23c2-4b59-a329-eafbab20a8f9",
+    "timestamp": "2025-11-21 09:36:01.607010",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetModuleVersionMap properly handle cases where the version map is empty or corrupted? keeper.go:118-135",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0c61a58f-10da-4b94-bb4a-0598d86aa3f7",
+    "timestamp": "2025-11-21 09:36:15.009832",
+    "report_generated": false
+  },
+  {
+    "question": "Can the SetModuleVersionMap function be called with an empty map to corrupt the version state? keeper.go:93-116",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_22b79c16-3b98-4b60-8a9b-8f733c01eee3",
+    "timestamp": "2025-11-21 09:36:29.456941",
+    "report_generated": false
+  },
+  {
+    "question": "Is the binary encoding of protocol version vulnerable to endianness issues across different architectures? keeper.go:74-76",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62f0fcf2-d799-46b8-850f-db4b3cc74071",
+    "timestamp": "2025-11-21 09:36:45.702374",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the prefix store to read or modify upgrade state from other modules? keeper.go:97",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62c3774c-2479-4934-b125-02b1d0cbe7ff",
+    "timestamp": "2025-11-21 09:37:02.018128",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module version map iteration maintain deterministic ordering across all nodes? keeper.go:98-106",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3ddd5874-e58c-4a8d-ade5-d10b2b9417af",
+    "timestamp": "2025-11-21 09:37:20.442814",
+    "report_generated": false
+  },
+  {
+    "question": "Can the version map store be corrupted by concurrent writes from multiple upgrade handlers? keeper.go:93-116",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a38dd824-2c3b-4f26-a2d9-2ba5f2b91d50",
+    "timestamp": "2025-11-21 09:37:40.222385",
+    "report_generated": false
+  },
+  {
+    "question": "Is the DoneByte prefix properly isolated to prevent key collisions with other upgrade state? keys.go:23",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8e9c4403-5094-44f4-a9c8-2611141262c9",
+    "timestamp": "2025-11-21 09:38:01.924686",
+    "report_generated": false
+  },
+  {
+    "question": "Can the PlanKey be overwritten by other modules using the same byte prefix? keys.go:20-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4517b4b3-2632-4a29-a62f-46e3071bef58",
+    "timestamp": "2025-11-21 09:38:23.780780",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a check to prevent scheduling an upgrade with an empty or whitespace-only name? plan.go:28-30",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fb953b12-cbe3-4f8b-9c19-632dbbb5b4b6",
+    "timestamp": "2025-11-21 09:38:47.545821",
+    "report_generated": false
+  },
+  {
+    "question": "Can proposal marshaling fail in a way that corrupts the upgrade plan in the store? keeper.go:200-201",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9c6b61cd-84ed-40a7-81e7-56d25c8e216c",
+    "timestamp": "2025-11-21 09:39:12.238375",
+    "report_generated": false
+  },
+  {
+    "question": "Does clearing the old plan properly handle all associated IBC state without leaving orphaned data? keeper.go:194-198",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eb640fde-7801-4ea8-bdc6-c48e6d927673",
+    "timestamp": "2025-11-21 09:39:38.233039",
+    "report_generated": false
+  },
+  {
+    "question": "Can the GetDoneHeight check be circumvented to allow re-execution of completed upgrades? keeper.go:281-290",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55a2e72a-fc7f-46a2-a498-19065aa0c530",
+    "timestamp": "2025-11-21 09:40:06.270523",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that prevents scheduling two upgrades with the same name at different heights? keeper.go:188-190",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a77af35a-3ec6-491a-afaa-e7f3c626f278",
+    "timestamp": "2025-11-21 09:40:34.764851",
+    "report_generated": false
+  },
+  {
+    "question": "Can governance parameters be modified to reduce the voting period for upgrade proposals dangerously? handler.go:14-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7d5bf415-d40c-4c3a-8908-744f971ab011",
+    "timestamp": "2025-11-21 09:41:04.557789",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proposal title and description validation prevent injection attacks or excessively long strings? tx.go:145-153",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c0a8cbd1-e85e-400b-906e-bf469e68f0dd",
+    "timestamp": "2025-11-21 09:41:35.581786",
+    "report_generated": false
+  },
+  {
+    "question": "Can the expedited proposal flag be abused to rush through malicious upgrades? tx.go:60-63",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b30134c-80ef-4a35-bdaa-24eb681f60b7",
+    "timestamp": "2025-11-21 09:42:08.422567",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that the upgrade info string doesn't contain executable code or malicious payloads? tx.go:160-163",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d66055d7-16ad-4e7c-b744-15d6d6a0adad",
+    "timestamp": "2025-11-21 09:42:42.460828",
+    "report_generated": false
+  },
+  {
+    "question": "Can proposal content be manipulated after validation but before execution? handler.go:15-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f621b064-a96f-455e-baef-1dc0f2819d38",
+    "timestamp": "2025-11-21 09:43:16.917576",
+    "report_generated": false
+  },
+  {
+    "question": "Does the IBC client state check properly reject upgrades that try to manipulate IBC state? plan.go:25-27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_814ce657-dfda-45b7-ab94-5d79ba34990d",
+    "timestamp": "2025-11-21 09:43:50.808794",
+    "report_generated": false
+  },
+  {
+    "question": "Can time-based upgrades still be scheduled despite being deprecated? plan.go:22-24",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cfba763a-2c73-4bdf-83b1-fa038f39370f",
+    "timestamp": "2025-11-21 09:44:25.933815",
+    "report_generated": false
+  },
+  {
+    "question": "Is the Plan validation in ValidateBasic sufficient to prevent all malformed plans? plan.go:20-36",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5144d158-41d8-49d3-9c39-ca014173f995",
+    "timestamp": "2025-11-21 09:45:01.167353",
+    "report_generated": false
+  },
+  {
+    "question": "Can an upgrade be scheduled in the past if the block height check is manipulated? keeper.go:184-186",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9ed3faf-1028-461e-b9b5-a232802e0404",
+    "timestamp": "2025-11-21 09:45:36.984941",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proposal handler check for duplicate upgrade names to prevent confusion? keeper.go:188-190",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_957a1c5c-2172-45af-9e8c-e64e33a85a17",
+    "timestamp": "2025-11-21 09:46:13.474332",
+    "report_generated": false
+  },
+  {
+    "question": "Can the upgrade proposal validation be bypassed by submitting proposals through non-standard interfaces? proposal.go:32-37",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f16c172c-aeb6-4c4b-9cb6-893823cf70c4",
+    "timestamp": "2025-11-21 09:46:51.592531",
+    "report_generated": false
   }
 ]
