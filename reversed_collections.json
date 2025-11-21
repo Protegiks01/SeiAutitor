@@ -6598,5 +6598,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fdf95613-4cf8-4d98-9d49-306da2b2fb20",
     "timestamp": "2025-11-21 15:06:24.543697",
     "report_generated": false
+  },
+  {
+    "question": "Does the goroutine spawning in validate_genesis.go:116-155 properly handle errors without leaking goroutines?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a7538632-ba1a-408d-b234-9e5f6a5e4ed4",
+    "timestamp": "2025-11-21 15:08:29.960631",
+    "report_generated": false
+  },
+  {
+    "question": "Can the module state parser in validate_genesis.go:81-91 be exploited with malformed JSON to cause parsing divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_586c7c94-2793-4043-86e0-ee6747d16e20",
+    "timestamp": "2025-11-21 15:08:43.429216",
+    "report_generated": false
+  },
+  {
+    "question": "Does the streaming validation in validate_genesis.go:93-158 properly handle modules that appear multiple times?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e40c808-04d0-437c-a6f4-4344c676b1f8",
+    "timestamp": "2025-11-21 15:08:57.563264",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause memory exhaustion by sending infinite genesis data through the streaming validator in module.go:56-64?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_216601c1-488d-4508-b497-40bc282dab4f",
+    "timestamp": "2025-11-21 15:09:11.867433",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateGenesisStream in module.go:131-139 properly handle channel closures to prevent deadlocks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_343f7238-5e22-4e0b-9134-0bdff03710d6",
+    "timestamp": "2025-11-21 15:09:27.251756",
+    "report_generated": false
+  },
+  {
+    "question": "Does the single-message requirement in genesis_state.go:108-111 prevent multi-msg attacks during genesis?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1946aef1-cec0-4097-bd63-db1500d8b607",
+    "timestamp": "2025-11-21 15:09:43.496582",
+    "report_generated": false
+  },
+  {
+    "question": "Can type assertions fail unexpectedly if the message type registry is corrupted during genesis processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5bd715ad-c451-4d0f-830e-aaa3b29876f5",
+    "timestamp": "2025-11-21 15:10:01.095184",
+    "report_generated": false
+  },
+  {
+    "question": "Does the message extraction in genesis_state.go:107 handle messages with nil pointers safely?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1628ec6f-82e7-41b0-b86d-562927f583fa",
+    "timestamp": "2025-11-21 15:10:20.964557",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft a MsgCreateValidator with invalid commission rates that bypasses validation in the gentx but causes runtime errors?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b57b23de-1f2f-40f6-a8bb-237388229e2f",
+    "timestamp": "2025-11-21 15:10:42.911438",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateGenesis in genesis_state.go:98-120 properly validate all fields of MsgCreateValidator, preventing malformed validator creation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1fa393a5-af22-408f-b089-629648d00693",
+    "timestamp": "2025-11-21 15:11:06.121126",
+    "report_generated": false
+  },
+  {
+    "question": "Does the genesis state maintain the invariant that all staking delegations reference existing accounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6ab906e9-d256-476b-9315-51d48134a2bb",
+    "timestamp": "2025-11-21 15:11:30.119426",
+    "report_generated": false
+  },
+  {
+    "question": "Can the validator set become inconsistent if some gentxs succeed and others fail during DeliverGenTxs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_178adb78-3e28-4006-8e3a-597f8470bf8b",
+    "timestamp": "2025-11-21 15:11:55.999237",
+    "report_generated": false
+  },
+  {
+    "question": "Does the validator power calculation respect integer overflow limits when processing multiple high-stake gentxs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1b17bbca-dc6c-4e5f-9583-40d0f53c7cce",
+    "timestamp": "2025-11-21 15:12:22.769191",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create gentxs that collectively stake more tokens than exist in the genesis bank balances?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2329e586-f0a4-4384-ab7c-e21a84e39452",
+    "timestamp": "2025-11-21 15:12:51.038961",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeliverGenTxs ensure that the total staked amount across all gentxs doesn't exceed the total supply defined in genesis?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_39940d4c-7bee-440a-84a2-512c027728ec",
+    "timestamp": "2025-11-21 15:13:19.903247",
+    "report_generated": false
+  },
+  {
+    "question": "Can errors from ApplyAndReturnValidatorSetUpdates in gentx.go:119-122 be silently ignored, causing validator set inconsistency?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_74b6a276-c163-4457-b9dc-60ee11d13e77",
+    "timestamp": "2025-11-21 15:13:50.030234",
+    "report_generated": false
+  },
+  {
+    "question": "Does the error handling in genesis_state.go:103-105 properly propagate errors up the call stack?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ec4c89d3-ac83-4c7e-9691-0da439cb6ce3",
+    "timestamp": "2025-11-21 15:14:20.682363",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker trigger the panic in gentx.go:115 with a carefully crafted gentx that passes validation but fails delivery?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e54bafd0-daa0-4392-8ced-f3bbbe8b9845",
+    "timestamp": "2025-11-21 15:14:52.512743",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic in gentx.go:110 provide sufficient error context for operators to diagnose genesis failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3eb540a0-8955-4acc-acbd-0aab2c937dd5",
+    "timestamp": "2025-11-21 15:15:28.113962",
+    "report_generated": false
+  },
+  {
+    "question": "Are all panic calls in gentx.go:105 recoverable at a higher level, or will they cause permanent chain halt?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1bda4f9d-5db8-49a7-9e05-facf2a704675",
+    "timestamp": "2025-11-21 15:16:04.561799",
+    "report_generated": false
+  },
+  {
+    "question": "Does the map iteration in GenesisBalancesIterator callbacks introduce non-determinism if the underlying implementation uses Go maps?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0b8f098-8578-4cc4-a827-3302507442de",
+    "timestamp": "2025-11-21 15:16:40.857703",
+    "report_generated": false
+  },
+  {
+    "question": "Can timing-dependent operations in genesis collection cause different nodes to generate different genesis states?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0ed524c3-3a5a-4e80-8f39-c4ccfe87d3e5",
+    "timestamp": "2025-11-21 15:17:17.502834",
+    "report_generated": false
+  },
+  {
+    "question": "Does the file system iteration order in collect.go:82-86 depend on filesystem type, causing different gentx processing orders?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7f896b4b-2811-4c46-b58a-bf8ae0bb44e1",
+    "timestamp": "2025-11-21 15:17:55.039482",
+    "report_generated": false
+  },
+  {
+    "question": "Can the sort.Strings operation in collect.go:180 cause different orderings on different locale settings, causing consensus divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0e9d20e0-d3e7-4be7-b304-3f9ebd5e230c",
+    "timestamp": "2025-11-21 15:18:33.686065",
+    "report_generated": false
+  },
+  {
+    "question": "Does the runtime.Caller debug code in collect.go:150-153 introduce non-determinism by printing file paths that may differ across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_267a472a-baa3-423d-9f4f-d7b3f82c3c5e",
+    "timestamp": "2025-11-21 15:19:13.478027",
+    "report_generated": false
   }
 ]
