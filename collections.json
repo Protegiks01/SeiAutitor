@@ -5848,5 +5848,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1349eddd-42b5-499f-9c3f-4a0f9881079b",
     "timestamp": "2025-11-21 12:52:42.720601",
     "report_generated": false
+  },
+  {
+    "question": "Is there a maximum owner count enforced to prevent memory exhaustion? keeper.go:453-467",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8182697d-5c92-4cff-a06b-261d1ef39ffe",
+    "timestamp": "2025-11-21 12:53:52.187178",
+    "report_generated": false
+  },
+  {
+    "question": "Can scopedModules map grow unbounded despite Seal? keeper.go:34-36",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b1f87e2d-eb50-43ad-9e27-2863473717f4",
+    "timestamp": "2025-11-21 12:54:05.164121",
+    "report_generated": false
+  },
+  {
+    "question": "Can LookupModules cause O(n) DoS when n is large? keeper.go:431-451",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ab75c7c6-b905-466d-9a2f-823ce555b1a0",
+    "timestamp": "2025-11-21 12:54:19.088416",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetOwners persistent vs scoped keeper cause DoS via inconsistent performance? keeper.go:177-189",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6362503a-48fe-4e2f-8ee6-228b2d4c0d96",
+    "timestamp": "2025-11-21 12:54:34.752665",
+    "report_generated": false
+  },
+  {
+    "question": "Does CapabilityOwners.Set cause quadratic behavior on large slices? types.go:46-59",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a6cbe78c-d18a-43a2-ba29-709e8f2932c1",
+    "timestamp": "2025-11-21 12:54:51.500526",
+    "report_generated": false
+  },
+  {
+    "question": "Can ExportGenesis iterate millions of indices causing block delay? genesis.go:29-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3b37cd52-a2da-4d4c-96c4-d85069acab2d",
+    "timestamp": "2025-11-21 12:55:09.763569",
+    "report_generated": false
+  },
+  {
+    "question": "Can AuthenticateCapability leak timing information through string comparison? keeper.go:275-280",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2a64c7c3-3dc6-475b-9ebe-2f6ff62088e4",
+    "timestamp": "2025-11-21 12:55:29.490514",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitializeIndex panic on zero index due to malicious genesis? keeper.go:146-149",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_057874e9-f61b-4363-9469-521530778554",
+    "timestamp": "2025-11-21 12:55:50.580035",
+    "report_generated": false
+  },
+  {
+    "question": "Can MustUnmarshal panic in BeginBlocker halt the chain? keeper.go:125-128",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93f062d9-f4f7-46fd-95d5-3a525e2580fb",
+    "timestamp": "2025-11-21 12:56:12.894209",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetCapability panic if capMap entry becomes nil after retrieving index? keeper.go:382-385",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bca029b7-d86d-43db-8b51-83239c002d31",
+    "timestamp": "2025-11-21 12:56:36.352439",
+    "report_generated": false
+  },
+  {
+    "question": "Can ScopeToModule panic after sealing, enabling chain halt attacks? keeper.go:70-72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_326b388c-ac2d-4a0b-8ca4-68ebbcdfe16b",
+    "timestamp": "2025-11-21 12:57:01.227454",
+    "report_generated": false
+  },
+  {
+    "question": "Can double-sealing panic due to corrupted sealed flags? keeper.go:95-97",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_888f283c-dec9-4454-83b9-839600b240be",
+    "timestamp": "2025-11-21 12:57:27.576743",
+    "report_generated": false
+  },
+  {
+    "question": "Does addOwner properly return and handle errors, preventing ownership inconsistency? keeper.go:453-467",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9146e80a-e31d-42f3-b5b9-2348b901386e",
+    "timestamp": "2025-11-21 12:57:54.973254",
+    "report_generated": false
+  },
+  {
+    "question": "Can ErrOwnerClaimed be ignored by callers, causing duplicate ownership entries? types.go:46-51",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7467bd11-defa-4942-9fdd-c262175fbcd4",
+    "timestamp": "2025-11-21 12:58:23.233908",
+    "report_generated": false
+  },
+  {
+    "question": "Does NewCapability propagate errors from GetCapability or addOwner correctly? keeper.go:225-265",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0a9c82e0-4cdf-4e9a-8f37-d09fd1ca0e5b",
+    "timestamp": "2025-11-21 12:58:53.688055",
+    "report_generated": false
+  },
+  {
+    "question": "Does ClaimCapability properly handle nil capability cases to avoid panics? keeper.go:288-290",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_114e5ceb-3bae-4730-b82f-cffc085ae530",
+    "timestamp": "2025-11-21 12:59:25.585929",
+    "report_generated": false
+  },
+  {
+    "question": "Can ReleaseCapability delete capabilities even when encountering invalid names, leaving orphan state? keeper.go:319-356",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b8100a69-696a-4f1d-9715-6b8a19beabf4",
+    "timestamp": "2025-11-21 12:59:58.213991",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitGenesis leave chain unrecoverable if validation passes but initialization fails? genesis.go:21-49",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5338e0aa-7c23-4c74-a401-cae7fb2c84b0",
+    "timestamp": "2025-11-21 13:00:31.461276",
+    "report_generated": false
+  },
+  {
+    "question": "Does genesis index validation correctly reject out-of-range indices? genesis.go:32-35",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5dd3e52a-15b5-46ea-b0f5-a68447a97c1f",
+    "timestamp": "2025-11-21 13:01:06.760603",
+    "report_generated": false
+  },
+  {
+    "question": "Does ConsensusVersion perform correct capability migration on version change? module.go:160-161",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b3c89465-7c2b-4630-9b61-bedbf7427afc",
+    "timestamp": "2025-11-21 13:01:43.568250",
+    "report_generated": false
+  },
+  {
+    "question": "Can ExportGenesis silently skip owner entries creating invalid reimport state? genesis.go:25-46",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f2e0965f-7fe4-4fc9-8d41-b189f6ec1654",
+    "timestamp": "2025-11-21 13:02:18.700725",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module provide handlers for migrating capability state safely during upgrades?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7042e5e2-af82-45b8-8a65-86fcc47b2cfb",
+    "timestamp": "2025-11-21 13:02:54.903552",
+    "report_generated": false
+  },
+  {
+    "question": "Nested MsgExec Recursion: In x/authz/keeper/keeper.go, does the DispatchActions method validate that nested messages within a MsgExec do not themselves contain another MsgExec, which could lead to unbounded recursion causing stack overflow and chain halt? keeper.go:74-139",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_18b7c8fc-33e4-458a-9fb2-268cf8bb0d67",
+    "timestamp": "2025-11-21 13:03:31.347687",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Type Mismatch: In x/authz/keeper/keeper.go:90, can an attacker craft a MsgExec where the GetCleanAuthorization returns an authorization that doesn't match the message type being executed, bypassing authorization checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_89cb34e1-7538-44c9-96a7-0804a684a6dc",
+    "timestamp": "2025-11-21 13:04:08.823998",
+    "report_generated": false
+  },
+  {
+    "question": "Multiple Signers Bypass: In x/authz/keeper/keeper.go:80-83, the code checks that messages have exactly one signer. Can an attacker exploit multi-signature messages or messages with zero signers to bypass this validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2df26152-d9a1-494d-a8f5-050d02c9098d",
+    "timestamp": "2025-11-21 13:04:47.567654",
+    "report_generated": false
   }
 ]
