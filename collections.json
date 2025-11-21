@@ -4648,5 +4648,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_586e0c18-7fd9-4e20-88e3-829879e3125e",
     "timestamp": "2025-11-21 08:24:20.697654",
     "report_generated": false
+  },
+  {
+    "question": "Does GetTxPriority handle overflow when multiplying gas price with large fees in validator_tx_fee.go:67-86?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f6dc7bf4-3865-48c4-92d6-5e3f45521042",
+    "timestamp": "2025-11-21 08:25:29.297307",
+    "report_generated": false
+  },
+  {
+    "question": "Can the amplification factor in base denom create priority overflow bugs in validator_tx_fee.go:11?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_618f1ae2-b6da-471c-97c3-5ac639084498",
+    "timestamp": "2025-11-21 08:25:42.399672",
+    "report_generated": false
+  },
+  {
+    "question": "Does merging minimum gas prices from validators and global params behave deterministically in validator_tx_fee.go:57-59?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e26b39bb-b536-4db3-adc2-b3c574d9b4e9",
+    "timestamp": "2025-11-21 08:25:56.540816",
+    "report_generated": false
+  },
+  {
+    "question": "Can simulate=true bypass minimum gas price validation during CheckTx in validator_tx_fee.go:29?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c2b110e4-2381-4def-a41c-b3721cd694c6",
+    "timestamp": "2025-11-21 08:26:10.466881",
+    "report_generated": false
+  },
+  {
+    "question": "Does AnteDeps in fee.go:53-131 correctly declare all fee-related dependencies for parallel execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5dba5134-d5d6-429e-b96f-8d7bde67af3c",
+    "timestamp": "2025-11-21 08:26:25.015852",
+    "report_generated": false
+  },
+  {
+    "question": "Can fee deduction dependency tracking cause race conditions under concurrent execution in fee.go:59-75?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1990c238-c5bd-4a8d-b484-067450b2267d",
+    "timestamp": "2025-11-21 08:26:41.371303",
+    "report_generated": false
+  },
+  {
+    "question": "Does the txFeeChecker pointer allow unsafe custom fee logic that bypasses validation in fee.go:40-42?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff4c2f27-43cb-49f1-92f9-c6cd70da3574",
+    "timestamp": "2025-11-21 08:26:58.806105",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetNextAccountNumber handle concurrent account creation safely to prevent account number collisions in keeper.go:121-144?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b4aa53ef-d11d-41f6-a441-027b864b56d9",
+    "timestamp": "2025-11-21 08:27:17.721271",
+    "report_generated": false
+  },
+  {
+    "question": "Can account number overflow occur when incrementing from MaxUint64 in keeper.go:140-141?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5b9edfb8-af57-4e63-b123-2ec937760f76",
+    "timestamp": "2025-11-21 08:27:39.120528",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic on unmarshal errors in GetNextAccountNumber halt the chain in keeper.go:132-135?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e8745045-ff86-47a7-ba6d-19c8236ef54b",
+    "timestamp": "2025-11-21 08:28:01.432197",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetAccount validate account fields before writing them to state in account.go:56-66?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_afdc0037-a2ae-4206-875f-f0066f1258d3",
+    "timestamp": "2025-11-21 08:28:25.091502",
+    "report_generated": false
+  },
+  {
+    "question": "Can RemoveAccount accidentally delete module accounts breaking supply invariants in account.go:70-74?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_63fab08a-7b93-42e3-91da-eea9be4bde82",
+    "timestamp": "2025-11-21 08:28:49.271051",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateAccounts ensure iterator closure to prevent resource leaks in account.go:78-90?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_82dd5a0d-57fa-40c8-b2f3-3a9e70fffccb",
+    "timestamp": "2025-11-21 08:29:15.060199",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetModuleAccount create module accounts with unintended permissions in keeper.go:206-209?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e3193edf-9d55-4a2a-b9a2-8039e7e0ee3f",
+    "timestamp": "2025-11-21 08:29:43.048995",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetModuleAccountAndPermissions validate permissions before module account creation in keeper.go:181-202?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_587251e9-83c4-45e9-afee-1e8498c66996",
+    "timestamp": "2025-11-21 08:30:11.476730",
+    "report_generated": false
+  },
+  {
+    "question": "Can panic at keeper.go:189-193 be triggered by non-module accounts to halt execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0d66689-96e8-4643-931a-dc9e3851cb98",
+    "timestamp": "2025-11-21 08:30:39.894203",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidatePermissions prevent modules from escalating privileges in keeper.go:148-157?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d9ebcb33-6ff6-48b1-b556-337492ec8128",
+    "timestamp": "2025-11-21 08:31:10.788485",
+    "report_generated": false
+  },
+  {
+    "question": "Can the proto function in AccountKeeper be replaced to create accounts with invalid fields in keeper.go:59?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bf97a3e8-a653-4b26-9898-5ded2492ee05",
+    "timestamp": "2025-11-21 08:31:42.505273",
+    "report_generated": false
+  },
+  {
+    "question": "Does MarshalAccount handle all account variants without type confusion in keeper.go:226-228?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_742e9b5f-fead-490b-99ae-55fdbae77679",
+    "timestamp": "2025-11-21 08:32:14.825497",
+    "report_generated": false
+  },
+  {
+    "question": "Can UnmarshalAccount be exploited with malformed data to panic in keeper.go:232-235?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cf4eb57a-0eb9-4a82-9d04-d116377e10cb",
+    "timestamp": "2025-11-21 08:32:48.486917",
+    "report_generated": false
+  },
+  {
+    "question": "Does decodeAccount panic on invalid protobuf and halt the chain in keeper.go:216-223?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_756e8fa7-72fd-43b4-a027-49f2d8fe46df",
+    "timestamp": "2025-11-21 08:33:23.661503",
+    "report_generated": false
+  },
+  {
+    "question": "Can NewAccountWithAddress create accounts at attacker-chosen addresses in account.go:9-17?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8190dd82-1c45-4295-98c9-9b74e32c3d16",
+    "timestamp": "2025-11-21 08:34:00.603206",
+    "report_generated": false
+  },
+  {
+    "question": "Does sequence increment occur atomically with execution to prevent races in sigverify.go:352-369?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_32becc0a-6f99-4b84-988d-ffeb7e2d9d09",
+    "timestamp": "2025-11-21 08:34:37.724242",
+    "report_generated": false
+  },
+  {
+    "question": "Can IncrementSequenceDecorator increment sequence before a failure causing desynchronization in sigverify.go:352-369?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_57b7ae76-ce62-4517-9334-c4ecf2f68475",
+    "timestamp": "2025-11-21 08:35:15.878137",
+    "report_generated": false
+  },
+  {
+    "question": "Does DisableSeqnoCheck enable replay attacks if activated in params.go:27?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8e8bab80-696b-49e7-9873-2af2f8cfe1bd",
+    "timestamp": "2025-11-21 08:35:53.859626",
+    "report_generated": false
   }
 ]
