@@ -4048,5 +4048,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9a45e8bc-356d-476f-9faf-da9f37f44107",
     "timestamp": "2025-11-21 11:46:48.869474",
     "report_generated": false
+  },
+  {
+    "question": "The check at invariants.go:84-89 ensures wei has no remainder when converted to usei - could fractional wei amounts cause invariant violations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f036a84-6b5b-4dc1-b35c-80e8d0fe0728",
+    "timestamp": "2025-11-21 11:47:54.912766",
+    "report_generated": false
+  },
+  {
+    "question": "Are deferred balances at invariants.go:74-78 correctly included in total supply, or could they be double-counted or omitted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_49006b61-d231-4a9f-96c8-1708a06e69b2",
+    "timestamp": "2025-11-21 11:48:09.377024",
+    "report_generated": false
+  },
+  {
+    "question": "The NonnegativeBalanceInvariant at invariants.go:25-56 checks account balances - could wei balances at lines 40-47 become negative through integer underflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cb50386b-0f80-46ab-b51d-0e733d688073",
+    "timestamp": "2025-11-21 11:48:23.779690",
+    "report_generated": false
+  },
+  {
+    "question": "Does the TotalSupply invariant in invariants.go:59-105 account for all token locations (accounts, modules, locked, vesting, IBC escrow)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6a61defc-b370-46dd-b66d-446a64a05849",
+    "timestamp": "2025-11-21 11:48:39.329332",
+    "report_generated": false
+  },
+  {
+    "question": "If a proposer fails to produce a block, do all validators timeout simultaneously, or could timing differences cause splits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55136d9e-9a3f-4316-80b9-9f4291ac3aa8",
+    "timestamp": "2025-11-21 11:48:56.132543",
+    "report_generated": false
+  },
+  {
+    "question": "Is each validator's vote weight calculated deterministically from power, or could rounding differences cause consensus failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_19fa71d1-52ed-492c-b5c6-0b2216c68d4b",
+    "timestamp": "2025-11-21 11:49:14.199954",
+    "report_generated": false
+  },
+  {
+    "question": "Are consensus parameters in genesis validated before chain start, or could invalid params prevent first block?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6b8ba16-222b-4033-87fa-9e2e9308802b",
+    "timestamp": "2025-11-21 11:49:33.548798",
+    "report_generated": false
+  },
+  {
+    "question": "When a validator is removed (power=0), are all references cleaned up, or could stale references cause panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a43468ee-6ec3-4e9d-ad08-ab58806c25eb",
+    "timestamp": "2025-11-21 11:49:54.545057",
+    "report_generated": false
+  },
+  {
+    "question": "Are both evidence types handled correctly, and could one type be used to incorrectly slash using the other's rules?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a4007dd5-3fbc-480b-8b46-6c315966c68e",
+    "timestamp": "2025-11-21 11:50:17.709956",
+    "report_generated": false
+  },
+  {
+    "question": "Are all consensus parameters validated for reasonable bounds (e.g., MaxGas > 0, TimeoutCommit > 0)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_24d29113-75cc-4db7-9640-a2c759b2e3ba",
+    "timestamp": "2025-11-21 11:50:40.499903",
+    "report_generated": false
+  },
+  {
+    "question": "Are validators properly tracked for downtime, and could intermittent connections exploit liveness scoring?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7dc94502-cc03-4389-95d6-944ff5a2b8f0",
+    "timestamp": "2025-11-21 11:51:04.728653",
+    "report_generated": false
+  },
+  {
+    "question": "For unbonding or governance voting periods, is only block timestamp used (not wall clock), ensuring determinism?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6abaca31-5f4b-4286-a829-6c0c8e456934",
+    "timestamp": "2025-11-21 11:51:31.063763",
+    "report_generated": false
+  },
+  {
+    "question": "If >1/3 of validators are Byzantine, are safety guarantees maintained, or could they force arbitrary state transitions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4198184c-c2d0-458b-b80d-c199a1c4c69c",
+    "timestamp": "2025-11-21 11:51:59.048559",
+    "report_generated": false
+  },
+  {
+    "question": "Is the MaxBytes consensus parameter strictly enforced, or could oversize blocks be accepted under certain conditions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_32e45873-7f04-41c4-8ffb-5d01f60396c7",
+    "timestamp": "2025-11-21 11:52:26.865806",
+    "report_generated": false
+  },
+  {
+    "question": "Is the chain ID enforced as immutable throughout chain lifetime, preventing chain ID confusion attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e65ae5e4-a3ae-4af9-8e82-b9eb156d8452",
+    "timestamp": "2025-11-21 11:52:56.427097",
+    "report_generated": false
+  },
+  {
+    "question": "In CometBFT's proposer priority calculation, could integer overflow after many rounds cause incorrect proposer selection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48fe1c4d-fdfd-409a-85c9-94571f2354a0",
+    "timestamp": "2025-11-21 11:53:27.079984",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker forge light client attacks that appear valid but cause honest validators to be slashed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ae04a2c4-ca3c-4a23-9b75-d8f1787b4f90",
+    "timestamp": "2025-11-21 11:53:58.948212",
+    "report_generated": false
+  },
+  {
+    "question": "The MaxAgeNumBlocks and MaxAgeDuration in evidence params - could evidence from beyond these limits still be accepted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cf4b65c9-8a98-4ad8-9b87-36c89ee0d894",
+    "timestamp": "2025-11-21 11:54:32.508902",
+    "report_generated": false
+  },
+  {
+    "question": "Do validator power calculations use only integer arithmetic, or could floating-point rounding cause power inconsistencies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_88a1389b-8f8a-45ea-9077-6523e6afb974",
+    "timestamp": "2025-11-21 11:55:06.627465",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a cap on the total number of active validators, and if exceeded, could performance degrade or consensus fail?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cd9d5ad0-9242-4042-aec7-9b004fda5e57",
+    "timestamp": "2025-11-21 11:55:42.910608",
+    "report_generated": false
+  },
+  {
+    "question": "Is the proposer selection algorithm deterministic and Byzantine-resistant, preventing proposer monopolization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5330b1d1-9bcf-499e-8b28-e6fcb64263f8",
+    "timestamp": "2025-11-21 11:56:19.589532",
+    "report_generated": false
+  },
+  {
+    "question": "Are duplicate validator public keys prevented in genesis state, or could key collisions cause undefined behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62de8937-d588-45fd-9721-de6928dabe24",
+    "timestamp": "2025-11-21 11:56:57.276455",
+    "report_generated": false
+  },
+  {
+    "question": "In the event of temporary network partition, do all nodes follow identical fork choice rules when reconnecting?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_64609295-427c-4de3-9d87-b0911c03012b",
+    "timestamp": "2025-11-21 11:57:36.149184",
+    "report_generated": false
+  },
+  {
+    "question": "If consensus parameters are changed via governance, are all validators guaranteed to apply them at the same height?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0f3b222e-0d3a-429d-be0a-f73620cad438",
+    "timestamp": "2025-11-21 11:58:15.305528",
+    "report_generated": false
+  },
+  {
+    "question": "Could duplicate evidence submissions (same validator, height, time) be processed multiple times, causing over-slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_19928aa5-8c6a-4d21-b9bd-b3ce9bb00993",
+    "timestamp": "2025-11-21 11:58:56.757586",
+    "report_generated": false
   }
 ]
