@@ -4798,5 +4798,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8e8bab80-696b-49e7-9873-2af2f8cfe1bd",
     "timestamp": "2025-11-21 08:35:53.859626",
     "report_generated": false
+  },
+  {
+    "question": "Can sequence caching in batch verification allow reused sequence numbers in batch_sigverify.go:96-131?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_24664c75-a34d-4024-8f5e-8ee7b1578385",
+    "timestamp": "2025-11-21 08:37:05.147152",
+    "report_generated": false
+  },
+  {
+    "question": "Does sequence validation properly handle wraparound at MaxUint64 in sigverify.go:270-278?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7130e0c6-cd2a-4612-9bb6-dcf0fe73f381",
+    "timestamp": "2025-11-21 08:37:18.123479",
+    "report_generated": false
+  },
+  {
+    "question": "Can identical sequence transactions be included in the same block causing inconsistent behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b6fcb9c6-59a0-4191-b419-ed4700926755",
+    "timestamp": "2025-11-21 08:37:32.170861",
+    "report_generated": false
+  },
+  {
+    "question": "Do legacy amino signatures bypass sequence checks in sigverify.go:298-302?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_81be26bd-a355-44bc-9bf8-b688d7240f51",
+    "timestamp": "2025-11-21 08:37:46.235611",
+    "report_generated": false
+  },
+  {
+    "question": "Can AnteDeps in IncrementSequenceDecorator cause dependency tracking errors in sigverify.go:333-350?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9cb4478-5bce-489c-bc3e-a530cbe67e73",
+    "timestamp": "2025-11-21 08:38:00.984337",
+    "report_generated": false
+  },
+  {
+    "question": "Does batch verifier track sequence numbers correctly across multiple signers in batch_sigverify.go:124-131?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7bd81f4c-6a19-4ad4-8704-44d7ecbdd2dc",
+    "timestamp": "2025-11-21 08:38:17.463458",
+    "report_generated": false
+  },
+  {
+    "question": "Can sequence cache poisoning occur in batch_sigverify.go:96?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2aee212e-92f4-4b9f-8601-87e227fa51b9",
+    "timestamp": "2025-11-21 08:38:35.182526",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetUpContextDecorator set a zero-limit gas meter for invalid transactions to prevent infinite gas abuse in setup.go:46-50?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5b815edc-481c-459f-8f6f-3301bb6daf0c",
+    "timestamp": "2025-11-21 08:38:54.914725",
+    "report_generated": false
+  },
+  {
+    "question": "Can block max gas overflow bypass gas limit checks in setup.go:54-60?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c5402c7f-0aba-4d7b-a389-dc396cde22ec",
+    "timestamp": "2025-11-21 08:39:16.443109",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetGasMeter handle simulation mode correctly to prevent simulation DoS in setup.go:85-94?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e9cd2fcb-b697-49fa-bd2c-5286d6fa38af",
+    "timestamp": "2025-11-21 08:39:39.625739",
+    "report_generated": false
+  },
+  {
+    "question": "Does ConsumeTxSizeGasDecorator consume gas before reading tx bytes to prevent DoS in basic.go:116?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73ccaa0e-5447-4719-b0bd-409473ff93f6",
+    "timestamp": "2025-11-21 08:40:03.059523",
+    "report_generated": false
+  },
+  {
+    "question": "Can TxSizeCostPerByte be misconfigured to allow cheap large transaction spam in params.go:25?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_38a7a421-25a4-4bd6-8ab5-bb5db7117f8e",
+    "timestamp": "2025-11-21 08:40:26.522699",
+    "report_generated": false
+  },
+  {
+    "question": "Does multisig verification gas metering prevent underpriced multisig DoS attacks in sigverify.go:446-471?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0f7510b7-b808-490d-a03a-7cc0f24d24b1",
+    "timestamp": "2025-11-21 08:40:52.236701",
+    "report_generated": false
+  },
+  {
+    "question": "Can simulate mode return incorrect gas estimates enabling DoS in basic.go:119-161?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ad8febe8-6d8c-4cb2-beec-3f628c7003c6",
+    "timestamp": "2025-11-21 08:41:19.873404",
+    "report_generated": false
+  },
+  {
+    "question": "Can TxSigLimit multiplication overflow in basic.go:155-157?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d5972f79-83d7-4aa5-8801-77cfccde87fe",
+    "timestamp": "2025-11-21 08:41:51.001291",
+    "report_generated": false
+  },
+  {
+    "question": "Does infinite gas meter in simulation mode allow unbounded computation in setup.go:90?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0b5bb0d3-60f8-4bef-960a-b95df7a4795a",
+    "timestamp": "2025-11-21 08:42:20.134460",
+    "report_generated": false
+  },
+  {
+    "question": "Can gas consumption be manipulated by crafted public keys in sigverify.go:412-443?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a923d4e6-d2f2-47fb-9f89-96bba718b684",
+    "timestamp": "2025-11-21 08:42:53.329209",
+    "report_generated": false
+  },
+  {
+    "question": "Is SR25519 gas cost correctly priced to avoid underpriced DoS in sigverify.go:420-422?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_de3d1e4c-6512-4c62-9d6a-10efef6c5074",
+    "timestamp": "2025-11-21 08:43:25.104615",
+    "report_generated": false
+  },
+  {
+    "question": "Can secp256r1 gas pricing be exploited since it's half-cost of secp256k1 in params.go:82-84?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2e169d1e-f424-4137-ba61-b0bfb42e4cd8",
+    "timestamp": "2025-11-21 08:43:57.788443",
+    "report_generated": false
+  },
+  {
+    "question": "Can gas multiplier overflow create unbounded gas in setup.go:93?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fbfdfb69-cd27-4f1f-a1fe-8d609cb8692a",
+    "timestamp": "2025-11-21 08:44:32.280287",
+    "report_generated": false
+  },
+  {
+    "question": "Can OutOfGas recovery be bypassed in setup.go:66-79?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_935754df-f091-42ef-bf68-523eb2172138",
+    "timestamp": "2025-11-21 08:45:06.873238",
+    "report_generated": false
+  },
+  {
+    "question": "Does defer/recover handle all panic types or can some escape in setup.go:66-79?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_03fa08a4-c725-4ac6-bf20-55f3b05768d9",
+    "timestamp": "2025-11-21 08:45:41.568975",
+    "report_generated": false
+  },
+  {
+    "question": "Can CreateVestingAccount create vesting accounts for existing addresses in msg_server.go:52-54?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a9c0892d-589c-420e-a2c5-bb3f8b091c3b",
+    "timestamp": "2025-11-21 08:46:16.724358",
+    "report_generated": false
+  },
+  {
+    "question": "Does vesting account creation validate blocked addresses in msg_server.go:48-50?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4d5548d4-5d01-4373-baf4-93212db5f60a",
+    "timestamp": "2025-11-21 08:46:52.708608",
+    "report_generated": false
+  },
+  {
+    "question": "Can admin parameter be abused to take over vesting accounts in msg_server.go:61-70?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cbf83dab-99cb-45e0-87f5-5347c30baa7d",
+    "timestamp": "2025-11-21 08:47:29.252224",
+    "report_generated": false
   }
 ]
