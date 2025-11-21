@@ -6298,5 +6298,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_88ed3ecc-bd8e-434c-87d4-434e1cddb4ed",
     "timestamp": "2025-11-21 13:28:56.107316",
     "report_generated": false
+  },
+  {
+    "question": "Handler Execution Gas: In x/authz/keeper/keeper.go:118, the handler executes nested messages. Can nested messages consume more gas than expected, causing the transaction to fail unexpectedly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9553ed21-a62f-47c0-97e0-1935cf1de767",
+    "timestamp": "2025-11-21 13:30:12.064088",
+    "report_generated": false
+  },
+  {
+    "question": "Event Emission Gas: In x/authz/keeper/keeper.go:125-135, events are emitted for each dispatched message. Is gas properly charged for event emission, or can this be exploited for DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d208c307-cc7c-44cc-bccf-67e397852e7d",
+    "timestamp": "2025-11-21 13:30:25.079355",
+    "report_generated": false
+  },
+  {
+    "question": "Query Pagination Bypass: In x/authz/keeper/grpc_query.go:56-72, pagination is used for grants query. Can the pagination be bypassed or manipulated to return excessive results?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_083edb8d-e275-415b-82b0-7012bdd29458",
+    "timestamp": "2025-11-21 13:30:39.427706",
+    "report_generated": false
+  },
+  {
+    "question": "GenericFilteredPaginate Gas: In x/authz/keeper/grpc_query.go:56, query.GenericFilteredPaginate is used. Does this properly meter gas for filtered results, or can filters cause expensive operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_489c9de6-d984-41f0-b159-658037d577ec",
+    "timestamp": "2025-11-21 13:30:53.491846",
+    "report_generated": false
+  },
+  {
+    "question": "GranterGrants Prefix Iteration: In x/authz/keeper/grpc_query.go:96, a prefix store is created with grantStoreKey(nil, granter, ''). Can this cause unexpected iteration behavior or excessive gas consumption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4c860302-91e1-4560-a18f-9e5fb45b53e1",
+    "timestamp": "2025-11-21 13:31:08.574199",
+    "report_generated": false
+  },
+  {
+    "question": "GranteeGrants Full Scan: In x/authz/keeper/grpc_query.go:143-169, GranteeGrants iterates the entire grant store and filters by grantee. Can this cause DoS for grantees with many grants across multiple granters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3d3407f9-e7f0-4f64-a8cf-0c9bb1767ab0",
+    "timestamp": "2025-11-21 13:31:25.193700",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Packing Gas: In x/authz/keeper/grpc_query.go:40-42, codectypes.NewAnyWithValue packs authorization. Is gas properly charged for large authorization objects?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_96a2f67a-4d86-4fa7-b265-22824d2e99ff",
+    "timestamp": "2025-11-21 13:31:43.078657",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Count Invariant: Is there an invariant that ensures the total number of grants is consistent with individual granter and grantee counts? Can state corruption cause these to diverge?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_df39fe80-75df-48f5-ae5c-7b09ac72fd28",
+    "timestamp": "2025-11-21 13:32:02.135319",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Expiration Invariant: Can expired grants remain in storage indefinitely if never accessed, wasting storage and causing state bloat?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7a66191c-ec08-4a80-a49a-6dc2df19b98f",
+    "timestamp": "2025-11-21 13:32:22.880265",
+    "report_generated": false
+  },
+  {
+    "question": "Duplicate Grant Detection: Is there validation to prevent duplicate grants for the same (grantee, granter, msgType) tuple, or can concurrent transactions create duplicates?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c7527f52-1514-48ad-8ffa-08b1bc5bb537",
+    "timestamp": "2025-11-21 13:32:43.769287",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Deletion Completeness: When a grant is deleted in x/authz/keeper/keeper.go:171, are all associated state entries (events, indices) properly cleaned up?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bc7e24d0-7fd6-4e81-b8db-b8b567f28b58",
+    "timestamp": "2025-11-21 13:33:06.644331",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Interface Consistency: When storing an authorization in x/authz/keeper/keeper.go:68-70, is it validated that the authorization correctly implements the Authorization interface?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_87168143-6ecd-4f2c-a5f1-14c01964577d",
+    "timestamp": "2025-11-21 13:33:30.272256",
+    "report_generated": false
+  },
+  {
+    "question": "GetGrant Consistency: In x/authz/keeper/keeper.go:41-49, getGrant unmarshals grants. Can corrupted storage cause unmarshaling to return inconsistent or invalid grants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c23ccd52-d45f-4a24-84ec-4c07260fe605",
+    "timestamp": "2025-11-21 13:33:54.443249",
+    "report_generated": false
+  },
+  {
+    "question": "SaveGrant Event Emission Failure: In x/authz/keeper/keeper.go:155-160, event emission can fail. If this fails, is the grant still saved, causing event/state inconsistency?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_12638161-0813-4d39-a1a6-000d7d3ccc3b",
+    "timestamp": "2025-11-21 13:34:21.182253",
+    "report_generated": false
+  },
+  {
+    "question": "DeleteGrant Event Emission Failure: In x/authz/keeper/keeper.go:172-177, if event emission fails during deletion, can the grant still be deleted, causing inconsistency?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1db65f6a-3502-4f27-b19b-251d854a526f",
+    "timestamp": "2025-11-21 13:34:48.307997",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis State Validation: In x/authz/keeper/keeper.go:246-260, genesis import can panic. Are all genesis authorizations validated to prevent chain start failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6bde372d-c0df-4a78-8ea1-387afe6bf014",
+    "timestamp": "2025-11-21 13:35:17.248309",
+    "report_generated": false
+  },
+  {
+    "question": "Export/Import Symmetry: In x/authz/keeper/keeper.go:228-243, genesis export iterates grants. Is the export/import process symmetric, or can state be lost during export-import cycles?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_895ec132-080f-4adb-8d13-5320df3445d0",
+    "timestamp": "2025-11-21 13:35:47.211310",
+    "report_generated": false
+  },
+  {
+    "question": "Module Invariant Registration: In x/authz/module/module.go:128, RegisterInvariants does nothing. Should there be invariants checking grant consistency, and could their absence allow undetected state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2c27dfe4-65d5-4441-9382-4a5b6bb3f4f1",
+    "timestamp": "2025-11-21 13:36:17.957177",
+    "report_generated": false
+  },
+  {
+    "question": "Bank Module Integration: When SendAuthorization executes a MsgSend, does the bank module correctly attribute the send to the granter, not the grantee, for accounting purposes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_75bdc182-dc19-486c-9732-a8498dc45175",
+    "timestamp": "2025-11-21 13:36:49.565101",
+    "report_generated": false
+  },
+  {
+    "question": "Staking Authorization Slash Events: When a StakeAuthorization is used to delegate, if the validator is slashed, are the slashing penalties correctly applied to the granter's stake?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b1d4cf7d-bd4a-478d-b449-43fe321769fa",
+    "timestamp": "2025-11-21 13:37:22.966519",
+    "report_generated": false
+  },
+  {
+    "question": "Distribution Rewards Attribution: If authz is used to claim distribution rewards, are the rewards correctly sent to the granter or grantee? Can this be exploited to redirect rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8a5ecf9b-c807-44cb-a1b4-10d755f04253",
+    "timestamp": "2025-11-21 13:37:56.530672",
+    "report_generated": false
+  },
+  {
+    "question": "Gov Module Proposal Voting: Can authz be used to vote on governance proposals? If so, does the voting power correctly reflect the granter's stake, not the grantee's?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5cea8420-d44c-442f-99b5-44a8405b3654",
+    "timestamp": "2025-11-21 13:38:30.547525",
+    "report_generated": false
+  },
+  {
+    "question": "IBC Transfer Authorization: Can authz be used to authorize IBC transfers? If so, are IBC packet timeouts and acknowledgments correctly handled when executed via authz?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7e7d91cf-d7c9-4f60-a182-94e5523b0ff6",
+    "timestamp": "2025-11-21 13:39:04.743245",
+    "report_generated": false
+  },
+  {
+    "question": "Group Module Integration: Can authz grants interact with group module permissions? Could this create permission escalation where a group member uses authz to bypass group policy?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dcf6051c-4c46-4e07-8626-7551f68f181b",
+    "timestamp": "2025-11-21 13:39:38.936328",
+    "report_generated": false
+  },
+  {
+    "question": "Vesting Account Compatibility: If a granter has a vesting account, can authz be used to transfer vested tokens? Are vesting schedule checks properly enforced?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5a590545-c139-4a20-8738-3af6031ae622",
+    "timestamp": "2025-11-21 13:40:14.729162",
+    "report_generated": false
   }
 ]
