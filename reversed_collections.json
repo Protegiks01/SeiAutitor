@@ -1648,5 +1648,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_25e0d8e0-5db3-4d26-be83-dae54f1ce349",
     "timestamp": "2025-11-21 08:22:28.421617",
     "report_generated": false
+  },
+  {
+    "question": "Does GetBooleanFromBitGroups signing_info.go:78-90 correctly return false for out-of-bounds indices (line 82-84), or could this mask missed blocks and prevent legitimate slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f84feb2-fef5-4afc-b961-db735bb50fde",
+    "timestamp": "2025-11-21 08:23:41.395803",
+    "report_generated": false
+  },
+  {
+    "question": "In SetBooleanInBitGroups signing_info.go:93-107 , can an out-of-bounds index cause a panic if indexKey >= len(bitGroupArray), and does this get validated before array access?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_106352bb-16f5-4542-9d69-67653d35fe11",
+    "timestamp": "2025-11-21 08:23:54.583759",
+    "report_generated": false
+  },
+  {
+    "question": "Bit Array & Missed Blocks Tracking (Questions 26-45)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_47f9f18f-bbbc-4d41-ae8c-120221500e4b",
+    "timestamp": "2025-11-21 08:24:08.422263",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a gas limit or computation limit for BeginBlocker execution abci.go:24-66 to prevent DoS through excessive validator set sizes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_175e7650-bc06-4e1e-a320-40d128509903",
+    "timestamp": "2025-11-21 08:24:22.218673",
+    "report_generated": false
+  },
+  {
+    "question": "Does BeginBlocker correctly handle the scenario where all validators are jailed simultaneously, potentially halting the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_552381ee-db5b-4393-a3bb-c9bd21d46390",
+    "timestamp": "2025-11-21 08:24:36.902552",
+    "report_generated": false
+  },
+  {
+    "question": "Can the SignedLastBlock boolean abci.go:41 be manipulated by validators to avoid downtime slashing, and is it properly verified against CometBFT signatures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_51dad429-3284-484e-a206-2fc3f13e46a2",
+    "timestamp": "2025-11-21 08:24:52.932644",
+    "report_generated": false
+  },
+  {
+    "question": "Does the concurrent execution model prevent TOCTOU (Time-Of-Check-Time-Of-Use) vulnerabilities where validator state changes between the read phase and write phase abci.go:36-65 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_498cd5ad-7e63-4b91-8708-5418344bc236",
+    "timestamp": "2025-11-21 08:25:10.568529",
+    "report_generated": false
+  },
+  {
+    "question": "Is the power parameter passed to HandleValidatorSignatureConcurrent abci.go:41 validated to prevent negative or zero values that could bypass slashing calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_20d81f4f-4925-49c4-8d7e-d83cb941f03e",
+    "timestamp": "2025-11-21 08:25:30.418869",
+    "report_generated": false
+  },
+  {
+    "question": "Can a validator be slashed multiple times in the same block if they appear multiple times in the votes list abci.go:35-36 , causing excessive penalties?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5155e9ad-f8e2-4b22-8dab-43083c2e7f68",
+    "timestamp": "2025-11-21 08:25:51.412098",
+    "report_generated": false
+  },
+  {
+    "question": "Does the telemetry call at line 139 infractions.go:139 execute deterministically across all nodes, or could it introduce consensus divergence through side effects?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6b8d56ec-1b22-474e-8f27-00e8ce3aae54",
+    "timestamp": "2025-11-21 08:26:14.168448",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a maximum limit on len(req.LastCommitInfo.GetVotes()) abci.go:33 to prevent memory allocation attacks in the slashingWriteInfo slice?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8ef7c2f3-3048-4326-9511-13be91f78bb7",
+    "timestamp": "2025-11-21 08:26:37.330684",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent goroutines reading the same validator's signing info infractions.go:33-36 get stale data due to SDK context caching, leading to incorrect slash decisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4c4f6118-35fc-4720-99ec-c94433b990d0",
+    "timestamp": "2025-11-21 08:27:02.119247",
+    "report_generated": false
+  },
+  {
+    "question": "Does the ClearValidatorMissedBlockBitArray call at line 59 abci.go:59 properly delete state before the validator is slashed, preventing double-slashing scenarios?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dc27f443-956a-40d2-9f41-e036f04f9143",
+    "timestamp": "2025-11-21 08:27:27.887574",
+    "report_generated": false
+  },
+  {
+    "question": "Can the event emission in BeginBlocker infractions.go:74-81 cause non-determinism if event attributes are ordered differently across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5537b056-2cac-41d2-8552-c519e87ed08e",
+    "timestamp": "2025-11-21 08:27:55.142545",
+    "report_generated": false
+  },
+  {
+    "question": "Is ctx.BlockHeader().Time used correctly at line 142 infractions.go:142 instead of time.Now() to ensure deterministic jail duration calculation across all nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_75d3c244-c4a3-4a72-a973-f5a42b1d0edc",
+    "timestamp": "2025-11-21 08:28:23.415912",
+    "report_generated": false
+  },
+  {
+    "question": "Does the bit array resizing logic in ResizeMissedBlockArray infractions.go:157-181 execute within BeginBlocker, and could a large window size cause block processing to exceed time limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80287a15-968c-4c8b-9f87-5995c4cdaf11",
+    "timestamp": "2025-11-21 08:28:53.136557",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause BeginBlocker to execute unbounded computation by manipulating the SignedBlocksWindow parameter infractions.go:38 to an extremely large value through governance?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_669a926f-ee0d-4440-83f7-efd56b011d6b",
+    "timestamp": "2025-11-21 08:29:23.607727",
+    "report_generated": false
+  },
+  {
+    "question": "In SlashJailAndUpdateSigningInfo infractions.go:126-155 , does resetting MissedBlocksCounter and IndexOffset to 0 (lines 143-144) create a window where a validator could immediately get slashed again if they continue missing blocks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_352d639e-7506-4804-b008-8c61a14909b3",
+    "timestamp": "2025-11-21 08:29:54.807804",
+    "report_generated": false
+  },
+  {
+    "question": "Is the order of writes in lines 53-65 abci.go:53-65 deterministic across all nodes? Could different iteration orders over the slashingWriteInfo array cause consensus splits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_277e4ab9-4bb4-41da-b52b-9c24203d10eb",
+    "timestamp": "2025-11-21 08:30:27.795575",
+    "report_generated": false
+  },
+  {
+    "question": "Can the WaitGroup abci.go:27-51 lead to a deadlock if one of the goroutines panics before calling Done(), permanently blocking BeginBlocker?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_923ad137-c81b-4492-986e-b4cdb8061e53",
+    "timestamp": "2025-11-21 08:31:02.436898",
+    "report_generated": false
+  },
+  {
+    "question": "Does BeginBlocker correctly handle the case where req.LastCommitInfo.GetVotes() returns nil or an empty slice abci.go:35-36 , preventing out-of-bounds access in the slashingWriteInfo array?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ddbfe846-afd7-43bc-84b7-6102289d96fa",
+    "timestamp": "2025-11-21 08:31:39.201869",
+    "report_generated": false
+  },
+  {
+    "question": "In the concurrent write phase (lines 53-65) abci.go:53-65 , are state writes guaranteed to be deterministic across all nodes despite the concurrent read phase, or could goroutine scheduling differences cause state divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4c874fa8-8bf6-4ee4-b91f-653929eb800d",
+    "timestamp": "2025-11-21 08:32:16.116059",
+    "report_generated": false
+  },
+  {
+    "question": "Can the panic at line 29 infractions.go:28-30 (Validator consensus - address not found) be triggered by removing a validator's pubkey between block N-1 and block N, causing a chain halt?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_61d37295-048e-496f-92ea-e07d08086a2d",
+    "timestamp": "2025-11-21 08:32:55.603687",
+    "report_generated": false
+  },
+  {
+    "question": "Does the HandleValidatorSignatureConcurrent function infractions.go:22-124 panic at line 29 or 35 if validator consensus addresses are malformed, and would this halt block processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_18fcfc50-9964-46ec-9183-2c32b35a4c46",
+    "timestamp": "2025-11-21 08:33:33.416501",
+    "report_generated": false
+  },
+  {
+    "question": "In the panic check at line 55 abci.go:54-56 , if writeInfo is nil, the chain panics. Can this condition ever be triggered by malicious validator behavior or consensus message manipulation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37178d18-da31-4eea-ad69-a8377f0604dd",
+    "timestamp": "2025-11-21 08:34:11.687322",
+    "report_generated": false
   }
 ]
