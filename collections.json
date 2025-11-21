@@ -6748,5 +6748,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4fd63e08-f32f-4079-8fb5-4b70a6e3663a",
     "timestamp": "2025-11-21 14:03:31.943761",
     "report_generated": false
+  },
+  {
+    "question": "Store Gas Metering: Are KV store reads/writes for grants properly metered? Can expensive operations bypass gas limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f633419c-e950-4f6e-bfd0-7bdf2d1e6117",
+    "timestamp": "2025-11-21 14:04:49.842782",
+    "report_generated": false
+  },
+  {
+    "question": "Historical State Queries: Can grants be queried at historical block heights? If so, is expiration correctly evaluated against the historical block time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b4e491d8-5ec3-4ad3-bb5d-f34370b2330c",
+    "timestamp": "2025-11-21 14:05:04.387226",
+    "report_generated": false
+  },
+  {
+    "question": "Event Ordering: When multiple grants are created or revoked in a single transaction, are events emitted in deterministic order?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f483952d-6bd8-4cd4-8fd2-6f41b65179ad",
+    "timestamp": "2025-11-21 14:05:19.122206",
+    "report_generated": false
+  },
+  {
+    "question": "Event Attribute Completeness: Do grant/revoke events include all necessary information (granter, grantee, msgType)? Can missing attributes break off-chain indexers?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a0cb56b8-ff21-47a3-9909-7991de66786d",
+    "timestamp": "2025-11-21 14:05:34.455383",
+    "report_generated": false
+  },
+  {
+    "question": "Event Emission Failure: If event emission fails, does the transaction fail or succeed silently? Can this cause event/state divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7cd358c5-02c3-4707-b58d-ba676f75bd18",
+    "timestamp": "2025-11-21 14:05:51.598691",
+    "report_generated": false
+  },
+  {
+    "question": "Authz_msg_index Attribute: In x/authz/keeper/keeper.go:130, authz_msg_index is added to events. Can this attribute be spoofed or manipulated to confuse event processors?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ff2dc5fc-2693-4100-90b2-6d755ad054f1",
+    "timestamp": "2025-11-21 14:06:10.088318",
+    "report_generated": false
+  },
+  {
+    "question": "Event Emission Gas: Is gas properly charged for emitting authorization events? Can excessive event emission cause DoS?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76856c90-028e-4a9d-89e6-3802ff34d9e1",
+    "timestamp": "2025-11-21 14:06:30.274825",
+    "report_generated": false
+  },
+  {
+    "question": "Nil Authorization Handling: Throughout the keeper, are nil authorizations properly handled or can they cause nil pointer panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1def8228-5045-4439-b02f-db6de54c73a0",
+    "timestamp": "2025-11-21 14:06:52.196808",
+    "report_generated": false
+  },
+  {
+    "question": "Error Wrapping Consistency: Are errors consistently wrapped with context (e.g., sdkerrors.Wrap) to provide useful debugging information without exposing sensitive data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9b72c65c-9302-463f-abf1-d8979f2976cb",
+    "timestamp": "2025-11-21 14:07:14.354097",
+    "report_generated": false
+  },
+  {
+    "question": "Panic Recovery: Are panics in authorization Accept methods caught and converted to errors, or can they halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e1577702-168b-4bd1-a1bd-16db9a9a6b8e",
+    "timestamp": "2025-11-21 14:07:37.814697",
+    "report_generated": false
+  },
+  {
+    "question": "Empty Granter/Grantee: Can empty or zero-length addresses be used as granter or grantee? What behavior results?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_51f147de-3818-4f5b-b91c-9acf145bd7e8",
+    "timestamp": "2025-11-21 14:08:02.392196",
+    "report_generated": false
+  },
+  {
+    "question": "Max Authorization Size: Is there a limit on authorization size? Can extremely large authorizations (e.g., large spend limits) cause storage or processing issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_23fc14bf-9861-44eb-8d86-dddf42cec29d",
+    "timestamp": "2025-11-21 14:08:28.788160",
+    "report_generated": false
+  },
+  {
+    "question": "Negative Expiration Time: Can grants be created with negative Unix timestamps? How is this handled?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6cb4b15d-5551-46b0-bc1f-f82f75ac856d",
+    "timestamp": "2025-11-21 14:08:55.810495",
+    "report_generated": false
+  },
+  {
+    "question": "Far Future Expiration: Can grants with expiration times billions of years in the future cause integer overflow in time comparisons?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ab584ca7-d1e4-4ce5-9111-d2a9e281a65a",
+    "timestamp": "2025-11-21 14:09:25.344674",
+    "report_generated": false
+  },
+  {
+    "question": "Unicode in MsgTypeURL: Can non-ASCII or special Unicode characters in message type URLs cause key construction or comparison issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a2744d08-f7a2-4bad-95d2-0837b28f8322",
+    "timestamp": "2025-11-21 14:09:55.595047",
+    "report_generated": false
+  },
+  {
+    "question": "Zero Gas Context: If a context with zero gas is passed to keeper methods, can this bypass gas metering?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93c66256-0e08-4bed-8b79-b37ac12f4191",
+    "timestamp": "2025-11-21 14:10:26.971210",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Accept Non-Determinism: Can custom authorization implementations introduce non-determinism in their Accept logic (e.g., using random numbers, time.Now())?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78017418-947f-4da9-957a-6e1d3b01c93d",
+    "timestamp": "2025-11-21 14:10:59.939745",
+    "report_generated": false
+  },
+  {
+    "question": "Map Iteration in Authorization: If authorization implementations iterate over Go maps, can non-deterministic iteration order cause consensus failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9fa18fc6-f7fd-4de0-aab4-91f81dcccb69",
+    "timestamp": "2025-11-21 14:11:35.215072",
+    "report_generated": false
+  },
+  {
+    "question": "Float Arithmetic in Limits: Can authorization implementations use floating-point arithmetic for limits (e.g., percentage-based spend limits), causing non-deterministic rounding?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9db8a045-c02c-4aa0-bd95-4c88c1f5b69f",
+    "timestamp": "2025-11-21 14:12:10.994062",
+    "report_generated": false
+  },
+  {
+    "question": "Concurrent Map Access: Are any maps accessed concurrently in the keeper without proper locking? Can this cause data races and non-deterministic behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e2dbf990-53a8-4a67-be60-7a9df2a66348",
+    "timestamp": "2025-11-21 14:12:47.515430",
+    "report_generated": false
+  },
+  {
+    "question": "Store Iterator Determinism: When iterating grants with IterateGrants, is the iteration order deterministic across all nodes? Can storage backend differences cause divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dc3db867-deb6-4fda-bff0-1eec713c55a8",
+    "timestamp": "2025-11-21 14:13:26.198516",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Comparison Logic: When comparing authorizations for equality (e.g., in tests), is the comparison deterministic? Can authorization with semantically identical but structurally different representations cause issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b35051dc-a47a-4e9c-b018-e4ccd2903abb",
+    "timestamp": "2025-11-21 14:14:04.319633",
+    "report_generated": false
+  },
+  {
+    "question": "In SendCoins, does the implementation correctly handle the case where sender and recipient are the same address, potentially allowing double-spending or balance corruption? send.go:155-173",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6646ea24-8f49-4d27-a4dd-a68e01342f38",
+    "timestamp": "2025-11-21 14:14:43.149821",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit race conditions in sendCoinsWithoutAccCreation by sending coins to an address that is simultaneously being modified by another transaction in the same block? send.go:179-204",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7446be46-8031-4e3d-8277-ffcfcf6a0391",
+    "timestamp": "2025-11-21 14:15:21.764176",
+    "report_generated": false
+  },
+  {
+    "question": "Does SubUnlockedCoins correctly validate that locked coins from vesting accounts cannot be spent, or can an attacker craft transactions that bypass the locked coin check? send.go:206-246",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b7cbfc6-d762-48e5-b0a0-1c9a037a949e",
+    "timestamp": "2025-11-21 14:16:00.962027",
+    "report_generated": false
   }
 ]
