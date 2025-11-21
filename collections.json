@@ -9148,5 +9148,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_227c36b5-9ddf-423a-97bb-a11cab9c4b4b",
     "timestamp": "2025-11-21 17:17:55.556953",
     "report_generated": false
+  },
+  {
+    "question": "Evidence Atomicity: Multi-write rollback guaranteed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_359cda65-8f60-4888-b61a-c4e71e059f79",
+    "timestamp": "2025-11-21 17:19:09.185562",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Concurrent Modification: Thread-safe?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4e77c20d-035a-4dcc-9704-0e51f88ded47",
+    "timestamp": "2025-11-21 17:19:23.866854",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Backup/Recovery: If evidence store corrupts, chain dead?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a3414a23-9d68-49ce-a626-a6977ff19300",
+    "timestamp": "2025-11-21 17:19:39.720314",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Hash Function Future Security: Post-quantum risks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f97c94e4-6f0e-40c2-a88f-eeccea400002",
+    "timestamp": "2025-11-21 17:19:54.932033",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Format Migration: Any migration path?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5019c25a-4acb-4b43-82c2-c4b6aee752f1",
+    "timestamp": "2025-11-21 17:20:09.961016",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Size Limits: None — DoS vector?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a0a510d-40c7-4794-9ec3-32225f88f0ae",
+    "timestamp": "2025-11-21 17:20:26.222261",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Access Control: Can other modules mutate evidence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4a1bd591-1d6c-4374-889d-eae72b436a8e",
+    "timestamp": "2025-11-21 17:20:43.912746",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence State Export: Large evidence set DoS export?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f7361c49-5a1f-452d-a5a6-43f9705d988a",
+    "timestamp": "2025-11-21 17:21:05.372588",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Validation Panic: Could malformed genesis halt chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ceef4b75-98e8-49eb-9aed-1ab71e19e1f8",
+    "timestamp": "2025-11-21 17:21:26.846651",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Duplicate Evidence Panic: Duplicate hashes halt chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_304a1557-ceb1-4561-8071-f678b2f4d516",
+    "timestamp": "2025-11-21 17:21:48.615690",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Ordering: Deterministic across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ddb5c847-1ff6-4cf2-a773-dccd838b1498",
+    "timestamp": "2025-11-21 17:22:12.824140",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Any Unpacking: Wrong type returned?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7a10ce0a-9ac8-47c3-955a-668562275b69",
+    "timestamp": "2025-11-21 17:22:36.785723",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Skips Handlers: Direct SetEvidence — bypassing handler logic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37bb3b18-70d4-4ce9-b43f-61e99a48bc4c",
+    "timestamp": "2025-11-21 17:23:03.042713",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Validation Weak: Only ValidateBasic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dcb87b4d-09b9-49dd-b6eb-fcb62a48dd5c",
+    "timestamp": "2025-11-21 17:23:29.923082",
+    "report_generated": false
+  },
+  {
+    "question": "InitGenesis Missing Handler: What if evidence route unregistered?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f5ff77c7-5cd8-4bf5-a909-cdeaa0033d63",
+    "timestamp": "2025-11-21 17:23:58.143482",
+    "report_generated": false
+  },
+  {
+    "question": "ExportGenesis Ordering: Deterministic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c0e9e03d-27b5-4ee4-b0e6-25f44ec8f5b3",
+    "timestamp": "2025-11-21 17:24:29.306531",
+    "report_generated": false
+  },
+  {
+    "question": "ExportGenesis Marshal Panic: Evidence that can’t marshal halts export?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8bd37534-c780-4c16-be66-85a9ee14af7e",
+    "timestamp": "2025-11-21 17:25:01.353772",
+    "report_generated": false
+  },
+  {
+    "question": "ExportGenesis Any Creation Panic: Can Any packing fail?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9b3eefc5-744e-4552-84b3-fc83f781ff7b",
+    "timestamp": "2025-11-21 17:25:34.811837",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Empty Evidence Safe?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dff0b21d-6da4-4917-be57-25ac5e67e8d3",
+    "timestamp": "2025-11-21 17:26:09.876921",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Interface Registration: Incorrect or missing interfaces?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e61f385-6295-4d83-b9e1-491733486283",
+    "timestamp": "2025-11-21 17:26:47.735095",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Unpack Error Propagation: Partial failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_39606b6c-fe22-4d95-9955-6c8fdb1093a7",
+    "timestamp": "2025-11-21 17:27:24.318935",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Type Registration: Unknown types allowed?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7d2a9a9b-59d9-46de-9d2e-44f918c14aef",
+    "timestamp": "2025-11-21 17:28:02.120241",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Duplicate Hash Check Missing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c03a0607-3f5d-4164-a0b2-a8c0880e0dc3",
+    "timestamp": "2025-11-21 17:28:40.731257",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Hash Collision Effects?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80438996-1c00-483d-a54c-18c10d322907",
+    "timestamp": "2025-11-21 17:29:21.638179",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis Migration Not Implemented?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2bc24a38-7d8b-4193-b08d-cf133f6b0b91",
+    "timestamp": "2025-11-21 17:30:03.096297",
+    "report_generated": false
   }
 ]
