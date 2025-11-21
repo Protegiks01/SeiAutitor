@@ -3148,5 +3148,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_27c7a13a-fb53-4161-a4a8-49c4b78a53bf",
     "timestamp": "2025-11-21 10:34:16.090980",
     "report_generated": false
+  },
+  {
+    "question": "Can the FlagTrace option in server/start.go be exploited to write trace data to arbitrary file paths, causing directory traversal vulnerabilities? start.go:57",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ed4b86dd-56e8-4d8a-8e56-40587b7be274",
+    "timestamp": "2025-11-21 10:35:30.151754",
+    "report_generated": false
+  },
+  {
+    "question": "Does the server properly handle the case where the CPU profiling flag (FlagCPUProfile) is enabled in production, potentially leaking sensitive performance data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ddcfd6b5-b887-499f-a2cf-0420f570f4e3",
+    "timestamp": "2025-11-21 10:35:43.368507",
+    "report_generated": false
+  },
+  {
+    "question": "In server/api/server.go, does the REST API properly validate and sanitize all input parameters to prevent injection attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b7527f17-d6ca-4860-80f1-5fa3abd74657",
+    "timestamp": "2025-11-21 10:35:57.152074",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker send malformed ABCI messages that cause panics in the server's message handling code?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bad674c1-6d98-473a-92a5-b6e4ad81823e",
+    "timestamp": "2025-11-21 10:36:11.233880",
+    "report_generated": false
+  },
+  {
+    "question": "Does the RPC layer properly rate-limit expensive query operations to prevent DoS attacks via query flooding?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c2cdff00-3d83-44df-a8d6-54abc5071f77",
+    "timestamp": "2025-11-21 10:36:26.186027",
+    "report_generated": false
+  },
+  {
+    "question": "In server/grpc/server.go, are all gRPC endpoints properly authenticated and authorized, or could unauthenticated users call privileged operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_261af1be-3e33-4e63-aea8-83cf2dfc7729",
+    "timestamp": "2025-11-21 10:36:42.775652",
+    "report_generated": false
+  },
+  {
+    "question": "Does the FlagUnsafeSkipUpgrades flag in server/start.go properly restrict its use to prevent bypassing critical security upgrades? start.go:56",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e7ddac69-646d-424e-86ad-fb8cbc120100",
+    "timestamp": "2025-11-21 10:37:01.557913",
+    "report_generated": false
+  },
+  {
+    "question": "Can the FlagHaltHeight or FlagHaltTime flags in server/start.go be manipulated by an attacker to cause premature chain halts? start.go:53-54",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73e519b0-6eeb-41de-8935-7ac6d4f40765",
+    "timestamp": "2025-11-21 10:37:21.435809",
+    "report_generated": false
+  },
+  {
+    "question": "In server/start.go, does the server properly validate the FlagMinGasPrices parameter to prevent operators from setting it to zero or negative values that could enable spam attacks? start.go:45-96",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_87c6a801-c8d5-4cc1-bb80-2bfdba6667fb",
+    "timestamp": "2025-11-21 10:37:42.545412",
+    "report_generated": false
+  },
+  {
+    "question": "In crypto/ledger/ledger.go, does the Ledger integration properly validate responses from the hardware device to prevent malicious firmware from returning crafted signatures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1b70858e-6e11-4d53-8885-14da4a1e7d72",
+    "timestamp": "2025-11-21 10:38:05.349926",
+    "report_generated": false
+  },
+  {
+    "question": "Can the keyring be manipulated to return different keys for the same address across different operations, causing transaction signing inconsistencies?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_74ae8db9-5851-4458-b94b-19a227823f89",
+    "timestamp": "2025-11-21 10:38:28.934795",
+    "report_generated": false
+  },
+  {
+    "question": "Does the crypto/hd package properly validate BIP32/BIP44 derivation paths to prevent out-of-bounds child key derivation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e78aa8a2-0284-40c5-850a-7b1fc4dce46b",
+    "timestamp": "2025-11-21 10:38:53.515545",
+    "report_generated": false
+  },
+  {
+    "question": "In crypto/keys/secp256k1/secp256k1.go, does the implementation use constant-time operations for signature verification to prevent timing side-channel attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_66885d9b-bb37-4893-9df8-6e0a71a8cc7d",
+    "timestamp": "2025-11-21 10:39:20.268960",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker manipulate the keyring backend selection to downgrade from secure storage (OS keyring) to insecure storage (file/test backend)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a661c2a5-fd5a-47d5-9762-906175cc9bcc",
+    "timestamp": "2025-11-21 10:39:46.657678",
+    "report_generated": false
+  },
+  {
+    "question": "Does the keyring properly handle the case where a key is deleted while a transaction signing operation is in progress, or could this cause a panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_51646729-c929-47a8-8812-eb3f61551a29",
+    "timestamp": "2025-11-21 10:40:15.139953",
+    "report_generated": false
+  },
+  {
+    "question": "In crypto/keyring/keyring.go, are there any operations that could leak private key material through error messages or logs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1cdda018-f76f-4189-8120-96743c02e0d6",
+    "timestamp": "2025-11-21 10:40:43.417166",
+    "report_generated": false
+  },
+  {
+    "question": "Does the NewMnemonic function in the keyring interface properly validate mnemonic strength and entropy, or could weak mnemonics be generated?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7f5237d8-7a6b-4226-999c-b5b742a00bda",
+    "timestamp": "2025-11-21 10:41:13.524319",
+    "report_generated": false
+  },
+  {
+    "question": "Can the maxPassphraseEntryAttempts limit in crypto/keyring/keyring.go be bypassed to allow unlimited brute-force attempts on encrypted keys? keyring.go:48-51",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2f488c22-9892-438d-a168-4704ac4e8bfe",
+    "timestamp": "2025-11-21 10:41:44.072954",
+    "report_generated": false
+  },
+  {
+    "question": "In crypto/keyring/keyring.go, does the keyring properly protect against timing attacks when comparing passphrases or performing key operations? keyring.go:48-51",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a9cb9b19-36a8-4c41-a314-66be359e717a",
+    "timestamp": "2025-11-21 10:42:18.334899",
+    "report_generated": false
+  },
+  {
+    "question": "Does the snapshot pruning logic properly account for ongoing restore operations, or could a snapshot be deleted while still being used for restoration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_37b399c4-b915-4f4c-8662-753dbda18b2d",
+    "timestamp": "2025-11-21 10:42:52.380069",
+    "report_generated": false
+  },
+  {
+    "question": "Can a malicious node provide snapshots with incorrect metadata (e.g., wrong format version) that cause other nodes to fail state sync and remain out of consensus?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_52f392e3-1d3c-4941-a615-ebf236503e83",
+    "timestamp": "2025-11-21 10:43:26.435916",
+    "report_generated": false
+  },
+  {
+    "question": "Does the RegisterExtensions function in snapshots/manager.go properly validate extension snapshotters to prevent duplicates or malicious extensions from being registered? manager.go:94-100",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_914cefd4-a639-4085-b877-1bedf80f9d0d",
+    "timestamp": "2025-11-21 10:44:01.521438",
+    "report_generated": false
+  },
+  {
+    "question": "In snapshots/store.go, can an attacker fill up disk space by requesting the creation of many snapshots that are never pruned?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f9fedc38-82a0-4eb1-bdab-a5ec887849f7",
+    "timestamp": "2025-11-21 10:44:36.867493",
+    "report_generated": false
+  },
+  {
+    "question": "Does the snapshot manager properly rate-limit snapshot requests to prevent resource exhaustion from nodes repeatedly requesting snapshots?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_71f356f4-86a4-4df5-8284-ce0086d1eb23",
+    "timestamp": "2025-11-21 10:45:13.002941",
+    "report_generated": false
+  },
+  {
+    "question": "Can the restoreChunkHashes array in snapshots/manager.go be manipulated to cause the restore process to accept chunks out of order or skip chunks, leading to incomplete state restoration? manager.go:58-63",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3da3f92d-bcd5-4181-a6f3-8432f4c6f7f4",
+    "timestamp": "2025-11-21 10:45:50.316055",
+    "report_generated": false
   }
 ]
