@@ -4948,5 +4948,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cbf83dab-99cb-45e0-87f5-5347c30baa7d",
     "timestamp": "2025-11-21 08:47:29.252224",
     "report_generated": false
+  },
+  {
+    "question": "Does admin existence check prevent nonexistent admin assignment in msg_server.go:67-69?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5b3ab3b0-27cd-4a6b-9892-c773ad43b5fa",
+    "timestamp": "2025-11-21 08:48:40.584402",
+    "report_generated": false
+  },
+  {
+    "question": "Can SendCoins fail after account creation causing inconsistent vesting state in msg_server.go:98-101?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7febb79b-2bc2-4c9c-980e-e5c16c141cc6",
+    "timestamp": "2025-11-21 08:48:53.639894",
+    "report_generated": false
+  },
+  {
+    "question": "Does vesting account type conversion validate base account fields in msg_server.go:57-59?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6332383a-c06d-4ebc-9135-b934c1423a49",
+    "timestamp": "2025-11-21 08:49:07.602180",
+    "report_generated": false
+  },
+  {
+    "question": "Can vesting end time be set in the past to unlock all funds immediately in msg_server.go:72?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bb236cd8-b5de-4351-bf7d-a8c1192deafb",
+    "timestamp": "2025-11-21 08:49:21.673342",
+    "report_generated": false
+  },
+  {
+    "question": "Does continuous vesting use consistent block timestamps across nodes in msg_server.go:79?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ea4a2c88-af88-49c0-9dcf-23bc38c76ba9",
+    "timestamp": "2025-11-21 08:49:36.463764",
+    "report_generated": false
+  },
+  {
+    "question": "Can telemetry overflow on large vesting amounts in msg_server.go:87-95?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76e31ff9-e1fc-4cbc-b508-6c7bea002b8e",
+    "timestamp": "2025-11-21 08:49:52.738692",
+    "report_generated": false
+  },
+  {
+    "question": "Does IsSendEnabledCoins prevent vesting accounts using disabled denoms in msg_server.go:35-37?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_492a10dc-7002-4257-8ab3-3fffed8a6ff3",
+    "timestamp": "2025-11-21 08:50:10.152772",
+    "report_generated": false
+  },
+  {
+    "question": "Can module permissions be modified after creation to escalate privileges in keeper.go:148-157?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_58fa7fc6-400e-473a-93ef-f3056a2dc579",
+    "timestamp": "2025-11-21 08:50:29.760931",
+    "report_generated": false
+  },
+  {
+    "question": "Does permAddrs prevent duplicate module names from mapping to different permissions in keeper.go:80-83?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_05fc2e56-c3a6-48a3-a37e-e3ac7769aefe",
+    "timestamp": "2025-11-21 08:50:50.440800",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetModuleAddress return valid-looking addresses for nonexistent modules in keeper.go:160-167?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b3518699-2531-4d22-abd6-d1d3de2af9cc",
+    "timestamp": "2025-11-21 08:51:13.046792",
+    "report_generated": false
+  },
+  {
+    "question": "Does module account creation set account number deterministically in keeper.go:198?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b145f734-8fc3-4738-b590-97e9d758330a",
+    "timestamp": "2025-11-21 08:51:36.589465",
+    "report_generated": false
+  },
+  {
+    "question": "Can SetModuleAccount overwrite non-module accounts in keeper.go:212-214?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ee2e088c-6a80-4247-a141-1925fc4ea8f7",
+    "timestamp": "2025-11-21 08:52:01.924273",
+    "report_generated": false
+  },
+  {
+    "question": "Does ModuleAccount.SetPubKey prevent all key-setting attempts in account.go:217-219?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f106fdf-17e1-4c4d-8f3a-8d50cf225081",
+    "timestamp": "2025-11-21 08:52:27.028665",
+    "report_generated": false
+  },
+  {
+    "question": "Can module account address derivation be predicted for front-running in account.go:163-165?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_53aca89f-c4ce-4f9c-bcb7-51b91a0b6537",
+    "timestamp": "2025-11-21 08:52:54.917621",
+    "report_generated": false
+  },
+  {
+    "question": "Does HasPermission correctly validate permission strings in account.go:197-204?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd42bd39-b7ee-4f9c-89de-5393cc432089",
+    "timestamp": "2025-11-21 08:53:22.879516",
+    "report_generated": false
+  },
+  {
+    "question": "Can create-module-account bypass validatePermissions using empty permission sets in account.go:172-173?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b10819ed-672b-43e0-a859-aeaba628deec",
+    "timestamp": "2025-11-21 08:53:52.370901",
+    "report_generated": false
+  },
+  {
+    "question": "Does module account validation ensure name-derived address correctness in account.go:227-229?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a1c7ebc5-e743-4328-b7a6-0bffd65215f4",
+    "timestamp": "2025-11-21 08:54:23.361943",
+    "report_generated": false
+  },
+  {
+    "question": "Can MaxMemoCharacters be set to MaxUint64 to allow unbounded memos in params.go:22?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1bc473b8-41a2-40c4-8437-5e2da5a88cb0",
+    "timestamp": "2025-11-21 08:54:55.144384",
+    "report_generated": false
+  },
+  {
+    "question": "Does TxSigLimit validation prevent zero which breaks signature validation in params.go:92-102?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d80d40a4-dffd-4760-98a3-1a0bf7bfbb10",
+    "timestamp": "2025-11-21 08:55:28.132268",
+    "report_generated": false
+  },
+  {
+    "question": "Can underpriced signature verification costs enable DoS attacks in params.go:105-129?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_05ebbffc-1441-4f6d-92f1-9ce86c1f7174",
+    "timestamp": "2025-11-21 08:56:01.302695",
+    "report_generated": false
+  },
+  {
+    "question": "Can inconsistent gas cost parameters break chain economics in params.go:158-176?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8bf7f593-6191-4576-8d9b-0c02fede424e",
+    "timestamp": "2025-11-21 08:56:33.890671",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetParams return stale parameters during updates in keeper/params.go:14-17?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d080989a-9ede-40ef-8cf0-54cd4f6f1850",
+    "timestamp": "2025-11-21 08:57:06.186560",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetParams validate parameters before writing in keeper/params.go:9-11?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7629be5f-8d47-40ab-b39a-dd414989e34d",
+    "timestamp": "2025-11-21 08:57:40.147748",
+    "report_generated": false
+  },
+  {
+    "question": "Can DisableSeqnoCheck be enabled via governance to allow replay attacks in params.go:59?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_337492f3-86df-4c26-9135-a87cfbe1cacb",
+    "timestamp": "2025-11-21 08:58:15.173850",
+    "report_generated": false
+  },
+  {
+    "question": "Does SR25519 cost fallback cause pricing inconsistencies in params.go:178-181?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_012fb5e9-2e0a-4c4e-bbc9-e6b7c0dab45c",
+    "timestamp": "2025-11-21 08:58:50.762850",
+    "report_generated": false
   }
 ]
