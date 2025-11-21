@@ -4648,5 +4648,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1943493d-27c0-4f32-aa2f-747d62bb68e6",
     "timestamp": "2025-11-21 12:33:50.491663",
     "report_generated": false
+  },
+  {
+    "question": "Does the total bonded tokens value from staking remain consistent during the entire tally process? tally.go:94-99",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_47b3ccc3-380b-4b0b-a6a0-672eb1f1c5f4",
+    "timestamp": "2025-11-21 12:35:03.179373",
+    "report_generated": false
+  },
+  {
+    "question": "Is the bank keeper's BurnCoins atomic with the deposit deletion in DeleteDeposits? deposit.go:58-61",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd4683ac-8e17-46d9-a39c-aaddec44c7e1",
+    "timestamp": "2025-11-21 12:35:16.181320",
+    "report_generated": false
+  },
+  {
+    "question": "Could delegation changes during a vote iteration affect the delegator deduction calculation? tally.go:47-68",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0a25a640-afad-483d-bf55-d5f014007aed",
+    "timestamp": "2025-11-21 12:35:30.158660",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gov module account exist check in keeper initialization prevent all edge cases? keeper.go:54-56",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f7595ab-d988-48be-bbc7-76efc106fcf9",
+    "timestamp": "2025-11-21 12:35:44.098236",
+    "report_generated": false
+  },
+  {
+    "question": "Can x/authz grant permissions to vote on behalf of other accounts, and is this reflected in tally? vote.go:12-42",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ec7a22a-5bea-4d8e-a127-85c11a448db8",
+    "timestamp": "2025-11-21 12:35:58.748113",
+    "report_generated": false
+  },
+  {
+    "question": "Does the params keeper validation in SubmitProposal check for the existence of nested subspaces? proposal.go:30-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_167c588a-d1e0-401b-bab1-0e21def5efce",
+    "timestamp": "2025-11-21 12:36:14.782289",
+    "report_generated": false
+  },
+  {
+    "question": "Could a validator unbond during tally computation, causing their voting power to be counted incorrectly? tally.go:24-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a97b359b-d887-4fc7-a846-e5d6318fc8c7",
+    "timestamp": "2025-11-21 12:36:32.093539",
+    "report_generated": false
+  },
+  {
+    "question": "Does the bank keeper's SendCoinsFromAccountToModule properly validate amounts in AddDeposit, preventing negative transfers? deposit.go:121-124",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f203fdaa-1c7e-4cdb-b8d1-8f035a4d5250",
+    "timestamp": "2025-11-21 12:36:51.686706",
+    "report_generated": false
+  },
+  {
+    "question": "Can the staking keeper's IterateBondedValidatorsByPower return inconsistent results during tally computation? tally.go:24-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b1b1833e-6bf6-4bb3-b4d0-72c01ded1590",
+    "timestamp": "2025-11-21 12:37:12.856270",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proposal active queue correctly handle expedited proposals with different voting periods? proposal.go:201-210",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_68aba804-d7b8-405b-9138-ed2c891c63cc",
+    "timestamp": "2025-11-21 12:37:35.063339",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a check to prevent expedited proposals from being submitted with regular minimum deposit? proposal.go:18-70",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_628621b2-5741-430e-ba6e-21b331337637",
+    "timestamp": "2025-11-21 12:37:58.642102",
+    "report_generated": false
+  },
+  {
+    "question": "Could the expedited quorum be lower than regular quorum due to parameter validation bugs? params.go:172-174",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2733093b-7df9-4f99-8e85-95afe6be5fb6",
+    "timestamp": "2025-11-21 12:38:23.607728",
+    "report_generated": false
+  },
+  {
+    "question": "Does the tally computation use the correct thresholds when an expedited proposal converts to regular? tally.go:100-119",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d1870998-891d-43a1-a2cd-9d29b09b1fe2",
+    "timestamp": "2025-11-21 12:38:48.887267",
+    "report_generated": false
+  },
+  {
+    "question": "Can an expedited proposal activate with insufficient deposits if checked between regular and expedited minimums? deposit.go:133-137",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d15ce60f-794a-4cfb-bd4c-62e2615090bf",
+    "timestamp": "2025-11-21 12:39:16.220419",
+    "report_generated": false
+  },
+  {
+    "question": "Does the deposit refund logic handle the special case of failed expedited proposals correctly at line 57-63? abci.go:54-63",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3c41759d-75de-46fd-9b3f-d465ca5f9818",
+    "timestamp": "2025-11-21 12:39:44.552333",
+    "report_generated": false
+  },
+  {
+    "question": "Is the expedited proposal check at line 57 vulnerable to status manipulation after proposal submission? abci.go:57",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62adb19c-ef5c-41ef-8f7f-d06a5aba6f9b",
+    "timestamp": "2025-11-21 12:40:12.772168",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker submit expedited proposals that fail intentionally to extend voting periods indefinitely? abci.go:95-106",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0a3af3cc-1bc6-4532-9396-15d2e8654209",
+    "timestamp": "2025-11-21 12:40:43.497119",
+    "report_generated": false
+  },
+  {
+    "question": "Does the expedited voting period extension properly calculate new end time without integer overflow? abci.go:101-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2fb1230e-24bb-45f3-aecc-84f514cf2575",
+    "timestamp": "2025-11-21 12:41:15.414384",
+    "report_generated": false
+  },
+  {
+    "question": "Can an expedited proposal be converted back to regular after being converted once, creating infinite loops? abci.go:95-106",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4e507a76-4c81-4427-97da-697ffb90497d",
+    "timestamp": "2025-11-21 12:41:47.804161",
+    "report_generated": false
+  },
+  {
+    "question": "Does the param validation check for coin denomination validity in minimum deposit requirements? params.go:91-96",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ef41feb4-65c5-4890-81c9-462ad70167cd",
+    "timestamp": "2025-11-21 12:42:20.514475",
+    "report_generated": false
+  },
+  {
+    "question": "Is the max deposit period validated to prevent extremely long or short periods that could break proposal processing? params.go:100-103",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bdf6b24d-a5d9-42a2-a74f-f4814c3a8a59",
+    "timestamp": "2025-11-21 12:42:53.854807",
+    "report_generated": false
+  },
+  {
+    "question": "Could deposit parameters be changed to require negative deposits, breaking the deposit logic? params.go:85-105",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a0071ad9-cac6-426f-b483-8bbf5abd10db",
+    "timestamp": "2025-11-21 12:43:26.749699",
+    "report_generated": false
+  },
+  {
+    "question": "Does the expedited threshold validation at line 187 prevent configurations where expedited proposals are easier to pass? params.go:187-189",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f13cbf0-2a40-419e-b039-23c574c75b74",
+    "timestamp": "2025-11-21 12:44:00.985430",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that prevents setting the veto threshold above 100% or below 0%? params.go:190-195",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_25c062f4-87e2-40c5-8b8f-088ddab5f40d",
+    "timestamp": "2025-11-21 12:44:35.798412",
+    "report_generated": false
+  },
+  {
+    "question": "Could parameter changes be applied mid-proposal, changing the rules while a proposal is being voted on? params.go:1-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5464e6c9-c148-41fa-9888-a09fdfc32194",
+    "timestamp": "2025-11-21 12:45:09.663467",
+    "report_generated": false
   }
 ]
