@@ -3748,5 +3748,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e657a6a4-7639-4b90-b8a0-6afc6b25d523",
     "timestamp": "2025-11-21 11:22:23.572188",
     "report_generated": false
+  },
+  {
+    "question": "Are relayers prevented from submitting packets for channels they shouldn't access, or is this properly permissionless?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_68dd0e0b-9cb5-43d5-b5b7-2bfc8e3256c8",
+    "timestamp": "2025-11-21 11:23:41.728445",
+    "report_generated": false
+  },
+  {
+    "question": "If both timeout height and timestamp are set, which takes precedence, and could this cause packet loss?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8ceb2439-2dfe-445f-b3a0-8ea014578a95",
+    "timestamp": "2025-11-21 11:23:56.157330",
+    "report_generated": false
+  },
+  {
+    "question": "Could two parties simultaneously open channels with the same identifiers, causing state confusion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e9deeb82-104e-4f65-a2f9-e6f6c09e87a4",
+    "timestamp": "2025-11-21 11:24:10.420500",
+    "report_generated": false
+  },
+  {
+    "question": "Are packet commitment proofs verified correctly against the counterparty chain's consensus state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_532c1703-5945-49d7-ad9a-2e4afff9160a",
+    "timestamp": "2025-11-21 11:24:26.883920",
+    "report_generated": false
+  },
+  {
+    "question": "If access control hooks panic during BeginBlocker/EndBlocker, is there recovery or does the chain halt permanently?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_488a34f5-3080-4134-a723-5e5fd05741ad",
+    "timestamp": "2025-11-21 11:24:43.449840",
+    "report_generated": false
+  },
+  {
+    "question": "When processing packet timeouts in BeginBlocker, could nil channel states cause panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_890827cd-3e3f-4191-9d3a-5293c744acb7",
+    "timestamp": "2025-11-21 11:25:02.290838",
+    "report_generated": false
+  },
+  {
+    "question": "If invariants are checked in EndBlocker and fail, are panics handled gracefully or does the chain halt?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8d5234d-dd3d-47de-a9e6-644833d22710",
+    "timestamp": "2025-11-21 11:25:21.581929",
+    "report_generated": false
+  },
+  {
+    "question": "When applying upgrades in EndBlocker, could missing upgrade handlers panic instead of gracefully failing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f0f1f8e-4d2e-4467-98a1-a9b04c8f8c7c",
+    "timestamp": "2025-11-21 11:25:42.839730",
+    "report_generated": false
+  },
+  {
+    "question": "Could executing proposals in EndBlocker panic if proposal handlers aren't registered?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e8f2aebf-5c0a-4dd0-8bd2-6a22c229a334",
+    "timestamp": "2025-11-21 11:26:06.001864",
+    "report_generated": false
+  },
+  {
+    "question": "When iterating evidence, could the iteration panic if evidence state is corrupted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e6e74fea-cd43-4e2e-ac62-203d7423f35d",
+    "timestamp": "2025-11-21 11:26:29.414554",
+    "report_generated": false
+  },
+  {
+    "question": "Could mint module panic if bonded ratio calculations result in division by zero?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7cec8377-da9d-4875-8576-66eda669979b",
+    "timestamp": "2025-11-21 11:26:54.068400",
+    "report_generated": false
+  },
+  {
+    "question": "Could the distribution module panic in BeginBlocker if reward pools are unexpectedly zero or negative?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95ffbe33-3586-4b1c-a3a4-2cacdd530680",
+    "timestamp": "2025-11-21 11:27:20.264508",
+    "report_generated": false
+  },
+  {
+    "question": "When processing evidence in BeginBlocker, could malformed evidence trigger panics that halt the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_00e5810b-cbc6-4e11-9f5d-4225efcdba41",
+    "timestamp": "2025-11-21 11:27:48.272733",
+    "report_generated": false
+  },
+  {
+    "question": "Could the staking EndBlocker panic if validator updates return inconsistent power values?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f52f8b0-e9ea-4897-80f1-7c22096239dc",
+    "timestamp": "2025-11-21 11:28:16.032718",
+    "report_generated": false
+  },
+  {
+    "question": "When unbonding entries are added to the maturity queue, is gas metered for queue insertion and future processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7b5290aa-7ddd-414b-b2c5-ca4b70aec03b",
+    "timestamp": "2025-11-21 11:28:44.652881",
+    "report_generated": false
+  },
+  {
+    "question": "Could creating numerous fee grant allowances exhaust storage without proportional gas costs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e78a79bc-7de7-4354-a7ff-671afd33e45e",
+    "timestamp": "2025-11-21 11:29:18.282119",
+    "report_generated": false
+  },
+  {
+    "question": "When validators update commission rates, is adequate gas charged for state updates?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_40790d5a-7c29-48e6-818e-8cc22663ebf2",
+    "timestamp": "2025-11-21 11:29:49.645625",
+    "report_generated": false
+  },
+  {
+    "question": "Does staking module charge appropriate gas for storing historical validator set information?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3aea18a4-01ff-4313-8ab9-a1ad5144d131",
+    "timestamp": "2025-11-21 11:30:21.204741",
+    "report_generated": false
+  },
+  {
+    "question": "Could creating complex group policies bypass gas metering?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7c8abad8-3cf9-4a8b-9c44-0e31ca6b363b",
+    "timestamp": "2025-11-21 11:30:54.997606",
+    "report_generated": false
+  },
+  {
+    "question": "When creating x/authz grants, is gas charged proportionally to grant complexity and duration?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4280abe6-5734-46c4-84fa-c5f5f64f9ead",
+    "timestamp": "2025-11-21 11:31:29.514272",
+    "report_generated": false
+  },
+  {
+    "question": "Could submitting numerous proposals with minimum deposits exhaust storage without paying proportional gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a7a3f369-8b64-4ff0-a207-cfd87f240255",
+    "timestamp": "2025-11-21 11:32:05.395409",
+    "report_generated": false
+  },
+  {
+    "question": "When timing out packets, is gas properly metered for cleanup operations on both source and destination?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e4d93e00-ffd7-47be-b751-eb9e657b13f3",
+    "timestamp": "2025-11-21 11:32:43.318851",
+    "report_generated": false
+  },
+  {
+    "question": "Are IBC receive packet operations fully gas-metered, or could relayers send expensive packets without sufficient gas?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_06757830-54d5-4910-9f7a-95415d257ecf",
+    "timestamp": "2025-11-21 11:33:22.567977",
+    "report_generated": false
+  },
+  {
+    "question": "Is gas charged proportionally for multi-signature verification, or could massively multi-signed transactions bypass limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ec9e8a8f-6258-4010-ba31-bbefd04da989",
+    "timestamp": "2025-11-21 11:33:59.112204",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker submit transactions with massive message counts that exceed gas but consume excessive processing before rejection?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3b16bd6b-2d08-45f2-8e50-f5b35db6f04b",
+    "timestamp": "2025-11-21 11:34:35.792437",
+    "report_generated": false
   }
 ]
