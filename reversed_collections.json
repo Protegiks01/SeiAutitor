@@ -5248,5 +5248,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85959612-56f7-4832-9b0c-6563a6ad708f",
     "timestamp": "2025-11-21 13:21:26.190461",
     "report_generated": false
+  },
+  {
+    "question": "Is the veto threshold check vulnerable to precision loss when comparing sdk.Dec values, allowing proposals that should be vetoed to pass? tally.go:112-114",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_daab62dc-4fde-4fe4-b640-3d8781498240",
+    "timestamp": "2025-11-21 13:22:37.215019",
+    "report_generated": false
+  },
+  {
+    "question": "Could weighted vote options with crafted weights sum to greater than 1.0 and cause incorrect tally results? tally.go:59-62",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e3c02320-dc1a-4182-8155-36a3b409976d",
+    "timestamp": "2025-11-21 13:22:50.712755",
+    "report_generated": false
+  },
+  {
+    "question": "Does the quorum check at line 102 properly handle the case where TotalBondedTokens is zero, and could this be exploited during chain genesis? tally.go:94-104",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_381b394c-8a80-4430-86bf-442f401d540f",
+    "timestamp": "2025-11-21 13:23:04.378926",
+    "report_generated": false
+  },
+  {
+    "question": "Can a validator vote multiple times by exploiting the validator voting power calculation at lines 79-86 before their vote is recorded? tally.go:74-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c070a013-6bfb-409c-b70c-84fb135a962e",
+    "timestamp": "2025-11-21 13:23:18.364540",
+    "report_generated": false
+  },
+  {
+    "question": "Does the delegator deduction logic at lines 50-54 correctly handle the case where delegator shares exceed validator shares due to rounding? tally.go:50-64",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_48fb49e3-7f2d-4be3-b3a9-fd16850b6217",
+    "timestamp": "2025-11-21 13:23:33.347449",
+    "report_generated": false
+  },
+  {
+    "question": "Is the IterateBondedValidatorsByPower iteration order deterministic, or could different nodes get different validator sets affecting tally results? tally.go:24-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca05eb57-a801-4116-b7de-f78e4b3826b7",
+    "timestamp": "2025-11-21 13:23:49.415155",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker create a validator with zero bonded tokens to manipulate the tally computation and avoid proper vote weight calculation? tally.go:24-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c06f910d-867f-41e1-82cc-2055c6d9604c",
+    "timestamp": "2025-11-21 13:24:07.439475",
+    "report_generated": false
+  },
+  {
+    "question": "Does the vote deletion in Tally at line 69 create a window where votes could be double-counted if the same voter votes twice through different paths? tally.go:69",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_869d2fcb-dd84-413d-aebd-9e3f2a048642",
+    "timestamp": "2025-11-21 13:24:27.117102",
+    "report_generated": false
+  },
+  {
+    "question": "Can the tally computation in tally.go produce different results on different validators due to floating-point precision issues with sdk.Dec operations? tally.go:13-125",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a5839a24-a1d7-4969-b452-35f082b48b0e",
+    "timestamp": "2025-11-21 13:24:48.441300",
+    "report_generated": false
+  },
+  {
+    "question": "Does the router's GetRoute function panic if called with an empty or malformed route string, and is this exploitable via malicious proposal content? router.go:66-72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eccc1536-8415-40b4-8263-05fe4e314156",
+    "timestamp": "2025-11-21 13:25:11.443073",
+    "report_generated": false
+  },
+  {
+    "question": "Could the event emission in line 84 leak sensitive information from failed proposal executions that should remain private? abci.go:84",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76fbe68b-a8a1-4c38-b758-e2580dcd0221",
+    "timestamp": "2025-11-21 13:25:35.251316",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a maximum execution time or gas limit for proposal handlers, or could a malicious handler run indefinitely and halt the chain? abci.go:74",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca735285-47b3-4209-9755-b5e8aec21649",
+    "timestamp": "2025-11-21 13:26:00.410606",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proposal handler have access to the original (non-cached) context, allowing it to bypass the error isolation mechanism? abci.go:69-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78430350-4311-4da0-b7bc-1d092fa3245c",
+    "timestamp": "2025-11-21 13:26:26.878894",
+    "report_generated": false
+  },
+  {
+    "question": "Can multiple proposals with interdependent state changes execute in the same block, causing invariant violations if executed in an unexpected order? abci.go:48-139",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b7adde13-fdc7-4b4c-a696-713d79b2f596",
+    "timestamp": "2025-11-21 13:26:54.092880",
+    "report_generated": false
+  },
+  {
+    "question": "Does the handler execution cache context properly isolate gas consumption, preventing a handler from exhausting the block gas limit? abci.go:69-74",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b0af61d-6776-4351-a902-da0ea41e46a1",
+    "timestamp": "2025-11-21 13:27:22.970491",
+    "report_generated": false
+  },
+  {
+    "question": "Could an attacker craft a ParameterChangeProposal that passes validation in lines 23-40 but causes a panic when actually applied by the handler? proposal.go:23-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_495825d3-adf9-4162-bdfd-776747b88445",
+    "timestamp": "2025-11-21 13:27:51.381766",
+    "report_generated": false
+  },
+  {
+    "question": "Is the route validation in SubmitProposalWithExpedite at line 19 sufficient to prevent submission of proposals with handlers that don't exist or were removed? proposal.go:19-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d0f208f5-ae57-440b-863b-7df00e185669",
+    "timestamp": "2025-11-21 13:28:22.278399",
+    "report_generated": false
+  },
+  {
+    "question": "Can a parameter change proposal bypass validation by directly modifying the params subspace without going through the keeper's paramsKeeper in proposal.go? proposal.go:23-40",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9c8ccc88-f901-45b9-9dd9-2d21825fa577",
+    "timestamp": "2025-11-21 13:28:53.391507",
+    "report_generated": false
+  },
+  {
+    "question": "Does the proposal handler execution in abci.go line 74 properly validate that the handler cannot call back into x/gov to submit new proposals, creating reentrancy issues? abci.go:74",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9b4d5007-e871-49f4-91bf-81c2f26d27ae",
+    "timestamp": "2025-11-21 13:29:24.958152",
+    "report_generated": false
+  },
+  {
+    "question": "Could the keeper.Router().GetRoute() call panic if the router is not properly sealed or if a proposal route is modified after sealing? abci.go:68",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a1171cc1-71bb-45a5-ba6b-f44f2da1134a",
+    "timestamp": "2025-11-21 13:29:57.684621",
+    "report_generated": false
+  },
+  {
+    "question": "Is the proposal status update at line 119 in abci.go vulnerable to race conditions if multiple goroutines access the same proposal? abci.go:119",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d9565398-20ba-4505-94a3-dc491368c6dd",
+    "timestamp": "2025-11-21 13:30:32.044452",
+    "report_generated": false
+  },
+  {
+    "question": "Does the AfterProposalFailedMinDeposit hook in abci.go line 25 have gas metering, and could a malicious hook implementation halt the chain during EndBlocker? abci.go:24-26",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b489349e-5640-42dd-bf32-85d00758e84b",
+    "timestamp": "2025-11-21 13:31:08.092484",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker spam failed proposals to trigger excessive DeleteDeposits calls in EndBlocker, causing unbounded loop execution and DoS? abci.go:54-63",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9f2b2a25-eea6-4948-80eb-47edc0db47e7",
+    "timestamp": "2025-11-21 13:31:44.234795",
+    "report_generated": false
+  },
+  {
+    "question": "Does the expedited proposal conversion logic at line 100-104 in abci.go correctly handle cases where the new VotingEndTime extends beyond the maximum allowed governance period? abci.go:95-106",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a8e04da8-a4c6-47ce-9044-1f656185e101",
+    "timestamp": "2025-11-21 13:32:23.300474",
+    "report_generated": false
+  },
+  {
+    "question": "Is the writeCache() call in abci.go atomic, and could a partial state write occur if the node crashes immediately after this call but before the block is committed? abci.go:87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b5f0d2f1-a12e-4c0a-b8be-39fa1ca88e2e",
+    "timestamp": "2025-11-21 13:33:02.650401",
+    "report_generated": false
   }
 ]
