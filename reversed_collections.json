@@ -6898,5 +6898,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b364614f-4b15-4ee8-9e73-882c39c1106d",
     "timestamp": "2025-11-21 15:30:40.786235",
     "report_generated": false
+  },
+  {
+    "question": "Does MigrateGenesisCmd in migrate.go:53-138 properly validate the target version before applying migrations, preventing migration to invalid versions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_43e0114c-c108-4f2c-83ed-57640d90bfa6",
+    "timestamp": "2025-11-21 15:32:01.393180",
+    "report_generated": false
+  },
+  {
+    "question": "Can the collect-gentxs command in collect.go:21-70 be exploited by providing a gentx directory path that contains symbolic links to arbitrary directories?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_045a33fb-d0b5-4b68-9979-2de07c0fabfe",
+    "timestamp": "2025-11-21 15:32:14.541513",
+    "report_generated": false
+  },
+  {
+    "question": "Does the output file path generation in gentx.go:216-223 prevent directory traversal attacks via malicious node IDs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f4dd0961-465a-4818-bc8e-4bdfe6e4a631",
+    "timestamp": "2025-11-21 15:32:28.965469",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker bypass the offline key check in gentx.go:156-159 to create signed gentxs with insufficient validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0492b044-17e4-4981-9b67-7160ff3312b3",
+    "timestamp": "2025-11-21 15:32:43.094488",
+    "report_generated": false
+  },
+  {
+    "question": "Does the gentx command in gentx.go:37-214 properly validate that the key exists in the keyring before attempting to create the gentx?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_be45d627-3bcd-423f-90fc-8815786cc49d",
+    "timestamp": "2025-11-21 15:32:58.054731",
+    "report_generated": false
+  },
+  {
+    "question": "Can the directory creation in utils.go:72-74 be exploited to create directories with overly permissive permissions (0777)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_83dd6b70-e422-4418-bbdc-6da9e159eaed",
+    "timestamp": "2025-11-21 15:33:15.048524",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitializeNodeValidatorFilesFromMnemonic in utils.go:59-100 securely handle the mnemonic in memory, or can it be leaked through debug logs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a5dc85b-be07-45f8-a597-269beb796a53",
+    "timestamp": "2025-11-21 15:33:33.274988",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the random chain ID generation in init.go:80-83 to cause non-deterministic chain initialization across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_39b82ce6-a7a2-4e3e-a712-4ff168956148",
+    "timestamp": "2025-11-21 15:33:53.244156",
+    "report_generated": false
+  },
+  {
+    "question": "Does the mnemonic recovery feature in init.go:88-99 properly validate mnemonic entropy, preventing weak key generation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d3c21bfc-bd78-4a56-add1-89571852bb4c",
+    "timestamp": "2025-11-21 15:34:14.478289",
+    "report_generated": false
+  },
+  {
+    "question": "Can the init command in init.go:66-153 be exploited to overwrite existing validator keys when the --overwrite flag is misused?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93440029-a789-46d1-90af-5c6287e6815a",
+    "timestamp": "2025-11-21 15:34:37.049098",
+    "report_generated": false
+  },
+  {
+    "question": "Does GenesisDocFromFile validation in genesis_state.go:89-92 properly handle symbolic links that could point to arbitrary files?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f30434e1-164d-486d-9831-a469e0d3e88e",
+    "timestamp": "2025-11-21 15:35:00.314324",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the file permissions in writeSignedGenTx at gentx.go:240-244 to create world-readable gentx files containing sensitive validator information?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a93fa839-03b0-4a12-bbbf-ae48c67a1252",
+    "timestamp": "2025-11-21 15:35:25.274242",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesisFileWithTime in utils.go:33-50 ensure the genesis time is in the future relative to block time, preventing timestamp-based attacks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e99812c7-5f5b-44c5-b43d-db348eb90a66",
+    "timestamp": "2025-11-21 15:35:51.510046",
+    "report_generated": false
+  },
+  {
+    "question": "Can ValidateAndComplete in utils.go:24-26 be bypassed by providing a genesis doc with missing required fields?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_341ea8d9-fa70-4622-aee7-6c4f2a719aad",
+    "timestamp": "2025-11-21 15:36:18.891453",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesisFile in utils.go:23-29 properly validate the genesis doc before writing, preventing creation of invalid genesis files?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9418541-c1cf-457d-a5fb-c7e44fed5700",
+    "timestamp": "2025-11-21 15:36:47.419396",
+    "report_generated": false
+  },
+  {
+    "question": "Does the genesis state unmarshaling in module.go:107-108 properly validate the structure before processing, preventing malformed data from causing panics?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9659c46a-f10c-4c9f-8d5b-8397ebdc3d89",
+    "timestamp": "2025-11-21 15:37:17.673556",
+    "report_generated": false
+  },
+  {
+    "question": "Can the hash computation in gentx.go:113 be exploited to cause non-deterministic transaction hashing across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_03281d5e-14cf-4206-8306-a188b90b2f20",
+    "timestamp": "2025-11-21 15:37:48.892604",
+    "report_generated": false
+  },
+  {
+    "question": "Does ApplyAndReturnValidatorSetUpdates in gentx.go:119-122 properly handle the case where gentx delivery succeeds but validator set update fails?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ef711424-33fe-4a81-a6ae-862d5e70b78e",
+    "timestamp": "2025-11-21 15:38:21.059518",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause the chain to initialize with an empty validator set by providing zero gentxs to genesis.go:17-19?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8d59c675-205f-4f35-9ca8-523333a11802",
+    "timestamp": "2025-11-21 15:38:54.178986",
+    "report_generated": false
+  },
+  {
+    "question": "Does the InitGenesis call in module.go:106-114 properly handle errors from DeliverGenTxs, or can a failed gentx delivery cause undefined validator state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5dfe63c2-a805-4e63-a43d-b9e76a9a2486",
+    "timestamp": "2025-11-21 15:39:26.603483",
+    "report_generated": false
+  },
+  {
+    "question": "Can GenesisStateFromGenDoc in genesis_state.go:71-77 be exploited by providing a genesis doc with malformed AppState that unmarshals non-deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_52a78ff3-765e-48bd-be4c-100a0bdbd389",
+    "timestamp": "2025-11-21 15:40:01.724173",
+    "report_generated": false
+  },
+  {
+    "question": "Does the file write operation in collect.go:40-41 properly handle concurrent access, preventing race conditions during genesis generation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_792932ae-4bb2-4523-b89a-fdbc687c82cc",
+    "timestamp": "2025-11-21 15:40:37.388784",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit the JSON marshaling in collect.go:59-62 to introduce non-deterministic field ordering in the genesis state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dda143eb-2a8c-49f8-862d-2d0d3906e098",
+    "timestamp": "2025-11-21 15:41:14.899096",
+    "report_generated": false
+  },
+  {
+    "question": "Does GenAppStateFromConfig in collect.go:27-68 ensure deterministic persistent peer ordering in collect.go:180-181, or can ordering differences cause consensus issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d089c7dd-e072-4f17-b5bb-f1ccaef9520e",
+    "timestamp": "2025-11-21 15:41:53.279343",
+    "report_generated": false
+  },
+  {
+    "question": "Can the panic on encoding error in genesis_state.go:40-43 be triggered by an attacker to halt genesis state construction?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_50929f9c-a2a5-4a06-ba88-bd4f23b92afe",
+    "timestamp": "2025-11-21 15:42:33.162698",
+    "report_generated": false
   }
 ]
