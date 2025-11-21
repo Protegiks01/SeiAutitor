@@ -8398,5 +8398,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d8b0b229-42b3-4461-9ca9-8a6b7a3374c2",
     "timestamp": "2025-11-21 16:18:14.793064",
     "report_generated": false
+  },
+  {
+    "question": "Community Tax Precision: When community tax is applied at allocation.go:82-84 , can rounding cause the actual tax collected to differ from the configured rate?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ae09fa8f-16e8-4146-aae6-46a19c992acd",
+    "timestamp": "2025-11-21 16:19:32.906393",
+    "report_generated": false
+  },
+  {
+    "question": "Slash Fraction Multiplication: In CalculateDelegationRewards at delegation.go:87 , stake.MulTruncate(OneDec - fraction) is used. Can multiple slashing events compound truncation errors?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73cd5ce0-a292-4fd4-ae7b-4bf24781e3f0",
+    "timestamp": "2025-11-21 16:19:46.301191",
+    "report_generated": false
+  },
+  {
+    "question": "QuoDecTruncate Division by Zero: In IncrementValidatorPeriod at validator.go:48 , division by validator tokens occurs. Is there a check to prevent division by zero?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0038107-b296-4d9f-b845-e4fb12f79d4c",
+    "timestamp": "2025-11-21 16:20:00.740778",
+    "report_generated": false
+  },
+  {
+    "question": "DecCoins to Coins Conversion Loss: Every TruncateDecimal() call loses precision. Can an attacker game the system to maximize truncation losses and drain the difference?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6b18908f-a467-448a-aa6e-8d352e7e8197",
+    "timestamp": "2025-11-21 16:20:16.250370",
+    "report_generated": false
+  },
+  {
+    "question": "Proposer Reward Multiplier Overflow: In AllocateTokens at allocation.go:50 , can the multiplier calculation overflow with extreme parameter values?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7908c528-4412-48c1-b6ca-ac41eadd483e",
+    "timestamp": "2025-11-21 16:20:31.515426",
+    "report_generated": false
+  },
+  {
+    "question": "Cumulative Reward Ratio Precision: In IncrementValidatorPeriod at validator.go:52-58 , cumulative rewards are added. Can precision loss accumulate over many periods?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c5386f3-f269-4193-a61d-7892bc7c31e7",
+    "timestamp": "2025-11-21 16:20:47.963189",
+    "report_generated": false
+  },
+  {
+    "question": "Power Fraction Calculation: In AllocateTokens at allocation.go:97-98 , powerFraction = vote.Validator.Power / totalPreviousPower. Can integer division cause precision loss?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c9f7a203-2171-4c66-b173-8d228d2f9d77",
+    "timestamp": "2025-11-21 16:21:05.933203",
+    "report_generated": false
+  },
+  {
+    "question": "Intersection Operation Loss: In withdrawDelegationRewards at delegation.go:152 , Intersect caps rewards to outstanding. Can this cause legitimate rewards to be permanently lost?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e6849827-fc32-469f-bbb3-f5ee925e1544",
+    "timestamp": "2025-11-21 16:21:25.423297",
+    "report_generated": false
+  },
+  {
+    "question": "Reward Sub Operation: When outstanding.Sub(rewards) is called, are there checks to ensure outstanding >= rewards to prevent underflow?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ded28bee-278b-4094-8545-b57feaa81fc9",
+    "timestamp": "2025-11-21 16:21:47.244317",
+    "report_generated": false
+  },
+  {
+    "question": "Stake Sanity Check Margin: In CalculateDelegationRewards at delegation.go:122-124 , a 3*SmallestDec margin is allowed. Can this margin be exploited to withdraw excess rewards?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dac39ca2-bb21-4634-b548-8c05c17eafd6",
+    "timestamp": "2025-11-21 16:22:09.702144",
+    "report_generated": false
+  },
+  {
+    "question": "DecCoins IsZero Check: When checking if DecCoins.IsZero(), can rounding cause non-zero amounts to appear as zero, resulting in rewards being skipped?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f4daf05e-cf56-4b8b-bef0-5e7085b083f1",
+    "timestamp": "2025-11-21 16:22:33.572788",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Collection Decimal Conversion: In AllocateTokens at allocation.go:27 , NewDecCoinsFromCoins is used. Can this conversion lose precision for very small amounts?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93fdbe64-b232-4975-9ce1-8370cbd4a917",
+    "timestamp": "2025-11-21 16:22:57.900006",
+    "report_generated": false
+  },
+  {
+    "question": "Unbounded Iteration in BeginBlocker: The loop at allocation.go:91-102 iterates over all bonded votes. Can an attacker increase validator set size to make this loop exceed block gas limit?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c6f53259-148f-4e40-8360-15b50ffe7e17",
+    "timestamp": "2025-11-21 16:23:24.687859",
+    "report_generated": false
+  },
+  {
+    "question": "Historical Rewards Iteration Cost: In DeleteValidatorHistoricalRewards at store.go:165-172 , all historical periods are iterated. Can this become prohibitively expensive for long-lived validators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_62a30dd9-9d1c-4ca4-812f-2a4e5da59d86",
+    "timestamp": "2025-11-21 16:23:52.379439",
+    "report_generated": false
+  },
+  {
+    "question": "Invariant Check Gas Cost: The invariants at invariants.go:12-21 iterate over all validators/delegations. Can running these checks consume excessive gas and slow the chain?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3de596a2-b5e7-4448-858f-0e1348b2be53",
+    "timestamp": "2025-11-21 16:24:20.914678",
+    "report_generated": false
+  },
+  {
+    "question": "Slash Event Iteration Unbounded: In IterateValidatorSlashEventsBetween at store.go:334-350 , events are iterated. Can creating many slash events DoS reward calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3cd81bce-35e0-40c5-96c9-bd51ed9986f7",
+    "timestamp": "2025-11-21 16:24:51.086445",
+    "report_generated": false
+  },
+  {
+    "question": "Withdrawal Calculation Complexity: In CalculateDelegationRewards at delegation.go:55-136 , complexity depends on number of slash events. Can an attacker grief a delegator by causing many slashes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ea804c56-1021-4409-9cfd-d5c916442b91",
+    "timestamp": "2025-11-21 16:25:21.982706",
+    "report_generated": false
+  },
+  {
+    "question": "Community Pool Spend Gas: Does executing a community pool spend proposal consume gas from the proposal executor or from a module account?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_989e83b1-323e-4dd7-8e88-8b6063895c88",
+    "timestamp": "2025-11-21 16:25:54.041692",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Balance Query: In ModuleAccountInvariant at invariants.go:151 , all balances are queried. Can this become expensive with many token denominations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_384627a9-6e2b-4bb7-8bda-101b8dda835b",
+    "timestamp": "2025-11-21 16:26:27.428969",
+    "report_generated": false
+  },
+  {
+    "question": "Iterator Creation Cost: Are there limits on how many iterators can be created in a single transaction, or can this be used for resource exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c51a3a42-35fd-439e-9f65-d4550082a25b",
+    "timestamp": "2025-11-21 16:27:01.687353",
+    "report_generated": false
+  },
+  {
+    "question": "CanWithdrawInvariant Simulation: The invariant at invariants.go:65-104 simulates withdrawals. Does this consume real gas or is it unmetered and exploitable?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_22ea984c-c073-4528-8867-d37ae073a3d6",
+    "timestamp": "2025-11-21 16:27:38.919455",
+    "report_generated": false
+  },
+  {
+    "question": "Protobuf Marshal/Unmarshal Cost: Are protobuf operations properly gas metered, or can large state objects cause disproportionate CPU usage?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a8bd663-1e8b-4710-9386-d830600763d2",
+    "timestamp": "2025-11-21 16:28:16.267412",
+    "report_generated": false
+  },
+  {
+    "question": "Delete Operations Gas Metering: When deleting large numbers of records (e.g., store.go:175-182 ), is gas properly charged?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ad8e93b5-b421-4f3a-adb5-d21dc7d20cf6",
+    "timestamp": "2025-11-21 16:28:53.455534",
+    "report_generated": false
+  },
+  {
+    "question": "Event Emission Cost: Multiple events are emitted in hooks and handlers. Can event spam be used to increase block processing time?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d4ee169d-b63c-4aae-b216-b70f59d8bad8",
+    "timestamp": "2025-11-21 16:29:31.576373",
+    "report_generated": false
+  },
+  {
+    "question": "Hook Reentrancy: When withdrawDelegationRewards is called from BeforeDelegationSharesModified hook at hooks.go:89-91 , can this trigger other hooks recursively?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_623a58ab-6c1e-4f92-96cb-068bad602a52",
+    "timestamp": "2025-11-21 16:30:11.169487",
+    "report_generated": false
   }
 ]
