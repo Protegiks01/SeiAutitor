@@ -1,0 +1,84 @@
+name: Run Validation Automation
+
+on:
+  workflow_dispatch:  # allows manual trigger from Actions tab
+
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run-deepwiki:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium webdriver-manager
+          pip install -r requirements.txt || echo "No requirements.txt found, skipping"
+
+      - name: Run Validator
+        run: python run_validator.py
+
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add validated.json || echo "No validated.json to add"
+          
+          if git diff --staged --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          git commit -m "Auto-update: collections and reports"
+          git push
+
+      - name: Check if more Reports remain
+        id: check_remaining
+        run: |
+          REMAINING=$(python -c "
+          from run_validator import get_remaining_count
+
+          print(get_remaining_count())
+          ")
+
+          echo "remaining=$REMAINING" >> $GITHUB_OUTPUT
+          echo "Remaining questions: $REMAINING"
+
+      - name: Debug outputs
+        run: |
+          echo "Remaining: ${{ steps.check_remaining.outputs.remaining }}"
+          echo "Has changes: ${{ steps.commit.outputs.has_changes }}"
+
+      - name: Trigger next batch
+        if: ${{ fromJSON(steps.check_remaining.outputs.remaining) > 0  }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'run_validator.yml',
+              ref: 'master'
+            });
+            console.log('Triggered next batch of 25 questions');
