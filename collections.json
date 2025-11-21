@@ -5248,5 +5248,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d4a59c16-e648-45e7-b6a0-c6df37d96263",
     "timestamp": "2025-11-21 09:10:23.692312",
     "report_generated": false
+  },
+  {
+    "question": "Can ExportGenesis skip valid capabilities when iterating i := 1; i < index due to index gaps from deleted capabilities? genesis.go:25-46",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f9aed03-2abf-41d2-a00d-fde49c9c29b2",
+    "timestamp": "2025-11-21 09:11:39.199376",
+    "report_generated": false
+  },
+  {
+    "question": "Can concurrent capability creation cause race conditions during the index increment in NewCapability, leading to capMap index collisions? keeper.go:245-246",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_eb22a540-6b6c-4e61-a95d-86b1edbfe3d7",
+    "timestamp": "2025-11-21 09:11:52.416273",
+    "report_generated": false
+  },
+  {
+    "question": "Can a corrupted memory store or failed type check in InitMemStore cause a chain halt? keeper.go:107-135",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3cf6928c-087d-4ea6-8d82-7537df3cbea8",
+    "timestamp": "2025-11-21 09:12:06.749754",
+    "report_generated": false
+  },
+  {
+    "question": "Can transactions access capabilities before InitMemStore completes in BeginBlocker, causing unsafe operations? abci.go:17-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bc7247b1-7526-49d9-929b-5442a9240071",
+    "timestamp": "2025-11-21 09:12:20.750720",
+    "report_generated": false
+  },
+  {
+    "question": "Does MustUnmarshal panic on corrupted CapabilityOwners protobufs during InitMemStore, halting the chain? keeper.go:115-129",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_979fabbc-b519-4167-8340-e3c3f9078a38",
+    "timestamp": "2025-11-21 09:12:35.532942",
+    "report_generated": false
+  },
+  {
+    "question": "Can inconsistent memory initialization flags between nodes cause consensus divergence in InitMemStore? keeper.go:132-134",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d0af732a-6931-4010-88d1-ec8dec6f36ad",
+    "timestamp": "2025-11-21 09:12:51.868526",
+    "report_generated": false
+  },
+  {
+    "question": "Can wiping the memory store but not the persistent store bypass the IsInitialized flag and create inconsistent state? keeper.go:138-141",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_91e46a7d-a4ff-4cd5-84ed-5ff707fab6c8",
+    "timestamp": "2025-11-21 09:13:09.409184",
+    "report_generated": false
+  },
+  {
+    "question": "Can passing a nil capability pointer to AuthenticateCapability cause silent authorization failures? keeper.go:275-280",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_662c3cb3-0962-4d74-a601-f199d12ebd7f",
+    "timestamp": "2025-11-21 09:13:28.044948",
+    "report_generated": false
+  },
+  {
+    "question": "Does ClaimCapability prevent claiming the same capability twice under different names, avoiding forward-map corruption? keeper.go:287-314",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3876ed80-fc7c-431f-ae83-c98e9cd22f51",
+    "timestamp": "2025-11-21 09:13:48.981726",
+    "report_generated": false
+  },
+  {
+    "question": "Can addOwner be exploited under concurrency to add duplicate owners due to race conditions? keeper.go:453-467",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b7b6fb76-7b45-4e3a-b799-a290903388f8",
+    "timestamp": "2025-11-21 09:14:11.963445",
+    "report_generated": false
+  },
+  {
+    "question": "Can timing attacks during ReleaseCapability allow re-claiming an index before deletion completes? keeper.go:319-356",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e481aa58-5c66-49f8-b300-307dea0ca56a",
+    "timestamp": "2025-11-21 09:14:35.106272",
+    "report_generated": false
+  },
+  {
+    "question": "Can CapabilityOwners.Set break sorted order, causing incorrect results in binary search? types.go:46-87",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b12ec9f7-8b7c-488a-a294-73fe896f4a2a",
+    "timestamp": "2025-11-21 09:15:00.058948",
+    "report_generated": false
+  },
+  {
+    "question": "Is FwdCapabilityKey pointer formatting deterministic across architectures to prevent consensus splits? keys.go:41-50",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca2ac940-c697-4d49-a94f-20a5c906c8d7",
+    "timestamp": "2025-11-21 09:15:25.554353",
+    "report_generated": false
+  },
+  {
+    "question": "Can pointer truncation in FwdCapabilityKey cause collisions for capabilities with similar pointer suffixes? keys.go:44-49",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_33cf80df-5e0f-4ae2-931f-08bf66d65278",
+    "timestamp": "2025-11-21 09:15:54.593366",
+    "report_generated": false
+  },
+  {
+    "question": "Can module names containing '/rev/' break namespace isolation in RevCapabilityKey? keys.go:35-37",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f45c4653-0d70-4cb4-929f-37284a336c7b",
+    "timestamp": "2025-11-21 09:16:24.462894",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious module or capability names collide in RevCapabilityKey and steal ownership? keys.go:35-37",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2e190f52-88e4-4776-9d8c-e74ed60a392f",
+    "timestamp": "2025-11-21 09:16:56.019655",
+    "report_generated": false
+  },
+  {
+    "question": "Does GetCapability correctly panic when a capability exists in the store but has a nil entry in capMap? keeper.go:361-388",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8c54906a-5de3-40c9-83a2-7dc4befd8c65",
+    "timestamp": "2025-11-21 09:17:28.334338",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious module names bypass scoped keeper isolation in ScopeToModule? keeper.go:69-90",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4aaf2d6f-66cf-4d44-93dc-571317507591",
+    "timestamp": "2025-11-21 09:18:00.979153",
+    "report_generated": false
+  },
+  {
+    "question": "Can bypassing the sealed flag allow creation of scoped keepers after initialization? keeper.go:70-72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1344a02d-40ed-4b1e-97bc-c9b107674d2b",
+    "timestamp": "2025-11-21 09:18:35.596497",
+    "report_generated": false
+  },
+  {
+    "question": "Can memory initialization happen on a sealed keeper, violating invariants? keeper.go:94-100",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e2b04526-f004-453f-ace1-4d8b85499489",
+    "timestamp": "2025-11-21 09:19:11.581515",
+    "report_generated": false
+  },
+  {
+    "question": "Can a scoped keeper modify other modules’ pointers due to shared capMap references? keeper.go:83-89",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9f8b42e0-60a6-4e84-b093-fc7040626cbe",
+    "timestamp": "2025-11-21 09:19:48.643594",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious modules trigger panic in ScopeToModule during BeginBlocker to halt the chain? keeper.go:70-72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e079a4e9-faee-4edc-ab5c-b2490bef1806",
+    "timestamp": "2025-11-21 09:20:24.438543",
+    "report_generated": false
+  },
+  {
+    "question": "Does NewCapability properly sanitize capability names to prevent path traversal or control characters? keeper.go:226-228",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fd8aafd5-e39a-4c28-995e-79354c15db6b",
+    "timestamp": "2025-11-21 09:21:02.261769",
+    "report_generated": false
+  },
+  {
+    "question": "Can whitespace-only names pass validation and create ambiguous capability entries? keeper.go:226-228",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_deb9c13f-c9e1-444b-b033-39b3587369a4",
+    "timestamp": "2025-11-21 09:21:41.381248",
+    "report_generated": false
+  },
+  {
+    "question": "Can extremely long capability names in genesis cause memory exhaustion during initialization? genesis.go:37-45",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_46c1e9b4-c0bc-4a7e-abbd-c0d272448cf3",
+    "timestamp": "2025-11-21 09:22:19.698459",
+    "report_generated": false
   }
 ]
