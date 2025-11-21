@@ -6898,5 +6898,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b7cbfc6-d762-48e5-b0a0-1c9a037a949e",
     "timestamp": "2025-11-21 14:16:00.962027",
     "report_generated": false
+  },
+  {
+    "question": "In AddCoins, can an attacker cause integer overflow by repeatedly adding coins to an account until the balance exceeds sdk.Int maximum value? send.go:248-274",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34572f85-fcc4-4ea3-8cb6-74af721d97e2",
+    "timestamp": "2025-11-21 14:17:17.766954",
+    "report_generated": false
+  },
+  {
+    "question": "Does setBalance correctly delete zero-balance entries to maintain the bank invariant, or can an attacker pollute storage with zero balances causing state bloat? send.go:296-313",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6431cdbd-f067-4ff2-b50d-5b5b4bd7b59b",
+    "timestamp": "2025-11-21 14:17:31.545376",
+    "report_generated": false
+  },
+  {
+    "question": "Can the checkNeg parameter in SubUnlockedCoins be exploited when set to false to create negative balances that break invariants? send.go:209-246",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_da032565-5fb0-40ca-8ed7-5659629a703c",
+    "timestamp": "2025-11-21 14:17:45.301763",
+    "report_generated": false
+  },
+  {
+    "question": "Does SendCoinsWithoutAccCreation validate recipient address existence properly, or can coins be sent to invalid addresses causing permanent fund loss? send.go:175-177",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7e83a382-eabd-4a5a-b8a2-9ed2ef299f74",
+    "timestamp": "2025-11-21 14:17:59.578286",
+    "report_generated": false
+  },
+  {
+    "question": "In initBalances, can an attacker exploit the lack of duplicate checking to set multiple balance entries for the same denom during genesis? send.go:276-294",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34cbd961-5256-42a8-9726-fc5269c15541",
+    "timestamp": "2025-11-21 14:18:16.667662",
+    "report_generated": false
+  },
+  {
+    "question": "Does the CanSendTo recipient checker list allow an attacker to register a malicious checker that blocks all transfers, causing a DoS? send.go:439-446",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_47a19060-f8e6-4323-a56f-92ef73903204",
+    "timestamp": "2025-11-21 14:18:35.189874",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetBalance return stale cached data when called multiple times in a transaction, leading to inconsistent balance checks? view.go:100-114",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3e915e71-e556-4ffb-b3b4-79a5782b1ad2",
+    "timestamp": "2025-11-21 14:18:55.001785",
+    "report_generated": false
+  },
+  {
+    "question": "In SpendableCoins, can the subtraction of locked coins from total balance result in panic or incorrect computation if locked coins exceed total balance? view.go:182-200",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca8c4c0c-5bd9-46c9-9b41-96994aa14fa3",
+    "timestamp": "2025-11-21 14:19:16.052235",
+    "report_generated": false
+  },
+  {
+    "question": "Does IterateAccountBalances maintain deterministic iteration order, or can non-deterministic iteration cause consensus failures? view.go:116-133",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f2daa4b-5393-4ee3-8660-ff0bb8a9db28",
+    "timestamp": "2025-11-21 14:19:39.540629",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker exploit IterateAllBalances by creating millions of small-balance accounts to cause iteration DoS during invariant checks? view.go:135-161",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ee203a14-7cec-449b-b609-8c7d67704e60",
+    "timestamp": "2025-11-21 14:20:03.495199",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateBalance during genesis correctly handle edge cases where vesting account original vesting exceeds actual balance? view.go:202-229",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f727358-1849-4eb2-b859-d5147691c3e8",
+    "timestamp": "2025-11-21 14:20:28.987232",
+    "report_generated": false
+  },
+  {
+    "question": "In the message server's Send function, can the allow list cache be poisoned to bypass allow list checks for subsequent transactions? msg_server.go:26-76",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a4bae29f-55f2-4ac9-bfac-9459e8f94a1d",
+    "timestamp": "2025-11-21 14:20:55.827042",
+    "report_generated": false
+  },
+  {
+    "question": "Does MultiSend correctly validate that total inputs equal total outputs atomically, or can rounding errors create supply imbalances? msg_server.go:78-113",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fe551dd9-3ee5-4ae1-86ca-9f70249a3e12",
+    "timestamp": "2025-11-21 14:21:23.997286",
+    "report_generated": false
+  },
+  {
+    "question": "Can BlockedAddr be bypassed by encoding addresses in alternative formats or using special coinbase addresses? send.go:346-355",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_38f791cb-5013-4650-b988-a0d65caf48a6",
+    "timestamp": "2025-11-21 14:21:53.186922",
+    "report_generated": false
+  },
+  {
+    "question": "Does the send-enabled check in IsSendEnabledCoins prevent all transfers including module-to-module transfers, or can it be bypassed? send.go:329-344",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_84ed588f-97ff-4354-bfb2-4bd7638017bd",
+    "timestamp": "2025-11-21 14:22:23.001579",
+    "report_generated": false
+  },
+  {
+    "question": "In SendCoins, does the account creation side effect execute atomically with the transfer, or can it be interrupted causing state inconsistency? send.go:155-173",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f973d215-f61c-4825-824c-0d09413ed2ea",
+    "timestamp": "2025-11-21 14:22:55.059656",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker send coins to themselves repeatedly to trigger account creation telemetry counter overflow or other side effects? send.go:167-170",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dcd7f749-0731-44d4-8270-9da9161c6ee1",
+    "timestamp": "2025-11-21 14:23:27.833089",
+    "report_generated": false
+  },
+  {
+    "question": "Does SubUnlockedCoins properly check spendable balance considering both locked coins and the amount being subtracted simultaneously? send.go:214-226",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_806cc3c2-5221-45f5-89d1-ee54c13708c3",
+    "timestamp": "2025-11-21 14:24:01.104459",
+    "report_generated": false
+  },
+  {
+    "question": "Can the balance update in setBalance be exploited by concurrent modifications within the same block to create race conditions? send.go:296-313",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f3bfb7d0-454b-4b25-a60f-5c872c377174",
+    "timestamp": "2025-11-21 14:24:35.213974",
+    "report_generated": false
+  },
+  {
+    "question": "Does AddCoins check for recipient validity before modifying state, preventing coins from being lost to invalid addresses? send.go:248-274",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8b49c19c-20a9-43f6-86f8-c5e7ce8bd748",
+    "timestamp": "2025-11-21 14:25:14.841615",
+    "report_generated": false
+  },
+  {
+    "question": "In InputOutputCoins, can the iteration order over inputs and outputs cause non-determinism affecting consensus? send.go:95-153",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a83dbb3-1ee7-41d2-8a0b-dcfcb3a24f98",
+    "timestamp": "2025-11-21 14:25:51.201069",
+    "report_generated": false
+  },
+  {
+    "question": "Does the event emission in SendCoins happen before or after state changes, and can this ordering be exploited to create inconsistent event logs? send.go:190-201",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_904123b2-a29f-4417-a035-71a94a942807",
+    "timestamp": "2025-11-21 14:26:27.246469",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetAllBalances be called on module accounts to reveal sensitive internal balances that should be hidden? view.go:63-72",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_80df16aa-90ef-4591-991c-a8819592e0ac",
+    "timestamp": "2025-11-21 14:27:04.287905",
+    "report_generated": false
+  },
+  {
+    "question": "Does HasBalance account for both regular and wei balances when checking if an address has sufficient funds? view.go:58-61",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cdd01230-5575-4774-9a2f-04bc82a0b04a",
+    "timestamp": "2025-11-21 14:27:42.392864",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft transactions that alternate between AddCoins and SubUnlockedCoins to exploit any caching mechanisms? send.go:206-274",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_77f3c211-f5f0-43ab-aeae-6ba4ed06e2e9",
+    "timestamp": "2025-11-21 14:28:21.547454",
+    "report_generated": false
   }
 ]
