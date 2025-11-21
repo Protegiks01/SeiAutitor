@@ -8998,5 +8998,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_40beef27-ae5e-47b5-b5ca-13d33038c7fe",
     "timestamp": "2025-11-21 17:05:58.796198",
     "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Redelegation Slashing: Any edge cases skipping slashing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b967982e-97c0-4770-b853-df5ba670dc5d",
+    "timestamp": "2025-11-21 17:07:10.260080",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Multi-Evidence Same Block: Slashed once or multiple times?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_93dd427f-b01d-4438-8aa4-bcedb87f975f",
+    "timestamp": "2025-11-21 17:07:23.993738",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Ordering Dependencies: Evidence A affecting B?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7b13e429-dd16-41d7-85dc-7f3fa3095e05",
+    "timestamp": "2025-11-21 17:07:37.625984",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence GetValidatorPower Usage: Evidence.GetTotalPower returns 0 — is this safe?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fef9dfcf-5e49-44de-8192-ba70e62f3394",
+    "timestamp": "2025-11-21 17:07:51.679495",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Address Validation: Are consensus addresses validated?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3a885774-44e5-4a88-85ec-c48d0894872d",
+    "timestamp": "2025-11-21 17:08:08.552532",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Time Precision: Are nanosecond differences deterministic across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_85934139-a981-411c-9f9c-489550f45004",
+    "timestamp": "2025-11-21 17:08:26.833605",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Extreme Heights: Height=0 or MaxInt64 — safe?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c333e87d-ac59-42fb-8ab5-4b78ddf7657f",
+    "timestamp": "2025-11-21 17:08:44.806726",
+    "report_generated": false
+  },
+  {
+    "question": "HandleEquivocationEvidence Log Output Determinism: Could logs cause nondeterministic state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_691cfd60-bcee-41ea-84c0-461fdd9344c8",
+    "timestamp": "2025-11-21 17:09:05.183094",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Key Prefix Collision: Does prefix 0x00 collide with other modules?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_70420c47-f05e-4e4f-9270-5051221ea946",
+    "timestamp": "2025-11-21 17:09:26.640662",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Storage Key Construction: Evidence stored by hash — can collisions overwrite entries?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_09289dd5-487b-41ee-8988-70918929c46b",
+    "timestamp": "2025-11-21 17:09:48.711219",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Store Iteration Performance: Can millions of entries DoS GetAllEvidence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_99d040bb-39d2-41f4-85f6-d5a867bc9515",
+    "timestamp": "2025-11-21 17:10:13.185585",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Store Pagination: Does GetAllEvidence respect limits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2b9f7404-493f-434d-849d-5f0f1bd56fdf",
+    "timestamp": "2025-11-21 17:10:38.503348",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Prefix Store Isolation: Is evidence truly isolated?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3da96cd8-775a-4601-80df-6142e85c086b",
+    "timestamp": "2025-11-21 17:11:05.273235",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Marshaling Determinism: Any nondeterministic protobuf fields?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0eac478e-569b-4c78-bddb-2b48ffba7859",
+    "timestamp": "2025-11-21 17:11:32.408997",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Unmarshaling Validation: Does genesis import re-validate?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_07a5b7e0-39bb-41c6-a062-8dfe814cc281",
+    "timestamp": "2025-11-21 17:12:01.101719",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Hash Length: SHA256 length — any issues?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c7d4ec3e-c89b-4d12-a341-4474a1937eb6",
+    "timestamp": "2025-11-21 17:12:31.069038",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Store ACID Properties: Is KVStore safe under concurrency?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_592a344b-43ec-4f58-ac76-0c86ea68ea12",
+    "timestamp": "2025-11-21 17:13:02.538009",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Iterator Memory Leaks: Does iterator always close?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_95b29f6a-7b4f-44c7-b470-8b9898261923",
+    "timestamp": "2025-11-21 17:13:35.511176",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Iterator Panic Handling: Panic inside callback leaks iterator?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_af5a4257-3161-4c5c-b09a-e00d9cf69265",
+    "timestamp": "2025-11-21 17:14:09.631148",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Write-Read Consistency: Is freshly written evidence visible?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c8121b67-b712-4a6c-a618-4d5af9a6f0ac",
+    "timestamp": "2025-11-21 17:14:43.912700",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Pruning: No pruning — infinite growth?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b715378b-aad5-4494-a18e-c5701b2d5060",
+    "timestamp": "2025-11-21 17:15:20.152079",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Store Gas: Under-metered operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9fc71c8f-3dfa-4624-a01e-2d7206dc6fc2",
+    "timestamp": "2025-11-21 17:15:57.859688",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence Key Ordering: Sorted by hash — any fingerprinting risks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_df17e452-aa70-42d2-9c03-ee0d976d1d89",
+    "timestamp": "2025-11-21 17:16:35.407524",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence GetEvidence Cache: Can stale cache cause incorrect behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_38703678-e318-4f75-b938-2522e8aadbc2",
+    "timestamp": "2025-11-21 17:17:15.429050",
+    "report_generated": false
+  },
+  {
+    "question": "Evidence SetEvidence Overwrites: Should duplicates be rejected instead?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_227c36b5-9ddf-423a-97bb-a11cab9c4b4b",
+    "timestamp": "2025-11-21 17:17:55.556953",
+    "report_generated": false
   }
 ]
