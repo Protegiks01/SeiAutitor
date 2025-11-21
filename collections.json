@@ -4348,5 +4348,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3ddcf05b-ea56-4b27-8588-553cda2b62a9",
     "timestamp": "2025-11-21 08:00:48.400612",
     "report_generated": false
+  },
+  {
+    "question": "Can BadWasmDependencyAddresses in context be abused to reset mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ef30fad-a8e4-44b1-9898-e689a4a77e8a",
+    "timestamp": "2025-11-21 08:01:59.630486",
+    "report_generated": false
+  },
+  {
+    "question": "Does module maintain invariant that all messages have valid or synchronous mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f723c68c-c6d7-4ddb-bb54-26077d081586",
+    "timestamp": "2025-11-21 08:02:12.822837",
+    "report_generated": false
+  },
+  {
+    "question": "Can missing mapping upgrades break dependency invariants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_67894a80-d945-473c-a785-f65758f5340b",
+    "timestamp": "2025-11-21 08:02:26.900834",
+    "report_generated": false
+  },
+  {
+    "question": "Can stale mappings persist after upgrade causing inconsistent execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c076de3a-346a-49b4-85c4-8d5f0b6fdb37",
+    "timestamp": "2025-11-21 08:02:40.989967",
+    "report_generated": false
+  },
+  {
+    "question": "Is state export deterministic even under large mapping sets?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cd7e9b5d-ef41-473d-a321-ff7dbffff393",
+    "timestamp": "2025-11-21 08:02:55.894292",
+    "report_generated": false
+  },
+  {
+    "question": "Can dependency mismatches cause hidden unsafe concurrent execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_db611b44-64e5-4bd9-ae7c-77f46616fd6b",
+    "timestamp": "2025-11-21 08:03:12.049492",
+    "report_generated": false
+  },
+  {
+    "question": "Can malformed genesis data bypass dependency validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_83b2586b-42c4-4352-894d-c16dc71ac20e",
+    "timestamp": "2025-11-21 08:03:29.661462",
+    "report_generated": false
+  },
+  {
+    "question": "Can genesis import accept unlimited-size dependency mappings causing bloat?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0bfee9fa-95ea-4a62-8317-7b9902520f53",
+    "timestamp": "2025-11-21 08:03:50.156121",
+    "report_generated": false
+  },
+  {
+    "question": "Can invalid wasm mappings persist until runtime?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_51077ef5-4c6c-41ea-8b8a-addc8447477e",
+    "timestamp": "2025-11-21 08:04:12.284342",
+    "report_generated": false
+  },
+  {
+    "question": "Does EndBlock clean up dependency artifacts deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dc7c2f5a-fbac-4efe-9bd0-40a379ceda76",
+    "timestamp": "2025-11-21 08:04:35.086009",
+    "report_generated": false
+  },
+  {
+    "question": "Can dependency changes mid-block violate invariants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bafb63c2-b18c-4261-8a5b-8bdbec6d1f86",
+    "timestamp": "2025-11-21 08:05:00.679390",
+    "report_generated": false
+  },
+  {
+    "question": "Can conflicting mappings cause undefined resource access behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a9590672-8deb-4f02-9cc3-ad1369072e84",
+    "timestamp": "2025-11-21 08:05:27.159252",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker bypass fee deduction by crafting a transaction that fails ValidateBasic after DeductFeeDecorator has already deducted fees in x/auth/ante/ante.go:47-60?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0f8090a7-d6c6-4b9b-b0ec-8389ff3abb58",
+    "timestamp": "2025-11-21 08:05:55.252111",
+    "report_generated": false
+  },
+  {
+    "question": "Does NewAnteHandler guarantee SetUpContextDecorator is always the outermost decorator to prevent gas meter bypass attacks in ante.go:48?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7f5d31a1-b6e6-4e55-b968-82f029746829",
+    "timestamp": "2025-11-21 08:06:25.353996",
+    "report_generated": false
+  },
+  {
+    "question": "Can ordering SetPubKeyDecorator before SigVerificationDecorator be exploited to set an incorrect public key that later passes signature verification in ante.go:55-58?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9970c719-26fc-46bc-9876-ccb04b0fa3f6",
+    "timestamp": "2025-11-21 08:06:56.300396",
+    "report_generated": false
+  },
+  {
+    "question": "Does IncrementSequenceDecorator run only after all validation decorators to prevent sequence increments on failed transactions in ante.go:59?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ef86a7f6-1cb4-492f-9628-4d71fbf2fe31",
+    "timestamp": "2025-11-21 08:07:28.003970",
+    "report_generated": false
+  },
+  {
+    "question": "Can a malicious transaction trigger a panic in one decorator to skip subsequent decorators and bypass validation in ante.go:61?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35c476ef-79de-437d-ae55-c3271c6813dd",
+    "timestamp": "2025-11-21 08:08:01.046850",
+    "report_generated": false
+  },
+  {
+    "question": "Does RejectExtensionOptionsDecorator fully reject all extension options or can they bypass other AnteHandler checks in ante.go:49?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_10429a5c-b98b-47b5-9faf-1911b81bd0dc",
+    "timestamp": "2025-11-21 08:08:35.483396",
+    "report_generated": false
+  },
+  {
+    "question": "Can a transaction pass ValidateBasicDecorator but include malformed fields that crash later decorators in basic.go:28-38?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f78520a-0bb9-4f91-b9f8-443f042ac978",
+    "timestamp": "2025-11-21 08:09:10.484890",
+    "report_generated": false
+  },
+  {
+    "question": "Does TxTimeoutHeightDecorator correctly reject edge-case timeout heights such as MaxUint64 in basic.go:213-226?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_617c8561-e75d-4ea4-8e4d-30869f70516d",
+    "timestamp": "2025-11-21 08:09:46.143381",
+    "report_generated": false
+  },
+  {
+    "question": "Can ValidateMemoDecorator be bypassed by transactions that do not implement TxWithMemo but still contain memo data in basic.go:54-70?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7da80444-bb04-4a6d-ac29-5513dc15ef65",
+    "timestamp": "2025-11-21 08:10:21.932513",
+    "report_generated": false
+  },
+  {
+    "question": "Does ConsumeTxSizeGasDecorator properly meter transaction size to prevent large unmetered transactions in basic.go:116?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35228479-5321-4ffd-a338-9f39f115704a",
+    "timestamp": "2025-11-21 08:10:58.617063",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetPubKeyDecorator validate that the public key matches the signer address correctly in non-simulate mode in sigverify.go:80-83?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_be881bc2-2686-4946-81d8-9027f5816bc1",
+    "timestamp": "2025-11-21 08:11:37.232084",
+    "report_generated": false
+  },
+  {
+    "question": "Can simulate mode where pubKey==nil allow simSecp256k1Pubkey to bypass signature verification in sigverify.go:74-77?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b7d81e18-d2df-43b8-bdae-466e3db9a5fc",
+    "timestamp": "2025-11-21 08:12:16.447988",
+    "report_generated": false
+  },
+  {
+    "question": "Does SigVerificationDecorator skip signature verification during ReCheckTx safely or can this allow replay attacks in sigverify.go:294?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_509170d5-95b3-4072-be8b-fd5e2689ff9c",
+    "timestamp": "2025-11-21 08:12:55.771762",
+    "report_generated": false
   }
 ]
