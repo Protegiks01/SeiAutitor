@@ -5998,5 +5998,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2df26152-d9a1-494d-a8f5-050d02c9098d",
     "timestamp": "2025-11-21 13:04:47.567654",
     "report_generated": false
+  },
+  {
+    "question": "Granter Equals Grantee Logic: In x/authz/keeper/keeper.go:89, when granter.Equals(grantee), authorization checks are skipped. Can an attacker craft messages where the granter and grantee are the same to execute unauthorized actions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7b0ac60d-0389-4db1-8e12-9ad5c040865e",
+    "timestamp": "2025-11-21 13:06:01.635868",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization.Accept Return Manipulation: In x/authz/keeper/keeper.go:94-110, can a malicious authorization implementation return a malformed AcceptResponse (e.g., Accept=true with a corrupt Updated authorization) that causes state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_bc33f4a5-f4b1-4dae-9349-22e130960928",
+    "timestamp": "2025-11-21 13:06:15.174639",
+    "report_generated": false
+  },
+  {
+    "question": "Delete Flag Race Condition: In x/authz/keeper/keeper.go:99-100, if resp.Delete=true, the grant is deleted. Can an attacker exploit timing to execute the same grant multiple times in a single block before deletion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78a95328-3b8e-4074-8570-19f7afd08292",
+    "timestamp": "2025-11-21 13:06:28.587591",
+    "report_generated": false
+  },
+  {
+    "question": "Updated Authorization Validation: In x/authz/keeper/keeper.go:101-102, when resp.Updated != nil, is the updated authorization validated before being stored? Can an attacker return an invalid authorization that corrupts state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c65245b4-cf26-4682-ad4c-99bb754b89f5",
+    "timestamp": "2025-11-21 13:06:42.647811",
+    "report_generated": false
+  },
+  {
+    "question": "Handler Nil Check: In x/authz/keeper/keeper.go:113-116, if k.router.Handler(msg) returns nil, an error is thrown. Can an attacker register custom message types that cause this check to fail inconsistently across nodes?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_041c4b5b-70bf-44ab-b0c9-21f2c95659a5",
+    "timestamp": "2025-11-21 13:06:57.557909",
+    "report_generated": false
+  },
+  {
+    "question": "Handler Execution Panic: In x/authz/keeper/keeper.go:118-121, if handler(ctx, msg) panics, does it properly propagate or could it halt the chain? Are all handler panics caught?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5da37876-16a3-40f5-a2a6-5f5759f6499e",
+    "timestamp": "2025-11-21 13:07:13.493205",
+    "report_generated": false
+  },
+  {
+    "question": "Event Attribute Injection: In x/authz/keeper/keeper.go:130, the authz_msg_index attribute is added. Can an attacker inject events that conflict with or overwrite this attribute to confuse indexers?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dc2f4280-665e-41e7-a9bc-d994b48c6c30",
+    "timestamp": "2025-11-21 13:07:30.959563",
+    "report_generated": false
+  },
+  {
+    "question": "Results Array Bounds: In x/authz/keeper/keeper.go:77, a results slice is pre-allocated. If message execution modifies the msgs slice length, could this cause out-of-bounds access?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aa7a68ee-6cbc-4f15-a7a4-e488e62fc738",
+    "timestamp": "2025-11-21 13:07:49.776760",
+    "report_generated": false
+  },
+  {
+    "question": "GetMessages Validation: In x/authz/keeper/msg_server.go:72-74, msg.GetMessages() extracts nested messages. Can the unpacking fail silently or return malformed messages that bypass validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3916d536-754e-4d64-8800-35a3e4d39e2c",
+    "timestamp": "2025-11-21 13:08:10.983550",
+    "report_generated": false
+  },
+  {
+    "question": "MsgExec Signature Verification: In x/authz/msgs.go:212-217, MsgExec.GetSigners() returns only the grantee. Does the AnteHandler correctly verify that only the grantee signed, preventing unauthorized execution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e6be419c-08bb-40c0-92f1-39e5e8a62949",
+    "timestamp": "2025-11-21 13:08:33.576193",
+    "report_generated": false
+  },
+  {
+    "question": "Empty Messages Array: In x/authz/msgs.go:227-229, MsgExec.ValidateBasic() checks for empty messages. Can this check be bypassed in custom transaction encoding or during protobuf deserialization?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5478aa6c-ad15-4706-b3ef-c087c7bc2057",
+    "timestamp": "2025-11-21 13:08:56.402848",
+    "report_generated": false
+  },
+  {
+    "question": "Cached Value Integrity: In x/authz/msgs.go:198-209, messages are retrieved from GetCachedValue(). Can an attacker manipulate the Any cache to execute different messages than those authorized?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cb327ee8-d7db-4831-a11d-e4737218ad9e",
+    "timestamp": "2025-11-21 13:09:21.008824",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Overwrite Attack: In x/authz/keeper/keeper.go:144-160, SaveGrant overwrites existing grants for the same message type. Can an attacker exploit this to replace a limited authorization with an unlimited one if the granter accidentally re-grants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c32f20a2-e7fa-4eaf-86cd-a133b3729f18",
+    "timestamp": "2025-11-21 13:09:46.926198",
+    "report_generated": false
+  },
+  {
+    "question": "Expiration Time Manipulation: In x/authz/authorization_grant.go:13-20, the commented-out code suggests expiration should be validated against block time. Without this check, can grants be created with past expiration times?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_34977ccf-c3ad-4cfc-80c9-6c2f990d3989",
+    "timestamp": "2025-11-21 13:10:14.130631",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Expiration Race: In x/authz/keeper/keeper.go:196-207, GetCleanAuthorization deletes expired grants. Can an attacker execute a grant immediately before it expires but after the deletion check, causing inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dec26da8-1d46-41b6-b48a-ac4dc3741a1c",
+    "timestamp": "2025-11-21 13:10:42.372802",
+    "report_generated": false
+  },
+  {
+    "question": "Time.Now() Non-Determinism: In x/authz/keeper/keeper.go:201, grant.Expiration.Before(ctx.BlockHeader().Time) uses block time. Could any code path use time.Now() instead, causing consensus divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_cad35c50-73e1-4dde-a5bc-72cd451040cd",
+    "timestamp": "2025-11-21 13:11:11.562755",
+    "report_generated": false
+  },
+  {
+    "question": "Key Collision in grantStoreKey: In x/authz/keeper/keys.go:23-36, the grantStoreKey function constructs keys with length prefixes. Can carefully crafted addresses cause key collisions between different granter/grantee pairs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8ccc16ed-d045-430d-a569-0e9734e3065d",
+    "timestamp": "2025-11-21 13:11:42.226932",
+    "report_generated": false
+  },
+  {
+    "question": "Length Prefix Overflow: In x/authz/keeper/keys.go:25-26, addresses are length-prefixed with address.MustLengthPrefix(). Can extremely long addresses cause buffer overflow or incorrect key construction?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_43d4e487-7b70-4748-b66c-8f4ed1c43735",
+    "timestamp": "2025-11-21 13:12:13.982004",
+    "report_generated": false
+  },
+  {
+    "question": "MsgType Injection: In x/authz/keeper/keys.go:24, msgType is converted from string to bytes. Can special characters in the message type URL cause key parsing errors or collisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dad0819a-ec44-46b1-80f8-078b68c2d93f",
+    "timestamp": "2025-11-21 13:12:46.720255",
+    "report_generated": false
+  },
+  {
+    "question": "AddressesFromGrantStoreKey Parsing: In x/authz/keeper/keys.go:39-50, addresses are extracted from keys. Can malformed keys cause incorrect address extraction or panic during parsing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9323c4cf-370c-4e67-bced-6fcfe400f061",
+    "timestamp": "2025-11-21 13:13:20.437057",
+    "report_generated": false
+  },
+  {
+    "question": "AssertKeyAtLeastLength Bypass: In x/authz/keeper/keys.go:42-47, kv.AssertKeyAtLeastLength validates key length. Can this assertion be bypassed with malformed keys in genesis or during state import?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d4014dcb-5eb9-44c0-8d36-d3b57f17e185",
+    "timestamp": "2025-11-21 13:13:56.104468",
+    "report_generated": false
+  },
+  {
+    "question": "Store Prefix Collision: In x/authz/keeper/keys.go:13, GrantKey = []byte{0x01} is the prefix. Can other modules or custom logic use the same prefix, causing state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_03141c3d-3541-4343-8608-e4d2bb73f6c7",
+    "timestamp": "2025-11-21 13:14:32.418358",
+    "report_generated": false
+  },
+  {
+    "question": "DeleteGrant Not Found: In x/authz/keeper/keeper.go:164-177, DeleteGrant returns an error if the grant is not found. Can this be exploited to drain gas by repeatedly attempting to delete non-existent grants?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76cb9c35-8ecf-49af-b690-25d339c87824",
+    "timestamp": "2025-11-21 13:15:08.664518",
+    "report_generated": false
+  },
+  {
+    "question": "Grant Update Race: In x/authz/keeper/keeper.go:51-72, the update function retrieves, modifies, and stores a grant. Is this atomic? Can concurrent transactions corrupt the grant state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ffeb8bdb-45cd-413a-8fc1-347f1c756d3e",
+    "timestamp": "2025-11-21 13:15:46.480265",
+    "report_generated": false
+  },
+  {
+    "question": "Authorization Unpacking Error: In x/authz/keeper/keeper.go:58-61, authorization is cast to proto.Message. Can malformed protobuf cause this to fail silently or return incorrect authorization types?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_02b96a2f-3d33-45c2-bbd1-4e7c8d42de63",
+    "timestamp": "2025-11-21 13:16:24.493549",
+    "report_generated": false
   }
 ]
