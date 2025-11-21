@@ -898,5 +898,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7a8edca3-128c-494a-be04-0fb925a2b71b",
     "timestamp": "2025-11-20 22:50:29.360861",
     "report_generated": false
+  },
+  {
+    "question": "Is there validation that genesis signing info has valid start heights genesis.go:29 , preventing negative or future heights?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6616aa0f-5b39-4a64-b50b-098e31f43014",
+    "timestamp": "2025-11-21 07:13:26.249221",
+    "report_generated": false
+  },
+  {
+    "question": "Can the genesis import at line 37 genesis.go:32-38 accept bit arrays with mismatched window sizes that corrupt the state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e668cd02-76ad-4a02-9a3f-8beb8c2389d2",
+    "timestamp": "2025-11-21 07:13:39.288032",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesis genesis.go:46-66 correctly handle the case where missed blocks exist but signing info doesn't, preventing incomplete exports?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c69ef4fa-9570-40f9-974a-599877136adf",
+    "timestamp": "2025-11-21 07:13:52.971535",
+    "report_generated": false
+  },
+  {
+    "question": "Can malformed genesis data with duplicate validator signing info genesis.go:24-30 cause state corruption or overwrites?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_03b98382-d817-474a-bfcb-39e1fabeb3bc",
+    "timestamp": "2025-11-21 07:14:06.917635",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic at line 17 genesis.go:16-18 during genesis import cause the chain to fail to start, and is there proper error handling?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_023183cd-8697-473c-9b46-0ba10b7859c4",
+    "timestamp": "2025-11-21 07:14:21.981423",
+    "report_generated": false
+  },
+  {
+    "question": "In InitGenesis genesis.go:12-41 , can the validator iteration at line 13 cause panics if validators have invalid consensus pubkeys?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7ce2bec1-e8b4-4163-94e2-c2fedf991967",
+    "timestamp": "2025-11-21 07:14:38.444780",
+    "report_generated": false
+  },
+  {
+    "question": "Genesis & Initialization (Questions 141-150)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b199e0be-628b-4825-8f3a-faf70a93ae29",
+    "timestamp": "2025-11-21 07:14:56.619702",
+    "report_generated": false
+  },
+  {
+    "question": "Can the parameter subspace keeper.go:20 be manipulated by other modules to corrupt slashing parameters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b117c212-5975-4e8d-8e6c-a4024f26ae3d",
+    "timestamp": "2025-11-21 07:15:15.290471",
+    "report_generated": false
+  },
+  {
+    "question": "Does parameter validation prevent setting MinSignedPerWindow and SignedBlocksWindow such that maxMissed becomes negative or zero?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_96d4a9ef-6d04-42e7-8ae8-905115205cf5",
+    "timestamp": "2025-11-21 07:15:35.192913",
+    "report_generated": false
+  },
+  {
+    "question": "Can malicious governance proposals set all slashing fractions to 1.0 params.go:114-128 , causing complete validator stake loss on any infraction?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_617e9869-97ef-4e08-a259-9ebe95edafee",
+    "timestamp": "2025-11-21 07:15:57.232686",
+    "report_generated": false
+  },
+  {
+    "question": "Does the RoundInt64() operation at line 24 params.go:24 handle edge cases where minSignedPerWindow * signedBlocksWindow approaches int64 maximum?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c43f6005-da01-4a91-ab23-bb3ebffb72e2",
+    "timestamp": "2025-11-21 07:16:19.379807",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a maximum value for SignedBlocksWindow to prevent governance from setting it to billions of blocks and causing storage exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ac6af3c3-d470-41fa-93d6-251701dcfc1a",
+    "timestamp": "2025-11-21 07:16:43.176256",
+    "report_generated": false
+  },
+  {
+    "question": "Can parameter changes take effect immediately in the middle of BeginBlocker execution, causing inconsistent slashing decisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ead76a5c-febf-4ccd-a17a-bea59161103f",
+    "timestamp": "2025-11-21 07:17:07.787918",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetParams params.go:52-54 validate the parameter set before storing, or can invalid combinations be persisted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1a0eff3b-c11f-417d-b696-a398f0685b87",
+    "timestamp": "2025-11-21 07:17:33.077189",
+    "report_generated": false
+  },
+  {
+    "question": "Can the MinSignedPerWindow parameter be changed to retroactively slash validators who were compliant under the old parameters?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c1b56268-8933-4c97-a33c-1a5b0834f570",
+    "timestamp": "2025-11-21 07:17:59.653630",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a minimum DowntimeJailDuration enforced params.go:101-112 to prevent instant unjailing that would make slashing ineffective?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_73598c47-fbcf-42df-88b9-b91671307945",
+    "timestamp": "2025-11-21 07:18:26.970532",
+    "report_generated": false
+  },
+  {
+    "question": "Can rapid parameter changes through governance cause the bit array to be repeatedly resized infractions.go:157-181 , causing DoS through expensive operations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b86403d4-1cc5-4cf4-a66d-a21c141c2b9a",
+    "timestamp": "2025-11-21 07:18:54.234410",
+    "report_generated": false
+  },
+  {
+    "question": "Does the parameter change flow properly handle ongoing downtime tracking windows when parameters are updated mid-window?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f7117772-3b11-4c8e-bb16-3c14892b120e",
+    "timestamp": "2025-11-21 07:19:22.212693",
+    "report_generated": false
+  },
+  {
+    "question": "Is the DefaultSlashFractionDoubleSign set to 0 params.go:20 by default, potentially making double-signing unpunished in production?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c907a495-57b6-454f-9ea7-5be6bef6051c",
+    "timestamp": "2025-11-21 07:19:51.294160",
+    "report_generated": false
+  },
+  {
+    "question": "Can MinSignedPerWindow be set to a value > 1.0 params.go:85-99 despite the validation at line 94, causing all validators to be immediately slashable?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_76490f5f-472d-4f88-97a0-c469466af84d",
+    "timestamp": "2025-11-21 07:20:22.141191",
+    "report_generated": false
+  },
+  {
+    "question": "Does the validation at line 78 params.go:78-80 prevent negative window values that could cause integer overflow in calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a957ad2c-e39a-4ae5-aae8-bd77536b4911",
+    "timestamp": "2025-11-21 07:20:53.607019",
+    "report_generated": false
+  },
+  {
+    "question": "Can governance proposals set SignedBlocksWindow to 0 params.go:72-83 , causing division by zero in the IndexOffset modulo operation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8db4f7f1-1b25-49c8-ad65-9167f82425a6",
+    "timestamp": "2025-11-21 07:21:24.508830",
+    "report_generated": false
+  },
+  {
+    "question": "Parameters & Governance (Questions 126-140)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aea1598a-1ac0-4e4d-8285-43d5b38caa10",
+    "timestamp": "2025-11-21 07:21:56.995681",
+    "report_generated": false
+  },
+  {
+    "question": "Does the slashing module properly handle staking module upgrades that change validator data structures, preventing hook execution failures?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_44e169b6-e160-40c7-9559-464c874e77ee",
+    "timestamp": "2025-11-21 07:22:31.256607",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a circular dependency where slashing hooks trigger staking operations that trigger more slashing hooks, causing infinite recursion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a27859c3-6267-4b54-b367-bb129d9e6c58",
+    "timestamp": "2025-11-21 07:23:04.880734",
+    "report_generated": false
   }
 ]
