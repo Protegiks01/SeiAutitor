@@ -1198,5 +1198,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9272fd4a-865e-4e5a-8cba-f951c20f34fc",
     "timestamp": "2025-11-21 07:34:31.970103",
     "report_generated": false
+  },
+  {
+    "question": "Can raw store access bypass keeper methods to directly manipulate signing info and missed blocks, avoiding validation checks?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ecdd67ad-3217-4b1e-a1f5-a658709a938d",
+    "timestamp": "2025-11-21 07:48:38.904872",
+    "report_generated": false
+  },
+  {
+    "question": "Does the missed blocks bit array deletion in ClearValidatorMissedBlockBitArray signing_info.go:168-171 execute atomically with signing info updates to prevent inconsistent state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d70cd79d-bf51-4376-a870-ff964ccede98",
+    "timestamp": "2025-11-21 07:48:52.521991",
+    "report_generated": false
+  },
+  {
+    "question": "Can the iterator in IterateValidatorSigningInfos signing_info.go:41-55 be left open, causing resource leaks if the handler returns early?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_40b1db3d-9988-44f7-927f-1ea7ec99a20a",
+    "timestamp": "2025-11-21 07:49:06.083957",
+    "report_generated": false
+  },
+  {
+    "question": "Does SetValidatorSigningInfo signing_info.go:34-38 validate the signing info structure before storing, preventing corrupted data from being persisted?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f84d3b15-ba2f-4e40-b0f6-5ca3a960685b",
+    "timestamp": "2025-11-21 07:49:20.108707",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a mechanism to prune old signing info for validators who have been removed for extended periods?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1f4bc27d-13c9-4b14-aee7-c38e4d0e996e",
+    "timestamp": "2025-11-21 07:49:34.988008",
+    "report_generated": false
+  },
+  {
+    "question": "Can the signing info store grow unbounded as validators are added and removed signing_info.go:34-38 , eventually causing node storage exhaustion?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_10429a38-f874-4b05-9308-8e3ca5cdc40f",
+    "timestamp": "2025-11-21 07:49:51.126024",
+    "report_generated": false
+  },
+  {
+    "question": "Does deleteAddrPubkeyRelation keeper.go:94-97 properly clean up state when validators are removed, preventing unbounded state growth?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_69a75e82-7e55-4ac8-8f97-a82e04ba9c98",
+    "timestamp": "2025-11-21 07:50:09.270533",
+    "report_generated": false
+  },
+  {
+    "question": "Is the MarshalInterface at line 45 keeper.go:45-47 deterministic across all nodes, or could different serialization orders cause consensus divergence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b0dcb864-4f52-4390-9ab9-25738569684e",
+    "timestamp": "2025-11-21 07:50:29.160710",
+    "report_generated": false
+  },
+  {
+    "question": "Can GetPubkey keeper.go:56-64 return stale pubkeys for validators who have changed their consensus keys, causing slashing to target wrong validators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e7c506b-de1c-4eb6-aacc-53e1d0d224c3",
+    "timestamp": "2025-11-21 07:50:50.802768",
+    "report_generated": false
+  },
+  {
+    "question": "Does AddPubkey keeper.go:44-53 validate that the pubkey hasn't already been added, preventing duplicate entries and state bloat?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e579195-9239-49ff-a624-b469320b772f",
+    "timestamp": "2025-11-21 07:51:13.261214",
+    "report_generated": false
+  },
+  {
+    "question": "Can two different consensus addresses hash to the same store key through the MustLengthPrefix encoding keys.go:52-54 , causing validator data collisions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_55ae2eac-b421-446b-ade8-9296aa9d6bb2",
+    "timestamp": "2025-11-21 07:51:37.219001",
+    "report_generated": false
+  },
+  {
+    "question": "Is the address extraction in ValidatorSigningInfoAddress keys.go:43-49 safe from out-of-bounds access if the key is shorter than expected (line 45)?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_706da18c-d264-4dc3-b092-f683fbf29a45",
+    "timestamp": "2025-11-21 07:52:01.940963",
+    "report_generated": false
+  },
+  {
+    "question": "Can the address.MustLengthPrefix() call at line 39 keys.go:39 panic on invalid address lengths, causing store operations to fail?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_53705cf1-90ea-476f-8ef2-9e51b6783ad4",
+    "timestamp": "2025-11-21 07:52:27.956587",
+    "report_generated": false
+  },
+  {
+    "question": "Do the store key prefixes keys.go:31-35 (0x01, 0x02, 0x03) have any collisions with other modules, potentially causing state corruption?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7603439c-509c-4a6d-8781-67f15fe18804",
+    "timestamp": "2025-11-21 07:52:59.247696",
+    "report_generated": false
+  },
+  {
+    "question": "Storage & State Management (Questions 86-105)",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aba625a0-0d77-4622-8932-c0441657f2f6",
+    "timestamp": "2025-11-21 07:53:28.560037",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic at line 150 signing_info.go:150 prevent chain halt if a tombstoned validator is erroneously tombstoned again?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_abdaf4f7-d5e1-4afb-92dc-0d59bce6bffe",
+    "timestamp": "2025-11-21 07:53:58.618504",
+    "report_generated": false
+  },
+  {
+    "question": "Can tombstoning be reversed through any code path, or is it truly permanent as intended signing_info.go:149-151 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e4099895-4f93-4b26-b209-42dbd8fe5f01",
+    "timestamp": "2025-11-21 07:54:29.910888",
+    "report_generated": false
+  },
+  {
+    "question": "Does the slashing logic correctly handle the scenario where a validator's power is 0 keeper.go:68 , preventing division by zero in penalty calculations?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1e0eab2d-378d-4656-876d-87d34bf16e8d",
+    "timestamp": "2025-11-21 07:55:02.029178",
+    "report_generated": false
+  },
+  {
+    "question": "Is there a maximum slashing amount per validator per block to prevent a single infraction from destroying all staked tokens?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7538f58c-7e8f-4da2-bb3c-a86feb7e6587",
+    "timestamp": "2025-11-21 07:55:33.610384",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause mass slashing of validators by manipulating the SignedBlocksWindow to be very small and MinSignedPerWindow to be very high through governance?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_35d93f44-5d43-4466-85ac-0ea0b3629784",
+    "timestamp": "2025-11-21 07:56:06.692702",
+    "report_generated": false
+  },
+  {
+    "question": "Does the DowntimeJailDuration parameter validation params.go:101-112 prevent setting it to 0, which would allow instant unjailing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_158e2fcc-eb79-4553-9abf-351448e21a19",
+    "timestamp": "2025-11-21 07:56:41.308003",
+    "report_generated": false
+  },
+  {
+    "question": "Can the JailedUntil time at line 142 infractions.go:142 be set to a time in the past, causing immediate unjailability?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d7c4e673-a8e4-4181-a44b-e241bb43c2de",
+    "timestamp": "2025-11-21 07:57:15.362525",
+    "report_generated": false
+  },
+  {
+    "question": "Does the slashing module check validator bond status before slashing to prevent slashing unbonded validators infractions.go:97-98 ?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_21c8049b-f195-48ca-90cc-404e8d5cbb73",
+    "timestamp": "2025-11-21 07:57:50.106485",
+    "report_generated": false
+  },
+  {
+    "question": "Can the ValidatorUpdateDelay constant in the distribution height calculation infractions.go:106 be manipulated to cause incorrect slashing of delegators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f124c195-70b9-4d21-9df1-fbe106c6ed63",
+    "timestamp": "2025-11-21 07:58:26.209711",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidatorByConsAddr at line 97 infractions.go:97 properly handle the case where the validator has been removed but signing info still exists?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e611b201-5be1-4a59-a4da-d07fca9f255c",
+    "timestamp": "2025-11-21 07:59:02.247787",
+    "report_generated": false
   }
 ]
