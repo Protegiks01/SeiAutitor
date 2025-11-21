@@ -4198,5 +4198,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c50893f-1aec-4753-aad5-fb85cc28509e",
     "timestamp": "2025-11-21 07:49:29.357234",
     "report_generated": false
+  },
+  {
+    "question": "Is graph.Acyclic keeper.go:605 gas-bounded?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_da9b7ea5-387b-4288-9749-e92a4fb051ae",
+    "timestamp": "2025-11-21 07:50:40.026087",
+    "report_generated": false
+  },
+  {
+    "question": "Can Wasm dependency lookups cause unmetered expensive resolution?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_44a84073-585b-4e1e-8d8d-94b6fea7e49d",
+    "timestamp": "2025-11-21 07:50:53.895336",
+    "report_generated": false
+  },
+  {
+    "question": "Can IterateResourceKeys or IterateWasmDependencies iterate unbounded entries?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78049267-ffd4-4aad-a19d-19323b938252",
+    "timestamp": "2025-11-21 07:51:07.319877",
+    "report_generated": false
+  },
+  {
+    "question": "Can telemetry MeasureBuildDagDuration be exploited for overhead?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9aef06b9-63e8-4627-a4cc-52c7e5b00aff",
+    "timestamp": "2025-11-21 07:51:21.254476",
+    "report_generated": false
+  },
+  {
+    "question": "Can extremely long IdentifierTemplates cause excessive processing?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2054f299-c837-4481-82ba-c2da0350ed4d",
+    "timestamp": "2025-11-21 07:51:35.788561",
+    "report_generated": false
+  },
+  {
+    "question": "Can dynamic dependency generation run unbounded?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_665a5037-e5c0-460a-abfb-65fb65b1f877",
+    "timestamp": "2025-11-21 07:51:51.792256",
+    "report_generated": false
+  },
+  {
+    "question": "Does JSON unmarshal in GetRawWasmDependencyMapping limit input size?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_686e4a36-5597-488d-94f0-f7e2e199dbfd",
+    "timestamp": "2025-11-21 07:52:09.213294",
+    "report_generated": false
+  },
+  {
+    "question": "Does ToSlice map iteration cause nondeterministic access-op ordering?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_fbd6a0ad-ad71-4e17-90bf-f30a7146fda0",
+    "timestamp": "2025-11-21 07:52:28.369545",
+    "report_generated": false
+  },
+  {
+    "question": "Is CommitAccessOp always appended deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4676c678-2fb9-4481-a24b-4c4e595ce573",
+    "timestamp": "2025-11-21 07:52:48.975391",
+    "report_generated": false
+  },
+  {
+    "question": "Can nondeterministic fallback between dynamic and static deps occur?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_660839e4-501d-438c-abea-31dc295e0799",
+    "timestamp": "2025-11-21 07:53:11.196460",
+    "report_generated": false
+  },
+  {
+    "question": "Can JQ parsing differ across platforms or versions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d5a4b7ce-8152-4983-af69-c6425d42d181",
+    "timestamp": "2025-11-21 07:53:35.140475",
+    "report_generated": false
+  },
+  {
+    "question": "Does ParseContractReferenceAddress fail nondeterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3cb7a080-04bc-400a-b262-e89016019540",
+    "timestamp": "2025-11-21 07:53:59.684319",
+    "report_generated": false
+  },
+  {
+    "question": "Does TranslateMessageBody wasm.go:79-88 produce deterministic JSON?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_820b50b8-a992-45ee-be8d-2fa577bd9170",
+    "timestamp": "2025-11-21 07:54:25.795586",
+    "report_generated": false
+  },
+  {
+    "question": "Does error-handling in imports cause nodes to diverge in fallback behavior?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_dda2d650-3efa-4158-af29-723297823024",
+    "timestamp": "2025-11-21 07:54:52.174899",
+    "report_generated": false
+  },
+  {
+    "question": "Does circular dependency detection generate deterministic outputs?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_259b454a-46dd-47d3-9380-05c63717c4af",
+    "timestamp": "2025-11-21 07:55:20.350329",
+    "report_generated": false
+  },
+  {
+    "question": "Can timestamps or floats cause nondeterminism?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9eaf7592-05ba-44cb-a6d4-3f5619de2d2a",
+    "timestamp": "2025-11-21 07:55:49.301367",
+    "report_generated": false
+  },
+  {
+    "question": "Does DAG construction depend on iteration order?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3b74d0a5-84c4-4902-a250-f399ed3a6da2",
+    "timestamp": "2025-11-21 07:56:19.739346",
+    "report_generated": false
+  },
+  {
+    "question": "Does telemetry use wall-clock time causing nondeterminism?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ca65eb21-d621-4794-806e-086f6e092214",
+    "timestamp": "2025-11-21 07:56:52.005399",
+    "report_generated": false
+  },
+  {
+    "question": "Can log formatting differences leak into state transitions?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6db8a464-7792-44a9-a6f5-f0616b269b01",
+    "timestamp": "2025-11-21 07:57:25.357499",
+    "report_generated": false
+  },
+  {
+    "question": "Can strings.Trim produce inconsistent results across edge cases?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_357217ff-a638-4360-b34e-53dcfb142f5b",
+    "timestamp": "2025-11-21 07:57:57.793984",
+    "report_generated": false
+  },
+  {
+    "question": "Does hex.EncodeToString behave identically across platforms?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_32a3fd71-56eb-47d1-bd7f-3d1891129407",
+    "timestamp": "2025-11-21 07:58:30.450629",
+    "report_generated": false
+  },
+  {
+    "question": "Does address.MustLengthPrefix behave deterministically?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_be792afa-7df5-4b1e-af9b-935745ef2ca8",
+    "timestamp": "2025-11-21 07:59:04.188451",
+    "report_generated": false
+  },
+  {
+    "question": "Does InitGenesis panic correctly prevent startup with invalid mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4e23d1ae-4be8-4c3b-b6b7-4e2f0733c46d",
+    "timestamp": "2025-11-21 07:59:37.839396",
+    "report_generated": false
+  },
+  {
+    "question": "Can genesis contain conflicting dependency mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f0491348-7ca4-4bc4-86b9-ff733d3c7321",
+    "timestamp": "2025-11-21 08:00:12.884621",
+    "report_generated": false
+  },
+  {
+    "question": "Does ExportGenesis iterate deterministically when exporting mappings?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3ddcf05b-ea56-4b27-8588-553cda2b62a9",
+    "timestamp": "2025-11-21 08:00:48.400612",
+    "report_generated": false
   }
 ]
