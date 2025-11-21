@@ -7048,5 +7048,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_50929f9c-a2a5-4a06-ba88-bd4f23b92afe",
     "timestamp": "2025-11-21 15:42:33.162698",
     "report_generated": false
+  },
+  {
+    "question": "Does SetGenTxsInAppGenesisState in gentx.go:20-38 maintain deterministic ordering of gentxs, or can an attacker cause consensus divergence by providing gentxs in different orders?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f3aee017-0d00-4fbf-b3dc-7f0e8adb4c4d",
+    "timestamp": "2025-11-21 15:43:46.062842",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker manipulate the GenesisBalancesIterator callback to stop prematurely in collect.go:90-96, causing incomplete balance map construction?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b41fdb35-2a49-444a-9245-04605ad92eac",
+    "timestamp": "2025-11-21 15:43:59.338459",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateAccountInGenesis properly handle the case where the same account appears multiple times in the genesis balances, potentially allowing double-validation exploits?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d1c21a5b-e44a-44aa-8bfe-529cfa2e57d2",
+    "timestamp": "2025-11-21 15:44:13.461607",
+    "report_generated": false
+  },
+  {
+    "question": "Can the balance check in collect.go:167-172 be exploited by providing a denomination that doesn't match the bond denom, allowing overstaking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3545efd2-378a-4612-8645-6fe3f0184e81",
+    "timestamp": "2025-11-21 15:44:27.532448",
+    "report_generated": false
+  },
+  {
+    "question": "Does the delegator balance validation in collect.go:148-156 prevent an attacker from creating a gentx with more staked tokens than available in their account?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5c8a9948-a2f6-401b-82f8-bfa940668a12",
+    "timestamp": "2025-11-21 15:44:42.461532",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker create a gentx that references a validator address not in the genesis balances map, bypassing the check in collect.go:158-165?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_36746ef5-ef05-44f1-a624-895beae0e24e",
+    "timestamp": "2025-11-21 15:45:00.695749",
+    "report_generated": false
+  },
+  {
+    "question": "Does the balance comparison in gentx.go:63-70 properly handle integer overflow when checking if an account has sufficient funds for staking?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_1c526884-e770-4425-b724-c2250d16bac8",
+    "timestamp": "2025-11-21 15:45:20.094472",
+    "report_generated": false
+  },
+  {
+    "question": "Can ValidateAccountInGenesis in gentx.go:42-89 be bypassed by an attacker who manipulates the balance iterator to return false positives for account existence?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_363123fc-1cd5-4740-a5b9-e9c8c75c28de",
+    "timestamp": "2025-11-21 15:45:41.756913",
+    "report_generated": false
+  },
+  {
+    "question": "Does the moniker comparison in collect.go:175-177 properly handle Unicode normalization, preventing an attacker from creating duplicate validators with visually similar monikers?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_db2a3096-50d3-451c-87df-44053d2a7f9c",
+    "timestamp": "2025-11-21 15:46:04.383532",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause consensus divergence by including gentx files with identical node IDs but different IP addresses in collect.go:130-133?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a21f2264-605d-49f2-ad91-7d9129e65868",
+    "timestamp": "2025-11-21 15:46:29.311279",
+    "report_generated": false
+  },
+  {
+    "question": "Does the type assertion for TxWithMemo in collect.go:126-129 safely handle transactions that don't implement this interface, or will it cause a panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e0036d5e-7818-444b-b7a8-3428b99f3d3e",
+    "timestamp": "2025-11-21 15:46:58.916490",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker include a gentx file with non-JSON suffix to bypass validation, or does the check in collect.go:105-107 prevent all non-JSON files?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_31c0c4d0-7e74-4efe-8d3b-4cf311bede41",
+    "timestamp": "2025-11-21 15:47:28.420747",
+    "report_generated": false
+  },
+  {
+    "question": "Does CollectTxs properly handle the case where a gentx file is modified during the collection process in collect.go:110-113, potentially causing non-deterministic genesis state?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9aaee3e5-da93-4093-8093-7e75b93f301a",
+    "timestamp": "2025-11-21 15:47:59.049114",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause a DoS by placing an extremely large number of JSON files in the gentx directory, causing collect.go:101-120 to consume excessive resources?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5915da26-c4c0-42fc-8d75-bc16666925de",
+    "timestamp": "2025-11-21 15:48:32.020316",
+    "report_generated": false
+  },
+  {
+    "question": "Does the directory traversal in collect.go:82-86 properly sanitize directory names to prevent an attacker from placing gentx files outside the expected directory?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_99f55c1c-800f-4844-8df6-b32e70abda26",
+    "timestamp": "2025-11-21 15:49:05.113702",
+    "report_generated": false
+  },
+  {
+    "question": "Can CollectTxs in collect.go:72-184 be exploited by creating symbolic links in the gentx directory to read arbitrary files from the filesystem?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9e798846-d18e-47af-8ee9-e3b26818530a",
+    "timestamp": "2025-11-21 15:49:39.879785",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic on error in module.go:109-112 during InitGenesis provide a DoS vector where an attacker can permanently halt chain initialization with malformed genesis data?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0fa82c5a-a0d0-485a-9d9f-f57dd8293efa",
+    "timestamp": "2025-11-21 15:50:14.764109",
+    "report_generated": false
+  },
+  {
+    "question": "Can InitGenesis in genesis.go:12-21 be exploited by providing an empty GenTxs array to skip validator initialization and launch a chain with no validators?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7f46774b-681b-48fe-97dd-495e1cbbde8a",
+    "timestamp": "2025-11-21 15:50:51.626125",
+    "report_generated": false
+  },
+  {
+    "question": "Does the type assertion in genesis_state.go:114-117 safely handle unexpected message types, or can a malicious gentx with a different message type cause a panic?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8151d89d-8358-4ac2-b1aa-747373ffc79e",
+    "timestamp": "2025-11-21 15:51:29.741629",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker craft a gentx with zero messages to bypass the single-message check in genesis_state.go:108-111 and cause undefined behavior during genesis?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_78977b9a-3612-4da8-9284-de74e0ab5726",
+    "timestamp": "2025-11-21 15:52:08.236313",
+    "report_generated": false
+  },
+  {
+    "question": "Does ValidateGenesis in genesis_state.go:98-120 properly validate that all gentxs contain exactly one MsgCreateValidator, or can an attacker bypass this with multiple messages?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5814a655-6a26-45d5-9146-84028b620aeb",
+    "timestamp": "2025-11-21 15:52:48.868604",
+    "report_generated": false
+  },
+  {
+    "question": "Can the unconditional panic on non-OK response in gentx.go:114-116 be exploited to prevent chain genesis if an attacker includes an invalid gentx that passes initial validation?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f2c7dfd6-c983-490b-8974-9f0aa69f853d",
+    "timestamp": "2025-11-21 15:53:27.326377",
+    "report_generated": false
+  },
+  {
+    "question": "Does the panic on transaction encoding failure in gentx.go:108-111 allow an attacker to halt chain initialization by crafting a gentx that encodes improperly?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e6227eb-00c8-457a-b988-106fe286afb7",
+    "timestamp": "2025-11-21 15:54:07.894918",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause DeliverGenTxs to panic by providing a malformed genesis transaction that fails decoding in gentx.go:103-106, leading to a permanent chain initialization failure?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ad582727-a61b-461a-9c63-d04972424cdc",
+    "timestamp": "2025-11-21 15:54:52.617476",
+    "report_generated": false
+  },
+  {
+    "question": "Does DeliverGenTxs in gentx.go:96-129 properly handle the case where a genesis transaction decoder panics, potentially causing a chain halt during InitGenesis?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_75948fe0-cabc-4cad-a474-7a4c3ed67c1f",
+    "timestamp": "2025-11-21 15:55:38.453444",
+    "report_generated": false
   }
 ]
