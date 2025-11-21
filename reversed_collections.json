@@ -5398,5 +5398,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b5f0d2f1-a12e-4c0a-b8be-39fa1ca88e2e",
     "timestamp": "2025-11-21 13:33:02.650401",
     "report_generated": false
+  },
+  {
+    "question": "Could a malicious proposal handler cause a chain halt by panicking within the cached context in abci.go line 74, and would the error be properly caught and logged? abci.go:67-92",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8c0bdea4-b97a-45c4-908b-5e6493b8a543",
+    "timestamp": "2025-11-21 13:34:21.781622",
+    "report_generated": false
+  },
+  {
+    "question": "Does the iteration order in IterateActiveProposalsQueue remain deterministic across all nodes, or could key prefix issues cause different validators to process proposals in different orders? keeper.go:133-148",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f9b3ef7b-16d2-4e00-9709-c3494eb41d56",
+    "timestamp": "2025-11-21 13:34:34.761876",
+    "report_generated": false
+  },
+  {
+    "question": "Can an attacker cause a chain halt by submitting proposals with carefully crafted DepositEndTime values that trigger panics in IterateInactiveProposalsQueue when parsing time-based keys? keeper.go:152-167",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_badd2aa2-2d3c-460f-95fd-cc55288b6987",
+    "timestamp": "2025-11-21 13:34:48.650975",
+    "report_generated": false
+  },
+  {
+    "question": "Does the EndBlocker function in x/gov/abci.go properly handle edge cases where ctx.BlockHeader().Time equals a proposal's DepositEndTime or VotingEndTime, preventing off-by-one errors in proposal queue processing? abci.go:14-140",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_38d73c4b-ff6e-4fab-9dc2-929eb05833f1",
+    "timestamp": "2025-11-21 13:35:02.490597",
+    "report_generated": false
+  },
+  {
+    "question": "Event System Integration: Do emitted mint events properly integrate with event listeners and subscribers?",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_aa859003-d9aa-46c8-b6f1-d07da68fe032",
+    "timestamp": "2025-11-21 13:35:17.456166",
+    "report_generated": false
+  },
+  {
+    "question": "Codec Registration: Are all mint module types properly registered with amino and protobuf codecs? codec.go:8-15",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b259a410-c191-4c86-bcac-0c686d7955ba",
+    "timestamp": "2025-11-21 13:35:33.610356",
+    "report_generated": false
+  },
+  {
+    "question": "Module Router Integration: Does the mint module correctly integrate with SDK routers (though it has no messages)? module.go:122",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b2a3cfbd-f611-4a8b-9fd1-1793de6a9ca7",
+    "timestamp": "2025-11-21 13:35:51.040612",
+    "report_generated": false
+  },
+  {
+    "question": "Module Invariant Registration: Should the mint module register invariants, and are there missing invariant checks? module.go:119",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_67cee89e-e08b-4900-a918-ae9d8b51c4b0",
+    "timestamp": "2025-11-21 13:36:10.580160",
+    "report_generated": false
+  },
+  {
+    "question": "Module Registration Order: Does the mint module's registration order in the app affect its initialization or operation? module.go:97-111",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_980d30f4-a86d-4813-af5a-1d1a99710565",
+    "timestamp": "2025-11-21 13:36:31.471605",
+    "report_generated": false
+  },
+  {
+    "question": "Governance Module Integration: Can governance proposals modify mint parameters in ways that break other modules? params.go:93-102",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_be3eed73-1031-4462-bdc6-91a4c63d317e",
+    "timestamp": "2025-11-21 13:36:53.744722",
+    "report_generated": false
+  },
+  {
+    "question": "Distribution Module Integration: Does the fee collector properly distribute minted tokens to validators and delegators? keeper.go:108-110",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b13a1d7b-99f7-4845-8b39-2630e490469b",
+    "timestamp": "2025-11-21 13:37:16.556950",
+    "report_generated": false
+  },
+  {
+    "question": "Cross-Module Reentrancy: Could minting operations trigger callbacks that reenter the mint module, causing state corruption? keeper.go:97-110",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_418cf064-2207-45f6-b1fa-80a10e134be5",
+    "timestamp": "2025-11-21 13:37:42.868793",
+    "report_generated": false
+  },
+  {
+    "question": "Module Account Permissions: Are mint module account permissions correctly configured to allow minting but prevent other operations? keeper.go:28-31",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a939a9be-5219-44c7-8fbc-4b5df07f7ed0",
+    "timestamp": "2025-11-21 13:38:10.017378",
+    "report_generated": false
+  },
+  {
+    "question": "BankKeeper Interface Completeness: Does the BankKeeper interface expose all necessary methods for safe minting and transfers? expected_keepers.go:25-29",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ce66ba6b-3b8b-4165-a41c-1d5c8b026134",
+    "timestamp": "2025-11-21 13:38:37.974381",
+    "report_generated": false
+  },
+  {
+    "question": "StakingKeeper Interface Safety: Are the StakingKeeper interface methods (StakingTokenSupply, BondedRatio) guaranteed to be deterministic? expected_keepers.go:8-12",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f42bf21c-2a2d-41b0-9bad-ea77f1f33483",
+    "timestamp": "2025-11-21 13:39:07.639377",
+    "report_generated": false
+  },
+  {
+    "question": "Account Keeper Interface: Does the AccountKeeper interface provide all necessary safety guarantees for module account checks? expected_keepers.go:14-21",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6e6df768-c5ac-4699-947e-9d9c7be3813f",
+    "timestamp": "2025-11-21 13:39:38.556301",
+    "report_generated": false
+  },
+  {
+    "question": "Fee Collector Module Missing: What happens if the fee collector module is removed or renamed after initialization? keeper.go:19",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_54edece3-42cf-4a85-8742-9bc4623795fd",
+    "timestamp": "2025-11-21 13:40:10.521662",
+    "report_generated": false
+  },
+  {
+    "question": "Bank Module Dependency: Could bank module failures during minting cause the mint module to be in an inconsistent state? keeper.go:18",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_e8040960-605c-4885-9e10-8c6821af689b",
+    "timestamp": "2025-11-21 13:40:43.641149",
+    "report_generated": false
+  },
+  {
+    "question": "Staking Module Dependency: What happens if the staking keeper returns inconsistent or corrupted data to mint module? keeper.go:17",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d93bfe3-20b2-4c97-9ce0-0eddb81b34f9",
+    "timestamp": "2025-11-21 13:41:18.145341",
+    "report_generated": false
+  },
+  {
+    "question": "CLI Query Command Injection: Are CLI query commands protected against command injection or path traversal? module.go:92-94",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_add290dc-3559-42bc-8be3-b818228e1f90",
+    "timestamp": "2025-11-21 13:41:53.623320",
+    "report_generated": false
+  },
+  {
+    "question": "Query Error Handling: Do query methods return appropriate errors rather than panicking on invalid state? grpc_query.go:13-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_3aa92f14-ad0d-444b-813f-2e2ef0451e5d",
+    "timestamp": "2025-11-21 13:42:30.065306",
+    "report_generated": false
+  },
+  {
+    "question": "Protobuf Marshaling Issues: Do query responses properly marshal all decimal and integer types without loss? grpc_query.go:13-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_0d35199b-99bc-4603-9b73-a25659913c47",
+    "timestamp": "2025-11-21 13:43:08.121101",
+    "report_generated": false
+  },
+  {
+    "question": "Query Response Size: Can query responses grow unbounded, causing memory issues for clients or nodes? grpc_query.go:13-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d1c8835f-b900-478d-9237-6f6180f021f2",
+    "timestamp": "2025-11-21 13:43:47.862946",
+    "report_generated": false
+  },
+  {
+    "question": "QueryClient Registration: Is the QueryClient properly registered with correct service descriptors? module.go:83-85",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a9bcfda5-3512-4b77-b9cd-d592ab66aa67",
+    "timestamp": "2025-11-21 13:44:28.520430",
+    "report_generated": false
+  },
+  {
+    "question": "Query Gas Metering: Are query operations properly gas-metered to prevent query-based DoS? grpc_query.go:13-34",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_186162ae-739e-4bc5-b082-59081667e8dd",
+    "timestamp": "2025-11-21 13:45:08.589329",
+    "report_generated": false
   }
 ]
