@@ -1948,5 +1948,155 @@
     "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_086e06ab-7506-4081-a168-58b2a736a4f9",
     "timestamp": "2025-11-21 08:46:49.103314",
     "report_generated": false
+  },
+  {
+    "question": "Can filesystem operations cause non-deterministic behavior if disk I/O fails on some nodes? keeper.go:402-427",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_551213e7-f800-4a46-aca4-05bb5e333e2a",
+    "timestamp": "2025-11-21 08:48:09.771360",
+    "report_generated": false
+  },
+  {
+    "question": "Is the upgrade handler map iteration order deterministic across all nodes? keeper.go:59",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b9fbc9d0-303c-415f-91ce-e1f5a5081f1a",
+    "timestamp": "2025-11-21 08:48:22.990306",
+    "report_generated": false
+  },
+  {
+    "question": "Can the panic message construction cause non-determinism if it includes timestamps? abci.go:128-130",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6f708555-fc6c-465f-bf76-5b34d5e55daa",
+    "timestamp": "2025-11-21 08:48:36.586168",
+    "report_generated": false
+  },
+  {
+    "question": "Does the block height comparison for ShouldExecute handle edge cases deterministically? plan.go:39-44",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_b32f3ce0-05a8-4e10-84cd-53226abcbf02",
+    "timestamp": "2025-11-21 08:48:50.934236",
+    "report_generated": false
+  },
+  {
+    "question": "Can string comparison for upgrade type be affected by locale or case sensitivity? plan.go:72-74",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_56b6b946-8a7b-44c9-8a7f-ab4c9b228467",
+    "timestamp": "2025-11-21 08:49:05.686461",
+    "report_generated": false
+  },
+  {
+    "question": "Is the JSON unmarshaling of upgrade details deterministic across all validator nodes? plan.go:63-68",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c3e9628c-5730-43c3-a03c-699aeaf29e88",
+    "timestamp": "2025-11-21 08:49:22.030619",
+    "report_generated": false
+  },
+  {
+    "question": "Can different nodes have different skipUpgradeHeights configurations causing a chain split? keeper.go:53-61",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_7957efd6-a85d-40bc-9e32-e90dc6bd9134",
+    "timestamp": "2025-11-21 08:49:39.555864",
+    "report_generated": false
+  },
+  {
+    "question": "Does the time measurement in BeginBlocker affect consensus determinism? abci.go:27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4c4bf0ab-c128-4483-b6a5-1a8973038ffd",
+    "timestamp": "2025-11-21 08:49:59.358895",
+    "report_generated": false
+  },
+  {
+    "question": "Can telemetry operations introduce non-determinism in BeginBlocker execution? abci.go:27",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_8f15be4b-ea0d-4311-a96a-0f5bd9f53ea6",
+    "timestamp": "2025-11-21 08:50:20.725347",
+    "report_generated": false
+  },
+  {
+    "question": "Can the upgrade module's state become inconsistent if a node crashes during upgrade execution? keeper.go:364-391",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f792da20-777a-4523-9d53-89a6e30c9fb9",
+    "timestamp": "2025-11-21 08:50:43.592109",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module ensure that protocol version is never decremented? keeper.go:71-77",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f60223b3-2480-4d6a-aaae-9e7940bb1508",
+    "timestamp": "2025-11-21 08:51:07.177892",
+    "report_generated": false
+  },
+  {
+    "question": "Can multiple upgrades be marked as 'done' at the same height, causing confusion? keeper.go:350-356",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_6903c3a6-7929-4fb1-a88f-474b7ee9709b",
+    "timestamp": "2025-11-21 08:51:31.166939",
+    "report_generated": false
+  },
+  {
+    "question": "Is there verification that clearing an upgrade plan also clears all associated metadata? keeper.go:320-330",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_2ea03dcd-f279-4e69-8484-898211c4433a",
+    "timestamp": "2025-11-21 08:51:57.644515",
+    "report_generated": false
+  },
+  {
+    "question": "Can the skip heights map be modified after initialization, breaking determinism? keeper.go:39",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f40cc8b1-6cfc-4fbc-963a-82e3b4b7e0e5",
+    "timestamp": "2025-11-21 08:52:26.069322",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module maintain the invariant that upgrade height must be in the future when scheduled? keeper.go:184-186",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_4b7f53aa-748d-4d18-a16f-a5e67bb97a2f",
+    "timestamp": "2025-11-21 08:52:55.582693",
+    "report_generated": false
+  },
+  {
+    "question": "Can an upgrade leave the chain in a state where future upgrades cannot be applied? keeper.go:364-391",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_ba25ac79-3b97-4fe3-a4a9-f57ee2fff02f",
+    "timestamp": "2025-11-21 08:53:27.004908",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that added/renamed/deleted stores don't conflict with existing stores? storeloader.go:15-17",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d726582b-07bd-4e3a-a009-b9a300c9d1bb",
+    "timestamp": "2025-11-21 08:53:59.366955",
+    "report_generated": false
+  },
+  {
+    "question": "Can the store loader apply migrations to the wrong upgrade height? storeloader.go:13-14",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_9566f002-6fc9-46ad-930a-a9e2d788ed9f",
+    "timestamp": "2025-11-21 08:54:32.870355",
+    "report_generated": false
+  },
+  {
+    "question": "Does the upgrade module verify that store migrations complete successfully before marking upgrade as done? storeloader.go:11-23",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_c5b38b87-6e27-487b-8cd6-ba84f3108534",
+    "timestamp": "2025-11-21 08:55:07.208750",
+    "report_generated": false
+  },
+  {
+    "question": "Can an upgrade handler return a modified version map that violates module version constraints? keeper.go:371",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_696ad600-c9cf-4981-8157-b5b17d398107",
+    "timestamp": "2025-11-21 08:55:42.530706",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that all module versions are updated atomically during an upgrade? keeper.go:376",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_5f3e631a-6908-4da2-bf8f-7fac77bb89d9",
+    "timestamp": "2025-11-21 08:56:20.276243",
+    "report_generated": false
+  },
+  {
+    "question": "Can the version setter fail silently, leaving BaseApp with incorrect protocol version? keeper.go:381-384",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_38be8af5-250d-447f-832d-a277c8612985",
+    "timestamp": "2025-11-21 08:56:59.960531",
+    "report_generated": false
+  },
+  {
+    "question": "Does the module maintain the invariant that only one upgrade can be active at a time? keeper.go:339-348",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_a06ad6d0-8306-464a-bb82-3a72baa4e0f5",
+    "timestamp": "2025-11-21 08:57:39.084975",
+    "report_generated": false
+  },
+  {
+    "question": "Can the IBC client and consensus state become out of sync with the upgrade plan? keeper.go:312-318",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_d73b8acf-e51a-4cc3-9bf2-3eea565a5400",
+    "timestamp": "2025-11-21 08:58:19.937790",
+    "report_generated": false
+  },
+  {
+    "question": "Is there validation that upgrade names are unique across the chain's lifetime? keeper.go:188-190",
+    "url": "https://deepwiki.com/search/-you-are-a-web3-security-resea_f8ad490e-e57e-457f-a268-238e78df1ae7",
+    "timestamp": "2025-11-21 08:59:02.839231",
+    "report_generated": false
   }
 ]
