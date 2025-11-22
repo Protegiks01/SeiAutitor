@@ -1,0 +1,1 @@
+Looking at the parallel execution implementation, I need to examine how the validation iterator handles keys during conflict detection.
