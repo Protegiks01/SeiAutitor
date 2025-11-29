@@ -1,159 +1,246 @@
+# Audit Report
+
 ## Title
-Block Gas Limit Bypass Due to Missing Cumulative Gas Tracking
+Index Out of Bounds Panic in SetPubKeyDecorator Due to Missing Length Validation
 
 ## Summary
-The sei-cosmos blockchain fails to enforce cumulative gas limits at the block level, allowing blocks to contain transactions whose total gas consumption exceeds the configured `MaxGas` consensus parameter. While individual transactions are validated against `MaxGas` in the ante handler, the removal of the block gas meter enables validators to include multiple transactions that collectively exceed the intended block gas limit. [1](#0-0) 
+The `SetPubKeyDecorator` in the ante handler chain lacks validation to ensure the number of public keys from `AuthInfo.SignerInfos` matches the number of signers derived from transaction messages. This allows any user to craft transactions that pass `ValidateBasic()` but trigger index out of bounds panics during ante handler processing, causing validators to waste resources on malformed transactions.
 
 ## Impact
-Medium
+Low
 
 ## Finding Description
 
-**Location:** The vulnerability spans multiple components:
-- Primary check location: `x/auth/ante/setup.go` lines 54-60
-- Missing enforcement: `baseapp/abci.go` (DeliverTx processing)
-- Removed functionality: Block gas meter (referenced in documentation but not implemented)
+**Location:** [1](#0-0) 
 
-**Intended Logic:** According to the Cosmos SDK documentation and consensus parameters, the block gas meter should track cumulative gas consumption across all transactions in a block and reject transactions when the cumulative gas would exceed `ConsensusParams.Block.MaxGas`. The documentation explicitly describes this behavior: [2](#0-1) 
+**Intended Logic:** 
+The `SetPubKeyDecorator` should safely iterate over public keys and match them with corresponding signers to validate and store public key information. It should reject transactions where the number of public keys doesn't match the number of signers.
 
-**Actual Logic:** The current implementation only validates that each individual transaction's gas does not exceed `MaxGas`, but does not track or enforce cumulative gas across all transactions in a block: [1](#0-0) 
+**Actual Logic:** 
+The decorator retrieves `pubkeys` from `GetPubKeys()` which returns an array of length `len(AuthInfo.SignerInfos)` [2](#0-1) , and `signers` from `GetSigners()` which derives signers from transaction messages [3](#0-2) . These two arrays can have different lengths because they come from independent data sources.
 
-The `Context` struct contains a `blockGasMeter` field that is never initialized or used: [3](#0-2) 
+The code loops over `pubkeys` and accesses `signers[i]` without validating that `i < len(signers)`, causing an index out of bounds panic when `len(pubkeys) > len(signers)`.
 
-Evidence of removal is found in test comments: [4](#0-3) 
+**Exploitation Path:**
+1. Attacker creates a transaction with one message having one unique signer (N=1)
+2. Sets `AuthInfo.SignerInfos` array to have 2 elements (M=2)
+3. Sets `Signatures` array to have 1 element (matching N signers)
+4. Transaction passes `ValidateBasic()` because it only checks `len(Signatures) == len(GetSigners())` (1 == 1) [4](#0-3) 
+5. During ante handler execution in `SetPubKeyDecorator`, the code loops over 2 pubkeys
+6. At iteration i=1, accessing `signers[1]` triggers an index out of bounds panic
+7. The panic is caught by recovery middleware [5](#0-4)  and the transaction is rejected
 
-**Exploit Scenario:**
-1. A validator/block proposer constructs a block with multiple transactions
-2. Each transaction has gas limit slightly below `MaxGas` (e.g., `MaxGas - 1`)
-3. Each transaction passes the individual check in `SetUpContextDecorator`
-4. If the block contains N transactions, total gas = N × (MaxGas - 1)
-5. The cumulative block gas far exceeds `MaxGas`, violating consensus parameters
-6. All transactions are processed and committed, consuming excessive resources
-
-**Security Failure:** This violates the consensus-critical invariant that blocks must not consume more than `MaxGas` total gas. The security property of resource limitation per block is broken, allowing validators to force nodes to process arbitrarily large amounts of computation per block (limited only by transaction count and byte size constraints).
+**Security Guarantee Broken:**
+The ante handler chain should efficiently reject invalid transactions during validation, not after processing through multiple expensive decorators. This vulnerability allows transactions to bypass early validation and consume validator resources unnecessarily.
 
 ## Impact Explanation
 
-**Affected Processes:**
-- Block validation and processing across all full nodes
-- Network resource consumption and throughput
-- Consensus parameter enforcement
+This vulnerability enables a denial-of-service attack vector where validators waste computational resources processing malformed transactions that should have been rejected during basic validation. Each malicious transaction forces validators to:
 
-**Severity:**
-- Validators can force nodes to process blocks with gas consumption far exceeding the configured limit
-- This increases CPU, memory, and I/O consumption beyond designed parameters
-- Network nodes must process transactions beyond the intended `MaxGas` limit
-- This can lead to increased block times, node performance degradation, and potential DOS conditions
-- The consensus parameters become effectively meaningless for gas limiting
+1. Decode the transaction
+2. Execute multiple ante handler decorators (SetUpContext, RejectExtensionOptions, ValidateBasic, TxTimeoutHeight, ValidateMemo, ConsumeGasForTxSize, DeductFee) [6](#0-5) 
+3. Panic in SetPubKeyDecorator
+4. Process panic recovery and cleanup
 
-**System Impact:**
-This matches the in-scope impact definition: "Causing network processing nodes to process transactions from the mempool beyond set parameters" (Medium severity). While it doesn't immediately cause fund loss or chain halt, it violates critical resource limitation guarantees and can degrade network performance significantly.
+Since these transactions are rejected during CheckTx (mempool admission), the attacker doesn't pay gas fees but still consumes validator resources. This fits the **Low severity** category: "Causing network processing nodes to process transactions from the mempool beyond set parameters."
+
+The network continues to function and no funds are at risk, but validator efficiency is degraded when processing these malicious transactions.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any validator/block proposer can exploit this during their proposal turn
-- No special conditions or timing required
-- Can be triggered repeatedly in normal network operation
+**Who can trigger it:**
+Any network participant can exploit this vulnerability. No special permissions or resources are required beyond the ability to submit transactions, which is available to all users.
 
-**Exploitation Frequency:**
-- High likelihood: Any malicious or compromised validator can trigger this
-- In a network with N validators, each validator proposes approximately 1/N of blocks
-- A single malicious validator could consistently create oversized blocks when it's their turn to propose
-- Even unintentional bugs in custom block construction logic could trigger this
+**Required conditions:**
+- The default ante handler chain includes `SetPubKeyDecorator` (standard configuration)
+- Attacker can craft and submit protobuf transactions (standard capability)
 
-**Realistic Scenario:**
-This is highly likely to be exploited or accidentally triggered because:
-1. The missing validation is not obvious to developers
-2. Block proposers have full control over transaction selection
-3. No runtime checks prevent this condition
-4. The removed block gas meter means existing tooling won't detect the issue
+**Frequency:**
+This can be exploited repeatedly. An attacker can pre-generate batches of malicious transactions and submit them continuously. Each transaction deterministically triggers the panic during CheckTx. The attack can be sustained as long as the attacker maintains network connectivity.
 
 ## Recommendation
 
-Restore block-level gas metering to track cumulative gas consumption across all transactions in a block:
+Add a length validation check in `SetPubKeyDecorator.AnteHandle` before the iteration loop:
 
-1. Add a `BlockGasMeter()` accessor method to the `Context` type
-2. Initialize a block gas meter in `BeginBlock` with limit set to `ConsensusParams.Block.MaxGas`
-3. After each `DeliverTx`, consume gas from the block gas meter:
-   ```go
-   ctx.BlockGasMeter().ConsumeGas(
-       ctx.GasMeter().GasConsumedToLimit(),
-       "block gas meter",
-   )
-   ```
-4. Check the block gas meter before processing each transaction and reject if it would exceed the limit
-5. Re-enable the commented-out `TestMaxBlockGasLimits` test to verify the fix
+```go
+func (spkd SetPubKeyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+    sigTx, ok := tx.(authsigning.SigVerifiableTx)
+    if !ok {
+        return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
+    }
 
-This restores the original Cosmos SDK behavior that was documented but removed from the codebase.
+    pubkeys, err := sigTx.GetPubKeys()
+    if err != nil {
+        return ctx, err
+    }
+    signers := sigTx.GetSigners()
+    
+    // Add this validation check
+    if len(pubkeys) != len(signers) {
+        return ctx, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, 
+            "invalid number of pubkeys; expected: %d, got %d", len(signers), len(pubkeys))
+    }
+
+    for i, pk := range pubkeys {
+        // ... existing logic
+    }
+}
+```
+
+This validation pattern is already implemented in the batch signature verifier [7](#0-6) , confirming that this check is necessary and should be consistently applied.
+
+Alternatively, add this check to `Tx.ValidateBasic()` to catch the issue earlier in the validation pipeline.
 
 ## Proof of Concept
 
-**File:** `baseapp/deliver_tx_test.go`
-
-**Test Function:** Add `TestBlockGasLimitBypass` after the existing gas limit tests (around line 753)
+While the provided PoC contains pseudo-code with incomplete sections, the vulnerability is evident from code analysis:
 
 **Setup:**
-1. Create a BaseApp with consensus params setting `MaxGas = 100`
-2. Configure ante handler to grant exactly the gas requested by transactions
-3. Set up a simple message router that consumes the specified gas
+- Create a transaction with one message (one signer)
+- Manually construct `AuthInfo` with two `SignerInfo` elements  
+- Set `Signatures` array to one element
 
-**Trigger:**
-1. Begin a new block with the configured consensus params
-2. Deliver first transaction with `gas = 60` (less than MaxGas)
-   - This should succeed as 60 < 100
-3. Deliver second transaction with `gas = 60`
-   - This should succeed individually as 60 < 100
-   - But cumulative gas is now 120, exceeding MaxGas of 100
-4. Deliver third transaction with `gas = 60`
-   - Cumulative gas now 180, far exceeding limit
+**Action:**
+- Call `ValidateBasic()` - passes because `len(Signatures) == len(GetSigners())` (1 == 1)
+- Execute ante handler chain with `SetPubKeyDecorator`
 
-**Observation:**
-All three transactions succeed and are committed, even though the cumulative block gas (180) far exceeds the configured `MaxGas` (100). The test demonstrates that:
-- Each individual transaction passes the `setup.go` check
-- No cumulative gas tracking occurs
-- The block gas limit is effectively bypassed
-- Total gas consumed is 180% of the configured maximum
+**Result:**
+- `GetPubKeys()` returns 2 elements (from `AuthInfo.SignerInfos`)
+- `GetSigners()` returns 1 element (from message signers)
+- Loop iterates twice, at i=1 accessing `signers[1]` causes panic
+- Panic is caught and transaction rejected after wasting resources
 
-This violates the consensus parameter invariant and proves the vulnerability. In a properly functioning system, the second or third transaction should be rejected due to block gas limit exceeded.
+The vulnerability can be verified by constructing a properly formatted protobuf transaction with mismatched `SignerInfos` and `Signatures` lengths that satisfy the existing `ValidateBasic()` check.
+
+## Notes
+
+The severity assessment differs from the report's claim:
+- **Report claims**: Medium ("30% resource consumption increase")
+- **Actual severity**: Low ("processing beyond set parameters")
+
+The Medium severity claim requires proof of "at least 30% resource consumption increase," which is not substantiated with measurements or benchmarks. The actual impact matches the Low severity category where transactions are processed further into the ante handler chain than they should be, causing inefficiency but not meeting the 30% threshold required for Medium severity.
+
+The vulnerability is valid and should be fixed, but the impact is resource inefficiency rather than a critical system failure.
 
 ### Citations
 
-**File:** x/auth/ante/setup.go (L54-60)
+**File:** x/auth/ante/sigverify.go (L71-85)
 ```go
-	if cp := ctx.ConsensusParams(); cp != nil && cp.Block != nil {
-		// If there exists a maximum block gas limit, we must ensure that the tx
-		// does not exceed it.
-		if cp.Block.MaxGas > 0 && gasTx.GetGas() > uint64(cp.Block.MaxGas) {
-			return newCtx, sdkerrors.Wrapf(sdkerrors.ErrOutOfGas, "tx gas wanted %d exceeds block max gas limit %d", gasTx.GetGas(), cp.Block.MaxGas)
+	for i, pk := range pubkeys {
+		// PublicKey was omitted from slice since it has already been set in context
+		if pk == nil {
+			if !simulate {
+				continue
+			}
+			pk = simSecp256k1Pubkey
 		}
+		// Only make check if simulate=false
+		if !simulate && !bytes.Equal(pk.Address(), signers[i]) {
+			return ctx, sdkerrors.Wrapf(sdkerrors.ErrInvalidPubKey,
+				"pubKey does not match signer address %s with signer index: %d", signers[i], i)
+		}
+
+		acc, err := GetSignerAcc(ctx, spkd.ak, signers[i])
+```
+
+**File:** x/auth/tx/builder.go (L107-128)
+```go
+func (w *wrapper) GetPubKeys() ([]cryptotypes.PubKey, error) {
+	signerInfos := w.tx.AuthInfo.SignerInfos
+	pks := make([]cryptotypes.PubKey, len(signerInfos))
+
+	for i, si := range signerInfos {
+		// NOTE: it is okay to leave this nil if there is no PubKey in the SignerInfo.
+		// PubKey's can be left unset in SignerInfo.
+		if si.PublicKey == nil {
+			continue
+		}
+
+		pkAny := si.PublicKey.GetCachedValue()
+		pk, ok := pkAny.(cryptotypes.PubKey)
+		if ok {
+			pks[i] = pk
+		} else {
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "Expecting PubKey, got: %T", pkAny)
+		}
+	}
+
+	return pks, nil
+}
+```
+
+**File:** types/tx/types.go (L94-99)
+```go
+	if len(sigs) != len(t.GetSigners()) {
+		return sdkerrors.Wrapf(
+			sdkerrors.ErrUnauthorized,
+			"wrong number of signers; expected %d, got %d", len(t.GetSigners()), len(sigs),
+		)
 	}
 ```
 
-**File:** docs/basics/gas-fees.md (L49-62)
-```markdown
-### Block Gas Meter
-
-`ctx.BlockGasMeter()` is the gas meter used to track gas consumption per block and make sure it does not go above a certain limit. A new instance of the `BlockGasMeter` is created each time [`BeginBlock`](../core/baseapp.md#beginblock) is called. The `BlockGasMeter` is finite, and the limit of gas per block is defined in the application's consensus parameters. By default Cosmos SDK applications use the default consensus parameters provided by Tendermint:
-
-+++ https://github.com/tendermint/tendermint/blob/v0.34.0-rc6/types/params.go#L34-L41
-
-When a new [transaction](../core/transactions.md) is being processed via `DeliverTx`, the current value of `BlockGasMeter` is checked to see if it is above the limit. If it is, `DeliverTx` returns immediately. This can happen even with the first transaction in a block, as `BeginBlock` itself can consume gas. If not, the transaction is processed normally. At the end of `DeliverTx`, the gas tracked by `ctx.BlockGasMeter()` is increased by the amount consumed to process the transaction:
-
+**File:** types/tx/types.go (L111-132)
 ```go
-ctx.BlockGasMeter().ConsumeGas(
-	ctx.GasMeter().GasConsumedToLimit(),
-	"block gas meter",
-)
-```
+func (t *Tx) GetSigners() []sdk.AccAddress {
+	var signers []sdk.AccAddress
+	seen := map[string]bool{}
+
+	for _, msg := range t.GetMsgs() {
+		for _, addr := range msg.GetSigners() {
+			if !seen[addr.String()] {
+				signers = append(signers, addr)
+				seen[addr.String()] = true
+			}
+		}
+	}
+
+	// ensure any specified fee payer is included in the required signers (at the end)
+	feePayer := t.AuthInfo.Fee.Payer
+	if feePayer != "" && !seen[feePayer] {
+		payerAddr := sdk.MustAccAddressFromBech32(feePayer)
+		signers = append(signers, payerAddr)
+	}
+
+	return signers
+}
 ```
 
-**File:** types/context.go (L41-41)
+**File:** baseapp/baseapp.go (L904-915)
 ```go
-	blockGasMeter     GasMeter
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
+		}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
 ```
 
-**File:** baseapp/deliver_tx_test.go (L1144-1144)
+**File:** x/auth/ante/ante.go (L48-60)
 ```go
-	// removed the block gas exceeded because of removal of block gas meter, gasWanted < max block gas is still fulfilled by various other checks
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
+		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
+		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
+		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+		NewIncrementSequenceDecorator(options.AccountKeeper),
+	}
+```
+
+**File:** x/auth/ante/batch_sigverify.go (L66-68)
+```go
+		if len(pubkeys) != len(signerAddrs) {
+			v.errors[i] = sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "invalid number of pubkeys;  expected: %d, got %d", len(signerAddrs), len(pubkeys))
+			continue
 ```

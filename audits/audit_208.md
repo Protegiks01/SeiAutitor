@@ -1,363 +1,309 @@
-## Audit Report
+# Audit Report
 
 ## Title
-GranteeGrants Query Causes O(N) Full Store Scan Leading to RPC Node Resource Exhaustion DoS
+Lack of Zero Voting Power Validation in Validator Set Updates Allows Complete Network Halt
 
 ## Summary
-The `GranteeGrants` query in `x/authz/keeper/grpc_query.go` (lines 132-178) scans through ALL grants in the entire system rather than using efficient indexing, causing O(N) complexity where N is the total number of grants. This allows attackers to exhaust RPC node resources by creating many grants once and then repeatedly triggering expensive queries at no cost. [1](#0-0) 
+The `ApplyAndReturnValidatorSetUpdates` function in the staking module fails to validate that total voting power remains above zero before setting it and returning validator updates to the consensus engine. When all validators are simultaneously jailed due to mass downtime, the function sets total power to zero without any validation, resulting in a complete network shutdown as Tendermint/CometBFT cannot reach consensus with zero voting power.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
-**Location:** 
-- Module: `x/authz`
-- File: `x/authz/keeper/grpc_query.go`
-- Function: `GranteeGrants` (lines 132-178)
+**Location:** `x/staking/keeper/val_state_change.go`, lines 108-222, specifically lines 217-219 where total power is set without validation. [1](#0-0) 
 
-**Intended Logic:**
-The `GranteeGrants` query should efficiently retrieve all grants where a specific address is the grantee, similar to how `GranterGrants` efficiently retrieves grants for a specific granter.
+**Intended Logic:** The validator set update mechanism should ensure the network maintains at least one validator with positive voting power to continue producing blocks and reaching consensus. The system should prevent scenarios where the entire validator set becomes powerless, as this would halt the blockchain.
 
-**Actual Logic:**
-The implementation creates a prefix store using only `GrantKey` (0x01), which matches ALL grants in the system: [2](#0-1) 
+**Actual Logic:** The function initializes `totalPower` to zero and accumulates power only from validators found in the power store iterator. When validators are jailed, they are removed from the power store via `DeleteValidatorByPowerIndex`. [2](#0-1)  If ALL validators are jailed simultaneously, the power store becomes empty, the iterator yields no validators, and `totalPower` remains at zero. The function then processes previously bonded validators and appends zero-power ABCI updates for them. [3](#0-2)  At lines 217-219, if there are any updates (which there would be - the zero-power updates), it sets `totalPower` to zero without any validation check.
 
-The key structure stores grants as: `GrantKey + Granter + Grantee + MsgType` [3](#0-2) 
+**Exploitation Path:**
+1. Network-wide outage or mass validator downtime occurs (e.g., cloud provider failure, software bug, network partition)
+2. All validators miss blocks beyond the `maxMissed` threshold configured in slashing parameters
+3. The slashing module's downtime detection logic identifies all validators as having exceeded the threshold [4](#0-3) 
+4. All validators are jailed via `k.sk.Jail(ctx, consAddr)`, which calls `jailValidator` and removes them from the power store
+5. In the next `EndBlock`, `ApplyAndReturnValidatorSetUpdates` is called via the module manager [5](#0-4) 
+6. The power store iterator finds no validators (all were removed when jailed)
+7. The loop doesn't accumulate any power, leaving `totalPower` at zero
+8. Previously bonded validators receive zero-power updates
+9. The function sets `totalPower` to zero and returns the zero-power validator set to Tendermint
+10. Tendermint receives a validator set with zero total voting power and cannot reach consensus (requires >2/3 of voting power)
+11. Network halts completely - no new blocks can be produced
 
-Since grantee comes AFTER granter in the key, there's no efficient prefix to query by grantee alone. The code iterates through ALL grants and filters by checking if the grantee matches: [4](#0-3) 
-
-When `CountTotal=true` or offset-based pagination is used, the pagination function must scan through the entire grant store even after collecting enough results: [5](#0-4) 
-
-**Exploit Scenario:**
-1. Attacker creates 10,000-100,000 grants by submitting `MsgGrant` transactions (one-time gas cost)
-2. Grants persist in state indefinitely
-3. Any user queries `GranteeGrants` via the gRPC endpoint `/cosmos/authz/v1beta1/grants/grantee/{grantee}`
-4. The query scans ALL grants in the system, unmarshaling and parsing each key
-5. Query executes with infinite gas meter (no resource limits): [6](#0-5) 
-
-6. Attacker can repeatedly trigger queries at no cost to exhaust RPC node CPU and I/O resources
-
-**Security Failure:**
-This breaks the denial-of-service protection property. RPC queries should have bounded resource consumption, but this query's cost grows linearly with the total number of grants in the system, not just the matching grants for the queried grantee.
+**Security Guarantee Broken:** The fundamental consensus availability invariant is violated. A Proof-of-Stake blockchain must maintain at least one active validator with positive voting power to function. This vulnerability allows the network to enter a state where this invariant is broken, causing permanent consensus halt.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- RPC node CPU (unmarshaling grants, parsing keys, filtering)
-- RPC node I/O (reading from store)  
-- RPC node memory (holding iteration state)
-- Network availability (RPC nodes becoming unresponsive)
+This vulnerability results in complete network shutdown with the following consequences:
 
-**Severity:**
-With 100,000 grants in the system and only 1 matching the queried grantee, each `GranteeGrants` query must:
-- Read 100,000 entries from disk
-- Unmarshal 100,000 protobuf messages
-- Parse 100,000 keys to extract addresses
-- Filter out 99,999 non-matching grants
+1. **No Block Production**: With zero total voting power, Tendermint/CometBFT cannot select a proposer or reach consensus on new blocks
+2. **Transaction Halt**: All pending and new transactions cannot be confirmed or executed
+3. **State Freeze**: The blockchain state becomes permanently frozen at the last successfully committed block
+4. **Unrecoverable Without Hard Fork**: Since no transactions can execute (including unjail transactions), validators cannot recover themselves. Recovery requires coordinated manual intervention such as a hard fork with validator set restoration
+5. **Economic Damage**: Extended downtime causes loss of user confidence, potential loss of network value, and damage to ecosystem projects
 
-Repeated queries can easily increase RPC node resource consumption by 30%+ compared to normal operation, making RPC services slow or unresponsive. This affects user experience and can prevent legitimate users from accessing the blockchain.
-
-The keeper itself includes a warning about this pattern: [7](#0-6) 
+The impact matches the explicitly listed category: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant can trigger this - both the grant creation (requires paying gas) and the query (free, no authentication required).
+**Who Can Trigger:** This is not directly triggered by a malicious actor but rather by operational conditions that affect all validators simultaneously:
+- Infrastructure providers (unintentional): Cloud provider outages, ISP failures
+- Software issues: Bugs in validator software affecting all nodes running the same version
+- Network conditions: Widespread DDoS attacks, network partitions
+- Operational errors: Misconfigured chain upgrades, incorrect parameter changes via governance
 
 **Conditions Required:**
-- Attacker creates many grants (one-time setup, pays gas once)
-- Anyone can then query repeatedly at no cost
-- Works during normal network operation
-- No special timing or race conditions needed
+- All validators must simultaneously exceed the downtime slashing threshold (`maxMissed` blocks)
+- This can realistically occur during network-wide infrastructure failures or software bugs
+- No privileged access or malicious intent required
 
 **Frequency:**
-Once grants are created, the vulnerability can be exploited continuously. An attacker can:
-- Set up once by creating 10,000+ grants (feasible with standard gas costs)
-- Repeatedly query to maintain resource pressure on RPC nodes
-- Target specific RPC endpoints to take them offline
+- Low probability under normal operations with geographically distributed, diverse validator infrastructure
+- Higher probability during:
+  - Major cloud provider outages (has precedent in other blockchains)
+  - Chain upgrades with bugs
+  - Network-level attacks or failures
+  - Coordinated infrastructure issues
 
-This is highly likely to be exploited because:
-1. Setup cost is reasonable (one-time gas fees)
-2. Attack cost is near-zero (queries are free)
-3. Impact is immediate and measurable
-4. No detection or rate limiting exists for query patterns
+While the likelihood is low, the catastrophic impact (complete network halt requiring hard fork) makes this a critical vulnerability requiring mitigation. Defense-in-depth principles dictate that the application layer should validate its own invariants rather than relying solely on operational best practices.
 
 ## Recommendation
 
-**Short-term Fix:**
-Implement query result limits and pagination constraints:
-1. Add a maximum limit on the number of grants that can be scanned (e.g., 10,000)
-2. Return an error if this limit is exceeded
-3. Require clients to use more specific queries when grant count is high
+Add validation in `ApplyAndReturnValidatorSetUpdates` to prevent zero total voting power:
 
-**Long-term Fix:**
-Create a secondary index for grantee-based lookups:
-1. Add a new key prefix structure: `GranteeIndexKey + Grantee + Granter + MsgType → Grant`
-2. Maintain this index when grants are created/deleted in `SaveGrant` and `DeleteGrant`
-3. Update `GranteeGrants` to use the grantee index for efficient lookups
-4. This matches the pattern used by `GranterGrants` which efficiently queries by granter
+```go
+// set total power on lookup index if there are any updates
+if len(updates) > 0 {
+    if totalPower.IsZero() {
+        return nil, fmt.Errorf("total voting power cannot be zero: this would halt the network")
+    }
+    k.SetLastTotalPower(ctx, totalPower)
+}
+```
 
-The fix should mirror how `GranterGrants` works: [8](#0-7) 
+Additional recommendations:
+1. **Genesis Validation**: Add checks during chain initialization to ensure at least one validator with positive power exists
+2. **Minimum Validator Check**: Consider adding a configurable minimum number of active validators required
+3. **Emergency Recovery Mechanism**: Document and implement emergency validator set recovery procedures
+4. **Monitoring and Alerting**: Implement alerts when total voting power drops below critical thresholds (e.g., 50% of normal)
+5. **Operator Documentation**: Document this failure mode and recovery procedures for validator operators
 
 ## Proof of Concept
 
-**File:** `x/authz/keeper/grpc_query_test.go`
-
-**Test Function:** Add new test `TestGranteeGrantsPerformanceDoS` to the existing test suite
+**Test Structure**: The following test demonstrates the vulnerability by simulating mass validator jailing:
 
 **Setup:**
-1. Initialize test app and context using existing `TestSuite`
-2. Create 1,000 grants from different granters to different grantees
-3. Create only 1 grant for the target grantee being queried
-4. Set up query client
+1. Initialize test application with 3 validators having bonded status and positive voting power
+2. Apply initial validator set updates to establish the bonded validator set
+3. Verify the network has positive total voting power
 
-**Trigger:**
-1. Call `GranteeGrants` with `CountTotal=true` to force full store scan
-2. Measure that the pagination result shows `Total=1000` (confirming all grants were scanned)
-3. Compare with `GranterGrants` which only scans grants from specific granter
+**Action:**
+1. Simulate mass jailing by setting all validators' `Jailed` flag to true
+2. Remove all validators from the power index (via `DeleteValidatorByPowerIndex`)
+3. Update validator status to unbonding
+4. Call `ApplyAndReturnValidatorSetUpdates` to process validator set changes
 
-**Observation:**
-The test demonstrates that:
-- `GranteeGrants` returns `Total=1000` (scanned entire store) to find 1 matching grant
-- `GranterGrants` returns only the grants for that specific granter (efficient)
-- The query must iterate through 999 irrelevant grants to find 1 match
+**Expected Result (demonstrating the bug):**
+1. The function returns successfully without error
+2. All validator updates have zero power
+3. `GetLastTotalPower` returns zero
+4. This zero-power validator set would be sent to Tendermint, causing network halt
 
-**Test Code Structure:**
-```
-func (suite *TestSuite) TestGranteeGrantsPerformanceDoS() {
-    // Setup: Create 1000 grants from different addresses
-    // Create only 1 grant where targetGrantee is the grantee
-    // Query GranteeGrants with CountTotal=true for targetGrantee
-    // Assert pagination.Total == 1000 (all grants scanned)
-    // Assert len(result.Grants) == 1 (only 1 matched)
-    // This proves O(N) scan where N = total grants in system
-}
-```
-
-This PoC proves the vulnerability is real and exploitable, demonstrating that the query performance degrades linearly with the total number of grants in the system rather than just the grants for the queried grantee.
+The test would follow the pattern of existing tests in `x/staking/keeper/validator_test.go`, using the `applyValidatorSetUpdates` helper function and standard test setup utilities. The test confirms that no validation prevents the total power from reaching zero, which would cause catastrophic network failure in production.
 
 ### Citations
 
-**File:** x/authz/keeper/grpc_query.go (L84-129)
+**File:** x/staking/keeper/val_state_change.go (L108-222)
 ```go
-func (k Keeper) GranterGrants(c context.Context, req *authz.QueryGranterGrantsRequest) (*authz.QueryGranterGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
-	}
+func (k Keeper) ApplyAndReturnValidatorSetUpdates(ctx sdk.Context) (updates []abci.ValidatorUpdate, err error) {
+	params := k.GetParams(ctx)
+	maxValidators := params.MaxValidators
+	powerReduction := k.PowerReduction(ctx)
+	totalPower := sdk.ZeroInt()
+	amtFromBondedToNotBonded, amtFromNotBondedToBonded := sdk.ZeroInt(), sdk.ZeroInt()
 
-	granter, err := sdk.AccAddressFromBech32(req.Granter)
+	// Retrieve the last validator set.
+	// The persistent set is updated later in this function.
+	// (see LastValidatorPowerKey).
+	last, err := k.getLastValidatorsByAddr(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx := sdk.UnwrapSDKContext(c)
-	store := ctx.KVStore(k.storeKey)
-	authzStore := prefix.NewStore(store, grantStoreKey(nil, granter, ""))
+	// Iterate over validators, highest power to lowest.
+	iterator := k.ValidatorsPowerStoreIterator(ctx)
+	defer iterator.Close()
 
-	grants, pageRes, err := query.GenericFilteredPaginate(k.cdc, authzStore, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
+	for count := 0; iterator.Valid() && count < int(maxValidators); iterator.Next() {
+		// everything that is iterated in this loop is becoming or already a
+		// part of the bonded validator set
+		valAddr := sdk.ValAddress(iterator.Value())
+		validator := k.mustGetValidator(ctx, valAddr)
+
+		if validator.Jailed {
+			panic("should never retrieve a jailed validator from the power store")
+		}
+
+		// if we get to a zero-power validator (which we don't bond),
+		// there are no more possible bonded validators
+		if validator.PotentialConsensusPower(k.PowerReduction(ctx)) == 0 {
+			break
+		}
+
+		// apply the appropriate state change if necessary
+		switch {
+		case validator.IsUnbonded():
+			validator, err = k.unbondedToBonded(ctx, validator)
+			if err != nil {
+				return
+			}
+			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
+		case validator.IsUnbonding():
+			validator, err = k.unbondingToBonded(ctx, validator)
+			if err != nil {
+				return
+			}
+			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
+		case validator.IsBonded():
+			// no state change
+		default:
+			panic("unexpected validator status")
+		}
+
+		// fetch the old power bytes
+		valAddrStr, err := sdk.Bech32ifyAddressBytes(sdk.GetConfig().GetBech32ValidatorAddrPrefix(), valAddr)
 		if err != nil {
 			return nil, err
 		}
+		oldPowerBytes, found := last[valAddrStr]
+		newPower := validator.ConsensusPower(powerReduction)
+		newPowerBytes := k.cdc.MustMarshal(&gogotypes.Int64Value{Value: newPower})
 
-		any, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
+		// update the validator set if power has changed
+		if !found || !bytes.Equal(oldPowerBytes, newPowerBytes) {
+			updates = append(updates, validator.ABCIValidatorUpdate(powerReduction))
+
+			k.SetLastValidatorPower(ctx, valAddr, newPower)
 		}
 
-		grantee := firstAddressFromGrantStoreKey(key)
-		return &authz.GrantAuthorization{
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-			Authorization: any,
-			Expiration:    auth.Expiration,
-		}, nil
+		delete(last, valAddrStr)
+		count++
 
-	}, func() *authz.Grant {
-		return &authz.Grant{}
-	})
+		totalPower = totalPower.Add(sdk.NewInt(newPower))
+	}
 
+	noLongerBonded, err := sortNoLongerBonded(last)
 	if err != nil {
 		return nil, err
 	}
 
-	return &authz.QueryGranterGrantsResponse{
-		Grants:     grants,
-		Pagination: pageRes,
-	}, nil
+	for _, valAddrBytes := range noLongerBonded {
+		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
+		validator, err = k.bondedToUnbonding(ctx, validator)
+		if err != nil {
+			return
+		}
+		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
+		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
+		updates = append(updates, validator.ABCIValidatorUpdateZero())
+	}
+
+	// Update the pools based on the recent updates in the validator set:
+	// - The tokens from the non-bonded candidates that enter the new validator set need to be transferred
+	// to the Bonded pool.
+	// - The tokens from the bonded validators that are being kicked out from the validator set
+	// need to be transferred to the NotBonded pool.
+	switch {
+	// Compare and subtract the respective amounts to only perform one transfer.
+	// This is done in order to avoid doing multiple updates inside each iterator/loop.
+	case amtFromNotBondedToBonded.GT(amtFromBondedToNotBonded):
+		k.notBondedTokensToBonded(ctx, amtFromNotBondedToBonded.Sub(amtFromBondedToNotBonded))
+	case amtFromNotBondedToBonded.LT(amtFromBondedToNotBonded):
+		k.bondedTokensToNotBonded(ctx, amtFromBondedToNotBonded.Sub(amtFromNotBondedToBonded))
+	default: // equal amounts of tokens; no update required
+	}
+
+	// set total power on lookup index if there are any updates
+	if len(updates) > 0 {
+		k.SetLastTotalPower(ctx, totalPower)
+	}
+
+	return updates, err
 }
 ```
 
-**File:** x/authz/keeper/grpc_query.go (L132-178)
+**File:** x/staking/keeper/val_state_change.go (L260-268)
 ```go
-func (k Keeper) GranteeGrants(c context.Context, req *authz.QueryGranteeGrantsRequest) (*authz.QueryGranteeGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
+func (k Keeper) jailValidator(ctx sdk.Context, validator types.Validator) {
+	if validator.Jailed {
+		panic(fmt.Sprintf("cannot jail already jailed validator, validator: %v\n", validator))
 	}
 
-	grantee, err := sdk.AccAddressFromBech32(req.Grantee)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx := sdk.UnwrapSDKContext(c)
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
-
-	authorizations, pageRes, err := query.GenericFilteredPaginate(k.cdc, store, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
-		if err != nil {
-			return nil, err
-		}
-
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
-		}
-
-		authorizationAny, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-
-		return &authz.GrantAuthorization{
-			Authorization: authorizationAny,
-			Expiration:    auth.Expiration,
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-		}, nil
-	}, func() *authz.Grant {
-		return &authz.Grant{}
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.QueryGranteeGrantsResponse{
-		Grants:     authorizations,
-		Pagination: pageRes,
-	}, nil
+	validator.Jailed = true
+	k.SetValidator(ctx, validator)
+	k.DeleteValidatorByPowerIndex(ctx, validator)
 }
 ```
 
-**File:** x/authz/keeper/keys.go (L19-35)
+**File:** x/slashing/keeper/infractions.go (L96-122)
 ```go
-// grantStoreKey - return authorization store key
-// Items are stored with the following key: values
-//
-// - 0x01<granterAddressLen (1 Byte)><granterAddress_Bytes><granteeAddressLen (1 Byte)><granteeAddress_Bytes><msgType_Bytes>: Grant
-func grantStoreKey(grantee sdk.AccAddress, granter sdk.AccAddress, msgType string) []byte {
-	m := conv.UnsafeStrToBytes(msgType)
-	granter = address.MustLengthPrefix(granter)
-	grantee = address.MustLengthPrefix(grantee)
-
-	l := 1 + len(grantee) + len(granter) + len(m)
-	var key = make([]byte, l)
-	copy(key, GrantKey)
-	copy(key[1:], granter)
-	copy(key[1+len(granter):], grantee)
-	copy(key[l-len(m):], m)
-	//	fmt.Println(">>>> len", l, key)
-	return key
-```
-
-**File:** types/query/filtered_pagination.go (L212-246)
-```go
-	for ; iterator.Valid(); iterator.Next() {
-		if iterator.Error() != nil {
-			return nil, nil, iterator.Error()
-		}
-
-		protoMsg := constructor()
-
-		err := cdc.Unmarshal(iterator.Value(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		val, err := onResult(iterator.Key(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if val.Size() != 0 {
-			// Previously this was the "accumulate" flag
-			if numHits >= offset && numHits < end {
-				results = append(results, val)
+	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+		validator := k.sk.ValidatorByConsAddr(ctx, consAddr)
+		if validator != nil && !validator.IsJailed() {
+			// Downtime confirmed: slash and jail the validator
+			// We need to retrieve the stake distribution which signed the block, so we subtract ValidatorUpdateDelay from the evidence height,
+			// and subtract an additional 1 since this is the LastCommit.
+			// Note that this *can* result in a negative "distributionHeight" up to -ValidatorUpdateDelay-1,
+			// i.e. at the end of the pre-genesis block (none) = at the beginning of the genesis block.
+			// That's fine since this is just used to filter unbonding delegations & redelegations.
+			shouldSlash = true
+			distributionHeight := height - sdk.ValidatorUpdateDelay - 1
+			slashInfo = SlashInfo{
+				height:             height,
+				power:              power,
+				distributionHeight: distributionHeight,
+				minHeight:          minHeight,
+				minSignedPerWindow: minSignedPerWindow,
 			}
-			numHits++
-		}
-
-		if numHits == end+1 {
-			if nextKey == nil {
-				nextKey = iterator.Key()
-			}
-
-			if !countTotal {
-				break
-			}
+			// This value is passed back and the validator is slashed and jailed appropriately
+		} else {
+			// validator was (a) not found or (b) already jailed so we do not slash
+			logger.Info(
+				"validator would have been slashed for downtime, but was either not found in store or already jailed",
+				"validator", consAddr.String(),
+			)
 		}
 	}
 ```
 
-**File:** baseapp/abci.go (L710-761)
+**File:** types/module/module.go (L642-669)
 ```go
-// CreateQueryContext creates a new sdk.Context for a query, taking as args
-// the block height and whether the query needs a proof or not.
-func (app *BaseApp) CreateQueryContext(height int64, prove bool) (sdk.Context, error) {
-	err := checkNegativeHeight(height)
-	if err != nil {
-		return sdk.Context{}, err
+func (m *Manager) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) abci.ResponseEndBlock {
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+	validatorUpdates := []abci.ValidatorUpdate{}
+	defer telemetry.MeasureSince(time.Now(), "module", "total_end_block")
+	for _, moduleName := range m.OrderEndBlockers {
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
+			continue
+		}
+		moduleStartTime := time.Now()
+		moduleValUpdates := module.EndBlock(ctx, req)
+		telemetry.ModuleMeasureSince(moduleName, moduleStartTime, "module", "end_block")
+		// use these validator updates if provided, the module manager assumes
+		// only one module will update the validator set
+		if len(moduleValUpdates) > 0 {
+			if len(validatorUpdates) > 0 {
+				panic("validator EndBlock updates already set by a previous module")
+			}
+
+			validatorUpdates = moduleValUpdates
+		}
+
 	}
 
-	lastBlockHeight := app.LastBlockHeight()
-	if height > lastBlockHeight {
-		return sdk.Context{},
-			sdkerrors.Wrap(
-				sdkerrors.ErrInvalidHeight,
-				"cannot query with height in the future; please provide a valid height",
-			)
+	return abci.ResponseEndBlock{
+		ValidatorUpdates: validatorUpdates,
+		Events:           ctx.EventManager().ABCIEvents(),
 	}
-
-	// when a client did not provide a query height, manually inject the latest
-	if height == 0 {
-		height = lastBlockHeight
-	}
-
-	if height <= 1 && prove {
-		return sdk.Context{},
-			sdkerrors.Wrap(
-				sdkerrors.ErrInvalidRequest,
-				"cannot query with proof when height <= 1; please provide a valid height",
-			)
-	}
-
-	var cacheMS types.CacheMultiStore
-	if height < app.migrationHeight && app.qms != nil {
-		cacheMS, err = app.qms.CacheMultiStoreWithVersion(height)
-	} else {
-		cacheMS, err = app.cms.CacheMultiStoreWithVersion(height)
-	}
-
-	if err != nil {
-		return sdk.Context{},
-			sdkerrors.Wrapf(
-				sdkerrors.ErrInvalidRequest,
-				"failed to load state at height %d; %s (latest height: %d)", height, err, lastBlockHeight,
-			)
-	}
-
-	checkStateCtx := app.checkState.Context()
-	// branch the commit-multistore for safety
-	ctx := sdk.NewContext(
-		cacheMS, checkStateCtx.BlockHeader(), true, app.logger,
-	).WithMinGasPrices(app.minGasPrices).WithBlockHeight(height)
-
-	return ctx, nil
-```
-
-**File:** x/authz/keeper/keeper.go (L209-211)
-```go
-// IterateGrants iterates over all authorization grants
-// This function should be used with caution because it can involve significant IO operations.
-// It should not be used in query or msg services without charging additional gas.
 ```

@@ -1,259 +1,219 @@
 # Audit Report
 
 ## Title
-Transaction Rollback Inconsistency in Capability Module Causes Node Panic and Consensus Failure
+Chain Halt Due to Missing Nil Check When Allocating Rewards to Removed Validators
 
 ## Summary
-The `GetCapability` function in the capability keeper panics when a capMap entry is missing after retrieving its index from the memstore. This occurs due to a transaction rollback inconsistency: when `ReleaseCapability` is called within a failing transaction, the in-memory Go map deletion persists while the memstore deletions are rolled back, creating an inconsistent state that causes subsequent `GetCapability` calls to panic. [1](#0-0) 
+The distribution module's `AllocateTokens` function fails to validate that validators exist before allocating rewards. When a validator participates in consensus but is subsequently removed from state before rewards are distributed, the code passes a nil validator reference to `AllocateTokensToValidator`, causing a panic that halts all nodes and prevents the chain from producing new blocks.
 
 ## Impact
-**High** - This vulnerability can cause network processing nodes to crash (panic), leading to shutdown of greater than 30% of network nodes and potential consensus failures.
+High
 
 ## Finding Description
 
-**Location:** 
-- Module: `x/capability`
-- File: `x/capability/keeper/keeper.go`
-- Function: `ScopedKeeper.GetCapability()` at lines 382-385
-- Related function: `ScopedKeeper.ReleaseCapability()` at line 349
+**Location:** `x/distribution/keeper/allocation.go` lines 91-102 and line 113
 
 **Intended Logic:**
-The capability module maintains consistency between three storage layers:
-1. Persistent store (for capability owners)
-2. Memory store (for name-to-index and index-to-name mappings)
-3. In-memory Go map `capMap` (for index-to-capability pointer mappings)
-
-When transactions use `CacheContext()`, store operations should be atomic - either all changes commit or all revert on transaction failure. [2](#0-1) 
+The `AllocateTokens` function should safely distribute block rewards to all validators that participated in creating the previous block. When looking up validators by consensus address, the function should handle cases where validators may have been removed from state between block production and reward distribution.
 
 **Actual Logic:**
-The `capMap` is a shared Go map that is NOT part of the transactional store system. When `ReleaseCapability` deletes from `capMap`, this deletion is NOT rolled back if the transaction fails. However, the memstore deletions ARE rolled back because they use the cached context. [3](#0-2) 
+The function retrieves each validator from the `bondedVotes` list by calling `ValidatorByConsAddr` but does not verify the returned value is non-nil before usage. [1](#0-0) 
 
-The code acknowledges this issue in a TODO comment but only handles one direction (extra entries from failed `NewCapability`), not the opposite (missing entries from failed `ReleaseCapability`). [4](#0-3) 
+When `ValidatorByConsAddr` returns nil (because the validator was removed), this nil value is passed directly to `AllocateTokensToValidator`, which immediately panics when attempting to call `val.GetCommission()` on the nil interface. [2](#0-1) 
 
-**Exploit Scenario:**
-1. A capability exists (both in memStore and capMap)
-2. A transaction starts with a cached context (e.g., IBC channel close transaction)
-3. `ReleaseCapability` is called, which deletes from memStore (lines 332, 336) and from capMap (line 349)
-4. Later in the transaction, an error occurs (gas exhaustion, validation failure, or any error)
-5. Transaction fails - the write cache is not committed
-6. MemStore deletions are reverted (part of cached store), but capMap deletion persists (just a Go map)
-7. Later, `GetCapability` is called with the same capability name:
-   - Retrieves index from memStore (line 368) - succeeds because deletion was reverted
-   - Accesses `capMap[index]` (line 382) - returns nil because deletion was NOT reverted
-   - Panics with "capability found in memstore is missing from map" (line 384) [5](#0-4) 
+Notably, the code already implements proper nil checking for the proposer validator with graceful error handling and logging, but this protection was not applied to regular voters. [3](#0-2) 
 
-**Security Failure:**
-This breaks the **availability** and **consensus consistency** properties. When different nodes process the same sequence of transactions but experience different transaction failures or timing, their capMap states diverge. Subsequent operations cause some nodes to panic while others continue, leading to consensus failure and network partition.
+**Exploitation Path:**
+1. A validator V is active in the bonded set at block N and participates in consensus (votes are recorded)
+2. At block N EndBlock, validator V is removed from the active set and transitions to Unbonding state [4](#0-3) 
+3. At block N+1 EndBlock (or later), V completes unbonding with zero delegations and is removed via `RemoveValidator` [5](#0-4) 
+4. The removal deletes V from the consensus address index, causing `ValidatorByConsAddr` to return nil [6](#0-5) 
+5. At block N+2 BeginBlock, `AllocateTokens` is called with votes from block N+1 including validator V
+6. The code retrieves nil for validator V but doesn't check before calling `AllocateTokensToValidator(ctx, nil, reward)`
+7. Panic occurs at `val.GetCommission()`, causing all nodes to crash simultaneously
+
+**Security Guarantee Broken:**
+The chain's liveness guarantee is violated. BeginBlock must never panic as it executes identically on all nodes, meaning a panic causes a total network halt that cannot be recovered without manual intervention.
 
 ## Impact Explanation
 
-**Affected Assets/Processes:**
-- Network availability: Nodes crash and cannot process further blocks
-- Consensus integrity: Different nodes may have different capMap states
-- IBC functionality: Channel operations use capabilities extensively
-- Any module using the capability system
+**Network Availability:** The entire blockchain network becomes unable to confirm new transactions. All validator nodes panic during BeginBlock execution at the same block height and cannot advance to the next block.
 
-**Severity:**
-- **Node Crashes**: The panic at line 384 terminates the node immediately
-- **Consensus Failures**: If >33% of validators crash, the network halts
-- **Non-deterministic Failures**: Different nodes may crash at different times depending on their transaction processing history
-- **Cascading Impact**: Once capMap is corrupted, all future operations on that capability will panic
+**Recovery Requirements:**
+- A coordinated hard fork to skip the problematic block, or
+- Manual intervention to modify chain parameters and restart from a previous state
+- Both options require coordinated off-chain action from validators
 
-**Systemic Risk:**
-This is not a theoretical issue. The code comment at lines 372-377 explicitly acknowledges that Go maps don't automatically revert on transaction failure. Any transaction that calls `ReleaseCapability` and then fails (which can happen during normal operation due to gas limits, validation errors, or other failures) will trigger this vulnerability.
+**Triggering Conditions:** This vulnerability can occur during normal chain operation when:
+- The chain has a short unbonding period (common in test networks or if governance reduces the parameter)
+- Any validator unbonds all delegations during the critical timing window
+- The code comments explicitly acknowledge this scenario: "if the unbonding period is 1 block" [7](#0-6) 
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any user or module that can cause a transaction containing `ReleaseCapability` to fail. This includes:
-- IBC relayers closing channels
-- Any module using capabilities (e.g., IBC, port binding)
-- Normal users if transaction fails due to gas exhaustion
-- No special privileges required
+**Who Can Trigger:** 
+- Any participant who can create and operate a validator
+- Any existing validator that fully unbonds when the unbonding period is short
+- The scenario can occur naturally without malicious intent
 
 **Conditions Required:**
-1. A capability must exist
-2. `ReleaseCapability` is called within a transaction
-3. The transaction must fail after `ReleaseCapability` but before commit
-4. Later, `GetCapability` is called for the same capability
+- Chain must have a short unbonding period (1-2 blocks), which is common in:
+  - Test networks and development environments
+  - Chains where governance has reduced the unbonding time
+- A validator must be removed from state between participating in consensus and reward allocation
 
-**Frequency:**
-- Can occur during normal operations (failed IBC channel closes are common)
-- Each occurrence corrupts one capability in capMap permanently
-- Cumulative effect: As more capabilities become corrupted, more operations panic
-- High likelihood in production environments with active IBC usage
+**Frequency:** While requiring specific timing, this scenario:
+- Is explicitly documented in the code comments as possible
+- Can happen naturally during validator exits with short unbonding periods
+- Could be deliberately triggered by a malicious actor who creates a validator and immediately unbonds all delegations
+
+The code's existing protection for the proposer case demonstrates the developers were aware of this timing issue but didn't apply the fix consistently to all validators.
 
 ## Recommendation
 
-Implement a transactional wrapper for capMap operations that can be rolled back with the store cache. Options include:
+Add a nil check for validators in the `bondedVotes` loop, mirroring the existing protection for the proposer validator. When a validator is not found, log a warning and skip reward allocation, allowing those rewards to remain in the community pool:
 
-1. **Deferred capMap Updates**: Track capMap changes in the cached context and only apply them on successful commit:
-   - Store pending capMap operations in the context
-   - Apply them in a hook after successful cache write
-   - Discard them if cache is not written
-
-2. **Rebuild from Store**: On transaction rollback, reconstruct the capMap entry from persistent store:
-   - Check if the capability still exists in persistent store
-   - If yes, recreate the capMap entry
-   - If no, confirm deletion
-
-3. **Lazy Deletion**: Instead of deleting from capMap immediately, mark for deletion and clean up during next successful operation:
-   - Add a "deleted" flag to capabilities
-   - Check this flag in GetCapability
-   - Clean up during successful transactions
-
-The first option is most robust and aligns with the transactional semantics of the store system.
+```go
+for _, vote := range bondedVotes {
+    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+    
+    if validator == nil {
+        logger.Error(fmt.Sprintf(
+            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
+            "This can happen if the validator unbonded completely within a short period.",
+            vote.Validator.Address))
+        continue
+    }
+    
+    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+    reward := feeMultiplier.MulDecTruncate(powerFraction)
+    
+    k.AllocateTokensToValidator(ctx, validator, reward)
+    remaining = remaining.Sub(reward)
+}
+```
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
-
-**Test Function:** Add this test to the existing test suite:
-
-```go
-func (suite *KeeperTestSuite) TestReleaseCapabilityPanicOnTransactionRollback() {
-    // Setup: Create a capability
-    sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
-    
-    cap, err := sk.NewCapability(suite.ctx, "transfer")
-    suite.Require().NoError(err)
-    suite.Require().NotNil(cap)
-    
-    // Verify capability exists
-    got, ok := sk.GetCapability(suite.ctx, "transfer")
-    suite.Require().True(ok)
-    suite.Require().Equal(cap, got)
-    
-    // Trigger: Create a cached context (simulating a transaction)
-    ms := suite.ctx.MultiStore()
-    msCache := ms.CacheMultiStore()
-    cacheCtx := suite.ctx.WithMultiStore(msCache)
-    
-    // Release the capability in the cached context
-    err = sk.ReleaseCapability(cacheCtx, cap)
-    suite.Require().NoError(err)
-    
-    // Verify capability is deleted in cached context
-    got, ok = sk.GetCapability(cacheCtx, "transfer")
-    suite.Require().False(ok)
-    suite.Require().Nil(got)
-    
-    // Simulate transaction failure by NOT calling msCache.Write()
-    // This means memStore changes are reverted, but capMap deletion persists
-    
-    // Observation: Attempting to get the capability from the original context
-    // will panic because:
-    // 1. The index exists in memStore (deletion was reverted)
-    // 2. But capMap[index] is nil (deletion was NOT reverted)
-    // 3. Line 382-384 will panic with "capability found in memstore is missing from map"
-    
-    suite.Require().Panics(func() {
-        sk.GetCapability(suite.ctx, "transfer")
-    }, "Expected panic: capability found in memstore is missing from map")
-}
-```
+**Test Function:** `TestAllocateTokensToRemovedValidator` (to be added to `x/distribution/keeper/allocation_test.go`)
 
 **Setup:**
-- Creates a new capability using `NewCapability` (establishes entries in both memStore and capMap)
-- Verifies the capability can be retrieved successfully
+1. Initialize test application with a very short unbonding time (1 second)
+2. Create a validator with self-delegation
+3. Fund the fee collector with tokens for distribution
 
 **Trigger:**
-- Creates a cached context using `CacheMultiStore()` to simulate transaction isolation
-- Calls `ReleaseCapability` in the cached context (deletes from capMap at line 349)
-- Does NOT call `msCache.Write()` to simulate transaction failure/rollback
-- This creates the inconsistent state: memStore entries restored, but capMap entry deleted
+1. Undelegate all tokens from the validator
+2. Apply validator set updates (EndBlock) to transition validator to Unbonding
+3. Advance time past the unbonding period
+4. Call `UnbondAllMatureValidators` to complete unbonding and remove the validator from state
+5. Verify validator is removed (not found in state)
+6. Create a `VoteInfo` list including the now-removed validator
+7. Call `AllocateTokens` with these votes
 
-**Observation:**
-- Calls `GetCapability` from the original (non-cached) context
-- The test expects a panic with message "capability found in memstore is missing from map"
-- This confirms the vulnerability: the code reaches line 382 where `capMap[index]` returns nil, triggering the panic at line 384
+**Result:**
+The call to `AllocateTokens` panics at line 113 of `allocation.go` when attempting to call `val.GetCommission()` on a nil validator interface, demonstrating that the vulnerability causes a chain-halting panic.
 
-This test will reliably reproduce the panic on the current codebase, demonstrating the vulnerability is real and exploitable under normal transaction processing conditions.
+## Notes
+
+This vulnerability is particularly concerning because:
+
+1. **Inconsistent Protection**: The code already handles this exact scenario for the proposer validator but fails to apply the same protection to regular voters, indicating an incomplete fix.
+
+2. **Documented Scenario**: The code comments explicitly acknowledge this timing issue can occur, yet the protection wasn't applied consistently across all code paths.
+
+3. **High Impact**: A panic in BeginBlock is one of the most severe issues in a blockchain system as it simultaneously crashes all nodes and requires coordinated manual intervention to recover.
+
+4. **Production Risk**: While more likely in test environments with short unbonding periods, production chains could be vulnerable if governance reduces the unbonding time or during specific validator exit patterns.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L319-356)
+**File:** x/distribution/keeper/allocation.go (L55-79)
 ```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
-	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
-	}
+	proposerValidator := k.stakingKeeper.ValidatorByConsAddr(ctx, previousProposer)
 
-	memStore := ctx.KVStore(sk.memKey)
+	if proposerValidator != nil {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeProposerReward,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, proposerReward.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, proposerValidator.GetOperator().String()),
+			),
+		)
 
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
+		k.AllocateTokensToValidator(ctx, proposerValidator, proposerReward)
+		remaining = remaining.Sub(proposerReward)
 	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+		// previous proposer can be unknown if say, the unbonding period is 1 block, so
+		// e.g. a validator undelegates at block X, it's removed entirely by
+		// block X+1's endblock, then X+2 we need to refer to the previous
+		// proposer for X+1, but we've forgotten about them.
+		logger.Error(fmt.Sprintf(
+			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
+				"This should happen only if the proposer unbonded completely within a single block, "+
+				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
+				"We recommend you investigate immediately.",
+			previousProposer.String()))
 	}
-
-	return nil
-}
 ```
 
-**File:** x/capability/keeper/keeper.go (L361-388)
+**File:** x/distribution/keeper/allocation.go (L91-102)
 ```go
-func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
-	if strings.TrimSpace(name) == "" {
-		return nil, false
+	for _, vote := range bondedVotes {
+		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+
+		// TODO: Consider micro-slashing for missing votes.
+		//
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
+		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+		reward := feeMultiplier.MulDecTruncate(powerFraction)
+
+		k.AllocateTokensToValidator(ctx, validator, reward)
+		remaining = remaining.Sub(reward)
 	}
-	memStore := ctx.KVStore(sk.memKey)
-
-	key := types.RevCapabilityKey(sk.module, name)
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-
-	if len(indexBytes) == 0 {
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-
-		return nil, false
-	}
-
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
-	}
-
-	return cap, true
-}
 ```
 
-**File:** types/context.go (L586-593)
+**File:** x/distribution/keeper/allocation.go (L109-114)
 ```go
-// CacheContext returns a new Context with the multi-store cached and a new
-// EventManager. The cached context is written to the context when writeCache
-// is called.
-func (c Context) CacheContext() (cc Context, writeCache func()) {
-	cms := c.MultiStore().CacheMultiStore()
-	cc = c.WithMultiStore(cms).WithEventManager(NewEventManager())
-	return cc, cms.Write
+// AllocateTokensToValidator allocate tokens to a particular validator,
+// splitting according to commission.
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+```
+
+**File:** x/staking/keeper/val_state_change.go (L190-199)
+```go
+	for _, valAddrBytes := range noLongerBonded {
+		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
+		validator, err = k.bondedToUnbonding(ctx, validator)
+		if err != nil {
+			return
+		}
+		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
+		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
+		updates = append(updates, validator.ABCIValidatorUpdateZero())
+	}
+```
+
+**File:** x/staking/keeper/validator.go (L441-444)
+```go
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
+
+**File:** x/staking/keeper/alias_functions.go (L88-96)
+```go
+// ValidatorByConsAddr gets the validator interface for a particular pubkey
+func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
+	val, found := k.GetValidatorByConsAddr(ctx, addr)
+	if !found {
+		return nil
+	}
+
+	return val
 }
 ```

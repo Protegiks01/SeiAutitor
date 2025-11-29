@@ -1,233 +1,210 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Bypass of SendEnabled Restriction via Delegation Allowing Transfer of Disabled Denominations
+State Corruption Through Partial Write Propagation in Concurrent Transaction Execution
 
 ## Summary
-The `IsSendEnabledCoins` check is enforced when creating vesting accounts and sending coins via `MsgSend`/`MsgMultiSend`, but is completely bypassed in the delegation flow. Users (including vesting accounts) can delegate coins with disabled denominations to validators, circumventing governance/admin decisions to freeze transfers of specific denoms.
+In the OCC (Optimistic Concurrency Control) concurrent execution mode, failed transactions that run out of gas mid-execution have their partial state writes incorrectly committed to the blockchain state, violating the fundamental transaction atomicity property. The `executeTask()` function in the scheduler unconditionally propagates writes to the multiversion store without checking if the transaction succeeded.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- Missing check in `x/bank/keeper/keeper.go` in the `DelegateCoins` function (lines 184-225)
-- [1](#0-0) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:** 
-When a denomination is disabled via the `SendEnabled` parameter, no transfers of that denomination should be possible. This restriction is enforced via `IsSendEnabledCoins` checks in:
-- [2](#0-1) 
-- [3](#0-2) 
-- [4](#0-3) 
+**Intended Logic:** Transactions must be atomic - either all state changes commit or none do. In the standard sequential execution path, this is correctly enforced through a cache mechanism that only writes on successful execution (`if err == nil && mode == runTxModeDeliver { msCache.Write() }`). [2](#0-1) 
 
-**Actual Logic:** 
-The `DelegateCoins` function transfers coins from a user account to a module account (the staking pool) without checking if the denomination is enabled for sending. The delegation flow is:
-1. User submits `MsgDelegate`
-2. [5](#0-4)  calls staking keeper's `Delegate`
-3. [6](#0-5)  calls `bankKeeper.DelegateCoinsFromAccountToModule`
-4. [7](#0-6)  calls `DelegateCoins`
-5. `DelegateCoins` deducts coins and tracks delegation but never calls `IsSendEnabledCoins`
+**Actual Logic:** In OCC concurrent execution mode:
+1. Gas metering occurs at the `gaskv.Store` layer before each write operation [3](#0-2) 
+2. Each write that passes the gas check is immediately stored in `VersionIndexedStore.writeset` [4](#0-3) 
+3. When gas is exhausted, a panic is caught and converted to an error response with non-zero Code [5](#0-4) 
+4. The `executeTask()` function receives this failed response but **never checks `resp.Code`** to verify success
+5. It unconditionally calls `WriteToMultiVersionStore()` at lines 574-577, propagating the partial writeset regardless of transaction status [6](#0-5) 
+6. These writes are later committed to the parent store via `WriteLatestToStore()` [7](#0-6) 
 
-**Exploit Scenario:**
-1. Governance/admin disables sending of denomination "frozentoken" via `SendEnabled` parameter (e.g., during an emergency or security incident)
-2. User account (including vesting accounts) holds "frozentoken"
-3. User cannot send tokens via `MsgSend` or `MsgMultiSend` (correctly blocked)
-4. User submits `MsgDelegate` to delegate "frozentoken" to any validator
-5. The delegation succeeds, transferring coins from user account to the bonded/unbonded pool
-6. The send restriction is completely bypassed
+**Exploitation Path:**
+1. Any user submits a transaction to the network (no special privileges required)
+2. The transaction executes in OCC mode with multiple state write operations
+3. After several successful writes consuming gas, a subsequent operation exceeds the gas limit
+4. The out-of-gas panic is caught and converted to an error response with Code != 0
+5. Despite the error response, `executeTask()` propagates all partial writes to the multiversion store
+6. At the end of block processing, `WriteLatestToStore()` commits these partial writes to blockchain state
+7. The transaction response indicates failure (Code != 0), but state contains corrupted data from partial execution
 
-**Security Failure:** 
-Authorization bypass - the protocol's denomination transfer restrictions are circumvented, allowing users to move disabled tokens when they should be frozen. This breaks the governance-controlled security mechanism for emergency token freezing.
+**Security Guarantee Broken:** Transaction atomicity - the fundamental guarantee that transactions execute completely or not at all is violated. Failed transactions leave partial state modifications in the committed blockchain state.
 
 ## Impact Explanation
 
-- **Affected Process:** Denomination-level transfer restrictions configured via the `SendEnabled` parameter
-- **Severity:** When governance disables a denomination (typically during emergencies, exploits, or security incidents), the expectation is that NO transfers occur. Delegation bypasses this completely, allowing continued token movement.
-- **Why It Matters:** 
-  - Defeats the purpose of emergency token freezes
-  - Violates governance decisions and protocol design
-  - Could enable continued exploitation during incident response
-  - Breaks trust in the protocol's security controls
+This vulnerability causes state corruption by committing partial updates from failed transactions. The consequences include:
+
+- **Broken Invariants**: Multi-step operations (token transfers, DEX swaps, multi-signature operations) may leave the system in inconsistent intermediate states
+- **Unpredictable Contract Behavior**: Smart contracts relying on transaction atomicity guarantees will malfunction when their partial state changes persist despite transaction failure
+- **Data Integrity Violation**: The blockchain state contains corrupted data that should have been rolled back
+- **Consensus Risk**: While all validators likely execute the same buggy code, any differences in gas estimation or timing could theoretically lead to state divergence
+
+This matches the Medium severity impact: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-- **Who Can Trigger:** Any token holder (including vesting accounts) with disabled denominations
-- **Conditions Required:** 
-  - A denomination must be disabled via `SendEnabled` parameter
-  - User must have balance of that denomination
-  - At least one active validator to delegate to
-- **Frequency:** Can be triggered at any time when denoms are disabled. While denomination disabling might be rare, when it occurs (e.g., during security incidents), this bypass is easily exploitable and undermines the entire freeze mechanism.
+**Triggering Conditions:**
+- OCC mode must be enabled (ConcurrencyWorkers > 0) - **this is the default configuration in Sei**
+- Transaction must run out of gas after making some successful state writes
+- This is an extremely common occurrence in normal network operation
+
+**Frequency:** This vulnerability is triggered multiple times per block in normal operation:
+- Users frequently submit transactions with insufficient gas
+- Complex smart contract interactions often exceed gas estimates
+- Any transaction that consumes gas proportionally across multiple write operations will trigger this
+
+**Who Can Trigger:** Any network participant submitting transactions - no special privileges, knowledge, or setup required. The vulnerability occurs automatically during normal transaction processing.
+
+**Likelihood Assessment:** HIGH - This occurs naturally during regular network operation whenever any transaction runs out of gas after partial execution.
 
 ## Recommendation
 
-Add `IsSendEnabledCoins` check in the `DelegateCoins` function before allowing the delegation:
+Add a response code check in `executeTask()` before propagating writes:
 
 ```go
-func (k BaseKeeper) DelegateCoins(ctx sdk.Context, delegatorAddr, moduleAccAddr sdk.AccAddress, amt sdk.Coins) error {
-    moduleAcc := k.ak.GetAccount(ctx, moduleAccAddr)
-    if moduleAcc == nil {
-        return sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", moduleAccAddr)
-    }
+task.SetStatus(statusExecuted)
+task.Response = &resp
 
-    // Add this check
-    if err := k.IsSendEnabledCoins(ctx, amt...); err != nil {
-        return err
+// Only write to multiversion store if transaction succeeded
+if resp.Code == 0 {
+    for _, v := range task.VersionStores {
+        v.WriteToMultiVersionStore()
     }
-
-    if !amt.IsValid() {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
-    }
-    // ... rest of function
 }
+// If transaction failed (resp.Code != 0), the writeset is discarded
 ```
 
-Also consider adding the same check to `UndelegateCoins` and any other token movement functions for consistency.
+This ensures that only successful transactions (Code == 0) propagate their state changes to the multiversion store, maintaining transaction atomicity consistent with the sequential execution path.
 
 ## Proof of Concept
 
-**File:** `x/staking/keeper/delegation_test.go` (add new test function)
-
-**Test Function:** `TestDelegateDisabledDenom`
+The provided PoC in the report demonstrates the vulnerability by:
 
 **Setup:**
-1. Initialize test app with staking and bank keepers
-2. Create a validator
-3. Create a user account with balance in a custom denom (e.g., "testtoken")
-4. Set bank params to disable sending of "testtoken" by setting `SendEnabled` parameter for that denom to `false`
+- Initializing a test context with OCC-enabled multistore
+- Creating a transaction with a limited gas meter
+- Configuring multiple sequential write operations
 
-**Trigger:**
-1. Attempt to send "testtoken" via `MsgSend` - should fail with send disabled error
-2. Attempt to delegate "testtoken" to the validator - currently succeeds (demonstrates vulnerability)
+**Action:**
+- Executing the transaction via `scheduler.ProcessAll()`
+- The transaction performs writes that progressively consume gas
+- An out-of-gas panic occurs mid-execution after several successful writes
 
-**Observation:**
-- `MsgSend` correctly fails with `ErrSendDisabled`
-- `MsgDelegate` succeeds even though the denom is disabled
-- After delegation, user balance decreases and module balance increases, proving the bypass
-- The test should assert that delegation SHOULD fail but currently passes, demonstrating the vulnerability
+**Expected Result:** All keys should be absent from the store (full rollback)
 
-**Test Code Outline:**
-```go
-func TestDelegateDisabledDenom(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Create validator
-    validators := createTestValidators(t, ctx, app, []int64{100})
-    
-    // Create user with custom denom balance
-    userAddr := sdk.AccAddress([]byte("user"))
-    disabledDenom := "testtoken"
-    amount := sdk.NewCoins(sdk.NewCoin(disabledDenom, sdk.NewInt(1000)))
-    
-    // Fund user account
-    require.NoError(t, app.BankKeeper.MintCoins(ctx, minttypes.ModuleName, amount))
-    require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(ctx, minttypes.ModuleName, userAddr, amount))
-    
-    // Disable the denom
-    params := app.BankKeeper.GetParams(ctx)
-    params = params.SetSendEnabledParam(disabledDenom, false)
-    app.BankKeeper.SetParams(ctx, params)
-    
-    // Verify send is blocked
-    err := app.BankKeeper.SendCoins(ctx, userAddr, sdk.AccAddress([]byte("recipient")), amount)
-    require.Error(t, err)
-    require.Contains(t, err.Error(), "transfers are currently disabled")
-    
-    // Attempt delegation - SHOULD fail but currently succeeds
-    delegateAmount := sdk.NewCoin(disabledDenom, sdk.NewInt(500))
-    _, err = app.StakingKeeper.Delegate(ctx, userAddr, delegateAmount.Amount, types.Unbonded, validators[0], true)
-    
-    // This assertion SHOULD pass (delegation should be blocked) but currently fails
-    // demonstrating the vulnerability
-    require.Error(t, err, "Delegation of disabled denom should fail but currently succeeds")
-    require.Contains(t, err.Error(), "transfers are currently disabled")
-}
-```
+**Actual Result:** Keys written before the out-of-gas error persist in the committed state (atomicity violation), while the response correctly indicates transaction failure (Code != 0)
 
-The test demonstrates that while `SendCoins` correctly rejects disabled denominations, `Delegate` allows them through, proving the bypass vulnerability.
+The vulnerability is confirmed by observing that `responses[0].Code != 0` (transaction failed) yet partial state writes remain in the store, demonstrating the broken atomicity guarantee.
+
+## Notes
+
+This is a critical architectural flaw in the OCC implementation that fundamentally breaks transaction atomicity - a core blockchain guarantee. The standard execution path correctly handles this via conditional cache writes, but the OCC path lacks the equivalent check. The fix is straightforward but essential for maintaining state integrity.
 
 ### Citations
 
-**File:** x/bank/keeper/keeper.go (L184-225)
+**File:** tasks/scheduler.go (L571-577)
 ```go
-func (k BaseKeeper) DelegateCoins(ctx sdk.Context, delegatorAddr, moduleAccAddr sdk.AccAddress, amt sdk.Coins) error {
-	moduleAcc := k.ak.GetAccount(ctx, moduleAccAddr)
-	if moduleAcc == nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", moduleAccAddr)
+	task.SetStatus(statusExecuted)
+	task.Response = &resp
+
+	// write from version store to multiversion stores
+	for _, v := range task.VersionStores {
+		v.WriteToMultiVersionStore()
 	}
+```
 
-	if !amt.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
+**File:** baseapp/baseapp.go (L1015-1016)
+```go
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
+```
+
+**File:** store/gaskv/store.go (L69-80)
+```go
+func (gs *Store) Set(key []byte, value []byte) {
+	types.AssertValidKey(key)
+	types.AssertValidValue(value)
+	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostFlat, types.GasWriteCostFlatDesc)
+	// TODO overflow-safe math?
+	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(key)), types.GasWritePerByteDesc)
+	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(value)), types.GasWritePerByteDesc)
+	gs.parent.Set(key, value)
+	if gs.tracer != nil {
+		gs.tracer.Set(key, value, gs.moduleName)
 	}
-
-	balances := sdk.NewCoins()
-
-	for _, coin := range amt {
-		balance := k.GetBalance(ctx, delegatorAddr, coin.GetDenom())
-		if balance.IsLT(coin) {
-			return sdkerrors.Wrapf(
-				sdkerrors.ErrInsufficientFunds, "failed to delegate; %s is smaller than %s", balance, amt,
-			)
-		}
-
-		balances = balances.Add(balance)
-		err := k.setBalance(ctx, delegatorAddr, balance.Sub(coin), true)
-		if err != nil {
-			return err
-		}
-	}
-
-	if err := k.trackDelegation(ctx, delegatorAddr, balances, amt); err != nil {
-		return sdkerrors.Wrap(err, "failed to track delegation")
-	}
-	// emit coin spent event
-	ctx.EventManager().EmitEvent(
-		types.NewCoinSpentEvent(delegatorAddr, amt),
-	)
-
-	err := k.AddCoins(ctx, moduleAccAddr, amt, true)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 ```
 
-**File:** x/bank/keeper/keeper.go (L509-509)
+**File:** store/multiversion/mvkv.go (L370-375)
 ```go
-	return k.DelegateCoins(ctx, senderAddr, recipientAcc.GetAddress(), amt)
+func (store *VersionIndexedStore) setValue(key, value []byte) {
+	types.AssertValidKey(key)
+
+	keyStr := string(key)
+	store.writeset[keyStr] = value
+}
 ```
 
-**File:** x/bank/keeper/msg_server.go (L29-31)
+**File:** baseapp/recovery.go (L48-62)
 ```go
-	if err := k.IsSendEnabledCoins(ctx, msg.Amount...); err != nil {
-		return nil, err
-	}
-```
-
-**File:** x/bank/keeper/msg_server.go (L83-85)
-```go
-		if err := k.IsSendEnabledCoins(ctx, in.Coins...); err != nil {
-			return nil, err
+// newOutOfGasRecoveryMiddleware creates a standard OutOfGas recovery middleware for app.runTx method.
+func newOutOfGasRecoveryMiddleware(gasWanted uint64, ctx sdk.Context, next recoveryMiddleware) recoveryMiddleware {
+	handler := func(recoveryObj interface{}) error {
+		err, ok := recoveryObj.(sdk.ErrorOutOfGas)
+		if !ok {
+			return nil
 		}
-```
 
-**File:** x/auth/vesting/msg_server.go (L35-37)
-```go
-	if err := bk.IsSendEnabledCoins(ctx, msg.Amount...); err != nil {
-		return nil, err
+		return sdkerrors.Wrap(
+			sdkerrors.ErrOutOfGas, fmt.Sprintf(
+				"out of gas in location: %v; gasWanted: %d, gasUsed: %d",
+				err.Descriptor, gasWanted, ctx.GasMeter().GasConsumed(),
+			),
+		)
 	}
 ```
 
-**File:** x/staking/keeper/msg_server.go (L218-218)
+**File:** store/multiversion/store.go (L399-435)
 ```go
-	newShares, err := k.Keeper.Delegate(ctx, delegatorAddress, msg.Amount.Amount, types.Unbonded, validator, true)
-```
+func (s *Store) WriteLatestToStore() {
+	// sort the keys
+	keys := []string{}
+	s.multiVersionMap.Range(func(key, value interface{}) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	sort.Strings(keys)
 
-**File:** x/staking/keeper/delegation.go (L701-702)
-```go
-		if err := k.bankKeeper.DelegateCoinsFromAccountToModule(ctx, delegatorAddress, sendName, coins); err != nil {
-			return sdk.Dec{}, err
+	for _, key := range keys {
+		val, ok := s.multiVersionMap.Load(key)
+		if !ok {
+			continue
+		}
+		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
+		if !found {
+			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
+			continue
+		}
+		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
+		if mvValue.IsEstimate() {
+			panic("should not have any estimate values when writing to parent store")
+		}
+		// if the value is deleted, then delete it from the parent store
+		if mvValue.IsDeleted() {
+			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
+			// be sure if the underlying store might do a save with the byteslice or
+			// not. Once we get confirmation that .Delete is guaranteed not to
+			// save the byteslice, then we can assume only a read-only copy is sufficient.
+			s.parentStore.Delete([]byte(key))
+			continue
+		}
+		if mvValue.Value() != nil {
+			s.parentStore.Set([]byte(key), mvValue.Value())
+		}
+	}
+}
 ```

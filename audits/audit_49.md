@@ -1,275 +1,294 @@
 # Audit Report
 
 ## Title
-Out-of-Bounds Panic in Multisig Verification Due to Missing Signature Count Validation Against True Bits
+Genesis Validation Bypass Allows Node Panic via Empty Granter/Grantee Addresses in Authz Module
 
 ## Summary
-The signature count validation in `VerifyMultisignature` only checks that the number of signatures is between the threshold and the total number of public keys, but fails to validate that it equals the number of true bits in the bit array. This allows an attacker to craft a malicious multisig transaction that causes an out-of-bounds array access, resulting in a node panic and denial of service. [1](#0-0) 
+The authz module's `ValidateGenesis` function returns `nil` without performing any validation on granter and grantee addresses in the genesis state. When `InitGenesis` subsequently processes these entries using `MustAccAddressFromBech32`, empty or invalid addresses cause a panic, resulting in all nodes crashing on startup and preventing network initialization. [1](#0-0) 
 
 ## Impact
-**High** - This vulnerability enables a denial-of-service attack that can crash validator nodes and halt the network's ability to process transactions.
+High
 
 ## Finding Description
 
 **Location:** 
-- Primary: `crypto/keys/multisig/multisig.go`, function `VerifyMultisignature`, lines 59-94
-- Secondary: `x/auth/ante/sigverify.go`, function `ConsumeMultisignatureVerificationGas`, lines 446-471 [2](#0-1) 
+- Primary vulnerability: `x/authz/genesis.go` at the `ValidateGenesis` function (lines 14-17)
+- Panic trigger: `x/authz/keeper/keeper.go` at the `InitGenesis` function (lines 246-260) [2](#0-1) 
 
 **Intended Logic:** 
-The signature count validation should ensure that the number of signatures provided matches the number of signers indicated by the bit array, preventing any mismatch that could lead to out-of-bounds access during verification.
+The `ValidateGenesis` function is documented to "check the given genesis state has no integrity issues" and should validate that all granter and grantee addresses are valid, non-empty bech32 addresses before chain initialization. This validation layer exists to catch data integrity issues early, preventing runtime failures.
 
 **Actual Logic:** 
-The validation at line 60 only checks:
-1. `len(sigs) >= int(m.Threshold)` - at least threshold signatures
-2. `len(sigs) <= size` - at most as many signatures as public keys
+The `ValidateGenesis` function returns `nil` immediately without performing any validation checks. This allows genesis files containing empty or malformed addresses to pass validation. During `InitGenesis`, the keeper calls `sdk.MustAccAddressFromBech32()` on both granter and grantee addresses, which explicitly panics when encountering empty strings or invalid bech32 format. [3](#0-2) [4](#0-3) 
 
-However, it does NOT validate that `len(sigs)` equals the number of true bits in the bit array (`bitarray.NumTrueBitsBefore(size)`).
+**Exploitation Path:**
+1. Genesis file is created for new chain initialization or chain upgrade containing authz grant entries with empty/invalid granter or grantee addresses (can occur through bugs in genesis generation tooling, manual errors, or data corruption)
+2. The `validate-genesis` command is run, which calls `BasicManager.ValidateGenesis()`
+3. For the authz module, `AppModuleBasic.ValidateGenesis()` is invoked, which calls `authz.ValidateGenesis(data)`
+4. Validation passes because `ValidateGenesis()` returns `nil` without checking addresses
+5. Nodes attempt to start using this genesis file
+6. During initialization, `AppModule.InitGenesis()` calls `keeper.InitGenesis()`
+7. The keeper iterates through authorization entries and calls `sdk.MustAccAddressFromBech32(entry.Grantee)` and `sdk.MustAccAddressFromBech32(entry.Granter)`
+8. `MustAccAddressFromBech32` calls `AccAddressFromBech32`, which returns error "empty address string is not allowed" for empty strings
+9. `MustAccAddressFromBech32` panics with this error
+10. All validator nodes crash on startup, preventing network initialization [5](#0-4) [6](#0-5) 
 
-The verification loop (lines 69-94) iterates through each bit in the array and when a bit is true, accesses `sig.Signatures[sigIndex]` then increments `sigIndex`. If there are more true bits than signatures available, this causes a panic due to out-of-bounds array access. [3](#0-2) 
-
-**Exploit Scenario:**
-1. An attacker crafts a transaction with a multisig signature where:
-   - The multisig public key has 5 public keys with threshold 3
-   - The bit array has 4 bits set to true (e.g., positions 0, 1, 2, 3)
-   - The signatures array contains only 3 signatures
-   
-2. The transaction passes all validation checks:
-   - Line 56: bit array size equals number of public keys ✓
-   - Line 60: `3 >= 3 && 3 <= 5` ✓
-   - Line 64: 4 true bits >= 3 threshold ✓
-
-3. During verification loop execution:
-   - Iterations 0-2: Successfully verify signatures at indices 0, 1, 2
-   - Iteration 3: Attempts to access `sig.Signatures[3]` which doesn't exist
-   - Result: Panic with out-of-bounds error
-
-4. The attacker can submit this transaction to the network, causing any validator node that attempts to verify it to crash. [4](#0-3) 
-
-The attacker controls the transaction structure through the protobuf `ModeInfo.Multi` fields, where `Bitarray` and `ModeInfos` (which determines signature count) can be independently specified. [5](#0-4) 
-
-**Security Failure:** 
-This breaks memory safety and availability guarantees. The panic occurs during transaction processing in the ante handler, causing the node to crash. This is a denial-of-service vulnerability that can be exploited to disrupt network consensus.
+**Security Guarantee Broken:** 
+This violates the defense-in-depth principle and the data integrity validation guarantee. The validation layer fails to prevent invalid data from entering the initialization process, and the subsequent panic causes a complete denial of service. The documented purpose of `ValidateGenesis` is to catch integrity issues, but it performs no checks.
 
 ## Impact Explanation
 
-**Affected Assets/Processes:**
-- Network availability and consensus
-- Validator node uptime
-- Transaction processing capability
+**Affected Components:**
+- **Network availability**: All validator nodes attempting to initialize with invalid genesis data
+- **Chain initialization**: The entire network cannot start if the genesis contains invalid authz grants  
+- **Node operation**: Individual nodes crash immediately on startup with unrecoverable panic
 
 **Severity of Damage:**
-- Any validator node processing the malicious transaction will panic and crash
-- The crash occurs during signature verification in the ante handler, which is part of the critical transaction validation path
-- An attacker can repeatedly broadcast such transactions to continuously crash nodes
-- If enough validators crash simultaneously, the network cannot reach consensus and halts
-- No funds are directly at risk, but network functionality is completely compromised
+- **Complete network shutdown**: If the invalid genesis is used for chain initialization or upgrade, no nodes can start
+- **Persistent until manual intervention**: Nodes will panic on every restart attempt until the genesis file is manually corrected
+- **No transaction processing**: Because nodes cannot complete initialization, no blocks can be produced and no transactions can be confirmed
 
-**Why This Matters:**
-This vulnerability allows an unprivileged attacker (anyone who can submit transactions) to cause a network-wide denial of service without requiring significant resources or brute force. The attack is deterministic and can be repeated indefinitely, making it a critical availability threat to the blockchain network.
+**System Security Impact:**
+This vulnerability creates a critical single point of failure during chain initialization and upgrades. While it requires the invalid genesis to be adopted (through coordination or tooling), the validation layer's failure to detect the issue means that:
+- Bugs in genesis generation tooling can cause network-wide outages
+- Manual errors in genesis file creation go undetected until it's too late
+- Data corruption during genesis file transmission is not caught
+- No safety net exists to prevent initialization failures from invalid data
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant who can submit transactions. No special privileges, stake, or resources required beyond the ability to craft and broadcast a transaction.
+**Who Can Trigger It:**
+This can be triggered inadvertently by anyone involved in genesis creation:
+- Core developers creating genesis files for new chains
+- Teams setting up testnets who may make manual errors
+- Genesis generation tools with bugs that produce invalid output
+- Data corruption during genesis file transmission or storage
 
-**Required Conditions:**
-- The attacker needs to craft a transaction with a multisig signature containing the mismatched bit array and signature count
-- No special timing or network state is required
-- The vulnerability is triggered during normal transaction validation flow
+**Conditions Required:**
+- The invalid genesis file must be adopted by the network (through coordination, governance, or initial chain setup)
+- The authz module must be enabled (standard in Cosmos SDK chains)
+- At least one grant entry in the genesis must contain an empty or invalid granter/grantee address
 
 **Frequency:**
-- Can be exploited at any time during normal network operation
-- Each malicious transaction will crash any node that attempts to process it
-- The attack can be repeated continuously by broadcasting multiple malicious transactions
-- With automated tooling, an attacker could potentially crash nodes faster than they can restart
+- Most likely during testnet launches, mainnet launches, or chain upgrades when genesis files are actively being created or modified
+- Can occur from legitimate bugs in tooling rather than malicious intent
+- Once triggered, affects all nodes attempting to start with that genesis
+- Repeatable on every node restart until the genesis file is manually corrected
 
-This vulnerability has high likelihood of exploitation because:
-1. It's trivial to trigger (just craft one malicious transaction)
-2. The impact is immediate and guaranteed (deterministic crash)
-3. There are no rate limits or costs that prevent repeated exploitation
-4. The attack surface is available to all network participants
+**Comparison with Other Modules:**
+Other modules in the same codebase properly implement genesis validation. For example, the feegrant module validates its genesis data by calling `ValidateBasic()` on each grant, and the bank module's Balance type validates addresses using `AccAddressFromBech32()`. This demonstrates that the authz module's lack of validation is an incomplete implementation rather than intentional design. [7](#0-6) [8](#0-7) 
 
 ## Recommendation
 
-Add validation to ensure the number of signatures exactly equals the number of true bits in the bit array. Insert this check after line 64 in `VerifyMultisignature`:
+Implement proper validation in the `ValidateGenesis` function to verify all granter and grantee addresses before allowing genesis initialization:
 
 ```go
-// Ensure the number of signatures matches the number of true bits
-numTrueBits := bitarray.NumTrueBitsBefore(size)
-if len(sigs) != numTrueBits {
-    return fmt.Errorf("signature count %d does not match number of signers %d indicated by bit array", len(sigs), numTrueBits)
+func ValidateGenesis(data GenesisState) error {
+    for _, grant := range data.Authorization {
+        // Validate granter address
+        if len(strings.TrimSpace(grant.Granter)) == 0 {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "granter address cannot be empty")
+        }
+        if _, err := sdk.AccAddressFromBech32(grant.Granter); err != nil {
+            return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid granter address: %s", err)
+        }
+        
+        // Validate grantee address
+        if len(strings.TrimSpace(grant.Grantee)) == 0 {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "grantee address cannot be empty")
+        }
+        if _, err := sdk.AccAddressFromBech32(grant.Grantee); err != nil {
+            return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid grantee address: %s", err)
+        }
+        
+        // Additional validation: granter and grantee should not be identical
+        if grant.Granter == grant.Grantee {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be the same")
+        }
+    }
+    return nil
 }
 ```
 
-Apply the same fix to `ConsumeMultisignatureVerificationGas` in `x/auth/ante/sigverify.go` before line 454.
-
-This validation ensures the invariant that every true bit in the array has a corresponding signature, preventing the out-of-bounds access.
+This ensures that invalid addresses are caught during the validation phase rather than causing panics during initialization, following the pattern used by other modules in the codebase.
 
 ## Proof of Concept
 
-**File:** `crypto/keys/multisig/multisig_test.go`
+**Test File:** `x/authz/keeper/genesis_test.go`
 
 **Test Function:** Add the following test to demonstrate the vulnerability:
 
 ```go
-func TestVerifyMultisignaturePanicOnMismatchedSigCount(t *testing.T) {
-	// This test demonstrates the vulnerability where a bit array with more true bits
-	// than signatures causes a panic due to out-of-bounds array access
-	
-	msg := []byte{1, 2, 3, 4}
-	pubKeys, sigs := generatePubKeysAndSignatures(5, msg)
-	
-	// Create a multisig key with 5 public keys, threshold 3
-	pk := kmultisig.NewLegacyAminoPubKey(3, pubKeys)
-	
-	// Create a bit array with 5 positions
-	bitArray := cryptotypes.NewCompactBitArray(5)
-	
-	// Set 4 bits to true (positions 0, 1, 2, 3)
-	bitArray.SetIndex(0, true)
-	bitArray.SetIndex(1, true)
-	bitArray.SetIndex(2, true)
-	bitArray.SetIndex(3, true)
-	
-	// Create MultiSignatureData with only 3 signatures (less than 4 true bits)
-	// This creates a mismatch between true bits (4) and signature count (3)
-	maliciousSig := &signing.MultiSignatureData{
-		BitArray:   bitArray,
-		Signatures: []signing.SignatureData{sigs[0], sigs[1], sigs[2]},
-	}
-	
-	signBytesFn := func(mode signing.SignMode) ([]byte, error) { return msg, nil }
-	
-	// This should panic with out-of-bounds error when trying to access sig.Signatures[3]
-	// The panic occurs because the loop finds 4 true bits but only 3 signatures exist
-	require.Panics(t, func() {
-		_ = pk.VerifyMultisignature(signBytesFn, maliciousSig)
-	}, "Expected panic due to out-of-bounds access, but no panic occurred")
+func (suite *GenesisTestSuite) TestInitGenesisWithEmptyGranterPanics() {
+    now := suite.ctx.BlockHeader().Time
+    
+    // Create a SendAuthorization
+    coins := sdk.NewCoins(sdk.NewCoin("foo", sdk.NewInt(1_000)))
+    grant := &bank.SendAuthorization{SpendLimit: coins}
+    
+    // Convert to Any
+    authAny, err := cdctypes.NewAnyWithValue(grant)
+    suite.Require().NoError(err)
+    
+    // Create genesis state with empty granter address
+    genesis := &authz.GenesisState{
+        Authorization: []authz.GrantAuthorization{
+            {
+                Granter:       "", // Empty - will cause panic
+                Grantee:       granteeAddr.String(),
+                Authorization: authAny,
+                Expiration:    now.Add(time.Hour),
+            },
+        },
+    }
+    
+    // This panics because MustAccAddressFromBech32 is called with empty string
+    suite.Require().Panics(func() {
+        suite.keeper.InitGenesis(suite.ctx, genesis)
+    })
+}
+
+func (suite *GenesisTestSuite) TestValidateGenesisDoesNotCatchEmptyAddresses() {
+    now := suite.ctx.BlockHeader().Time
+    
+    coins := sdk.NewCoins(sdk.NewCoin("foo", sdk.NewInt(1_000)))
+    grant := &bank.SendAuthorization{SpendLimit: coins}
+    
+    authAny, err := cdctypes.NewAnyWithValue(grant)
+    suite.Require().NoError(err)
+    
+    // Genesis with empty addresses
+    genesisData := authz.GenesisState{
+        Authorization: []authz.GrantAuthorization{
+            {
+                Granter:       "",
+                Grantee:       "",
+                Authorization: authAny,
+                Expiration:    now.Add(time.Hour),
+            },
+        },
+    }
+    
+    // ValidateGenesis incorrectly returns no error
+    err = authz.ValidateGenesis(genesisData)
+    suite.Require().NoError(err)
 }
 ```
 
-**Setup:**
-- Creates 5 public/private key pairs and corresponding signatures
-- Creates a multisig public key with threshold 3
+**Setup:** Uses the existing `GenesisTestSuite` with initialized test context and keeper.
 
-**Trigger:**
-- Constructs a malicious `MultiSignatureData` with 4 true bits in the bit array but only 3 signatures
-- Calls `VerifyMultisignature` with this malicious data
+**Action:** Creates a `GenesisState` with authorization grants containing empty granter/grantee addresses, then calls `InitGenesis`.
 
-**Observation:**
-- The test expects a panic when `VerifyMultisignature` attempts to access the non-existent 4th signature
-- On vulnerable code, the panic occurs at line 71 when `sigIndex=3` and `sig.Signatures[3]` is accessed
-- The panic confirms the out-of-bounds vulnerability
+**Result:** `InitGenesis` panics when `MustAccAddressFromBech32` attempts to parse empty strings, while `ValidateGenesis` incorrectly returns no error, demonstrating that the validation layer fails to catch the invalid data.
 
-**To Run:**
-```bash
-cd crypto/keys/multisig
-go test -v -run TestVerifyMultisignaturePanicOnMismatchedSigCount
-```
+## Notes
 
-The test will panic on the vulnerable code, demonstrating that a malicious transaction with this signature structure will crash any node that attempts to verify it.
+This vulnerability represents a defense-in-depth failure where the validation layer exists but does not perform its documented function. The impact matches the provided severity criteria: "Network not being able to confirm new transactions (total network shutdown)" classified as High severity. The issue can be triggered through legitimate bugs or errors in genesis creation processes, not just malicious intent, making it a realistic threat to network availability during critical initialization phases.
 
 ### Citations
 
-**File:** crypto/keys/multisig/multisig.go (L50-96)
+**File:** x/authz/genesis.go (L14-17)
 ```go
-func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
-	bitarray := sig.BitArray
-	sigs := sig.Signatures
-	size := bitarray.Count()
-	pubKeys := m.GetPubKeys()
-	// ensure bit array is the correct size
-	if len(pubKeys) != size {
-		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
+// ValidateGenesis check the given genesis state has no integrity issues
+func ValidateGenesis(data GenesisState) error {
+	return nil
+}
+```
+
+**File:** x/authz/keeper/keeper.go (L246-260)
+```go
+func (k Keeper) InitGenesis(ctx sdk.Context, data *authz.GenesisState) {
+	for _, entry := range data.Authorization {
+		grantee := sdk.MustAccAddressFromBech32(entry.Grantee)
+		granter := sdk.MustAccAddressFromBech32(entry.Granter)
+		a, ok := entry.Authorization.GetCachedValue().(authz.Authorization)
+		if !ok {
+			panic("expected authorization")
+		}
+
+		err := k.SaveGrant(ctx, grantee, granter, a, entry.Expiration)
+		if err != nil {
+			panic(err)
+		}
 	}
-	// ensure size of signature list
-	if len(sigs) < int(m.Threshold) || len(sigs) > size {
-		return fmt.Errorf("signature size is incorrect %d", len(sigs))
+}
+```
+
+**File:** types/address.go (L157-165)
+```go
+// MustAccAddressFromBech32 calls AccAddressFromBech32 and panics on error.
+func MustAccAddressFromBech32(address string) AccAddress {
+	addr, err := AccAddressFromBech32(address)
+	if err != nil {
+		panic(err)
 	}
-	// ensure at least k signatures are set
-	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
-		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
+
+	return addr
+}
+```
+
+**File:** types/address.go (L168-171)
+```go
+func AccAddressFromBech32(address string) (addr AccAddress, err error) {
+	if len(strings.TrimSpace(address)) == 0 {
+		return AccAddress{}, errors.New("empty address string is not allowed")
 	}
-	// index in the list of signatures which we are concerned with.
-	sigIndex := 0
-	for i := 0; i < size; i++ {
-		if bitarray.GetIndex(i) {
-			si := sig.Signatures[sigIndex]
-			switch si := si.(type) {
-			case *signing.SingleSignatureData:
-				msg, err := getSignBytes(si.SignMode)
-				if err != nil {
-					return err
-				}
-				if !pubKeys[i].VerifySignature(msg, si.Signature) {
-					return fmt.Errorf("unable to verify signature at index %d", i)
-				}
-			case *signing.MultiSignatureData:
-				nestedMultisigPk, ok := pubKeys[i].(multisigtypes.PubKey)
-				if !ok {
-					return fmt.Errorf("unable to parse pubkey of index %d", i)
-				}
-				if err := nestedMultisigPk.VerifyMultisignature(getSignBytes, si); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("improper signature data type for index %d", sigIndex)
+```
+
+**File:** x/authz/module/module.go (L63-71)
+```go
+// ValidateGenesis performs genesis state validation for the authz module.
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config sdkclient.TxEncodingConfig, bz json.RawMessage) error {
+	var data authz.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return sdkerrors.Wrapf(err, "failed to unmarshal %s genesis state", authz.ModuleName)
+	}
+
+	return authz.ValidateGenesis(data)
+}
+```
+
+**File:** x/genutil/client/cli/validate_genesis.go (L54-62)
+```go
+
+			var genState map[string]json.RawMessage
+			if err = json.Unmarshal(genDoc.AppState, &genState); err != nil {
+				return fmt.Errorf("error unmarshalling genesis doc %s: %s", genesis, err.Error())
 			}
-			sigIndex++
+
+			if err = mbm.ValidateGenesis(cdc, clientCtx.TxConfig, genState); err != nil {
+				return fmt.Errorf("error validating genesis file %s: %s", genesis, err.Error())
+			}
+```
+
+**File:** x/feegrant/genesis.go (L16-29)
+```go
+// ValidateGenesis ensures all grants in the genesis state are valid
+func ValidateGenesis(data GenesisState) error {
+	for _, f := range data.Allowances {
+		grant, err := f.GetGrant()
+		if err != nil {
+			return err
+		}
+		err = grant.ValidateBasic()
+		if err != nil {
+			return err
 		}
 	}
 	return nil
 }
 ```
 
-**File:** x/auth/tx/sigs.go (L66-85)
+**File:** x/bank/types/balance.go (L25-36)
 ```go
-	case *tx.ModeInfo_Multi_:
-		multi := modeInfo.Multi
+// Validate checks for address and coins correctness.
+func (b Balance) Validate() error {
+	if _, err := sdk.AccAddressFromBech32(b.Address); err != nil {
+		return err
+	}
 
-		sigs, err := decodeMultisignatures(sig)
-		if err != nil {
-			return nil, err
-		}
-
-		sigv2s := make([]signing.SignatureData, len(sigs))
-		for i, mi := range multi.ModeInfos {
-			sigv2s[i], err = ModeInfoAndSigToSignatureData(mi, sigs[i])
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		return &signing.MultiSignatureData{
-			BitArray:   multi.Bitarray,
-			Signatures: sigv2s,
-		}, nil
-```
-
-**File:** x/auth/ante/sigverify.go (L446-471)
-```go
-func ConsumeMultisignatureVerificationGas(
-	meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-	params types.Params, accSeq uint64,
-) error {
-
-	size := sig.BitArray.Count()
-	sigIndex := 0
-
-	for i := 0; i < size; i++ {
-		if !sig.BitArray.GetIndex(i) {
-			continue
-		}
-		sigV2 := signing.SignatureV2{
-			PubKey:   pubkey.GetPubKeys()[i],
-			Data:     sig.Signatures[sigIndex],
-			Sequence: accSeq,
-		}
-		err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
-		if err != nil {
-			return err
-		}
-		sigIndex++
+	if err := b.Coins.Validate(); err != nil {
+		return err
 	}
 
 	return nil

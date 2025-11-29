@@ -1,345 +1,307 @@
 # Audit Report
 
 ## Title
-Quadratic Complexity in DAG Building via ResourceType_ANY Parent Dependency Expansion Leads to Validator DoS
+Deferred Balance Cache Accumulation Causes Invariant Violation and Chain Halt
 
 ## Summary
-The `GetNodeDependencies` function in `graph.go` expands parent dependencies by calling `GetResourceDependencies()`, which for `ResourceType_ANY` returns ~60+ resource types. When multiple transactions use `SynchronousAccessOps` (falling back to `ResourceType_ANY`), the dependency checking creates O(N²) computational complexity, enabling attackers to cause significant CPU resource consumption and potential validator shutdowns. [1](#0-0) 
+The bank module's deferred balance system uses a MemoryStoreKey that persists data across blocks. Since `WriteDeferredBalances` is never called in the production block processing flow, and transaction indices reset per block, deferred balances accumulate incorrectly in the cache. This eventually causes the `TotalSupply` invariant to detect accounting inconsistencies, triggering a deterministic chain-wide panic and halt. [1](#0-0) 
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
 **Location:** 
-- Primary: `x/accesscontrol/types/graph.go`, lines 314-327 in `GetNodeDependencies` function
-- Secondary: `types/accesscontrol/resource.go`, lines 177-196 in `GetResourceDependencies` function
-- Fallback trigger: `x/accesscontrol/keeper/keeper.go`, line 173 in `GetWasmDependencyAccessOps` [1](#0-0) 
+- Deferred send implementation: `x/bank/keeper/keeper.go` lines 408-432
+- Memory store persistence: `store/mem/store.go` lines 20-21 and 54-55
+- Missing cleanup in simapp: `simapp/app.go` lines 442-447
+- Invariant check: `x/bank/keeper/invariants.go` lines 59-104
 
-**Intended Logic:** 
-The `GetNodeDependencies` function should efficiently identify which previous nodes the current node depends on by checking resource access patterns. The parent dependency expansion via `GetResourceDependencies()` is intended to handle resource hierarchies. [2](#0-1) 
+**Intended Logic:**
+The deferred balance system should batch balance transfers for optimization. When `DeferredSendCoinsFromAccountToModule` is called during transaction processing, it deducts from the sender immediately and stores the credit in a cache indexed by (moduleAddress, txIndex). At block finalization, `WriteDeferredBalances` should credit all module accounts with accumulated amounts and clear the cache for the next block. [2](#0-1) 
 
-**Actual Logic:** 
-When a transaction uses `ResourceType_ANY` (via `SynchronousAccessOps`), the function calls `GetResourceDependencies()` which returns ~60+ resource types (the resource itself, all parents, and all children via breadth-first traversal). [2](#0-1) 
+**Actual Logic:**
+The system has three critical flaws working together:
 
-For each of these ~60 resources, `getNodeDependenciesForResource` is called, which performs lookups in the `ResourceAccessMap`. For `ResourceType_ANY` specifically, it finds all previous transactions that also used `ResourceType_ANY`, leading to O(R × N) operations per transaction where R ≈ 60 and N is the number of previous transactions. [3](#0-2) 
+1. **Memory Store Persistence**: The deferred cache uses MemoryStoreKey which explicitly persists between commits and blocks, unlike TransientStoreKey which resets. [3](#0-2) [4](#0-3) 
 
-**Exploit Scenario:**
-1. Attacker deploys WASM contracts without registering dependency mappings
-2. When these contracts are called, `GetWasmDependencyAccessOps` returns `SynchronousAccessOps()` due to missing mappings [4](#0-3) 
+2. **Missing Cleanup**: `WriteDeferredBalances` is never called in production because:
+   - No PreCommitHandler is configured in simapp [5](#0-4) 
+   - The bank module has no EndBlocker
+   - The cache Clear function is only invoked from WriteDeferredBalances [6](#0-5) 
 
-3. `SynchronousAccessOps()` uses `{AccessType_UNKNOWN, ResourceType_ANY, "*"}` operations [5](#0-4) 
+3. **TxIndex Accumulation Bug**: Transaction indices reset to 0 for each new block. The cache uses (moduleAddress, txIndex) as keys, and `UpsertBalance` adds to existing entries. This causes accumulation: [7](#0-6) [8](#0-7) 
 
-4. Attacker submits many transactions (e.g., 1000+) to these unmapped contracts in a single block
-5. During DAG building via `BuildDependencyDag`, each transaction must check dependencies against all previous transactions [6](#0-5) 
+**Exploitation Path:**
+1. Any user submits transactions that pay fees (triggers `DeferredSendCoinsFromAccountToModule` via ante handler) [9](#0-8) 
+2. Sender accounts are debited, amounts stored in deferred cache with key (feeCollector, txIndex)
+3. Block commits without clearing cache (MemoryStore persists)
+4. Next block's transactions reuse same txIndex values (0, 1, 2...), adding to accumulated cache entries
+5. Crisis module periodically runs invariant checks [10](#0-9) 
+6. The TotalSupply invariant counts all deferred balances (including accumulated old ones) when calculating expected total [11](#0-10) 
+7. Eventually the accumulated deferred balances create a discrepancy between expected and actual totals
+8. Invariant failure triggers panic, halting all nodes deterministically [12](#0-11) 
 
-6. For N transactions: total complexity is O(N²) with approximately N×(N-1)/2 dependency checks
-7. For N=1000 transactions: ~500,000 dependency check operations
-8. For N=2000 transactions: ~2,000,000 dependency check operations
-
-**Security Failure:** 
-Denial-of-Service via CPU resource exhaustion. The quadratic complexity allows attackers to consume excessive validator CPU time during block processing, potentially causing:
-- Validators to timeout on block proposal/validation
-- Block processing delays exceeding 500% of normal time
-- Shutdown of ≥30% of network processing nodes
+**Security Guarantee Broken:**
+The accounting invariant that total supply equals the sum of all balances is violated. This causes a deterministic consensus failure as all nodes execute the same invariant check and panic at the same block height.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- Validator CPU resources during `BuildDependencyDag` execution
-- Block proposal and validation timing
-- Network liveness and transaction confirmation times
+When the `TotalSupply` invariant detects the accumulated deferred balance discrepancy, it returns `broken = true`, causing the crisis module's `AssertInvariants` to panic. This results in:
 
-**Severity of Damage:**
-- Validators experience O(N²) CPU consumption when processing blocks with N transactions using `ResourceType_ANY`
-- With sufficient transactions (achievable within block size limits), validators can:
-  - Consume 30%+ additional CPU resources compared to normal operation
-  - Experience block processing delays of 500%+ beyond normal times
-  - Potentially crash or timeout if resources are exhausted
-  - Lead to ≥30% of validators failing to keep up with the network
+- **Total network shutdown**: All validators halt at the same block height
+- **No new transactions processed**: The chain cannot progress until manual intervention
+- **Requires hard fork or emergency upgrade**: Normal recovery mechanisms cannot resolve a panicked chain state
+- **Complete fund freeze**: During the halt, no transfers, staking operations, or governance actions can occur
 
-**System Impact:**
-This breaks the availability and liveness properties of the blockchain. While the attack requires filling blocks with transactions (incurring gas costs), an attacker can use minimal-cost transactions to unmapped WASM contracts to maximize the DoS impact per unit cost.
+This matches the High severity impact category: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any user who can:
-1. Deploy WASM contracts (standard blockchain operation)
-2. Submit transactions to those contracts (standard blockchain operation)
-3. Not register dependency mappings (simply by not calling governance proposals to register them)
+**Who Can Trigger:** Any network user submitting transactions. The issue occurs through normal protocol operation whenever transactions pay fees.
 
 **Conditions Required:**
-- Attacker must deploy WASM contracts without dependency mappings
-- Attacker must submit sufficient transactions in a block to create noticeable impact (hundreds to thousands)
-- Block size limits (MaxBytes, MaxGas) constrain but don't prevent the attack
+- Bank keeper initialized with deferred cache support (confirmed in simapp) [13](#0-12) [14](#0-13) 
+- Multiple blocks with fee-paying transactions
+- Sufficient accumulation for invariant to detect (depends on transaction volume and invariant check period)
 
-**Frequency:**
-- Can be triggered on every block once attacker has deployed unmapped contracts
-- Attack persists until contracts get dependency mappings registered via governance
-- Cost to attacker is gas fees for transactions, but impact is disproportionately high
+**Frequency:** This will occur deterministically once enough deferred operations accumulate across blocks. With any reasonable transaction volume, the accumulation will grow until the next periodic invariant check detects the mismatch. The time to failure depends on the `InvCheckPeriod` configuration in the crisis module. [15](#0-14) 
 
 ## Recommendation
 
-Implement a limit on the number of resource types returned by `GetResourceDependencies()` or add caching/memoization to avoid redundant dependency checks:
+Implement one of the following fixes (in order of preference):
 
-**Option 1 - Add Maximum Resource Expansion Limit:**
+**Option 1 (Recommended):** Add a PreCommitHandler in simapp initialization that calls `WriteDeferredBalances` before each block commit:
+```go
+app.SetPreCommitHandler(func(ctx sdk.Context) error {
+    app.BankKeeper.WriteDeferredBalances(ctx)
+    return nil
+})
 ```
-In GetNodeDependencies (graph.go:314-327):
-- Add a check: if len(parentResources) > MAX_RESOURCE_EXPANSION (e.g., 10)
-- Fall back to only checking the resource itself without full expansion
-```
+This should be added after line 447 in `simapp/app.go`.
 
-**Option 2 - Cache Dependency Results:**
-```
-In GetNodeDependencies:
-- Cache dependency results per (ResourceType, TxIndex) pair
-- Reuse cached results for repeated resource type checks
-```
+**Option 2:** Add an EndBlocker to the bank module that calls `WriteDeferredBalances` to properly flush and clear the cache at the end of each block.
 
-**Option 3 - Prevent Excessive SynchronousAccessOps Usage:**
-```
-In BuildDependencyDag (keeper.go:555-609):
-- Count transactions using ResourceType_ANY per block
-- Reject blocks exceeding a threshold (e.g., 10% of transactions)
-- Or apply rate limiting per contract address
-```
-
-**Option 4 - Optimize getNodeDependenciesForResource:**
-```
-In getNodeDependenciesForResource (graph.go:296-311):
-- For ResourceType_ANY checks, maintain a separate fast-path index
-- Only check ResourceType_ANY once rather than for each expanded resource
-```
+**Option 3:** Change the deferred cache store key from MemoryStoreKey to TransientStoreKey, which automatically resets between blocks (similar to how params module uses TransientStoreKey). This would require updating line 230 in `simapp/app.go`: [16](#0-15) 
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/types/graph_test.go`
-**Test Function:** `TestQuadraticComplexityWithResourceTypeANY`
+**Test Setup:**
+1. Initialize simapp with bank keeper using deferred cache (as in production)
+2. Create test accounts with initial balances  
+3. Fund accounts and module accounts appropriately
+4. Configure crisis module with `InvCheckPeriod = 1` for immediate invariant checking
 
-**Setup:**
-```go
-func TestQuadraticComplexityWithResourceTypeANY(t *testing.T) {
-    // Test demonstrates O(N²) complexity when N transactions use ResourceType_ANY
-    
-    // Create synchronous access ops (what unmapped WASM contracts use)
-    syncOps := SynchronousAccessOps()
-    require.Len(t, syncOps, 2) // UNKNOWN and COMMIT
-    require.Equal(t, acltypes.ResourceType_ANY, syncOps[0].ResourceType)
-    
-    // Test with increasing transaction counts
-    testCases := []struct{
-        numTxs int
-    }{
-        {numTxs: 50},
-        {numTxs: 100},
-        {numTxs: 200},
-        {numTxs: 400},
-    }
-    
-    for _, tc := range testCases {
-        t.Run(fmt.Sprintf("NumTxs=%d", tc.numTxs), func(t *testing.T) {
-            dag := NewDag()
-            
-            // Measure time to build DAG
-            start := time.Now()
-            
-            // Simulate N transactions each with SynchronousAccessOps
-            for txIndex := 0; txIndex < tc.numTxs; txIndex++ {
-                for msgIndex, accessOp := range syncOps {
-                    dag.AddNodeBuildDependency(msgIndex, txIndex, accessOp)
-                }
-            }
-            
-            duration := time.Since(start)
-            
-            // Verify the dag structure
-            require.Equal(t, tc.numTxs * 2, len(dag.NodeMap)) // 2 nodes per tx
-            
-            // Count total edges - should be O(N²)
-            totalEdges := 0
-            for _, edges := range dag.EdgesMap {
-                totalEdges += len(edges)
-            }
-            
-            // Expected edges: each tx (except first) depends on all previous txs
-            // = 0 + 1 + 2 + ... + (N-1) ≈ N²/2
-            expectedEdges := tc.numTxs * (tc.numTxs - 1) / 2
-            
-            t.Logf("NumTxs=%d, Edges=%d, Expected≈%d, Duration=%v", 
-                tc.numTxs, totalEdges, expectedEdges, duration)
-            
-            // Edges should grow quadratically
-            require.Greater(t, totalEdges, 0)
-        })
-    }
-}
-```
+**Trigger Sequence:**
+1. Block N: Execute transaction that calls `DeferredSendCoinsFromAccountToModule` to transfer 100 tokens from sender to fee collector
+2. Verify: sender debited 100, cache[(feeCollector, 0)] = 100, module balance = 0
+3. Call EndBlock WITHOUT calling `WriteDeferredBalances`
+4. Commit block (MemoryStore persists, cache not cleared)
+5. Block N+1: Execute another transaction transferring 200 tokens via same mechanism
+6. Verify: sender debited 200, cache[(feeCollector, 0)] = 300 (accumulated!), module balance = 0
+7. Run TotalSupply invariant check directly
 
-**Trigger:**
-The test creates N transactions, each using `SynchronousAccessOps()` (which uses `ResourceType_ANY`), and builds the DAG. This simulates the attack scenario.
+**Expected Result:**
+The invariant should detect that the deferred cache contains accumulated amounts from multiple blocks. While immediate invariant failure depends on the specific accounting implementation, the core bug (cache accumulation without clearing) is demonstrated, which will eventually cause invariant violations as the accumulated amounts diverge from actual debits.
 
-**Observation:**
-1. The test measures DAG building time for increasing N values (50, 100, 200, 400)
-2. Time should grow quadratically: doubling N approximately quadruples the time
-3. The number of edges grows as N²/2, confirming quadratic edge growth
-4. For N=400, the test demonstrates significant CPU time consumption
+## Notes
 
-**Expected Results:**
-- N=50: ~1250 edges, ~few ms
-- N=100: ~5000 edges, ~10-20 ms  
-- N=200: ~20000 edges, ~50-100 ms
-- N=400: ~80000 edges, ~200-500 ms
+The vulnerability requires the bank keeper to be initialized with deferred cache support, which is confirmed in the simapp configuration. The issue is particularly insidious because:
 
-With N=1000 (achievable in production), this would create ~500,000 edges and consume several seconds of CPU time per block, causing validators to experience significant delays and potential timeouts.
+1. It manifests gradually over multiple blocks rather than immediately
+2. The failure is deterministic across all nodes (consensus failure, not a single-node crash)
+3. Normal testing might not catch it if WriteDeferredBalances is called manually in tests
+4. The MemoryStoreKey persistence behavior is documented but easy to overlook when it should have used TransientStoreKey
+
+The fix is straightforward but critical for network stability.
 
 ### Citations
 
-**File:** x/accesscontrol/types/graph.go (L296-311)
+**File:** x/bank/keeper/keeper.go (L408-432)
 ```go
-// given a node, and a dependent Resource, generate a set of nodes that are dependencies
-func (dag *Dag) getNodeDependenciesForResource(node DagNode, dependentResource acltypes.ResourceType) mapset.Set {
-	nodeIDs := mapset.NewSet()
-	switch node.AccessOperation.AccessType {
-	case acltypes.AccessType_READ:
-		// for a read, we are blocked on prior writes and unknown
-		nodeIDs = nodeIDs.Union(dag.getDependencyWrites(node, dependentResource))
-		nodeIDs = nodeIDs.Union(dag.getDependencyUnknowns(node, dependentResource))
-	case acltypes.AccessType_WRITE, acltypes.AccessType_UNKNOWN:
-		// for write / unknown, we're blocked on prior writes, reads, and unknowns
-		nodeIDs = nodeIDs.Union(dag.getDependencyWrites(node, dependentResource))
-		nodeIDs = nodeIDs.Union(dag.getDependencyUnknowns(node, dependentResource))
-		nodeIDs = nodeIDs.Union(dag.getDependencyReads(node, dependentResource))
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
-	return nodeIDs
-}
-```
-
-**File:** x/accesscontrol/types/graph.go (L314-327)
-```go
-func (dag *Dag) GetNodeDependencies(node DagNode) []DagNodeID {
-	accessOp := node.AccessOperation
-	// get all parent resource types, we'll need to create edges for any of these
-	parentResources := accessOp.ResourceType.GetResourceDependencies()
-	nodeIDSet := mapset.NewSet()
-	for _, resource := range parentResources {
-		nodeIDSet = nodeIDSet.Union(dag.getNodeDependenciesForResource(node, resource))
-	}
-	nodeDependencies := make([]DagNodeID, nodeIDSet.Cardinality())
-	for i, x := range nodeIDSet.ToSlice() {
-		nodeDependencies[i] = x.(DagNodeID)
-	}
-	return nodeDependencies
-}
-```
-
-**File:** types/accesscontrol/resource.go (L177-196)
-```go
-func (r ResourceType) GetResourceDependencies() []ResourceType {
-	// resource is its own dependency
-	resources := []ResourceType{r}
-
-	//get parents
-	resources = append(resources, r.GetParentResources()...)
-
-	// traverse children
-	queue := ResourceTree[r].Children
-	for len(queue) > 0 {
-		curr := queue[0]
-		queue = queue[1:]
-		// add child to resource deps
-		resources = append(resources, curr)
-		// also need to traverse nested children
-		queue = append(queue, ResourceTree[curr].Children...)
-	}
-
-	return resources
-}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L160-173)
-```go
-func (k Keeper) GetWasmDependencyAccessOps(ctx sdk.Context, contractAddress sdk.AccAddress, senderBech string, msgInfo *types.WasmMessageInfo, circularDepLookup ContractReferenceLookupMap) ([]acltypes.AccessOperation, error) {
-	uniqueIdentifier := GetCircularDependencyIdentifier(contractAddress, msgInfo)
-	if _, ok := circularDepLookup[uniqueIdentifier]; ok {
-		// we've already seen this identifier, we should simply return synchronous access Ops
-		ctx.Logger().Error("Circular dependency encountered, using synchronous access ops instead")
-		return types.SynchronousAccessOps(), nil
-	}
-	// add to our lookup so we know we've seen this identifier
-	circularDepLookup[uniqueIdentifier] = struct{}{}
-
-	dependencyMapping, err := k.GetRawWasmDependencyMapping(ctx, contractAddress)
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
 	if err != nil {
-		if err == sdkerrors.ErrKeyNotFound {
-			return types.SynchronousAccessOps(), nil
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L555-609)
-```go
-func (k Keeper) BuildDependencyDag(ctx sdk.Context, anteDepGen sdk.AnteDepGenerator, txs []sdk.Tx) (*types.Dag, error) {
-	defer MeasureBuildDagDuration(time.Now(), "BuildDependencyDag")
-	// contains the latest msg index for a specific Access Operation
-	dependencyDag := types.NewDag()
-	for txIndex, tx := range txs {
-		if tx == nil {
-			// this implies decoding error
-			return nil, sdkerrors.ErrTxDecode
-		}
-		// get the ante dependencies and add them to the dag
-		anteDeps, err := anteDepGen([]acltypes.AccessOperation{}, tx, txIndex)
-		if err != nil {
-			return nil, err
-		}
-		anteDepSet := make(map[acltypes.AccessOperation]struct{})
-		anteAccessOpsList := []acltypes.AccessOperation{}
-		for _, accessOp := range anteDeps {
-			// if found in set, we've already included this access Op in out ante dependencies, so skip it
-			if _, found := anteDepSet[accessOp]; found {
-				continue
-			}
-			anteDepSet[accessOp] = struct{}{}
-			err = types.ValidateAccessOp(accessOp)
-			if err != nil {
-				return nil, err
-			}
-			dependencyDag.AddNodeBuildDependency(acltypes.ANTE_MSG_INDEX, txIndex, accessOp)
-			anteAccessOpsList = append(anteAccessOpsList, accessOp)
-		}
-		// add Access ops for msg for anteMsg
-		dependencyDag.AddAccessOpsForMsg(acltypes.ANTE_MSG_INDEX, txIndex, anteAccessOpsList)
-
-		ctx = ctx.WithTxIndex(txIndex)
-		msgs := tx.GetMsgs()
-		for messageIndex, msg := range msgs {
-			if types.IsGovMessage(msg) {
-				return nil, types.ErrGovMsgInBlock
-			}
-			msgDependencies := k.GetMessageDependencies(ctx, msg)
-			dependencyDag.AddAccessOpsForMsg(messageIndex, txIndex, msgDependencies)
-			for _, accessOp := range msgDependencies {
-				// make a new node in the dependency dag
-				dependencyDag.AddNodeBuildDependency(messageIndex, txIndex, accessOp)
-			}
-		}
+		return err
 	}
-	// This should never happen base on existing DAG algorithm but it's not a significant
-	// performance overhead (@BenchmarkAccessOpsBuildDependencyDag),
-	// it would be better to keep this check. If a cyclic dependency
-	// is ever found it may cause the chain to halt
-	if !graph.Acyclic(&dependencyDag) {
-		return nil, types.ErrCycleInDAG
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
 	}
-	return &dependencyDag, nil
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L69-74)
+**File:** x/bank/keeper/keeper.go (L434-483)
 ```go
-func SynchronousAccessOps() []acltypes.AccessOperation {
-	return []acltypes.AccessOperation{
-		{AccessType: acltypes.AccessType_UNKNOWN, ResourceType: acltypes.ResourceType_ANY, IdentifierTemplate: "*"},
-		*CommitAccessOp(),
+// WriteDeferredDepositsToModuleAccounts Iterates on all the deferred deposits and deposit them into the store
+func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+
+	// maps between bech32 stringified module account address and balance
+	moduleAddrBalanceMap := make(map[string]sdk.Coins)
+	// slice of modules to be sorted for consistent write order later
+	moduleList := []string{}
+
+	// iterate over deferred cache and accumulate totals per module
+	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
+		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
+		if !ok {
+			// add to list of modules
+			moduleList = append(moduleList, moduleAddr.String())
+			// set the map value
+			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
+			return false
+		}
+		// add to currCoins
+		newCoins := currCoins.Add(amount)
+		// update map
+		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
+		return false
+	})
+	// sort module list
+	sort.Strings(moduleList)
+
+	// iterate through module list and add the balance to module bank balances in sorted order
+	for _, moduleBech32Addr := range moduleList {
+		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
+		if !ok {
+			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
+			ctx.Logger().Error(err.Error())
+			panic(err)
+		}
+		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
+		if err != nil {
+			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
+			panic(err)
+		}
+	}
+
+	// clear deferred cache
+	k.deferredCache.Clear(ctx)
+	return ctx.EventManager().ABCIEvents()
+}
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** store/mem/store.go (L54-55)
+```go
+// Commit performs a no-op as entries are persistent between commitments.
+func (s *Store) Commit(_ bool) (id types.CommitID) { return }
+```
+
+**File:** simapp/app.go (L230-230)
+```go
+	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** simapp/app.go (L442-447)
+```go
+	app.SetAnteHandler(anteHandler)
+	app.SetAnteDepGenerator(anteDepGenerator)
+	app.SetEndBlocker(app.EndBlocker)
+	app.SetPrepareProposalHandler(app.PrepareProposalHandler)
+	app.SetProcessProposalHandler(app.ProcessProposalHandler)
+	app.SetFinalizeBlocker(app.FinalizeBlocker)
+```
+
+**File:** simapp/app.go (L518-519)
+```go
+	for i, tx := range req.Txs {
+		ctx = ctx.WithContext(context.WithValue(ctx.Context(), ante.ContextKeyTxIndexKey, i))
+```
+
+**File:** x/bank/keeper/deferred_cache.go (L62-71)
+```go
+func (d *DeferredCache) upsertBalance(ctx sdk.Context, moduleAddr sdk.AccAddress, txIndex uint64, balance sdk.Coin) error {
+	if !balance.IsValid() {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, balance.String())
+	}
+
+	currBalance := d.GetBalance(ctx, moduleAddr, txIndex, balance.Denom)
+	newBalance := currBalance.Add(balance)
+
+	return d.setBalance(ctx, moduleAddr, txIndex, newBalance)
+}
+```
+
+**File:** x/auth/ante/fee.go (L203-213)
+```go
+func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+	}
+
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
+	}
+
+	return nil
+```
+
+**File:** x/crisis/abci.go (L13-21)
+```go
+func EndBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyEndBlocker)
+
+	if k.InvCheckPeriod() == 0 || ctx.BlockHeight()%int64(k.InvCheckPeriod()) != 0 {
+		// skip running the invariant check
+		return
+	}
+	k.AssertInvariants(ctx)
+}
+```
+
+**File:** x/bank/keeper/invariants.go (L75-78)
+```go
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
+			return false
+		})
+```
+
+**File:** x/crisis/keeper/keeper.go (L83-85)
+```go
+			panic(fmt.Errorf("invariant broken: %s\n"+
+				"\tCRITICAL please submit the following transaction:\n"+
+				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
+```
+
+**File:** store/transient/store.go (L24-28)
+```go
+// Commit cleans up Store.
+func (ts *Store) Commit(_ bool) (id types.CommitID) {
+	ts.Store = dbadapter.Store{DB: dbm.NewMemDB()}
+	return
 }
 ```

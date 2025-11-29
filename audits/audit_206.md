@@ -1,262 +1,196 @@
+Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**. Here is my audit report:
+
+# Audit Report
+
 ## Title
-GranteeGrants Query DoS via Full Grant Store Scan
+Permanent Goroutine Deadlock on Transaction Panic in OCC Mode Due to Double Signal Transmission
 
 ## Summary
-The `GranteeGrants` query in `x/authz/keeper/grpc_query.go` scans and unmarshals ALL grants in the entire system when queried without pagination or with `limit=0`, regardless of whether they match the requested grantee. This allows any attacker to repeatedly trigger expensive full-store scans, causing RPC endpoint resource exhaustion and denial of service.
+When Optimistic Concurrency Control (OCC) is enabled, a transaction panic causes `SendAllSignalsForTx` to be called twice due to two separate defer statements at lines 886 and 906 in `baseapp/baseapp.go`. Since completion signal channels are buffered with size 1, the second send blocks permanently, causing goroutine deadlock and accumulating resource exhaustion that can halt block processing. [1](#0-0) [2](#0-1) 
 
 ## Impact
-**Medium**
+**Medium** - Network not being able to confirm new transactions / Increasing network processing node resource consumption by at least 30%
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** 
+- Primary vulnerability: `baseapp/baseapp.go` lines 886 and 906
+- Channel send implementation: `types/accesscontrol/access_operation_map.go` lines 23-31
+- Channel creation: `x/accesscontrol/types/graph.go` line 78 [3](#0-2) [4](#0-3) 
 
-**Intended Logic:** 
-The GranteeGrants query should efficiently retrieve grants where a specific address is the grantee, using pagination to limit resource consumption per query.
+**Intended Logic:**
+When OCC is enabled, transactions execute concurrently in worker goroutines. Each transaction should signal completion exactly once via `SendAllSignalsForTx` to unblock dependent transactions. Completion channels are buffered with size 1 to allow non-blocking sends.
 
-**Actual Logic:** 
-The query uses only the global `GrantKey` prefix (0x01) instead of a grantee-specific prefix, causing it to iterate through ALL grants in the system. [2](#0-1) 
+**Actual Logic:**
+In Go, defers execute in LIFO (Last-In-First-Out) order. When a panic occurs:
+1. The panic recovery defer (lines 904-915, registered last) executes **first**
+2. Inside the recovery at line 906, `SendAllSignalsForTx` is called - **first send** fills the channel buffer
+3. Then the outer defer at line 886 executes **second**
+4. It attempts `SendAllSignalsForTx` again - **second send** blocks permanently because the buffer is full (size 1) and no consumer is reading
 
-The filtering by grantee happens in the application layer within the onResult callback, not at the storage layer: [3](#0-2) 
+The goroutine executing in the OCC scheduler worker pool hangs indefinitely at this blocking channel send operation. [5](#0-4) 
 
-When pagination is not provided or `limit=0`, the system sets `countTotal=true`: [4](#0-3) 
+**Exploitation Path:**
+1. OCC is enabled via configuration (default in sei-cosmos)
+2. Attacker submits a transaction that will panic (e.g., crafted to exceed gas, trigger invalid state, etc.)
+3. OCC scheduler executes transaction in worker goroutine (default 10 workers)
+4. Transaction panics during execution (ante handler, message handler, or gas exhaustion)
+5. Panic recovery defer catches it and calls `SendAllSignalsForTx` at line 906 (first send - succeeds)
+6. Outer defer at line 886 attempts `SendAllSignalsForTx` (second send - blocks forever)
+7. Worker goroutine is permanently hung
+8. Repeat with more panicking transactions until all workers are exhausted
+9. Block processing stalls as no workers are available [6](#0-5) 
 
-With `countTotal=true`, the iterator continues processing ALL remaining grants even after collecting enough results: [5](#0-4) 
-
-Each grant is unmarshaled regardless of whether it matches the grantee filter: [6](#0-5) 
-
-gRPC queries use an infinite gas meter, providing no gas-based protection: [7](#0-6) 
-
-**Exploit Scenario:**
-1. Attacker sends repeated requests to `/cosmos/authz/v1beta1/grantee_grants/{grantee_addr}` without pagination parameters or with `pagination.limit=0`
-2. Each query triggers iteration through ALL grants in the system (potentially thousands or millions)
-3. For each grant entry, the system:
-   - Unmarshals the protobuf message (CPU intensive)
-   - Parses the key to extract granter/grantee addresses
-   - Checks if grantee matches
-   - Only returns matching grants, but processes ALL grants
-4. With sufficient grants in the system (which accumulate naturally over time), each query consumes significant CPU and memory
-5. Repeated queries overwhelm RPC endpoints without any rate limiting
-
-**Security Failure:**
-Denial-of-service through resource exhaustion. The query design violates the principle of efficient data access by forcing full-store scans instead of using indexed access patterns.
+**Security Guarantee Broken:**
+Network availability and liveness. The system accumulates permanently blocked goroutines that consume resources and prevent transaction processing.
 
 ## Impact Explanation
 
-**Affected processes:** RPC endpoint availability and responsiveness
+With the default configuration of 10 concurrent workers, just 10 panicking transactions will exhaust all workers and halt transaction processing on that node. As panics accumulate over time:
 
-**Severity:** 
-- Each query forces unmarshaling and processing of ALL grants globally, not just those for the requested grantee
-- In a production blockchain with active authz usage (delegation, staking authorizations, etc.), thousands of grants could exist
-- Processing thousands of protobuf unmarshals per query consumes significant CPU
-- Memory pressure from iterating large datasets
-- RPC nodes become slow or unresponsive, affecting all users and applications
-- Unlike transaction-based attacks, queries incur no gas cost to the attacker
-- No rate limiting prevents sustained attacks
+- **Goroutine leak:** Each panic creates a permanently hung goroutine consuming memory
+- **Worker exhaustion:** Available workers decrease with each panic
+- **Processing degradation:** Transaction throughput drops proportionally to lost workers  
+- **Network disruption:** When 30%+ of network nodes experience this, network health degrades significantly (Medium impact)
+- **Potential halt:** With sufficient panics, individual nodes or the entire network can become unable to confirm new transactions
 
-**System impact:**
-This matters because RPC endpoints are critical infrastructure for blockchain interaction. Applications, wallets, and monitoring tools depend on RPC availability. Resource exhaustion can cause cascading failures affecting user experience and system reliability.
+Transaction panics are common in blockchain operations (out-of-gas, invalid transactions, state conflicts), making this vulnerability easily triggered without malicious intent.
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any network participant with access to the RPC endpoint (typically public and unauthenticated)
+**Who Can Trigger:**
+Any network participant submitting transactions. No special privileges required.
 
-**Conditions required:**
-- The authz module must have grants stored (this happens naturally in any active chain)
-- Attacker needs network access to the RPC endpoint (standard for public chains)
-- No special privileges, authentication, or on-chain state required
+**Triggering Conditions:**
+- OCC enabled (default configuration)
+- Transaction panics during execution (common: out-of-gas, invalid operations, state errors)
+- Completion channels exist (created by dependency DAG for concurrent transactions)
 
 **Frequency:**
-- Can be exploited immediately and repeatedly
-- Impact scales with the number of grants in the system
-- As the chain matures and more grants accumulate, the vulnerability becomes more severe
-- Each query is independent and cheap for the attacker (no gas costs)
+- Each panicking transaction creates a new hung goroutine
+- Panics occur naturally during normal operation (gas exhaustion, invalid txs)
+- Can be deliberately triggered by crafting transactions to panic
+- Accumulates over time without any recovery mechanism
+- No rate limiting or protection against this issue
+
+**Likelihood: HIGH** - In production networks with OCC enabled, this will be triggered either accidentally through normal operation or deliberately through simple transaction crafting.
 
 ## Recommendation
 
-**Fix 1 - Storage Key Restructuring (Optimal):**
-Modify the grant storage key structure to enable efficient grantee-based lookups. Add a secondary index with grantee as the prefix:
-- Primary key: `0x01<granter><grantee><msgType>` (existing)
-- Secondary index: `0x02<grantee><granter><msgType>` 
-
-Update GranteeGrants to use the grantee-prefixed index for efficient filtering.
-
-**Fix 2 - Disable countTotal for GranteeGrants (Quick mitigation):**
-Force `countTotal=false` in the GranteeGrants query regardless of the pagination parameters to prevent full-store scans:
+**Primary Fix:**
+Remove the duplicate `SendAllSignalsForTx` call from the panic recovery handler at line 906. The deferred call at line 886 is sufficient because Go defers **always execute** on function exit, whether normal return or panic.
 
 ```go
-// In GranteeGrants function, after line 143:
-if pageRequest != nil {
-    pageRequest = &query.PageRequest{
-        Key:        pageRequest.Key,
-        Offset:     pageRequest.Offset,
-        Limit:      pageRequest.Limit,
-        CountTotal: false,  // Force false to prevent full scans
-        Reverse:    pageRequest.Reverse,
+defer func() {
+    if r := recover(); r != nil {
+        // REMOVE: acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+        recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+        recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW)
+        err, result = processRecovery(r, recoveryMW), nil
+        if mode != runTxModeDeliver {
+            ctx.MultiStore().ResetEvents()
+        }
     }
-}
+    gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+}()
 ```
 
-**Fix 3 - Add Maximum Limit:**
-Enforce a reasonable maximum limit (e.g., 1000) for GranteeGrants queries to prevent unbounded iteration even with offset-based pagination.
+The outer defer at line 886 will execute after panic recovery completes, ensuring signals are sent exactly once in all cases.
+
+**Defense in Depth (Optional):**
+Consider adding a select statement with timeout in `SendAllSignalsForTx` to prevent indefinite blocking, though removing the duplicate call is the correct primary fix.
 
 ## Proof of Concept
 
-**File:** `x/authz/keeper/grpc_query_test.go`
+**Test Setup:**
+Create a test in `baseapp/baseapp_test.go` that:
+1. Initializes BaseApp with OCC enabled
+2. Sets up an ante handler that panics
+3. Creates completion channels (buffer size 1, matching production)
+4. Executes transaction in a goroutine (simulating OCC scheduler)
 
-**Test Function:** Add the following test to demonstrate the DoS vulnerability:
+**Action:**
+Execute a transaction that panics via the ante handler, triggering both the panic recovery defer (line 906) and the outer defer (line 886).
 
-```go
-func (suite *TestSuite) TestGranteeGrantsDoS() {
-    require := suite.Require()
-    app, ctx, queryClient, addrs := suite.app, suite.ctx, suite.queryClient, suite.addrs
-    
-    // Setup: Create many grants from different granters to simulate a real system
-    now := ctx.BlockHeader().Time
-    newCoins := sdk.NewCoins(sdk.NewInt64Coin("steak", 100))
-    authorization := &banktypes.SendAuthorization{SpendLimit: newCoins}
-    
-    // Create 100 grants from different granters (not involving the target grantee)
-    otherAddrs := simapp.AddTestAddrsIncremental(app, ctx, 100, sdk.NewInt(30000000))
-    for i := 0; i < 100; i++ {
-        err := app.AuthzKeeper.SaveGrant(ctx, otherAddrs[i], otherAddrs[(i+1)%100], authorization, now.Add(time.Hour))
-        require.NoError(err)
-    }
-    
-    // Create just 1 grant for the target grantee (addrs[0])
-    err := app.AuthzKeeper.SaveGrant(ctx, addrs[0], addrs[1], authorization, now.Add(time.Hour))
-    require.NoError(err)
-    
-    // Trigger: Query GranteeGrants for addrs[0] with no pagination (triggers countTotal=true)
-    start := time.Now()
-    result, err := queryClient.GranteeGrants(gocontext.Background(), &authz.QueryGranteeGrantsRequest{
-        Grantee: addrs[0].String(),
-        // No pagination - this triggers limit=100 and countTotal=true
-    })
-    elapsed := time.Since(start)
-    
-    // Observation: Query should return only 1 grant for addrs[0]
-    require.NoError(err)
-    require.Len(result.Grants, 1)
-    require.Equal(uint64(1), result.Pagination.Total)
-    
-    // But it processes ALL 101 grants in the system
-    // To verify this is expensive, measure time or add instrumentation
-    // In a real attack with thousands of grants, this would be significantly worse
-    suite.T().Logf("Query took %v to scan %d total grants to return %d matching grants", 
-        elapsed, 101, len(result.Grants))
-    
-    // The vulnerability: Each query unmarshals and processes ALL grants even though
-    // only 1 matches. With thousands of grants, this becomes a DoS vector.
-}
-```
+**Expected Result (Bug):**
+The goroutine hangs indefinitely at line 886 trying to send to an already-full channel, causing a timeout in the test.
 
-**Setup:** The test creates 101 grants total (100 between other addresses, 1 involving the target grantee)
-
-**Trigger:** Query GranteeGrants for a specific grantee without pagination parameters, which triggers `countTotal=true` and forces processing of all grants
-
-**Observation:** The query returns only 1 matching grant but processes all 101 grants in the system. The test demonstrates that the number of grants processed is proportional to ALL grants globally, not just those for the queried grantee. In a production system with thousands of grants, this becomes a severe DoS vector that can overwhelm RPC endpoints through repeated queries.
+**Expected Result (Fixed):**
+The goroutine completes normally, sending exactly one completion signal.
 
 ## Notes
 
-The specific Grants query mentioned in the security question (lines 19-81) is less vulnerable because it requires both granter AND grantee parameters, limiting its scope to specific address pairs. The key structure `<granter><grantee><msgType>` allows efficient prefix-based filtering for that query. [8](#0-7) 
+This vulnerability is deterministic and affects all transactions that panic when OCC is enabled. The issue exists because of a misunderstanding of Go's defer execution model - the duplicate call at line 906 was likely added to ensure signals are sent on panic, but the developer didn't realize the outer defer already handles this case since defers execute even on panic.
 
-However, GranteeGrants in the same file and module represents a more severe instance of the same underlying pagination inefficiency issue, where the storage key structure doesn't support efficient filtering by the query parameter (grantee alone).
+The fix is simple and safe: remove line 906. This ensures completion signals are sent exactly once regardless of whether execution completes normally or panics.
 
 ### Citations
 
-**File:** x/authz/keeper/grpc_query.go (L52-54)
+**File:** baseapp/baseapp.go (L886-886)
 ```go
-	store := ctx.KVStore(k.storeKey)
-	key := grantStoreKey(grantee, granter, "")
-	grantsStore := prefix.NewStore(store, key)
+	defer acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
 ```
 
-**File:** x/authz/keeper/grpc_query.go (L132-178)
+**File:** baseapp/baseapp.go (L904-915)
 ```go
-func (k Keeper) GranteeGrants(c context.Context, req *authz.QueryGranteeGrantsRequest) (*authz.QueryGranteeGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
-	}
-
-	grantee, err := sdk.AccAddressFromBech32(req.Grantee)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx := sdk.UnwrapSDKContext(c)
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
-
-	authorizations, pageRes, err := query.GenericFilteredPaginate(k.cdc, store, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
-		if err != nil {
-			return nil, err
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
 		}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
+```
 
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
+**File:** types/accesscontrol/access_operation_map.go (L23-31)
+```go
+func SendAllSignalsForTx(messageIndexToAccessOpsChannelMapping MessageAccessOpsChannelMapping) {
+	for _, accessOpsToChannelsMap := range messageIndexToAccessOpsChannelMapping {
+		for _, channels := range accessOpsToChannelsMap {
+			for _, channel := range channels {
+				channel <- struct{}{}
+			}
 		}
-
-		authorizationAny, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-
-		return &authz.GrantAuthorization{
-			Authorization: authorizationAny,
-			Expiration:    auth.Expiration,
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-		}, nil
-	}, func() *authz.Grant {
-		return &authz.Grant{}
-	})
-	if err != nil {
-		return nil, err
 	}
-
-	return &authz.QueryGranteeGrantsResponse{
-		Grants:     authorizations,
-		Pagination: pageRes,
-	}, nil
 }
 ```
 
-**File:** types/query/filtered_pagination.go (L153-158)
+**File:** x/accesscontrol/types/graph.go (L76-79)
 ```go
-	if limit == 0 {
-		limit = DefaultLimit
-
-		// count total results when the limit is zero/not supplied
-		countTotal = true
+		// channel used for signalling
+		// use buffered channel so that writing to channel won't be blocked by reads
+		Channel: make(chan interface{}, 1),
 	}
 ```
 
-**File:** types/query/filtered_pagination.go (L217-222)
+**File:** tasks/scheduler.go (L135-148)
 ```go
-		protoMsg := constructor()
-
-		err := cdc.Unmarshal(iterator.Value(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-```
-
-**File:** types/query/filtered_pagination.go (L237-245)
-```go
-		if numHits == end+1 {
-			if nextKey == nil {
-				nextKey = iterator.Key()
+func start(ctx context.Context, ch chan func(), workers int) {
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case work := <-ch:
+					work()
+				}
 			}
-
-			if !countTotal {
-				break
-			}
-		}
-```
-
-**File:** types/context.go (L280-280)
-```go
+		}()
 	}
+}
+```
+
+**File:** server/config/config.go (L98-102)
+```go
+	// ConcurrencyWorkers defines the number of workers to use for concurrent
+	// transaction execution. A value of -1 means unlimited workers.  Default value is 10.
+	ConcurrencyWorkers int `mapstructure:"concurrency-workers"`
+	// Whether to enable optimistic concurrency control for tx execution, default is true
+	OccEnabled bool `mapstructure:"occ-enabled"`
 ```

@@ -1,248 +1,126 @@
 # Audit Report
 
 ## Title
-Fee Grant Bypass via Authz MsgExec - AllowedMsgAllowance Validation Only Checks Outer Message
+Nested MsgExec Authorization Bypass Allows Unauthorized Message Execution
 
 ## Summary
-The feegrant module's `AllowedMsgAllowance` validates message types based on the outer transaction messages, not the inner messages contained within an authz `MsgExec`. This allows a grantee to bypass message type restrictions and have a fee granter pay fees for unauthorized actions executed on behalf of other accounts via authz delegation.
+A critical vulnerability in the x/authz module allows a grantee with `GenericAuthorization` for `MsgExec` to bypass authorization checks and execute arbitrary message types on behalf of the granter. By nesting `MsgExec` messages, an attacker exploits the "implicit accept" logic to execute unauthorized actions, resulting in direct loss of funds.
 
 ## Impact
 **High** - Direct loss of funds
 
 ## Finding Description
 
-**Location:** 
-- Primary issue: [1](#0-0) 
-- Validation logic: [2](#0-1) 
-- Message extraction: [3](#0-2) 
+**Location:** [1](#0-0) [2](#0-1) 
 
-**Intended Logic:** 
-When a fee granter creates an `AllowedMsgAllowance`, they specify which message types the grantee can execute using their fee grant. The feegrant module should validate that all messages in a transaction match the allowed message types before deducting fees from the granter's account.
+**Intended logic:** 
+The authorization system is designed to enforce fine-grained access control where a granter explicitly authorizes a grantee to execute specific message types on their behalf. The `DispatchActions` function verifies authorization when the message signer (granter) differs from the executing grantee. The "implicit accept" logic is intended to allow users to execute their own messages without requiring self-authorization.
 
-**Actual Logic:** 
-The fee deduction ante handler calls `UseGrantedFees` with `sdkTx.GetMsgs()`, which only returns the top-level transaction messages. When the transaction contains a `MsgExec` (authz module), the validation in `AllowedMsgAllowance.Accept` only checks if `MsgExec` itself is in the allowed list, completely ignoring the inner messages that will actually be executed via the authz dispatch mechanism.
+**Actual logic:** 
+The vulnerability arises from three interacting behaviors:
+1. `MsgExec.GetSigners()` returns the `grantee` field of the MsgExec message, not the actual transaction signer
+2. When `DispatchActions` processes a nested `MsgExec`, it uses the inner MsgExec's grantee as the "granter" for authorization checks
+3. An attacker can set the inner MsgExec's grantee to the victim's address, causing subsequent messages to bypass authorization via the implicit accept path (granter == grantee)
 
-The vulnerability occurs because:
-1. [1](#0-0)  passes `sdkTx.GetMsgs()` to feegrant validation
-2. For a `MsgExec` transaction, this only returns `[MsgExec]`, not the inner messages
-3. [4](#0-3)  validates only these outer messages
-4. The inner messages in `MsgExec` are executed later in [5](#0-4)  but never validated by feegrant
+**Exploitation path:**
+1. Alice grants Bob `GenericAuthorization` for `/cosmos.authz.v1beta1.MsgExec`
+2. Bob constructs a transaction with nested MsgExec messages:
+   - Outer `MsgExec`: grantee=Bob, msgs=[inner_MsgExec]
+   - Inner `MsgExec`: grantee=Alice, msgs=[MsgSend(from=Alice, to=Bob)]
+3. Bob signs and submits the transaction
+4. Outer MsgExec executes: `DispatchActions(ctx, Bob, [inner_MsgExec])` 
+   - inner_MsgExec.GetSigners() returns [Alice]
+   - Authorization check: Does Bob have MsgExec authorization from Alice? YES
+   - Inner MsgExec handler is invoked
+5. Inner MsgExec executes: `DispatchActions(ctx, Alice, [MsgSend])`
+   - MsgSend.GetSigners() returns [Alice]
+   - Check: Alice == Alice? YES
+   - Implicit accept triggered - NO authorization check
+   - MsgSend executes, transferring Alice's funds to Bob
 
-**Exploit Scenario:**
-1. Alice grants Bob a feegrant with `AllowedMsgAllowance` allowing only `["/cosmos.bank.v1beta1.MsgSend", "/cosmos.authz.v1beta1.MsgExec"]`
-2. Charlie grants Bob authz permission to execute `MsgBurn` on Charlie's behalf
-3. Bob creates a transaction with:
-   - FeeGranter: Alice
-   - Message: `MsgExec` containing `MsgBurn` (to burn Charlie's tokens)
-4. The feegrant validation sees `MsgExec` (allowed) and approves
-5. Alice's account pays the fees
-6. The `MsgBurn` executes via authz dispatch
-7. Alice paid fees for burning Charlie's tokens, which she never authorized
-
-**Security Failure:** 
-Authorization bypass - the fee granter's message type restrictions are circumvented, allowing unauthorized fee spending for arbitrary actions executed via authz delegation.
+**Security guarantee broken:** 
+The authorization invariant that a grantee can only execute message types explicitly authorized by the granter is violated. The system's fundamental security property of fine-grained access control is completely bypassed.
 
 ## Impact Explanation
 
-**Assets Affected:** Fee granter's token balance (direct loss of funds through unauthorized fee deduction)
+This vulnerability enables direct theft of funds and complete account takeover. An attacker with only `MsgExec` authorization can:
 
-**Severity of Damage:** 
-- Fee granters lose funds paying for transactions they did not authorize
-- The entire purpose of `AllowedMsgAllowance` is defeated - granters cannot restrict which message types consume their fee grants
-- Attackers can systematically drain fee grants by routing unauthorized actions through `MsgExec`
-- Multiple grantees can collaborate: one provides authz, another has the fee grant, allowing complex exploitation chains
+- **Drain all funds**: Execute `MsgSend` to transfer the victim's entire balance
+- **Modify staking positions**: Delegate, undelegate, or redelegate tokens
+- **Cast governance votes**: Vote on proposals on behalf of the victim
+- **Execute any message type**: The bypass works for all message types in the system
 
-**System Impact:**
-This fundamentally breaks the security model of the feegrant module's message filtering capability, making `AllowedMsgAllowance` ineffective for its intended purpose of restricting fee grant usage to specific message types.
+The impact is severe because users might grant `MsgExec` authorization believing it provides limited delegation capability for nested authorization workflows, without realizing it grants complete account control. All funds controlled by accounts that have granted `GenericAuthorization` for `MsgExec` are at risk.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any user who has both:
-1. A fee grant with `AllowedMsgAllowance` that includes `MsgExec`
-2. Authz permissions from any other account
+**Who can trigger:** Any user who receives `GenericAuthorization` for `MsgExec` from another account.
 
-**Conditions Required:**
-- Normal operation - no special network conditions needed
-- The fee granter must have included `MsgExec` in their allowed messages list (which is reasonable if they want the grantee to use authz features)
-- The grantee must have authz grants from other accounts
+**Conditions required:**
+- The granter must grant authorization for `/cosmos.authz.v1beta1.MsgExec` to the attacker
+- This is the ONLY authorization required - no authorization for the actual message types being executed is needed
 
-**Frequency:**
-This can be exploited repeatedly until the fee grant is exhausted. Each transaction drains fees from the granter for unauthorized message types. The exploit is deterministic and requires no special timing or race conditions.
+**Frequency:** 
+- Exploitable immediately after receiving the authorization
+- Works during normal network operation
+- No special timing, state conditions, or coordination required  
+- No privileged access needed
+- Highly likely to be exploited if users grant MsgExec authorization for legitimate use cases
+
+The vulnerability is particularly dangerous because granting `MsgExec` authorization might appear reasonable for advanced authorization workflows involving nested delegations, making it likely that users would grant this authorization without understanding the security implications.
 
 ## Recommendation
 
-Modify the fee grant validation to recursively validate inner messages within `MsgExec`. Specifically:
+**Option 1 (Recommended):** Prevent granting authorization for `MsgExec` by adding validation in the `Grant` method: [3](#0-2) 
 
-1. In [6](#0-5) , extract and validate all messages including those nested in `MsgExec`
-2. Add a helper function to recursively extract messages from `MsgExec`:
-   ```
-   func extractAllMessages(msgs []sdk.Msg) []sdk.Msg {
-       allMsgs := []sdk.Msg{}
-       for _, msg := range msgs {
-           allMsgs = append(allMsgs, msg)
-           if execMsg, ok := msg.(*authz.MsgExec); ok {
-               innerMsgs, _ := execMsg.GetMessages()
-               allMsgs = append(allMsgs, extractAllMessages(innerMsgs)...)
-           }
-       }
-       return allMsgs
-   }
-   ```
-3. Pass all extracted messages (including nested ones) to `UseGrantedFees` for validation
+Add a check after line 31:
+```go
+if t == sdk.MsgTypeURL(&authz.MsgExec{}) {
+    return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "cannot grant authorization for MsgExec")
+}
+```
 
-This ensures that `AllowedMsgAllowance` validates the actual messages being executed, not just the outer wrapper.
+**Option 2:** Track execution depth and disable implicit accept for nested executions by passing a context flag through `DispatchActions` to indicate when execution is within a MsgExec.
+
+**Option 3:** Modify the implicit accept logic to check the actual transaction signer rather than using the result from `GetSigners()`.
+
+Option 1 is the simplest and safest fix, as nested MsgExec creates complex authorization chains that are inherently difficult to reason about securely.
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/feegrant_authz_test.go` (new test file)
-
-**Test Function:** `TestFeeGrantBypassViaAuthzMsgExec`
+**File:** `x/authz/keeper/keeper_test.go`
 
 **Setup:**
-1. Initialize SimApp with three accounts: Alice (fee granter), Bob (grantee), Charlie (authz granter)
-2. Fund Alice and Charlie with tokens
-3. Alice grants Bob a feegrant with `AllowedMsgAllowance` allowing `[MsgSend, MsgExec]`
-4. Charlie grants Bob authz to execute `MsgBurn` on Charlie's behalf
-5. Record Alice's initial balance
+- Initialize test accounts (Alice as victim/granter, Bob as attacker/grantee)
+- Fund Alice's account with 10,000 tokens using `simapp.FundAccount`
+- Alice grants Bob `GenericAuthorization` for `MsgExec` via `SaveGrant`
+- Verify Alice has NOT granted Bob `SendAuthorization` via `GetCleanAuthorization`
 
-**Trigger:**
-1. Bob creates a `MsgExec` containing a `MsgBurn` message (burning Charlie's tokens)
-2. Bob sets Alice as the FeeGranter in the transaction
-3. Submit the transaction through the ante handler chain
+**Action:**
+- Bob constructs nested MsgExec:
+  - Outer: `authz.NewMsgExec(bobAddr, [inner_MsgExec])`
+  - Inner: `authz.NewMsgExec(aliceAddr, [MsgSend])`  
+  - Innermost: `banktypes.MsgSend{FromAddress: aliceAddr, ToAddress: bobAddr, Amount: 10000 tokens}`
+- Call `app.AuthzKeeper.DispatchActions(ctx, bobAddr, [inner_MsgExec])`
 
-**Observation:**
-The test observes that:
-1. The transaction succeeds (ante handler does not reject it)
-2. Alice's balance decreases by the fee amount (she paid fees)
-3. Charlie's tokens are burned (the inner message executed)
-4. Alice paid fees for `MsgBurn`, which was NOT in her allowed message list
+**Result:**
+- The call succeeds (when it should fail due to lack of SendAuthorization)
+- Alice's balance is drained to zero
+- Bob receives all 10,000 tokens
+- This occurs despite Alice never granting Bob authorization for `MsgSend`
 
-This demonstrates that Alice's `AllowedMsgAllowance` restriction was bypassed, causing her to pay fees for an unauthorized message type. The vulnerability allows the fee grant's message type restrictions to be circumvented via `MsgExec`.
+The PoC demonstrates complete authorization bypass, enabling arbitrary message execution and direct fund theft with only `MsgExec` authorization.
 
-**Test Code Structure:**
-```
-func TestFeeGrantBypassViaAuthzMsgExec(t *testing.T) {
-    // Setup accounts and app
-    // Grant feegrant from Alice to Bob (allowing MsgSend, MsgExec)
-    // Grant authz from Charlie to Bob (allowing MsgBurn)
-    // Record Alice's initial balance
-    
-    // Create MsgExec containing MsgBurn
-    // Set Alice as FeeGranter
-    // Execute through ante handler
-    
-    // Assert: Transaction succeeds
-    // Assert: Alice paid fees (balance decreased)
-    // Assert: MsgBurn was NOT in Alice's allowed messages
-    // This proves the bypass vulnerability
-}
-```
+## Notes
 
-The test will pass on the vulnerable code (demonstrating the exploit works) and should fail after applying the recommended fix (proving the fix prevents the bypass).
+The vulnerability fundamentally breaks the x/authz module's security model by allowing a single authorization grant to effectively grant unlimited account access. The interaction between `MsgExec.GetSigners()` returning the grantee field and the implicit accept logic creates an authorization bypass that undermines the entire purpose of the authorization system.
 
 ### Citations
 
-**File:** x/auth/ante/fee.go (L148-200)
+**File:** x/authz/keeper/keeper.go (L74-139)
 ```go
-func (dfd DeductFeeDecorator) checkDeductFee(ctx sdk.Context, sdkTx sdk.Tx, fee sdk.Coins) error {
-	feeTx, ok := sdkTx.(sdk.FeeTx)
-	if !ok {
-		return sdkerrors.Wrap(sdkerrors.ErrTxDecode, "Tx must be a FeeTx")
-	}
-
-	if addr := dfd.accountKeeper.GetModuleAddress(types.FeeCollectorName); addr == nil {
-		return fmt.Errorf("fee collector module account (%s) has not been set", types.FeeCollectorName)
-	}
-
-	feePayer := feeTx.FeePayer()
-	feeGranter := feeTx.FeeGranter()
-	deductFeesFrom := feePayer
-
-	// if feegranter set deduct fee from feegranter account.
-	// this works with only when feegrant enabled.
-	if feeGranter != nil {
-		if dfd.feegrantKeeper == nil {
-			return sdkerrors.ErrInvalidRequest.Wrap("fee grants are not enabled")
-		} else if !feeGranter.Equals(feePayer) {
-			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
-			if err != nil {
-				return sdkerrors.Wrapf(err, "%s does not not allow to pay fees for %s", feeGranter, feePayer)
-			}
-		}
-
-		deductFeesFrom = feeGranter
-	}
-
-	deductFeesFromAcc := dfd.accountKeeper.GetAccount(ctx, deductFeesFrom)
-	if deductFeesFromAcc == nil {
-		return sdkerrors.ErrUnknownAddress.Wrapf("fee payer address: %s does not exist", deductFeesFrom)
-	}
-
-	// deduct the fees
-	if !fee.IsZero() {
-		err := DeductFees(dfd.bankKeeper, ctx, deductFeesFromAcc, fee)
-		if err != nil {
-			return err
-		}
-	}
-
-	events := sdk.Events{
-		sdk.NewEvent(
-			sdk.EventTypeTx,
-			sdk.NewAttribute(sdk.AttributeKeyFee, fee.String()),
-			sdk.NewAttribute(sdk.AttributeKeyFeePayer, deductFeesFrom.String()),
-		),
-	}
-	ctx.EventManager().EmitEvents(events)
-
-	return nil
-}
-```
-
-**File:** x/feegrant/filtered_fee.go (L65-86)
-```go
-func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
-	if !a.allMsgTypesAllowed(ctx, msgs) {
-		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
-	}
-
-	allowance, err := a.GetAllowance()
-	if err != nil {
-		return false, err
-	}
-
-	remove, err := allowance.Accept(ctx, fee, msgs)
-	if err != nil {
-		return false, err
-	}
-
-	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
-	if err != nil {
-		return false, err
-	}
-
-    return remove, nil
-}
-```
-
-**File:** x/feegrant/filtered_fee.go (L98-109)
-```go
-func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
-	msgsMap := a.allowedMsgsToMap(ctx)
-
-	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
-		if !msgsMap[sdk.MsgTypeURL(msg)] {
-			return false
-		}
-	}
-
-	return true
-}
-```
-
-**File:** x/authz/keeper/keeper.go (L76-138)
-```go
+// DispatchActions attempts to execute the provided messages via authorization
+// grants from the message signer to the grantee.
 func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
 	results := make([][]byte, len(msgs))
 
@@ -306,4 +184,49 @@ func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []
 	}
 
 	return results, nil
+}
+```
+
+**File:** x/authz/msgs.go (L212-218)
+```go
+func (msg MsgExec) GetSigners() []sdk.AccAddress {
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		panic(err)
+	}
+	return []sdk.AccAddress{grantee}
+}
+```
+
+**File:** x/authz/keeper/msg_server.go (L14-42)
+```go
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
+	}
+
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
+	}
+
+	authorization := msg.GetAuthorization()
+	if authorization == nil {
+		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
+	}
+
+	t := authorization.MsgTypeURL()
+	if k.router.HandlerByTypeURL(t) == nil {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+	}
+
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgGrantResponse{}, nil
+}
 ```

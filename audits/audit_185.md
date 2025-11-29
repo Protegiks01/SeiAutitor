@@ -1,255 +1,355 @@
+# Audit Report
+
 ## Title
-Missing Migration Handler Registration Causes Network Halt on Capability Module Upgrade
+Genesis Transaction Validation Gap Allows Chain Startup Failure via Invalid Commission Rate
 
 ## Summary
-The capability module's `RegisterServices` method is empty and does not register any migration handlers, violating the requirement that each ConsensusVersion increment must have a corresponding migration handler. If the capability module's ConsensusVersion is ever incremented from its current value of 1, the chain upgrade will panic and halt the entire network.
+A validation gap in the genesis transaction (gentx) processing allows a `MsgCreateValidator` with commission rate below `MinCommissionRate` to pass collection but causes a panic during chain initialization, preventing the blockchain from starting.
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- `x/capability/module.go` lines 128 and 160-161 [1](#0-0) 
-- `x/capability/module.go` lines 160-161 [2](#0-1) 
+**Location:**
+- Validation gap: `x/staking/types/commission.go` (CommissionRates.Validate method)
+- Runtime enforcement: `x/staking/keeper/msg_server.go` (CreateValidator handler)
+- Panic trigger: `x/genutil/gentx.go` (DeliverGenTxs function)
+- Gentx validation: `x/genutil/client/cli/gentx.go` and `x/genutil/collect.go`
 
-**Intended Logic:** 
-According to the Cosmos SDK upgrade documentation and code comments, when a module's `ConsensusVersion()` is incremented, the module MUST register migration handlers in its `RegisterServices` method. The documentation explicitly states: "EACH TIME a module's ConsensusVersion increments, a new migration MUST be registered using this function. If a migration handler is missing for a particular function, the upgrade logic (see RunMigrations function) will panic." [3](#0-2) 
+**Intended Logic:**
+All validators must have a commission rate at or above the chain's `MinCommissionRate` parameter (default 5%). [1](#0-0)  This parameter should be enforced at all stages of validator creation.
 
-Other modules in the codebase correctly implement this pattern. For example, the auth module registers migrations for versions 1→2 and 2→3 [4](#0-3) , and the slashing module registers migrations for versions 1→2, 2→3, and 3→4 [5](#0-4) .
+**Actual Logic:**
+The `ValidateBasic()` function only validates that commission rates satisfy basic constraints (non-negative, within [0,1], rate ≤ maxRate, etc.) but does NOT check against `MinCommissionRate`. [2](#0-1) 
 
-**Actual Logic:** 
-The capability module's `RegisterServices` method is completely empty [1](#0-0) , meaning no migration handlers are registered. If the module's ConsensusVersion is incremented from 1 to 2 (or higher), the `RunMigrations` function will:
+During gentx generation, only `ValidateBasic()` is called: [3](#0-2) 
 
-1. Detect the version difference between the stored version (1) and the new code version (2+)
-2. Call `runModuleMigrations(ctx, "capability", 1, 2)` [6](#0-5) 
-3. Look for registered migrations in the configurator's migrations map [7](#0-6) 
-4. Return an error "no migrations found for module capability" since no migrations were registered
-5. This error propagates to `ApplyUpgrade` which panics [8](#0-7) 
+During gentx collection, commission rates are not validated against `MinCommissionRate`: [4](#0-3) 
 
-**Exploit Scenario:** 
-This vulnerability is triggered when:
-1. Developers make a consensus-breaking change to the capability module that requires incrementing ConsensusVersion
-2. They increment `ConsensusVersion()` from 1 to 2 in the code, as required by protocol
-3. They forget to register a migration handler in `RegisterServices` (or don't realize it's empty)
-4. The upgrade binary is deployed to the network
-5. At the upgrade height, all nodes execute the upgrade handler
-6. `RunMigrations` is called as part of the standard upgrade flow [9](#0-8) 
-7. The missing migration handler causes a panic on all nodes simultaneously
-8. The entire network halts at the same block height
+At runtime, the `CreateValidator` handler checks `MinCommissionRate` and returns an error if violated: [5](#0-4) 
 
-**Security Failure:** 
-This breaks network availability and consensus agreement. All nodes panic at the same upgrade height, causing complete network shutdown. The network cannot confirm any new transactions, and recovery requires a coordinated hard fork to either: (a) add the missing migration handler and re-release binaries, or (b) revert the ConsensusVersion change.
+When `DeliverGenTxs` processes gentxs during `InitChain`, any error causes a panic: [6](#0-5) 
+
+**Exploitation Path:**
+1. Genesis validator creates gentx with commission rate below `MinCommissionRate` (e.g., 0%)
+2. Gentx passes `ValidateBasic()` validation (0% satisfies basic constraints)
+3. Gentx is collected and included in genesis.json
+4. Chain initialization begins via `InitChain` [7](#0-6) 
+5. `InitGenesis` calls `DeliverGenTxs` [8](#0-7) 
+6. `DeliverGenTxs` processes gentx through `CreateValidator` handler
+7. Handler detects commission rate < `MinCommissionRate` and returns error
+8. `DeliverGenTxs` panics with error message
+9. Chain fails to initialize and cannot start
+
+**Security Guarantee Broken:**
+The blockchain's availability guarantee is violated. An invalid gentx that should have been rejected during collection prevents the entire network from starting.
 
 ## Impact Explanation
 
-**Assets/Processes Affected:**
-- **Network Availability**: The entire blockchain network halts and cannot process any transactions
-- **Transaction Finality**: No new blocks can be produced or finalized
-- **User Funds**: While funds are not stolen, they become completely inaccessible until the network is restored via hard fork
+This vulnerability causes complete network shutdown:
+- **Chain Startup Failure**: All nodes fail to initialize at genesis
+- **No Transaction Processing**: The chain cannot start to process any transactions
+- **Manual Intervention Required**: The only fix is to manually edit genesis.json to correct or remove the invalid gentx
+- **Network-Wide Impact**: Affects all validators and users attempting to start the network
 
-**Severity of Damage:**
-- **Complete Network Shutdown**: 100% of nodes halt simultaneously at the upgrade block
-- **Hard Fork Required**: Recovery requires coordinating a new binary release across all validators and node operators
-- **Potential Chain Split**: If some nodes skip the upgrade or apply a different fix, the network could permanently split into incompatible chains
-
-**Why This Matters:**
-This vulnerability represents a critical failure mode in the upgrade system. The capability module is a core system module used by IBC and other critical protocol features. A failed upgrade of this module would halt the entire Sei blockchain, preventing all DeFi operations, token transfers, and protocol functionality. The economic impact includes loss of user confidence, potential financial losses from halted operations, and significant operational costs to coordinate an emergency hard fork.
+The damage is severe because it prevents the blockchain from functioning at all. This matches the acceptable impact category: "Network not being able to confirm new transactions (total network shutdown)" (Medium severity).
 
 ## Likelihood Explanation
 
 **Who Can Trigger:**
-This is triggered by developers making legitimate protocol upgrades. It's not directly exploitable by external attackers, but represents a subtle logic error that will be triggered accidentally during normal development when:
-- The capability module requires any consensus-breaking changes (e.g., fixing bugs in capability tracking, modifying store structure, changing keeper logic)
-- Developers correctly increment ConsensusVersion as required
-- But overlook the empty RegisterServices method
+Any participant submitting a gentx during genesis setup. In typical network launches, multiple validators submit gentx files.
 
 **Conditions Required:**
-- A consensus-breaking change to the capability module necessitates incrementing ConsensusVersion
-- The developer follows standard protocol by incrementing the version number
-- The empty RegisterServices method provides no warning or safeguard
-- The upgrade is approved via governance and scheduled
+- Occurs during network initialization (genesis setup)
+- Requires creating gentx with commission rate below `MinCommissionRate`
+- No additional privileges needed beyond genesis validator participation
 
-**Frequency:**
-While not frequent, this is a realistic scenario that could occur during:
-- Security patches to the capability module
-- Feature additions that modify state
-- Bug fixes that change consensus behavior
-- Protocol upgrades adding new capabilities
-
-The vulnerability is particularly dangerous because the empty RegisterServices method provides no indication that migrations need to be registered, and standard testing might not catch this issue until the upgrade is deployed on mainnet.
+**Likelihood Assessment:**
+While this affects only genesis initialization, it is highly exploitable:
+- The validation gap makes it easy to create invalid gentxs accidentally or intentionally
+- A single invalid gentx from any genesis validator breaks the entire chain
+- Could affect mainnet launches, testnet setups, or network reinitializations
+- Even well-intentioned validators might set 0% commission without realizing the minimum
 
 ## Recommendation
 
-Implement one of the following fixes:
+Implement `MinCommissionRate` validation before accepting gentxs. Recommended approaches:
 
-**Option 1 (Immediate Fix):** Register a no-op migration handler in `RegisterServices` even though ConsensusVersion is currently 1. This provides a template for future migrations:
+**Option 1:** Add validation during gentx CLI creation by reading `MinCommissionRate` from staking genesis state and checking commission rates before signing.
 
-```go
-func (am AppModule) RegisterServices(cfg module.Configurator) {
-    // Register no-op migration from v1 to v2 as a template
-    // When ConsensusVersion is incremented, uncomment and implement:
-    // m := keeper.NewMigrator(am.keeper)
-    // cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
-}
-```
+**Option 2:** Add validation in `CollectTxs` function where genesis app state is available, check commission rates against `MinCommissionRate` from staking params before accepting gentxs.
 
-**Option 2 (Comprehensive Fix):** Add validation in the upgrade module that checks if a module's ConsensusVersion has been incremented without corresponding registered migrations, and fail fast during app initialization rather than at upgrade time.
+**Option 3 (Minimal):** Replace panic with graceful error handling in `DeliverGenTxs`, though this doesn't prevent the startup failure, it provides clearer error messages for debugging.
 
-**Option 3 (Documentation Fix):** At minimum, add prominent comments in the capability module's `RegisterServices` and `ConsensusVersion` methods warning that migrations MUST be registered before incrementing the version.
+The preferred solution is Option 1 or 2 to prevent invalid gentxs from being created or collected in the first place.
 
 ## Proof of Concept
 
-**File:** `simapp/app_test.go` (add new test function)
+**File:** `x/genutil/gentx_test.go`
 
-**Test Function Name:** `TestCapabilityModuleMissingMigrationPanic`
+**Test Function:** Add `TestDeliverGenTxsWithInvalidCommissionRate`
 
 **Setup:**
-```go
-func TestCapabilityModuleMissingMigrationPanic(t *testing.T) {
-    // Initialize test app
-    db := dbm.NewMemDB()
-    encCfg := MakeTestEncodingConfig()
-    logger := log.NewTestingLogger(t)
-    app := NewSimApp(logger, db, nil, true, map[int64]bool{}, DefaultNodeHome, 0, nil, encCfg, &EmptyAppOptions{})
-    
-    // Initialize the chain with capability module at version 1
-    app.InitChain(context.Background(), &abci.RequestInitChain{})
-    app.SetDeliverStateToCommit()
-    app.Commit(context.Background())
-    
-    // Create configurator
-    app.configurator = module.NewConfigurator(app.appCodec, app.MsgServiceRouter(), app.GRPCQueryRouter())
-    
-    // Register services for all modules (this registers migrations)
-    for _, module := range app.mm.Modules {
-        module.RegisterServices(app.configurator)
-    }
-    
-    // Create a VersionMap with capability at version 1 (simulating existing chain state)
-    ctx := app.NewContext(true, tmproto.Header{Height: app.LastBlockHeight()})
-    fromVM := module.VersionMap{
-        "capability": 1,  // Current version in state
-        // ... other modules at their current versions
-    }
-```
+1. Initialize test app with default staking params (`MinCommissionRate` = 5%)
+2. Create `MsgCreateValidator` with commission rate = 0% (below `MinCommissionRate`)
+3. Fund validator account with sufficient balance
+4. Sign the transaction to create valid gentx
 
-**Trigger:**
-```go
-    // Simulate incrementing capability module's ConsensusVersion to 2
-    // In real scenario, this would be done by changing the ConsensusVersion() method
-    // Here we manually create a VersionMap where capability is at version 2
-    // but no migration was registered for version 1->2
-    
-    // This simulates what RunMigrations sees when ConsensusVersion is incremented
-    // The function will try to migrate from version 1 to 2
-    // Since no migration is registered, it will panic
-```
+**Action:**
+1. Encode gentx as JSON
+2. Call `DeliverGenTxs` with this gentx via `suite.app.BaseApp.DeliverTx`
 
-**Observation:**
-```go
-    // Attempt to run migrations - this should panic with
-    // "no migrations found for module capability"
-    require.Panics(t, func() {
-        _, err := app.mm.RunMigrations(ctx, app.configurator, fromVM)
-        if err != nil {
-            panic(err)
-        }
-    }, "Expected panic due to missing capability migration handler")
-}
-```
+**Result:**
+The test should observe that `DeliverGenTxs` panics when processing the gentx. The existing test structure at [9](#0-8)  demonstrates panic detection. The test would show:
+- `ValidateBasic()` passes (commission rate valid within [0,1])
+- Runtime handler rejects commission rate (below `MinCommissionRate`)
+- Chain initialization fails with panic
 
-**Expected Behavior:** The test confirms that when RunMigrations is called with a version difference for the capability module (from version 1 to any higher version), and no migration handler is registered, the system panics with error "no migrations found for module capability" [7](#0-6) .
+## Notes
 
-**Verification:** This test demonstrates the exact failure mode that would occur during a real upgrade, confirming that the empty RegisterServices method creates a network halt scenario. The simapp test at line 125-128 already demonstrates this error case for the bank module [10](#0-9) , and the same pattern applies to the capability module.
+The existing test setup uses empty `CommissionRates{}` [10](#0-9)  which would also trigger this issue if used in actual `DeliverGenTxs` tests with the staking keeper. The vulnerability is real and exploitable during any genesis initialization where a validator submits an invalid commission rate.
 
 ### Citations
 
-**File:** x/capability/module.go (L128-128)
+**File:** x/staking/types/params.go (L36-38)
 ```go
-func (am AppModule) RegisterServices(module.Configurator) {}
+	// DefaultMinCommissionRate is set to 0%
+	DefaultMinCommissionRate = sdk.NewDecWithPrec(5, 2)
+)
 ```
 
-**File:** x/capability/module.go (L160-161)
+**File:** x/staking/types/commission.go (L51-79)
 ```go
-// ConsensusVersion implements AppModule/ConsensusVersion.
-func (AppModule) ConsensusVersion() uint64 { return 1 }
-```
+func (cr CommissionRates) Validate() error {
+	switch {
+	case cr.MaxRate.IsNegative():
+		// max rate cannot be negative
+		return ErrCommissionNegative
 
-**File:** types/module/configurator.go (L31-36)
-```go
-	// EACH TIME a module's ConsensusVersion increments, a new migration MUST
-	// be registered using this function. If a migration handler is missing for
-	// a particular function, the upgrade logic (see RunMigrations function)
-	// will panic. If the ConsensusVersion bump does not introduce any store
-	// changes, then a no-op function must be registered here.
-	RegisterMigration(moduleName string, forVersion uint64, handler MigrationHandler) error
-```
+	case cr.MaxRate.GT(sdk.OneDec()):
+		// max rate cannot be greater than 1
+		return ErrCommissionHuge
 
-**File:** types/module/configurator.go (L97-100)
-```go
-	moduleMigrationsMap, found := c.migrations[moduleName]
-	if !found {
-		return sdkerrors.Wrapf(sdkerrors.ErrNotFound, "no migrations found for module %s", moduleName)
+	case cr.Rate.IsNegative():
+		// rate cannot be negative
+		return ErrCommissionNegative
+
+	case cr.Rate.GT(cr.MaxRate):
+		// rate cannot be greater than the max rate
+		return ErrCommissionGTMaxRate
+
+	case cr.MaxChangeRate.IsNegative():
+		// change rate cannot be negative
+		return ErrCommissionChangeRateNegative
+
+	case cr.MaxChangeRate.GT(cr.MaxRate):
+		// change rate cannot be greater than the max rate
+		return ErrCommissionChangeRateGTMaxRate
 	}
-```
 
-**File:** x/auth/module.go (L140-150)
-```go
-func (am AppModule) RegisterServices(cfg module.Configurator) {
-	types.RegisterQueryServer(cfg.QueryServer(), am.accountKeeper)
-	m := keeper.NewMigrator(am.accountKeeper, cfg.QueryServer())
-	err := cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
-	if err != nil {
-		panic(err)
-	}
-	err = cfg.RegisterMigration(types.ModuleName, 2, m.Migrate2to3)
-	if err != nil {
-		panic(err)
-	}
-```
-
-**File:** x/slashing/module.go (L148-156)
-```go
-func (am AppModule) RegisterServices(cfg module.Configurator) {
-	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
-	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
-
-	m := keeper.NewMigrator(am.keeper)
-	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
-	cfg.RegisterMigration(types.ModuleName, 2, m.Migrate2to3)
-	cfg.RegisterMigration(types.ModuleName, 3, m.Migrate3to4)
+	return nil
 }
 ```
 
-**File:** types/module/module.go (L571-574)
+**File:** x/genutil/client/cli/gentx.go (L165-167)
 ```go
-			err := c.runModuleMigrations(ctx, moduleName, fromVersion, toVersion)
-			if err != nil {
-				return nil, err
+			if err = msg.ValidateBasic(); err != nil {
+				return err
 			}
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L365-376)
+**File:** x/genutil/collect.go (L139-172)
 ```go
-func (k Keeper) ApplyUpgrade(ctx sdk.Context, plan types.Plan) {
-	handler := k.upgradeHandlers[plan.Name]
-	if handler == nil {
-		panic("ApplyUpgrade should never be called without first checking HasHandler")
-	}
+		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
 
-	updatedVM, err := handler(ctx, plan, k.GetModuleVersionMap(ctx))
-	if err != nil {
-		panic(err)
-	}
+		// validate delegator and validator addresses and funds against the accounts in the state
+		delAddr := msg.DelegatorAddress
+		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
 
-	k.SetModuleVersionMap(ctx, updatedVM)
+		delBal, delOk := balancesMap[delAddr]
+		if !delOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
+			}
+
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
+		}
+
+		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
+		if !valOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
+			}
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
+		}
+
+		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
+			return appGenTxs, persistentPeers, fmt.Errorf(
+				"insufficient fund for delegation %v: %v < %v",
+				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
+			)
+		}
 ```
 
-**File:** simapp/app_test.go (L125-128)
+**File:** x/staking/keeper/msg_server.go (L38-40)
 ```go
-			"throws error on RunMigrations if no migration registered for bank",
-			"", 1,
-			false, "", true, "no migrations found for module bank: not found", 0,
+	if msg.Commission.Rate.LT(k.MinCommissionRate(ctx)) {
+		return nil, sdkerrors.Wrapf(types.ErrCommissionLTMinRate, "cannot set validator commission=%s to less than minimum rate of %s", msg.Commission.Rate, k.MinCommissionRate(ctx))
+	}
+```
+
+**File:** x/genutil/gentx.go (L113-116)
+```go
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
+		}
+```
+
+**File:** baseapp/abci.go (L33-76)
+```go
+// directly on the CommitMultiStore.
+func (app *BaseApp) InitChain(ctx context.Context, req *abci.RequestInitChain) (res *abci.ResponseInitChain, err error) {
+	// On a new chain, we consider the init chain block height as 0, even though
+	// req.InitialHeight is 1 by default.
+	initHeader := tmproto.Header{ChainID: req.ChainId, Time: req.Time}
+	app.ChainID = req.ChainId
+
+	// If req.InitialHeight is > 1, then we set the initial version in the
+	// stores.
+	if req.InitialHeight > 1 {
+		app.initialHeight = req.InitialHeight
+		initHeader = tmproto.Header{ChainID: req.ChainId, Height: req.InitialHeight, Time: req.Time}
+		err := app.cms.SetInitialVersion(req.InitialHeight)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// initialize the deliver state and check state with a correct header
+	app.setDeliverState(initHeader)
+	app.setCheckState(initHeader)
+	app.setPrepareProposalState(initHeader)
+	app.setProcessProposalState(initHeader)
+
+	// Store the consensus params in the BaseApp's paramstore. Note, this must be
+	// done after the deliver state and context have been set as it's persisted
+	// to state.
+	if req.ConsensusParams != nil {
+		app.StoreConsensusParams(app.deliverState.ctx, req.ConsensusParams)
+		app.StoreConsensusParams(app.prepareProposalState.ctx, req.ConsensusParams)
+		app.StoreConsensusParams(app.processProposalState.ctx, req.ConsensusParams)
+		app.StoreConsensusParams(app.checkState.ctx, req.ConsensusParams)
+	}
+
+	app.SetDeliverStateToCommit()
+
+	if app.initChainer == nil {
+		return
+	}
+
+	resp := app.initChainer(app.deliverState.ctx, *req)
+	app.initChainer(app.prepareProposalState.ctx, *req)
+	app.initChainer(app.processProposalState.ctx, *req)
+	res = &resp
+```
+
+**File:** x/genutil/genesis.go (L17-20)
+```go
+	if len(genesisState.GenTxs) > 0 {
+		validators, err = DeliverGenTxs(ctx, genesisState.GenTxs, stakingKeeper, deliverTx, txEncodingConfig)
+	}
+	return
+```
+
+**File:** x/genutil/gentx_test.go (L31-31)
+```go
+	comm  = stakingtypes.CommissionRates{}
+```
+
+**File:** x/genutil/gentx_test.go (L205-281)
+```go
+func (suite *GenTxTestSuite) TestDeliverGenTxs() {
+	var (
+		genTxs    []json.RawMessage
+		txBuilder = suite.encodingConfig.TxConfig.NewTxBuilder()
+	)
+
+	testCases := []struct {
+		msg      string
+		malleate func()
+		expPass  bool
+	}{
+		{
+			"no signature supplied",
+			func() {
+				err := txBuilder.SetMsgs(suite.msg1)
+				suite.Require().NoError(err)
+
+				genTxs = make([]json.RawMessage, 1)
+				tx, err := suite.encodingConfig.TxConfig.TxJSONEncoder()(txBuilder.GetTx())
+				suite.Require().NoError(err)
+				genTxs[0] = tx
+			},
+			false,
 		},
+		{
+			"success",
+			func() {
+				_ = suite.setAccountBalance(addr1, 50)
+				_ = suite.setAccountBalance(addr2, 1)
+
+				msg := banktypes.NewMsgSend(addr1, addr2, sdk.Coins{sdk.NewInt64Coin(sdk.DefaultBondDenom, 1)})
+				tx, err := helpers.GenTx(
+					suite.encodingConfig.TxConfig,
+					[]sdk.Msg{msg},
+					sdk.Coins{sdk.NewInt64Coin(sdk.DefaultBondDenom, 10)},
+					helpers.DefaultGenTxGas,
+					suite.ctx.ChainID(),
+					[]uint64{0},
+					[]uint64{0},
+					priv1,
+				)
+				suite.Require().NoError(err)
+
+				genTxs = make([]json.RawMessage, 1)
+				genTx, err := suite.encodingConfig.TxConfig.TxJSONEncoder()(tx)
+				suite.Require().NoError(err)
+				genTxs[0] = genTx
+			},
+			true,
+		},
+	}
+
+	for _, tc := range testCases {
+		suite.Run(fmt.Sprintf("Case %s", tc.msg), func() {
+			suite.SetupTest()
+
+			tc.malleate()
+
+			ctx := suite.app.GetContextForDeliverTx([]byte{})
+			if tc.expPass {
+				suite.Require().NotPanics(func() {
+					genutil.DeliverGenTxs(
+						ctx, genTxs, suite.app.StakingKeeper, suite.app.BaseApp.DeliverTx,
+						suite.encodingConfig.TxConfig,
+					)
+				})
+			} else {
+				suite.Require().Panics(func() {
+					genutil.DeliverGenTxs(
+						ctx, genTxs, suite.app.StakingKeeper, suite.app.BaseApp.DeliverTx,
+						suite.encodingConfig.TxConfig,
+					)
+				})
+			}
+		})
+	}
+}
 ```

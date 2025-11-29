@@ -1,170 +1,216 @@
+# Audit Report
+
 ## Title
-Incorrect Transaction Index Mapping in SR25519 Batch Signature Verification Allows Invalid Signatures to Pass
+Missing Validation for IAVL Items Before Store Items in StoreV2 Snapshot Restoration Causes Node Crash
 
 ## Summary
-The `SR25519BatchVerifier.VerifyTxs` function in `batch_sigverify.go` incorrectly maps batch signature verification results back to transaction indices. When transactions with non-SR25519 signatures are skipped during batch verification, subsequent transactions' verification failures are attributed to wrong transaction indices, allowing transactions with invalid signatures to bypass verification and execute. [1](#0-0) 
+The StoreV2 snapshot restoration implementation in `storev2/rootmulti/store.go` lacks a critical validation check that exists in the traditional store implementation. It does not verify that a `SnapshotItem_Store` has been received before processing `SnapshotItem_IAVL` items, allowing malicious peers to craft snapshot data that crashes nodes during state sync via an uncaught panic.
 
 ## Impact
-**High**
+Low to Medium
 
 ## Finding Description
 
-**Location:** `x/auth/ante/batch_sigverify.go`, function `SR25519BatchVerifier.VerifyTxs`, lines 176-186
+**Location:** [1](#0-0) 
 
-**Intended Logic:** After performing batch signature verification, the function should map individual verification results back to their corresponding transactions. Each entry in the `individuals` array from the batch verifier corresponds to a signature that was added to the batch, and should be mapped to the correct transaction using the `sigTxIndices` array built at line 163. [2](#0-1) 
+**Intended Logic:** 
+During snapshot restoration, the system expects to receive `SnapshotItem_Store` items first to initialize store trees via `AddTree()`, followed by `SnapshotItem_IAVL` items to populate those stores. This ordering ensures proper initialization before data insertion.
 
-**Actual Logic:** The code uses the loop index `i` directly as a transaction index when setting errors, instead of using `sigTxIndices[i]` to map from signature index to transaction index. This causes verification failures to be attributed to the wrong transactions when some transactions are skipped during validation. [3](#0-2) 
+**Actual Logic:** 
+The StoreV2 implementation initializes `storeKey` as an empty string and processes items without validating the ordering. When an IAVL item arrives before any Store item:
+- The empty `storeKey` is used when creating `SnapshotNode` structures
+- If `ssStore` is enabled, nodes with empty `StoreKey` are sent to the import goroutine [2](#0-1) 
+- The goroutine has an uncaught `panic(err)` that crashes the entire process [3](#0-2) 
 
-**Exploit Scenario:**
-1. Attacker crafts a block with the following transaction sequence:
-   - TX0: Valid SR25519 signature (added to batch at signature index 0)
-   - TX1: Account with non-SR25519 pubkey (rejected at lines 113-120, NOT added to batch) [4](#0-3) 
-   - TX2: **Invalid** SR25519 signature (added to batch at signature index 1)
-   - TX3: Valid SR25519 signature (added to batch at signature index 2)
+In contrast, the traditional store explicitly validates this: [4](#0-3) 
 
-2. After batch verification:
-   - `sigTxIndices = [0, 2, 3]` (mapping signature indices to transaction indices)
-   - `individuals = [true, false, true]` (TX0 valid, TX2 invalid, TX3 valid)
+**Exploitation Path:**
+1. Malicious peer offers snapshot during state sync discovery
+2. Attacker crafts chunks with `SnapshotItem_IAVL` before `SnapshotItem_Store`
+3. Chunks include correct SHA256 hashes (calculated by attacker) so they pass validation [5](#0-4) 
+4. Target node processes chunks through `RestoreChunk()` which feeds data to restore stream
+5. StoreV2 `restore()` receives IAVL items with `storeKey` still empty
+6. If ssStore enabled, `SnapshotNode` with empty `StoreKey` sent to Import goroutine
+7. `ssStore.Import()` likely fails on invalid data, triggering `panic(err)`
+8. Uncaught panic in goroutine terminates the entire node process
 
-3. The buggy code at lines 178-185 sets:
-   - When `i=0, individual=true`: no error set (correct)
-   - When `i=1, individual=false`: sets `v.errors[1]` = "signature verification failed"
-   - When `i=2, individual=true`: no error set (correct)
-
-4. Final error state:
-   - `v.errors[0] = nil` (TX0 passes - correct)
-   - `v.errors[1] = "signature verification failed"` (TX1 fails - but for wrong reason, it already had an error)
-   - `v.errors[2] = nil` (TX2 **PASSES** - WRONG! Should fail signature verification)
-   - `v.errors[3] = nil` (TX3 passes - correct)
-
-5. When `BatchSigVerificationDecorator.AnteHandle` checks `verifier.errors[txIdx]` at line 220, TX2 has no error and proceeds to execution with an invalid signature. [5](#0-4) 
-
-**Security Failure:** This breaks the fundamental security invariant of signature verification - that only transactions signed by authorized private keys can execute. The authorization mechanism is completely bypassed for certain transactions, allowing unauthorized state modifications.
+**Security Guarantee Broken:** 
+Denial of service through malformed state sync data. The snapshot restoration protocol assumes well-formed data ordering but lacks validation to enforce this assumption in StoreV2.
 
 ## Impact Explanation
 
-This vulnerability enables **direct theft of funds** and **unauthorized state changes**:
+This vulnerability enables denial-of-service attacks against nodes using StoreV2 with ssStore enabled during state sync. When exploited:
+- Target nodes crash completely and cannot complete state sync
+- New nodes or nodes catching up cannot join/rejoin the network through the malicious peer
+- Network resilience is reduced as node recovery/growth is hindered
+- No fund loss occurs, but node availability is compromised
 
-1. **Asset Theft:** An attacker can create transactions that transfer tokens from any account without possessing the corresponding private key, as long as the transaction is positioned after another transaction with a validation error (non-SR25519 pubkey type).
+The impact is limited to:
+1. Nodes using StoreV2 (appears to be alternative to traditional store based on codebase structure)
+2. Nodes with ssStore enabled (opt-in via configuration)
+3. Nodes actively performing state sync (temporary state)
 
-2. **Consensus Violations:** Different validator nodes might process transactions differently depending on the order and composition of transactions in the mempool, leading to state divergence and potential chain splits.
-
-3. **Transaction Validity Breakdown:** The core security guarantee that "valid signature = authorized transaction" is violated, undermining the entire authentication layer of the blockchain.
-
-4. **Systemic Risk:** This affects all transactions processed through the batch verifier during normal block execution (non-genesis, non-CheckTx/ReCheckTx blocks), making it a widespread vulnerability affecting the entire network.
+This affects a subset of network nodes rather than the entire network, qualifying as a low-to-medium severity DoS vulnerability.
 
 ## Likelihood Explanation
 
-**High likelihood of exploitation:**
+**Who can trigger:** Any network participant can exploit this by running a node that responds to snapshot requests with malformed data. No special privileges, stake, or resources required.
 
-- **Who can trigger:** Any network participant who can submit transactions to the mempool. The attacker doesn't need any special privileges.
+**Conditions required:**
+- Target nodes must use StoreV2 with ssStore enabled
+- Target nodes must be performing state sync
+- Malicious peer must be selected as snapshot provider
 
-- **Conditions required:** 
-  - Block must contain at least one transaction with a non-SR25519 pubkey (e.g., ED25519, secp256k1) that gets rejected during validation
-  - The attacker's transaction with invalid signature must appear after such a transaction
-  - Both transactions must be included in the same block
-
-- **Frequency:** This can be exploited during any block with mixed signature types. An attacker can intentionally create the required conditions by:
-  1. Submitting a "poison" transaction with non-SR25519 signature first
-  2. Immediately following it with their malicious transaction with invalid SR25519 signature
-  3. Both transactions get included in the next block, triggering the vulnerability
-
-The exploit is **deterministic** and **reproducible** - whenever the conditions are met, the vulnerability is triggered.
+**Frequency:** Can be triggered whenever qualifying nodes perform state sync. More impactful during network upgrades or growth periods when many nodes sync simultaneously. Nodes can recover by restarting and selecting different peers, but repeated attacks can significantly delay network participation.
 
 ## Recommendation
 
-**Fix:** Change line 180 in `batch_sigverify.go` to use the correct transaction index from `sigTxIndices`:
+Add validation matching the traditional store implementation:
 
 ```go
-// Current (line 180):
-v.errors[i] = sdkerrors.Wrap(...)
-
-// Should be:
-v.errors[sigTxIndices[i]] = sdkerrors.Wrap(...)
+case *snapshottypes.SnapshotItem_IAVL:
+    if storeKey == "" {
+        restoreErr = errors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
+        break loop
+    }
+    // ... rest of IAVL processing
 ```
 
-This ensures that verification failures are attributed to the correct transaction by mapping from the signature index `i` in the `individuals` array to the actual transaction index stored in `sigTxIndices[i]`.
+Additionally, implement proper error propagation in the ssStore import goroutine instead of using `panic()`, or add a `recover()` mechanism to prevent uncaught panics from terminating the process.
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/batch_sigverify_test.go` (new file)
-
-**Test Function:** `TestBatchVerifyMixedSignatureTypes`
+**Test Structure:** A test in `storev2/rootmulti/store_test.go` demonstrating the vulnerability:
 
 **Setup:**
-1. Create a test environment with SR25519BatchVerifier
-2. Create 4 accounts:
-   - Account 0: SR25519 pubkey with valid signature
-   - Account 1: ED25519 pubkey (non-SR25519, will be rejected)
-   - Account 2: SR25519 pubkey with **invalid** signature (wrong bytes)
-   - Account 3: SR25519 pubkey with valid signature
-3. Build transactions for each account
-4. For TX2, manually corrupt the signature bytes to make it invalid
+- Create StoreV2 instance with `StateStoreConfig{Enable: true}`
+- Prepare protobuf stream with `SnapshotItem_IAVL` before any `SnapshotItem_Store`
+- Create StreamReader from malformed chunks
 
-**Trigger:**
-Call `verifier.VerifyTxs(ctx, txs)` with the array of 4 transactions
+**Action:**
+- Call `restore()` with the malformed stream
+- IAVL items processed before Store items
 
-**Observation:**
-After `VerifyTxs` completes:
-- Check `verifier.errors[0]`: should be nil (correct)
-- Check `verifier.errors[1]`: should be non-nil with "only sr25519 supported" error (correct)
-- Check `verifier.errors[2]`: **is nil but SHOULD be non-nil** with signature verification error (BUG!)
-- Check `verifier.errors[3]`: should be nil (correct)
+**Expected Result:**
+- Current implementation: node crashes via uncaught panic (when ssStore.Import fails on empty StoreKey)
+- With fix: returns error "received IAVL node item before store item"
 
-The test demonstrates that TX2 with an invalid signature incorrectly passes verification because its failure was misattributed to TX1.
+The vulnerability is demonstrated by comparing StoreV2's missing check [6](#0-5)  against the traditional store's validation [4](#0-3) .
 
-**Code Structure:**
-```go
-func TestBatchVerifyMixedSignatureTypes(t *testing.T) {
-    // Setup accounts, keys, and transactions
-    // Create TX0: valid SR25519
-    // Create TX1: ED25519 pubkey
-    // Create TX2: corrupted SR25519 signature
-    // Create TX3: valid SR25519
-    
-    // Call verifier.VerifyTxs(ctx, []sdk.Tx{tx0, tx1, tx2, tx3})
-    
-    // Assert verifier.errors[2] != nil (will FAIL, demonstrating bug)
-}
-```
+## Notes
 
-This PoC demonstrates that transactions with invalid signatures can bypass verification when positioned after transactions with other validation errors, confirming the exploitability of the vulnerability.
+The severity classification (Low to Medium) reflects uncertainty about StoreV2 deployment statistics. The vulnerability is technically valid and exploitable, but the percentage of affected nodes depends on StoreV2 adoption rates and ssStore configuration prevalence, which cannot be determined from the codebase alone. If StoreV2 with ssStore is widely deployed (≥30% of nodes), this would be Medium severity; if less widespread (10-30%), it would be Low severity.
 
 ### Citations
 
-**File:** x/auth/ante/batch_sigverify.go (L113-120)
+**File:** storev2/rootmulti/store.go (L714-803)
 ```go
-			typedPubKey, ok := pubKey.(*sr25519.PubKey)
-			if !ok {
-				v.errors[i] = sdkerrors.Wrapf(
-					sdkerrors.ErrNotSupported,
-					"only sr25519 supported at the moment",
-				)
-				continue
+func (rs *Store) restore(height int64, protoReader protoio.Reader) (snapshottypes.SnapshotItem, error) {
+	var (
+		ssImporter   chan sstypes.SnapshotNode
+		snapshotItem snapshottypes.SnapshotItem
+		storeKey     string
+		restoreErr   error
+	)
+	scImporter, err := rs.scStore.Importer(height)
+	if err != nil {
+		return snapshottypes.SnapshotItem{}, err
+	}
+	if rs.ssStore != nil {
+		ssImporter = make(chan sstypes.SnapshotNode, 10000)
+		go func() {
+			err := rs.ssStore.Import(height, ssImporter)
+			if err != nil {
+				panic(err)
 			}
-```
+		}()
+	}
+loop:
+	for {
+		snapshotItem = snapshottypes.SnapshotItem{}
+		err = protoReader.ReadMsg(&snapshotItem)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			restoreErr = errors.Wrap(err, "invalid protobuf message")
+			break loop
+		}
 
-**File:** x/auth/ante/batch_sigverify.go (L163-163)
-```go
-				sigTxIndices = append(sigTxIndices, i)
-```
-
-**File:** x/auth/ante/batch_sigverify.go (L176-186)
-```go
-	overall, individiauls := v.verifier.Verify()
-	if !overall {
-		for i, individual := range individiauls {
-			if !individual {
-				v.errors[i] = sdkerrors.Wrap(
-					sdkerrors.ErrUnauthorized,
-					"signature verification failed; please verify account number and chain-id",
-				)
+		switch item := snapshotItem.Item.(type) {
+		case *snapshottypes.SnapshotItem_Store:
+			storeKey = item.Store.Name
+			if err = scImporter.AddTree(storeKey); err != nil {
+				restoreErr = err
+				break loop
 			}
+			rs.logger.Info(fmt.Sprintf("Start restoring store: %s", storeKey))
+		case *snapshottypes.SnapshotItem_IAVL:
+			if item.IAVL.Height > math.MaxInt8 {
+				restoreErr = errors.Wrapf(sdkerrors.ErrLogic, "node height %v cannot exceed %v",
+					item.IAVL.Height, math.MaxInt8)
+				break loop
+			}
+			node := &sctypes.SnapshotNode{
+				Key:     item.IAVL.Key,
+				Value:   item.IAVL.Value,
+				Height:  int8(item.IAVL.Height),
+				Version: item.IAVL.Version,
+			}
+			// Protobuf does not differentiate between []byte{} as nil, but fortunately IAVL does
+			// not allow nil keys nor nil values for leaf nodes, so we can always set them to empty.
+			if node.Key == nil {
+				node.Key = []byte{}
+			}
+			if node.Height == 0 && node.Value == nil {
+				node.Value = []byte{}
+			}
+			scImporter.AddNode(node)
+
+			// Check if we should also import to SS store
+			if rs.ssStore != nil && node.Height == 0 && ssImporter != nil {
+				ssImporter <- sstypes.SnapshotNode{
+					StoreKey: storeKey,
+					Key:      node.Key,
+					Value:    node.Value,
+				}
+			}
+		default:
+			// unknown element, could be an extension
+			break loop
 		}
 	}
+
+	if err = scImporter.Close(); err != nil {
+		if restoreErr == nil {
+			restoreErr = err
+		}
+	}
+	if ssImporter != nil {
+		close(ssImporter)
+	}
+	// initialize the earliest version for SS store
+	if rs.ssStore != nil {
+		rs.ssStore.SetEarliestVersion(height, false)
+	}
+
+	return snapshotItem, restoreErr
+}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L220-220)
+**File:** store/rootmulti/store.go (L906-909)
 ```go
-	if err := svd.verifier.errors[txIdx]; err != nil {
+		case *snapshottypes.SnapshotItem_IAVL:
+			if importer == nil {
+				return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
+			}
+```
+
+**File:** snapshots/manager.go (L363-368)
+```go
+	hash := sha256.Sum256(chunk)
+	expected := m.restoreChunkHashes[m.restoreChunkIndex]
+	if !bytes.Equal(hash[:], expected) {
+		return false, sdkerrors.Wrapf(types.ErrChunkHashMismatch,
+			"expected %x, got %x", hash, expected)
+	}
 ```

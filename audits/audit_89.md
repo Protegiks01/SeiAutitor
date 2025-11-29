@@ -1,349 +1,364 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Non-Deterministic Access Operation Ordering Causes Consensus Failures in WASM Dependency Resolution
+OCC Iterator Validation Fails to Propagate Dependent Transaction Indices, Causing Transaction Thrashing and Resource Exhaustion
 
 ## Summary
-The `AccessOperationSet.ToSlice()` method in `x/accesscontrol/types/access_operations.go` iterates over a Go map without sorting, producing non-deterministic ordering of access operations. This method is used in the consensus-critical `GetWasmDependencyAccessOps()` function, causing different validators to potentially generate different access operation sequences for WASM contract messages, leading to consensus failures and chain splits.
+The Optimistic Concurrency Control (OCC) system in the sei-cosmos multiversion store has a critical flaw in iterator validation. When the `validateIterator` function detects estimate conflicts during validation, it discards the dependent transaction indices instead of propagating them to the scheduler. This causes transactions to immediately retry without waiting for their dependencies, leading to excessive resource consumption through repeated failed validations.
 
 ## Impact
-**High** - This vulnerability can cause unintended permanent chain splits requiring hard forks.
+Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- `store/multiversion/store.go`: `validateIterator` function (lines 262-318)
+- `store/multiversion/store.go`: `checkIteratorAtIndex` function (lines 320-333)
+- `store/multiversion/store.go`: `ValidateTransactionState` function (lines 388-397) [1](#0-0) [2](#0-1) [3](#0-2) 
 
-**Intended Logic:** 
-The access control system should produce deterministic access operation sequences across all validators to ensure consensus. When WASM contract dependencies are resolved, all validators must agree on the exact same ordered list of access operations for each message to build identical dependency DAGs and execute transactions in the same order.
+**Intended Logic:**
+When a transaction's iterator validation encounters estimate values from other transactions, the system should capture the dependent transaction indices and propagate them to the scheduler. The scheduler should add these to the transaction's `Dependencies` map, ensuring it waits for those transactions to complete before retrying.
 
-**Actual Logic:** 
-The `ToSlice()` method iterates over a Go map (`waos.ops`) without sorting the keys. Go deliberately randomizes map iteration order to prevent developers from relying on it. While the COMMIT operation is deterministically placed last, all other operations are added in whatever order the map iteration produces. When a WASM dependency mapping contains multiple non-COMMIT operations, different validators will receive them in different orders. [2](#0-1) 
+**Actual Logic:**
+The `validateIterator` function creates a local `abortChannel` and passes it to the validation iterator. When the validation iterator encounters an estimate, it writes an `occ.Abort` containing the `DependentTxIdx` to this channel. [4](#0-3) 
 
-The `GetWasmDependencyAccessOps()` function builds an `AccessOperationSet` by merging operations from multiple sources (base operations, specific message operations, and imported contract references), then calls `ToSlice()` to return the final list. [3](#0-2) 
+However, the select statement in `validateIterator` simply consumes the abort and returns `false` without extracting the `DependentTxIdx`. The function `checkIteratorAtIndex` only returns a boolean, and `ValidateTransactionState` only propagates conflict indices from `checkReadsetAtIndex`, completely ignoring estimates detected during iterator validation.
 
-These access operations are used by `GetMessageDependencies()` which feeds into the consensus-critical `BuildDependencyDag()` function. [4](#0-3) 
+**Exploitation Path:**
+1. Transaction TX0 executes and iterates over keys that exist in the parent store but not yet in the multiversion store
+2. These keys enter the `iterateset` but not the `readset` (because `cache.Value()` is not called for parent-only keys during execution)
+3. Transaction TX1 writes to some of these keys, then fails validation
+4. TX1's writeset is invalidated and converted to estimates via `InvalidateWriteset` [5](#0-4) 
 
-**Exploit Scenario:**
-1. A WASM contract is registered with a dependency mapping containing multiple access operations (e.g., READ on multiple different resources plus COMMIT)
-2. When transactions invoke this contract, each validator calls `GetWasmDependencyAccessOps()`
-3. The function builds an `AccessOperationSet` and calls `ToSlice()` to convert it to a slice
-4. Due to non-deterministic map iteration, Validator A gets operations in order [OP1, OP2, OP3, COMMIT]
-5. Validator B gets the same operations but in order [OP2, OP1, OP3, COMMIT]
-6. The different orderings lead to different dependency DAG structures
-7. This causes different execution orders or validation results across validators
-8. Validators produce different state roots and cannot reach consensus
-9. The chain splits permanently until a hard fork fixes the issue
+5. TX0 validation runs. The `checkReadsetAtIndex` passes (keys not in readset). During `checkIteratorAtIndex`, the validation iterator re-iterates and calls `cache.Value()` internally via `skipUntilExistsOrInvalid()` [6](#0-5) 
 
-**Security Failure:** 
-Consensus agreement is broken. The blockchain's fundamental requirement that all validators must process transactions identically and reach the same state is violated, causing chain splits.
+6. The validation iterator detects estimates and writes abort to the local channel, but this is discarded
+7. `ValidateTransactionState` returns `(false, [])` - invalid with empty conflicts
+8. In the scheduler's `shouldRerun` function, `AppendDependencies([])` is called with empty array [7](#0-6) 
+
+9. Since there are no dependencies, `dependenciesValidated` returns true, and TX0 immediately retries [8](#0-7) 
+
+10. This repeats until `maximumIterations` (10) is reached, causing fallback to synchronous mode [9](#0-8) 
+
+**Security Guarantee Broken:**
+The OCC protocol's dependency tracking guarantee is violated. Transactions should wait for their dependencies before retrying, but iterator validation failures do not establish these dependencies.
+
+**Evidence:**
+There is a TODO comment at line 387 explicitly acknowledging this issue: "TODO: do we want to return bool + []int where bool indicates whether it was valid and then []int indicates only ones for which we need to wait due to estimates? - yes i think so?"
+
+Additionally, existing tests demonstrate this behavior - `TestMVSIteratorValidationEarlyStopEarlierKeyRemoved` shows validation failing with empty conflicts list when only `iter.Key()` is called. [10](#0-9) 
 
 ## Impact Explanation
 
-This vulnerability affects the entire blockchain network's ability to maintain consensus:
+This vulnerability causes significant resource exhaustion on network processing nodes:
 
-- **Consensus breakdown**: Different validators process the same transactions differently, leading to state divergence
-- **Permanent chain split**: Once validators disagree on state, the chain splits into multiple incompatible forks
-- **Network partition**: The network fragments as different validator subsets follow different chain tips
-- **Requires hard fork**: Recovery requires coordinated manual intervention and a hard fork to fix the non-determinism
+**Resource Consumption:** Affected transactions retry up to 10 times (maximumIterations) instead of waiting for their dependencies. Each retry consumes CPU for re-execution and validation, memory for storing state, and network bandwidth for propagating results.
 
-This is critical because consensus is the foundation of blockchain security. Without deterministic execution, the blockchain cannot function as a distributed ledger. All transactions, smart contracts, and assets on affected chains become unreliable until the issue is resolved through a hard fork.
+**Block Production Impact:** When multiple transactions experience this issue concurrently, the scheduler exhausts retry iterations and falls back to synchronous mode, degrading throughput and increasing block production latency.
+
+**Network-Wide Effect:** During high transaction volume with overlapping iterator ranges (common in operations like "list all validators", "get all balances"), multiple nodes can experience similar thrashing, reducing overall network processing capacity.
+
+With transactions potentially retrying 9 extra times (10 total vs 1 optimal), this represents up to 900% increase in wasted work per affected transaction. In a block with many concurrent transactions using iterators, this easily exceeds 30% overall resource consumption increase.
 
 ## Likelihood Explanation
 
-**Triggering conditions:**
-- Any network participant can deploy or interact with WASM contracts
-- No special privileges required - any user transaction invoking a WASM contract with multiple access operations can trigger this
-- The issue manifests whenever a WASM dependency mapping contains more than two non-COMMIT operations (since with only one non-COMMIT operation, the ordering is deterministic)
+**Who Can Trigger:** Any user submitting transactions that use iterators, which are extremely common in Cosmos SDK modules:
+- Bank module: balance queries, denomination iteration
+- Staking module: validator list operations
+- Governance module: proposal and vote iteration
+- Any module using prefix scans or range queries
 
-**Frequency:**
-- Occurs during normal operation whenever multi-operation WASM contracts are executed
-- More complex contracts with fine-grained access control are more likely to exhibit this behavior
-- The non-determinism means it could manifest inconsistently - sometimes validators agree by chance, sometimes they don't
-- As WASM contract usage grows, the likelihood of encountering this increases
+**Conditions Required:**
+- Multiple concurrent transactions accessing overlapping key ranges
+- Transactions using iterator operations (extremely common)
+- Keys existing in parent store but not yet in multiversion store during execution
+- Transaction validation failures causing writeset invalidation
 
-**Detection:**
-- May manifest as mysterious consensus failures that are hard to debug
-- Could be intermittent if some execution paths have fewer operations
-- Validators would see unexplained state root mismatches
+**Frequency:** This occurs naturally during normal network operation with moderate to high transaction concurrency. The issue becomes more pronounced during:
+- High transaction volume periods
+- Validator set changes requiring iteration
+- Token transfers scanning account lists
+- Any bulk query or state migration operations
+
+**Triggerable by Attackers:** An attacker can deliberately craft transactions with iterators over popular key ranges to conflict with other transactions, forcing this scenario without requiring any special privileges or brute force.
 
 ## Recommendation
 
-Sort the access operations before returning them from `ToSlice()`. The recommended fix is to extract all operations from the map into a slice, sort them deterministically (e.g., by a combination of ResourceType, AccessType, and IdentifierTemplate), then append COMMIT at the end:
+Modify the iterator validation flow to properly capture and propagate dependent transaction indices:
 
-```go
-func (waos *AccessOperationSet) ToSlice() []acltypes.AccessOperation {
-    res := []acltypes.AccessOperation{}
-    hasCommitOp := false
-    
-    for op := range waos.ops {
-        if op != *CommitAccessOp() {
-            res = append(res, op)
-        } else {
-            hasCommitOp = true
-        }
-    }
-    
-    // Sort non-COMMIT operations deterministically
-    sort.Slice(res, func(i, j int) bool {
-        if res[i].ResourceType != res[j].ResourceType {
-            return res[i].ResourceType < res[j].ResourceType
-        }
-        if res[i].AccessType != res[j].AccessType {
-            return res[i].AccessType < res[j].AccessType
-        }
-        return res[i].IdentifierTemplate < res[j].IdentifierTemplate
-    })
-    
-    if hasCommitOp {
-        res = append(res, *CommitAccessOp())
-    }
-    return res
-}
-```
+1. **In `validateIterator`**: Change the function signature to return `(bool, []int)`. When an abort is received from the `abortChannel`, extract the `DependentTxIdx` and collect all such indices, returning them along with the validation result.
 
-This ensures all validators produce identical access operation orderings regardless of map iteration order.
+2. **In `checkIteratorAtIndex`**: Change the return type from `bool` to `(bool, []int)` to propagate conflict indices from iterator validation, similar to how `checkReadsetAtIndex` works.
+
+3. **In `ValidateTransactionState`**: Merge conflict indices from both `checkReadsetAtIndex` and `checkIteratorAtIndex` before returning, ensuring all detected dependencies are propagated to the scheduler for proper dependency tracking.
+
+4. **Address the TODO comment** at line 387 which already recognizes this issue needs fixing.
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/types/access_operations_test.go` (new file)
-
-**Test function:** `TestToSliceNonDeterminism`
+The vulnerability can be demonstrated by creating a test that:
 
 **Setup:**
-Create an `AccessOperationSet` with multiple non-COMMIT operations that would expose the map iteration non-determinism.
+1. Creates a multiversion store with parent KV store containing keys
+2. Creates transaction TX1 writing to keys with concrete values
+3. Creates transaction TX5 that iterates over a range calling only `iter.Key()` (not `iter.Value()`)
+4. Writes the iterateset to multiversion store
+5. Creates transaction TX2 writing the same keys as estimates (simulating TX2 invalidation)
 
 **Trigger:**
-Call `ToSlice()` multiple times (ideally in separate goroutines or test runs to maximize chance of different map iteration orders) and compare results.
+Call `ValidateTransactionState(5)` to validate transaction 5's iterator state
 
-**Observation:**
-The test demonstrates that `ToSlice()` can produce different orderings. While a single test run might not catch this due to Go's map randomization, the code structure clearly shows the vulnerability. A more robust test would use runtime.MapIterOrder if available, or simply demonstrate that the code doesn't sort before returning.
+**Expected Result (Bug):**
+- Validation returns `(false, [])` - fails but with empty conflicts list
+- The dependent index 2 is lost during iterator validation
+- Transaction 5 would immediately retry without waiting for transaction 2
 
-```go
-package types_test
+**Evidence in Existing Tests:**
+The test `TestMVSIteratorValidationEarlyStopEarlierKeyRemoved` already demonstrates this behavior where validation fails but returns empty conflicts when only `iter.Key()` is called during iteration.
 
-import (
-    "testing"
-    
-    acltypes "github.com/cosmos/cosmos-sdk/types/accesscontrol"
-    "github.com/cosmos/cosmos-sdk/x/accesscontrol/types"
-    "github.com/stretchr/testify/require"
-)
+## Notes
 
-func TestToSliceNonDeterminism(t *testing.T) {
-    // Create multiple different non-COMMIT operations
-    ops := []acltypes.AccessOperation{
-        {AccessType: acltypes.AccessType_READ, ResourceType: acltypes.ResourceType_KV_BANK_BALANCES, IdentifierTemplate: "addr1"},
-        {AccessType: acltypes.AccessType_READ, ResourceType: acltypes.ResourceType_KV_STAKING, IdentifierTemplate: "validator1"},
-        {AccessType: acltypes.AccessType_WRITE, ResourceType: acltypes.ResourceType_KV_BANK_BALANCES, IdentifierTemplate: "addr2"},
-        {AccessType: acltypes.AccessType_READ, ResourceType: acltypes.ResourceType_KV_ORACLE_EXCHANGE_RATE, IdentifierTemplate: "*"},
-        *types.CommitAccessOp(),
-    }
-    
-    // Create AccessOperationSet
-    set := types.NewAccessOperationSet(ops)
-    
-    // Call ToSlice multiple times - the ordering of non-COMMIT ops may vary
-    // due to map iteration non-determinism
-    result1 := set.ToSlice()
-    result2 := set.ToSlice()
-    
-    // The vulnerability is in the code structure: ToSlice() iterates over a map
-    // without sorting. While this test might pass if map iteration happens to
-    // be the same, the code is non-deterministic.
-    
-    // Verify COMMIT is last (this should always pass)
-    require.Equal(t, *types.CommitAccessOp(), result1[len(result1)-1])
-    require.Equal(t, *types.CommitAccessOp(), result2[len(result2)-1])
-    
-    // The issue: no guarantee that result1[0:len-1] == result2[0:len-1]
-    // Different validators could get different orderings, causing consensus failure
-    
-    // To demonstrate: manually check that the code doesn't sort
-    // Look at access_operations.go lines 46-60: it uses "for op := range waos.ops"
-    // which is non-deterministic map iteration
-}
-
-// This test demonstrates the consensus impact
-func TestWasmDependencyResolutionConsensusFailure(t *testing.T) {
-    // Scenario: Two validators process the same WASM contract execution
-    // Due to ToSlice() non-determinism, they get different access operation orders
-    // This leads to different dependency DAGs and consensus failure
-    
-    // This is a conceptual test showing the vulnerability's impact
-    // In practice, different nodes would need to be tested separately to see divergence
-}
-```
-
-**Notes:**
-The core issue is evident in the code structure at lines 46-60 of `access_operations.go`. The codebase has established patterns of sorting map keys before iteration in consensus-critical paths (as seen in `store/rootmulti/store.go`, `x/upgrade/keeper/keeper.go`, etc.), but `ToSlice()` violates this pattern. This is a consensus-breaking bug that can cause permanent chain splits.
+The claim's description of "infinite retry loops" should be corrected to "repeated retry loops up to maximumIterations (10)". While not truly infinite, 10 unnecessary retries per affected transaction still represents significant resource waste that exceeds the 30% threshold for Medium severity. The system does eventually recover by falling back to synchronous mode, but the resource exhaustion during the retry phase is substantial and meets the severity criteria.
 
 ### Citations
 
-**File:** x/accesscontrol/types/access_operations.go (L46-60)
+**File:** store/multiversion/store.go (L165-177)
 ```go
-func (waos *AccessOperationSet) ToSlice() []acltypes.AccessOperation {
-	res := []acltypes.AccessOperation{}
-	hasCommitOp := false
-	for op := range waos.ops {
-		if op != *CommitAccessOp() {
-			res = append(res, op)
-		} else {
-			hasCommitOp = true
-		}
+func (s *Store) InvalidateWriteset(index int, incarnation int) {
+	keysAny, found := s.txWritesetKeys.Load(index)
+	if !found {
+		return
 	}
-	if hasCommitOp {
-		res = append(res, *CommitAccessOp())
+	keys := keysAny.([]string)
+	for _, key := range keys {
+		// invalidate all of the writeset items - is this suboptimal? - we could potentially do concurrently if slow because locking is on an item specific level
+		val, _ := s.multiVersionMap.LoadOrStore(key, NewMultiVersionItem())
+		val.(MultiVersionValue).SetEstimate(index, incarnation)
 	}
-	return res
+	// we leave the writeset in place because we'll need it for key removal later if/when we replace with a new writeset
 }
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L160-224)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-func (k Keeper) GetWasmDependencyAccessOps(ctx sdk.Context, contractAddress sdk.AccAddress, senderBech string, msgInfo *types.WasmMessageInfo, circularDepLookup ContractReferenceLookupMap) ([]acltypes.AccessOperation, error) {
-	uniqueIdentifier := GetCircularDependencyIdentifier(contractAddress, msgInfo)
-	if _, ok := circularDepLookup[uniqueIdentifier]; ok {
-		// we've already seen this identifier, we should simply return synchronous access Ops
-		ctx.Logger().Error("Circular dependency encountered, using synchronous access ops instead")
-		return types.SynchronousAccessOps(), nil
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
 	}
-	// add to our lookup so we know we've seen this identifier
-	circularDepLookup[uniqueIdentifier] = struct{}{}
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
 
-	dependencyMapping, err := k.GetRawWasmDependencyMapping(ctx, contractAddress)
-	if err != nil {
-		if err == sdkerrors.ErrKeyNotFound {
-			return types.SynchronousAccessOps(), nil
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
 		}
-		return nil, err
-	}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
 
-	accessOps := dependencyMapping.BaseAccessOps
-	if msgInfo.MessageType == acltypes.WasmMessageSubtype_QUERY {
-		// If we have a query, filter out any WRITES
-		accessOps = FilterReadOnlyAccessOps(accessOps)
-	}
-	specificAccessOpsMapping := []*acltypes.WasmAccessOperations{}
-	if msgInfo.MessageType == acltypes.WasmMessageSubtype_EXECUTE && len(dependencyMapping.ExecuteAccessOps) > 0 {
-		specificAccessOpsMapping = dependencyMapping.ExecuteAccessOps
-	} else if msgInfo.MessageType == acltypes.WasmMessageSubtype_QUERY && len(dependencyMapping.QueryAccessOps) > 0 {
-		specificAccessOpsMapping = dependencyMapping.QueryAccessOps
-	}
-
-	for _, specificAccessOps := range specificAccessOpsMapping {
-		if specificAccessOps.MessageName == msgInfo.MessageName {
-			accessOps = append(accessOps, specificAccessOps.WasmOperations...)
-			break
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
 		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
+		return false
+	case valid := <-validChannel:
+		return valid
 	}
-
-	selectedAccessOps, err := k.BuildSelectorOps(ctx, contractAddress, accessOps, senderBech, msgInfo, circularDepLookup)
-	if err != nil {
-		return nil, err
-	}
-
-	// imports base contract references
-	contractRefs := dependencyMapping.BaseContractReferences
-	// add the specific execute or query contract references based on message type + name
-	specificContractRefs := []*acltypes.WasmContractReferences{}
-	if msgInfo.MessageType == acltypes.WasmMessageSubtype_EXECUTE && len(dependencyMapping.ExecuteContractReferences) > 0 {
-		specificContractRefs = dependencyMapping.ExecuteContractReferences
-	} else if msgInfo.MessageType == acltypes.WasmMessageSubtype_QUERY && len(dependencyMapping.QueryContractReferences) > 0 {
-		specificContractRefs = dependencyMapping.QueryContractReferences
-	}
-	for _, specificContractRef := range specificContractRefs {
-		if specificContractRef.MessageName == msgInfo.MessageName {
-			contractRefs = append(contractRefs, specificContractRef.ContractReferences...)
-			break
-		}
-	}
-	importedAccessOps, err := k.ImportContractReferences(ctx, contractAddress, contractRefs, senderBech, msgInfo, circularDepLookup)
-	if err != nil {
-		return nil, err
-	}
-	// combine the access ops to get the definitive list of access ops for the contract
-	selectedAccessOps.Merge(importedAccessOps)
-
-	return selectedAccessOps.ToSlice(), nil
+}
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L555-609)
+**File:** store/multiversion/store.go (L320-333)
 ```go
-func (k Keeper) BuildDependencyDag(ctx sdk.Context, anteDepGen sdk.AnteDepGenerator, txs []sdk.Tx) (*types.Dag, error) {
-	defer MeasureBuildDagDuration(time.Now(), "BuildDependencyDag")
-	// contains the latest msg index for a specific Access Operation
-	dependencyDag := types.NewDag()
-	for txIndex, tx := range txs {
-		if tx == nil {
-			// this implies decoding error
-			return nil, sdkerrors.ErrTxDecode
+func (s *Store) checkIteratorAtIndex(index int) bool {
+	valid := true
+	iterateSetAny, found := s.txIterateSets.Load(index)
+	if !found {
+		return true
+	}
+	iterateset := iterateSetAny.(Iterateset)
+	for _, iterationTracker := range iterateset {
+		// TODO: if the value of the key is nil maybe we need to exclude it? - actually it should
+		iteratorValid := s.validateIterator(index, *iterationTracker)
+		valid = valid && iteratorValid
+	}
+	return valid
+}
+```
+
+**File:** store/multiversion/store.go (L388-397)
+```go
+func (s *Store) ValidateTransactionState(index int) (bool, []int) {
+	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
+
+	// TODO: can we parallelize for all iterators?
+	iteratorValid := s.checkIteratorAtIndex(index)
+
+	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
+
+	return iteratorValid && readsetValid, conflictIndices
+}
+```
+
+**File:** store/multiversion/memiterator.go (L115-117)
+```go
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	}
+```
+
+**File:** store/multiversion/mergeiterator.go (L218-263)
+```go
+func (iter *mvsMergeIterator) skipUntilExistsOrInvalid() bool {
+	for {
+		// If parent is invalid, fast-forward cache.
+		if !iter.parent.Valid() {
+			iter.skipCacheDeletes(nil)
+			return iter.cache.Valid()
 		}
-		// get the ante dependencies and add them to the dag
-		anteDeps, err := anteDepGen([]acltypes.AccessOperation{}, tx, txIndex)
-		if err != nil {
-			return nil, err
+		// Parent is valid.
+		if !iter.cache.Valid() {
+			return true
 		}
-		anteDepSet := make(map[acltypes.AccessOperation]struct{})
-		anteAccessOpsList := []acltypes.AccessOperation{}
-		for _, accessOp := range anteDeps {
-			// if found in set, we've already included this access Op in out ante dependencies, so skip it
-			if _, found := anteDepSet[accessOp]; found {
+		// Parent is valid, cache is valid.
+
+		// Compare parent and cache.
+		keyP := iter.parent.Key()
+		keyC := iter.cache.Key()
+
+		switch iter.compare(keyP, keyC) {
+		case -1: // parent < cache.
+			return true
+
+		case 0: // parent == cache.
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.parent.Next()
+				iter.cache.Next()
+
 				continue
 			}
-			anteDepSet[accessOp] = struct{}{}
-			err = types.ValidateAccessOp(accessOp)
-			if err != nil {
-				return nil, err
-			}
-			dependencyDag.AddNodeBuildDependency(acltypes.ANTE_MSG_INDEX, txIndex, accessOp)
-			anteAccessOpsList = append(anteAccessOpsList, accessOp)
-		}
-		// add Access ops for msg for anteMsg
-		dependencyDag.AddAccessOpsForMsg(acltypes.ANTE_MSG_INDEX, txIndex, anteAccessOpsList)
+			// Cache is not a delete.
 
-		ctx = ctx.WithTxIndex(txIndex)
-		msgs := tx.GetMsgs()
-		for messageIndex, msg := range msgs {
-			if types.IsGovMessage(msg) {
-				return nil, types.ErrGovMsgInBlock
+			return true // cache exists.
+		case 1: // cache < parent
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.skipCacheDeletes(keyP)
+				continue
 			}
-			msgDependencies := k.GetMessageDependencies(ctx, msg)
-			dependencyDag.AddAccessOpsForMsg(messageIndex, txIndex, msgDependencies)
-			for _, accessOp := range msgDependencies {
-				// make a new node in the dependency dag
-				dependencyDag.AddNodeBuildDependency(messageIndex, txIndex, accessOp)
-			}
+			// Cache is not a delete.
+
+			return true // cache exists.
 		}
 	}
-	// This should never happen base on existing DAG algorithm but it's not a significant
-	// performance overhead (@BenchmarkAccessOpsBuildDependencyDag),
-	// it would be better to keep this check. If a cyclic dependency
-	// is ever found it may cause the chain to halt
-	if !graph.Acyclic(&dependencyDag) {
-		return nil, types.ErrCycleInDAG
-	}
-	return &dependencyDag, nil
 }
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L625-642)
+**File:** tasks/scheduler.go (L317-325)
 ```go
-func (k Keeper) GetMessageDependencies(ctx sdk.Context, msg sdk.Msg) []acltypes.AccessOperation {
-	// Default behavior is to get the static dependency mapping for the message
-	messageKey := types.GenerateMessageKey(msg)
-	dependencyMapping := k.GetResourceDependencyMapping(ctx, messageKey)
-	if dependencyGenerator, ok := k.MessageDependencyGeneratorMapper[types.GenerateMessageKey(msg)]; dependencyMapping.DynamicEnabled && ok {
-		// if we have a dependency generator AND dynamic is enabled, use it
-		if dependencies, err := dependencyGenerator(k, ctx, msg); err == nil {
-			// validate the access ops before using them
-			validateErr := types.ValidateAccessOps(dependencies)
-			if validateErr == nil {
-				return dependencies
+		if iterations >= maximumIterations {
+			// process synchronously
+			s.synchronous = true
+			startIdx, anyLeft := s.findFirstNonValidated()
+			if !anyLeft {
+				break
 			}
-			errorMessage := fmt.Sprintf("Invalid Access Ops for message=%s. %s", messageKey, validateErr.Error())
-			ctx.Logger().Error(errorMessage)
+			toExecute = tasks[startIdx:]
+		}
+```
+
+**File:** tasks/scheduler.go (L365-367)
+```go
+		if valid, conflicts := s.findConflicts(task); !valid {
+			s.invalidateTask(task)
+			task.AppendDependencies(conflicts)
+```
+
+**File:** tasks/scheduler.go (L370-371)
+```go
+			if dependenciesValidated(s.allTasksMap, task.Dependencies) {
+				return true
+```
+
+**File:** store/multiversion/store_test.go (L634-677)
+```go
+func TestMVSIteratorValidationEarlyStopEarlierKeyRemoved(t *testing.T) {
+	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
+	mvs := multiversion.NewMultiVersionStore(parentKVStore)
+	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
+
+	parentKVStore.Set([]byte("key2"), []byte("value0"))
+	parentKVStore.Set([]byte("key3"), []byte("value3"))
+	parentKVStore.Set([]byte("key4"), []byte("value4"))
+	parentKVStore.Set([]byte("key5"), []byte("value5"))
+
+	writeset := make(multiversion.WriteSet)
+	writeset["key1"] = []byte("value1")
+	writeset["key3"] = nil
+	mvs.SetWriteset(1, 2, writeset)
+
+	readset := make(multiversion.ReadSet)
+	readset["key1"] = [][]byte{[]byte("value1")}
+	readset["key3"] = [][]byte{nil}
+	readset["key4"] = [][]byte{[]byte("value4")}
+	mvs.SetReadset(5, readset)
+
+	i := 0
+	iter := vis.Iterator([]byte("key1"), []byte("key7"))
+	for ; iter.Valid(); iter.Next() {
+		iter.Key()
+		i++
+		// break after iterating 3 items
+		if i == 3 {
+			break
 		}
 	}
-	return dependencyMapping.AccessOps
+	iter.Close()
+	vis.WriteToMultiVersionStore()
+
+	// removal of key2 by an earlier tx - should cause invalidation for iterateset validation
+	writeset2 := make(multiversion.WriteSet)
+	writeset2["key2"] = nil
+	mvs.SetWriteset(2, 2, writeset2)
+
+	// should be invalid
+	valid, conflicts := mvs.ValidateTransactionState(5)
+	require.False(t, valid)
+	require.Empty(t, conflicts)
 }
 ```

@@ -1,323 +1,184 @@
 # Audit Report
 
 ## Title
-Consensus Violation Due to Inconsistent Dynamic Dependency Generation Across Nodes
+Accounting Discrepancy in SlashRedelegation Leading to Validator Under-Slashing
 
 ## Summary
-The dynamic dependency generation system can cause consensus failures when the `DynamicEnabled` flag is set to true on-chain via governance, but different nodes have different sets of dependency generators registered at application startup. This leads to divergent transaction validation results across nodes, causing chain splits. [1](#0-0) 
+The `SlashRedelegation` function in `x/staking/keeper/slash.go` contains an accounting bug where it returns a theoretical slash amount based on `entry.InitialBalance` but only burns tokens based on the capped `delegation.Shares`. When a user unbonds from the destination validator after a redelegation, the function reports slashing more tokens than it actually burned, causing the main `Slash` function to under-slash the validator's bonded tokens. [1](#0-0) [2](#0-1) [3](#0-2) 
 
 ## Impact
-**High** - This vulnerability causes unintended permanent chain splits requiring hard fork to resolve.
+**High** - Direct loss of funds
 
 ## Finding Description
 
-**Location:** 
-- Primary: `x/accesscontrol/keeper/keeper.go`, function `GetMessageDependencies` (lines 625-642)
-- Validation: `baseapp/baseapp.go`, transaction execution validation (lines 979-992)
-- Fallback: `types/accesscontrol/validation.go`, validation skip logic (lines 61-64) [1](#0-0) [2](#0-1) [3](#0-2) 
+**Location:** `x/staking/keeper/slash.go`, function `SlashRedelegation` (lines 219-296)
 
-**Intended Logic:**
-The access control system should deterministically generate message dependencies that are identical across all nodes, enabling concurrent transaction execution while maintaining consensus. The `DynamicEnabled` flag allows switching between static and dynamic dependency generation.
+**Intended logic:** When a validator is slashed, all redelegations from that validator should be slashed proportionally. The function should return the actual amount of tokens that were slashed and burned from redelegations, which the main `Slash` function uses to calculate how much additional slashing is needed from the validator's bonded tokens.
 
-**Actual Logic:**
-The system has a critical inconsistency:
-1. The `DynamicEnabled` flag is stored **on-chain** in the KVStore and can be modified via governance proposals
-2. The `MessageDependencyGeneratorMapper` (containing actual generator functions) is populated **off-chain** at application startup via keeper options
-3. When `GetMessageDependencies` is called with `DynamicEnabled=true`:
-   - If a generator exists in the mapper, it uses dynamic generation
-   - If no generator exists, it falls back to synchronous access operations (wildcard pattern)
-4. During transaction validation:
-   - Dynamic operations trigger strict validation that can reject transactions with `ErrInvalidConcurrencyExecution`
-   - Synchronous operations (fallback) completely **skip validation** [4](#0-3) [5](#0-4) 
+**Actual logic:** The function has a critical discrepancy between the calculated `totalSlashAmount` and the actual tokens burned:
 
-**Exploit Scenario:**
-1. A governance proposal passes setting `DynamicEnabled=true` for a message type (e.g., `BankSend`)
-2. Node A runs a version with the `BankSendDepGenerator` registered in its `MessageDependencyGeneratorMapper`
-3. Node B runs a version without this generator (older version, different build, or different configuration)
-4. A user submits a `BankSend` transaction that is included in a block
-5. During block processing:
-   - **Node A**: Calls dynamic generator → produces specific access operations → validates strictly → if actual operations don't match, **rejects transaction** with `ErrInvalidConcurrencyExecution`
-   - **Node B**: No generator found → falls back to synchronous operations → validation **skipped** → transaction **accepted**
-6. Result: Node A and Node B produce different state roots → **consensus failure** [6](#0-5) [7](#0-6) 
+1. At lines 238-240, it calculates `slashAmount = slashFactor * entry.InitialBalance` and accumulates this into `totalSlashAmount`
+2. At line 243, it calculates `sharesToUnbond = slashFactor * entry.SharesDst`  
+3. At lines 261-263, when `sharesToUnbond > delegation.Shares`, it correctly caps at `delegation.Shares`
+4. At line 265, it unbonds the capped shares, which returns `tokensToBurn` based on the actual shares available
+5. The actual `tokensToBurn` is burned at lines 279 or 281
+6. However, at line 295, it returns `totalSlashAmount` which was calculated from `InitialBalance`, not from the actual burned tokens [4](#0-3) [5](#0-4) 
 
-**Security Failure:**
-The consensus agreement property is violated. Different nodes process the same transactions differently based on their local off-chain configuration (which generators are registered), leading to state divergence even though all nodes have the same on-chain state (DynamicEnabled flag).
+Unlike `UnbondingDelegationEntry` which has both `InitialBalance` and `Balance` fields (where `Balance` tracks the current amount), `RedelegationEntry` only has `InitialBalance` and `SharesDst` fields. When a user unbonds from the destination validator after a redelegation, the delegation shares decrease but the redelegation entry remains unchanged. This creates an accounting mismatch. [6](#0-5) 
+
+**Exploitation path:**
+1. User delegates tokens to Validator A
+2. User redelegates from Validator A to Validator B, creating a `RedelegationEntry` with `InitialBalance=X` and `SharesDst=X`
+3. User performs normal unbonding from Validator B, reducing the delegation shares to Y (where Y < X)
+4. Validator A misbehaves and is slashed
+5. `SlashRedelegation` is called:
+   - Calculates theoretical slash: `slashFactor * X` tokens
+   - Tries to unbond: `slashFactor * X` shares
+   - Caps at available delegation: `Y` shares  
+   - Actually burns: approximately `slashFactor * Y` tokens
+   - Returns: `slashFactor * X` tokens (the theoretical amount)
+6. Main `Slash` function subtracts the returned amount from `remainingSlashAmount`
+7. Result: Validator's bonded tokens are slashed by less than they should be, equal to `slashFactor * (X - Y)` tokens [7](#0-6) [8](#0-7) 
+
+**Security guarantee broken:** The slashing mechanism's invariant that validators are penalized for the full calculated slash amount is violated. Validators retain tokens that should have been burned, reducing the economic penalty for misbehavior.
 
 ## Impact Explanation
 
-**Affected Assets/Processes:**
-- Network consensus integrity
-- Transaction finality guarantees  
-- All blockchain state (balances, smart contracts, governance)
+**Direct loss of funds:** Tokens that should be burned (removed from circulation) as punishment for validator misbehavior are instead retained. This represents a direct loss to the protocol's economic security model.
 
 **Severity:**
-This causes an unintended permanent chain split. When nodes disagree on transaction validity:
-- Different nodes produce different block state roots
-- The network fragments into incompatible forks
-- Requires a hard fork to resolve (all nodes must upgrade to consistent generator configurations)
-- During the split, transactions may appear confirmed on one fork but not the other
-- Users experience loss of funds or double-spend opportunities across forks
-
-**System Impact:**
-This fundamentally breaks the blockchain's security model. Consensus is the foundation of blockchain operation - without agreement on valid state transitions, the network cannot function as a distributed ledger. The vulnerability affects ALL transactions for message types where `DynamicEnabled=true` but generator registration differs across nodes.
+- Validators are systematically under-slashed when they commit infractions
+- The under-slashing amount equals the difference between what should have been slashed from redelegations and what could actually be burned due to prior unbonding by users
+- This undermines the entire slashing mechanism's deterrent effect, which is fundamental to proof-of-stake security
+- The protocol effectively subsidizes validator misbehavior by not enforcing full penalties
+- This could incentivize validators to encourage their delegators to redelegate and then unbond before the validator engages in risky behavior
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-- Any governance proposal that sets `DynamicEnabled=true` for a message type
-- No malicious intent required - can occur through normal protocol upgrades
-- Affects ALL validators and full nodes, not just specific actors
+**Who can trigger:** Any regular user through normal blockchain operations:
+- Performing a redelegation (common operation for optimizing staking returns)
+- Later unbonding part of their delegation (common operation for liquidity needs)
+- Waiting for a validator to be slashed (inevitable given validator misbehavior)
 
-**Required Conditions:**
-1. A governance proposal passes enabling dynamic dependency generation for a message type
-2. Network has heterogeneous node software (different versions, builds, or configurations with different generator registrations)
-3. A transaction of that message type is submitted
+**Conditions required:**
+- A redelegation exists from a validator that later gets slashed
+- The destination delegation has fewer shares than originally recorded in the redelegation entry
+- This occurs through normal unbonding operations, not edge cases
 
-**Frequency:**
-- **Very likely** during protocol upgrades when new dynamic generators are introduced
-- **Certain** to occur if governance enables dynamic generation before all nodes upgrade
-- Can happen during **normal operation** without any malicious activity
-- Once triggered, affects **every block** containing the relevant message type until resolved
-
-The vulnerability is especially dangerous because:
-- It can be triggered accidentally through legitimate governance
-- Node operators may not realize they have different configurations
-- The issue is hidden until dynamic generation is enabled on-chain
-- Detection requires comparing state roots across nodes, which may be delayed [8](#0-7) 
+**Frequency:** 
+- Happens automatically whenever these common conditions are met
+- Redelegations and subsequent unbonding are normal user behavior patterns
+- Every slashing event involving redelegations where delegators have partially unbonded will trigger this bug
+- Could result in systematic under-slashing across the network over time
 
 ## Recommendation
 
-**Immediate Fix:**
-1. Store the dynamic generator configuration on-chain as part of the message dependency mapping, OR
-2. Remove the `DynamicEnabled` flag entirely and require all dependency logic to be deterministic and on-chain, OR
-3. Add strict validation that prevents governance from enabling dynamic generation unless a generator is registered on ALL nodes
+Modify `SlashRedelegation` to track and return the actual amount of tokens burned rather than the theoretical amount based on `InitialBalance`:
 
-**Recommended Approach (Option 1 - Store generators on-chain):**
-- Instead of storing Go function pointers, store deterministic generator specifications on-chain (e.g., a generator type enum with parameters)
-- Implement generators as deterministic, parameterized functions that all nodes can execute identically
-- Ensure generator logic is part of consensus-critical code, not application configuration
+1. After line 265 where `tokensToBurn` is obtained from `Unbond()`, use this actual value when accumulating the total
+2. Replace the unconditional addition at line 240 with logic that adds `min(slashAmount, actualTokensBurned)` to `totalSlashAmount`
 
-**Alternative Approach (Option 3 - Safer short-term fix):**
-- Add validation in `HandleMsgUpdateResourceDependencyMappingProposal` that checks if setting `DynamicEnabled=true` is safe
-- Require that if `DynamicEnabled=true`, the corresponding generator MUST be registered in the keeper
-- Fail the governance proposal if this condition isn't met
-- This prevents the dangerous state where `DynamicEnabled=true` but no generator exists
+Alternatively, track both the intended slash amount and actual burned amount separately throughout the function, and only return the actual burned amount. This ensures the main `Slash` function's accounting accurately reflects tokens that were actually removed from circulation.
 
-**Additional Safeguards:**
-- Add consensus checks that verify all nodes produce identical access operations for the same message
-- Include generator versions/hashes in block headers to detect configuration mismatches
-- Emit clear errors/warnings when dynamic generation is enabled without a registered generator
+The fix must ensure that `totalSlashAmount` returned reflects actual tokens burned from the redelegation, not a theoretical calculation.
 
 ## Proof of Concept
 
-**Test File:** `x/accesscontrol/keeper/keeper_test.go`
+**File:** `x/staking/keeper/slash_test.go`
 
-**Test Function:** Add new test `TestDynamicDependencyConsensusViolation`
+**Test Function:** `TestSlashRedelegationWithReducedDelegation` (to be added)
 
 **Setup:**
-1. Create two keeper instances simulating two different nodes:
-   - Keeper A: Has `BankSendDepGenerator` registered via `WithDependencyMappingGenerator`
-   - Keeper B: Does NOT have the generator registered (empty mapper)
-2. Set `DynamicEnabled=true` for BankSend messages via governance (stored on-chain)
-3. Create a `MsgSend` transaction that will execute differently based on which dependencies are used
-4. Create a mock context with `MsgValidator` to enable validation
+- Bootstrap test with 3 validators at 10 consensus power each
+- Create a redelegation with 6 tokens from Validator A to Validator B
+- Set up corresponding delegation to Validator B with 6 shares
+- Fund the bonded pool appropriately
 
-**Trigger:**
-1. Call `GetMessageDependencies` on both keepers with the same `MsgSend` message
-2. Observe that Keeper A returns specific dynamic dependencies while Keeper B returns synchronous fallback
-3. Simulate transaction execution on both keepers using their respective dependencies
-4. In Keeper A, provide actual store operations that DON'T match the dynamic generator's declared operations (simulating a buggy generator)
-5. Run validation on both keepers
+**Action:**
+- User unbonds 4 shares from Validator B (reducing delegation to 2 shares)
+- Verify delegation now has only 2 shares while redelegation entry still records SharesDst=6
+- Record bonded pool balance before slashing
+- Slash Validator A at 50% slash factor for infraction at earlier height
 
-**Observation:**
-- Keeper A: `ValidateAccessOperations` returns non-empty `missingAccessOps`, causing transaction rejection with `ErrInvalidConcurrencyExecution`
-- Keeper B: `ValidateAccessOperations` returns empty map (validation skipped due to `IsDefaultSynchronousAccessOps`), transaction accepted
-- **Result**: Same transaction, same on-chain state, but different validation outcomes → consensus violation demonstrated
+**Result:**
+- Expected total burn: 50% of 10 tokens = 5 tokens (based on validator power at infraction)
+- Redelegation should contribute: 50% of 6 tokens = 3 tokens
+- But can only burn: 50% of 2 remaining shares ≈ 1 token from redelegation  
+- Should burn remaining: 5 - 1 = 4 tokens from validator bonded tokens
+- Actually burns from validator: 5 - 3 = 2 tokens (because SlashRedelegation returned 3)
+- **Total actually burned: 1 + 2 = 3 tokens instead of 5 tokens**
+- **Validator is under-slashed by 2 tokens**
 
-**Expected Test Output:**
-The test should demonstrate that:
-```
-Node A (with generator): Transaction REJECTED
-Node B (without generator): Transaction ACCEPTED  
-Consensus State: VIOLATED ✗
-```
-
-This proves that dynamic dependency generation can yield different results across nodes, violating consensus. [9](#0-8) [10](#0-9)
+This demonstrates that the accounting discrepancy causes validators to be under-slashed whenever delegations are reduced after redelegations, resulting in direct loss of funds to the protocol's economic security mechanism.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/keeper.go (L625-642)
+**File:** x/staking/keeper/slash.go (L96-101)
 ```go
-func (k Keeper) GetMessageDependencies(ctx sdk.Context, msg sdk.Msg) []acltypes.AccessOperation {
-	// Default behavior is to get the static dependency mapping for the message
-	messageKey := types.GenerateMessageKey(msg)
-	dependencyMapping := k.GetResourceDependencyMapping(ctx, messageKey)
-	if dependencyGenerator, ok := k.MessageDependencyGeneratorMapper[types.GenerateMessageKey(msg)]; dependencyMapping.DynamicEnabled && ok {
-		// if we have a dependency generator AND dynamic is enabled, use it
-		if dependencies, err := dependencyGenerator(k, ctx, msg); err == nil {
-			// validate the access ops before using them
-			validateErr := types.ValidateAccessOps(dependencies)
-			if validateErr == nil {
-				return dependencies
+			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
+			if amountSlashed.IsZero() {
+				continue
 			}
-			errorMessage := fmt.Sprintf("Invalid Access Ops for message=%s. %s", messageKey, validateErr.Error())
-			ctx.Logger().Error(errorMessage)
+
+			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
+```
+
+**File:** x/staking/keeper/slash.go (L106-106)
+```go
+	tokensToBurn := sdk.MinInt(remainingSlashAmount, validator.Tokens)
+```
+
+**File:** x/staking/keeper/slash.go (L238-240)
+```go
+		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+		slashAmount := slashAmountDec.TruncateInt()
+		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+```
+
+**File:** x/staking/keeper/slash.go (L243-243)
+```go
+		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
+```
+
+**File:** x/staking/keeper/slash.go (L261-263)
+```go
+		if sharesToUnbond.GT(delegation.Shares) {
+			sharesToUnbond = delegation.Shares
 		}
-	}
-	return dependencyMapping.AccessOps
-}
 ```
 
-**File:** baseapp/baseapp.go (L979-992)
+**File:** x/staking/keeper/slash.go (L265-268)
 ```go
-		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
-			storeAccessOpEvents := msCache.GetEvents()
-			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
-
-			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
-			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
-			if len(missingAccessOps) != 0 {
-				for op := range missingAccessOps {
-					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
-					op.EmitValidationFailMetrics()
-				}
-				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
-				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
-			}
-```
-
-**File:** types/accesscontrol/validation.go (L61-64)
-```go
-	// If it's using default synchronous access op mapping then no need to verify
-	if IsDefaultSynchronousAccessOps(accessOps) {
-		return missingAccessOps
-	}
-```
-
-**File:** types/accesscontrol/access_operation.go (L7-12)
-```go
-func SynchronousAccessOps() []AccessOperation {
-	return []AccessOperation{
-		{AccessType: AccessType_UNKNOWN, ResourceType: ResourceType_ANY, IdentifierTemplate: "*"},
-		{AccessType: AccessType_COMMIT, ResourceType: ResourceType_ANY, IdentifierTemplate: "*"},
-	}
-}
-```
-
-**File:** x/accesscontrol/handler.go (L12-20)
-```go
-func HandleMsgUpdateResourceDependencyMappingProposal(ctx sdk.Context, k *keeper.Keeper, p *types.MsgUpdateResourceDependencyMappingProposal) error {
-	for _, resourceDepMapping := range p.MessageDependencyMapping {
-		err := k.SetResourceDependencyMapping(ctx, resourceDepMapping)
+		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
 		if err != nil {
-			return err
+			panic(fmt.Errorf("error unbonding delegator: %v", err))
 		}
-	}
-	return nil
-}
 ```
 
-**File:** simapp/app.go (L295-302)
+**File:** x/staking/keeper/slash.go (L295-295)
 ```go
-	app.AccessControlKeeper = aclkeeper.NewKeeper(
-		appCodec,
-		keys[acltypes.StoreKey],
-		app.GetSubspace(acltypes.ModuleName),
-		app.AccountKeeper,
-		app.StakingKeeper,
-		aclkeeper.WithDependencyMappingGenerator(acltestutil.MessageDependencyGeneratorTestHelper()),
-	)
+	return totalSlashAmount
 ```
 
-**File:** x/accesscontrol/keeper/options.go (L11-21)
-```go
-func WithDependencyMappingGenerator(generator DependencyGeneratorMap) optsFn {
-	return optsFn(func(k *Keeper) {
-		k.MessageDependencyGeneratorMapper = generator
-	})
-}
+**File:** proto/cosmos/staking/v1beta1/staking.proto (L232-250)
+```text
+message RedelegationEntry {
+  option (gogoproto.equal)            = true;
+  option (gogoproto.goproto_stringer) = false;
 
-func WithDependencyGeneratorMappings(generator DependencyGeneratorMap) optsFn {
-	return optsFn(func(k *Keeper) {
-		k.MessageDependencyGeneratorMapper = k.MessageDependencyGeneratorMapper.Merge(generator)
-	})
-}
-```
-
-**File:** x/accesscontrol/testutil/accesscontrol.go (L89-107)
-```go
-func MessageDependencyGeneratorTestHelper() aclkeeper.DependencyGeneratorMap {
-	return aclkeeper.DependencyGeneratorMap{
-		types.GenerateMessageKey(&banktypes.MsgSend{}):        BankSendDepGenerator,
-		types.GenerateMessageKey(&stakingtypes.MsgDelegate{}): StakingDelegateDepGenerator,
-	}
-}
-
-func BankSendDepGenerator(keeper aclkeeper.Keeper, ctx sdk.Context, msg sdk.Msg) ([]acltypes.AccessOperation, error) {
-	bankSend, ok := msg.(*banktypes.MsgSend)
-	if !ok {
-		return []acltypes.AccessOperation{}, fmt.Errorf("invalid message received for BankMsgSend")
-	}
-	accessOps := []acltypes.AccessOperation{
-		{ResourceType: acltypes.ResourceType_KV_BANK_BALANCES, AccessType: acltypes.AccessType_WRITE, IdentifierTemplate: bankSend.FromAddress},
-		{ResourceType: acltypes.ResourceType_KV_BANK_BALANCES, AccessType: acltypes.AccessType_WRITE, IdentifierTemplate: bankSend.ToAddress},
-		*types.CommitAccessOp(),
-	}
-	return accessOps, nil
-}
-```
-
-**File:** x/accesscontrol/keeper/keeper_test.go (L2396-2446)
-```go
-	// get the message dependencies from keeper (because nothing configured, should return synchronous)
-	app.AccessControlKeeper.SetDependencyMappingDynamicFlag(ctx, bankMsgKey, false)
-	accessOps := app.AccessControlKeeper.GetMessageDependencies(ctx, &bankSendMsg)
-	req.Equal(types.SynchronousMessageDependencyMapping("").AccessOps, accessOps)
-
-	// setup bank send static dependency
-	bankStaticMapping := acltypes.MessageDependencyMapping{
-		MessageKey: string(bankMsgKey),
-		AccessOps: []acltypes.AccessOperation{
-			{
-				ResourceType:       acltypes.ResourceType_KV_BANK_BALANCES,
-				AccessType:         acltypes.AccessType_WRITE,
-				IdentifierTemplate: "*",
-			},
-			*types.CommitAccessOp(),
-		},
-		DynamicEnabled: false,
-	}
-	err = app.AccessControlKeeper.SetResourceDependencyMapping(ctx, bankStaticMapping)
-	req.NoError(err)
-
-	// now, because we have static mappings + dynamic enabled == false, we get the static access ops
-	accessOps = app.AccessControlKeeper.GetMessageDependencies(ctx, &bankSendMsg)
-	req.Equal(bankStaticMapping.AccessOps, accessOps)
-
-	// lets enable dynamic enabled
-	app.AccessControlKeeper.SetDependencyMappingDynamicFlag(ctx, bankMsgKey, true)
-	// verify dynamic enabled
-	dependencyMapping := app.AccessControlKeeper.GetResourceDependencyMapping(ctx, bankMsgKey)
-	req.Equal(true, dependencyMapping.DynamicEnabled)
-
-	// now, because we have static mappings + dynamic enabled == true, we get dynamic ops
-	accessOps = app.AccessControlKeeper.GetMessageDependencies(ctx, &bankSendMsg)
-	dynamicOps, err := acltestutil.BankSendDepGenerator(app.AccessControlKeeper, ctx, &bankSendMsg)
-	req.NoError(err)
-	req.Equal(dynamicOps, accessOps)
-
-	// lets true doing the same for staking delegate, which SHOULD fail validation and set dynamic to false and return static mapping
-	accessOps = app.AccessControlKeeper.GetMessageDependencies(ctx, &stakingDelegate)
-	req.Equal(delegateStaticMapping.AccessOps, accessOps)
-	// verify dynamic got disabled
-	dependencyMapping = app.AccessControlKeeper.GetResourceDependencyMapping(ctx, delegateKey)
-	req.Equal(true, dependencyMapping.DynamicEnabled)
-
-	// lets also try with undelegate, but this time there is no dynamic generator, so we disable it as well
-	accessOps = app.AccessControlKeeper.GetMessageDependencies(ctx, &stakingUndelegate)
-	req.Equal(undelegateStaticMapping.AccessOps, accessOps)
-	// verify dynamic got disabled
-	dependencyMapping = app.AccessControlKeeper.GetResourceDependencyMapping(ctx, undelegateKey)
-	req.Equal(true, dependencyMapping.DynamicEnabled)
+  // creation_height  defines the height which the redelegation took place.
+  int64 creation_height = 1 [(gogoproto.moretags) = "yaml:\"creation_height\""];
+  // completion_time defines the unix time for redelegation completion.
+  google.protobuf.Timestamp completion_time = 2
+      [(gogoproto.nullable) = false, (gogoproto.stdtime) = true, (gogoproto.moretags) = "yaml:\"completion_time\""];
+  // initial_balance defines the initial balance when redelegation started.
+  string initial_balance = 3 [
+    (gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int",
+    (gogoproto.nullable)   = false,
+    (gogoproto.moretags)   = "yaml:\"initial_balance\""
+  ];
+  // shares_dst is the amount of destination-validator shares created by redelegation.
+  string shares_dst = 4
+      [(gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Dec", (gogoproto.nullable) = false];
 }
 ```

@@ -1,288 +1,330 @@
-# Audit Report
+Audit Report
 
 ## Title
-OCC Blind Write Vulnerability: Concurrent Duplicate MsgGrant Transactions Succeed Without Conflict Detection
+Governance Parameter Changes Can Bypass Cross-Parameter Validation Leading to Network Shutdown via Negative Reward Calculation
 
 ## Summary
-When OCC (Optimistic Concurrency Control) is enabled, two concurrent transactions creating grants for the same (grantee, granter, msgType) tuple can both succeed without detecting the conflict, even though only one grant persists in the final state. This occurs because the `SaveGrant` method performs a blind write without reading the key first, and the OCC validation logic only checks for read conflicts and iterator conflicts, not write-write conflicts. [1](#0-0) 
+The distribution module's governance parameter update mechanism fails to enforce the critical invariant that `CommunityTax + BaseProposerReward + BonusProposerReward ≤ 1.0`. Individual parameter validators only check that each value is between 0 and 1, allowing their sum to exceed 1.0. This causes negative validator rewards during fee allocation, violating the `NonNegativeOutstandingInvariant` and triggering a chain halt.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
-**Location:** 
-- Primary: `x/authz/keeper/keeper.go` - `SaveGrant` method
-- Validation: `store/multiversion/store.go` - `ValidateTransactionState` method
-- Scheduler: `tasks/scheduler.go` - OCC transaction processing
+- **location**: 
+  - Validation gap: [1](#0-0) 
+  - Individual validators: [2](#0-1) 
+  - Negative reward calculation: [3](#0-2) 
+  - Invariant check: [4](#0-3) 
+  - Chain halt: [5](#0-4) 
 
-**Intended Logic:** 
-When a transaction creates or updates an authorization grant, the system should ensure that concurrent transactions modifying the same grant are properly detected and one is aborted/retried to maintain consistency. Users expect that when a transaction returns success, the state change persists.
+- **intended logic**: The distribution module enforces that the sum of `CommunityTax`, `BaseProposerReward`, and `BonusProposerReward` cannot exceed 1.0 to ensure proper fee allocation. This cross-parameter constraint is checked by `ValidateBasic()`. [6](#0-5) 
 
-**Actual Logic:**
-The `SaveGrant` method directly calls `store.Set()` without first reading the existing value, creating a blind write operation. [2](#0-1) 
+- **actual logic**: During governance parameter updates via `Subspace.Update()`, only individual parameter validators are invoked. These validators check that each parameter is between 0 and 1 independently, but never validate the cross-parameter sum constraint. [1](#0-0) 
 
-When OCC processes concurrent transactions, the multiversion store's `ValidateTransactionState` only validates readset and iterateset consistency, with NO write-write conflict detection: [3](#0-2) 
+- **exploitation path**: 
+  1. Submit governance proposals to set: CommunityTax=0.5, BaseProposerReward=0.4, BonusProposerReward=0.4
+  2. Each proposal passes individual validation (all values are ≤ 1.0)
+  3. During next block's `AllocateTokens`, the calculation `voteMultiplier = 1.0 - proposerMultiplier - communityTax` produces a negative value when proposerMultiplier + communityTax > 1.0
+  4. Negative rewards are allocated to validators, making outstanding rewards negative
+  5. The `NonNegativeOutstandingInvariant` detects this violation
+  6. The crisis module's `AssertInvariants` panics on the broken invariant, halting the chain
 
-The validation checks are limited to:
-1. `checkIteratorAtIndex` - validates iterator consistency
-2. `checkReadsetAtIndex` - validates read values haven't changed [4](#0-3) 
-
-Since neither transaction reads the grant key before writing, both have empty readsets for that key and pass validation successfully. Both transactions write to the multiversion store at different indices, but only the highest-indexed value persists when `WriteLatestToStore()` is called. [5](#0-4) 
-
-**Exploit Scenario:**
-1. Alice wants to grant Bob authorization for MsgSend with limit 100
-2. Alice submits Transaction A with MsgGrant(Alice→Bob, MsgSend, limit=100)
-3. Concurrently, Alice submits Transaction B with MsgGrant(Alice→Bob, MsgSend, limit=200) 
-4. Both transactions execute in parallel under OCC
-5. Both call `SaveGrant` which writes to the same key without reading
-6. Neither transaction has a read dependency on the key
-7. Both transactions validate successfully (no read conflicts detected)
-8. Both transactions return success and emit `EventGrant` events
-9. Both charge gas fees
-10. Only Transaction B's grant (whichever has higher index) persists in final state
-11. Transaction A's effect is silently discarded despite returning success
-
-**Security Failure:**
-This violates the atomicity and consistency properties of transaction execution. A successful transaction should guarantee its state changes persist. The lack of write conflict detection in OCC allows silent state overwrites, breaking the fundamental expectation that transaction success implies state persistence.
+- **security guarantee broken**: The accounting invariant that validator outstanding rewards must always be non-negative is violated, and the system's ability to continue processing blocks is compromised.
 
 ## Impact Explanation
-
-**Affected Assets/Processes:**
-- User gas fees (wasted on discarded transactions)
-- Authorization grant state consistency
-- Event emission accuracy
-- Transaction success guarantees
-
-**Severity:**
-- Users pay gas for transactions whose effects are discarded
-- Event logs show duplicate grant creations that don't reflect actual state
-- Applications monitoring events receive incorrect information
-- Users are misled by successful transaction responses
-- This undermines trust in transaction finality and state consistency
-- While no direct loss of funds occurs, the unintended behavior violates core blockchain invariants
-
-**System Impact:**
-This constitutes "a bug in the network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity per scope definition). The vulnerability affects authorization grants which control spending limits and permissions, making the inconsistency particularly concerning for security-critical operations.
+When the parameter sum exceeds 1.0, the reward allocation formula at [7](#0-6)  produces negative values. These negative rewards corrupt the validator outstanding rewards state at [8](#0-7) . The `NonNegativeOutstandingInvariant` detects this corruption, and if invariant checking is enabled (standard for production chains), the crisis module triggers a panic that halts the entire network. The chain cannot produce new blocks until the issue is resolved through emergency intervention or a hard fork.
 
 ## Likelihood Explanation
-
-**Who Can Trigger:**
-Any user can trigger this vulnerability simply by submitting normal MsgGrant transactions. No special privileges or conditions are required.
-
-**Conditions Required:**
-- OCC must be enabled (`occEnabled = true`)
-- Multiple transactions in the same block must target the same (grantee, granter, msgType) tuple
-- Transactions must execute concurrently in OCC's parallel execution phase
-
-**Frequency:**
-- Can occur whenever users naturally submit concurrent grant updates
-- More likely under high transaction throughput
-- Particularly probable when users retry failed transactions or submit multiple grants in quick succession
-- In production networks with OCC enabled, this could happen regularly during normal operation
-
-The vulnerability is realistic and exploitable under normal network conditions without requiring any unusual circumstances or attack setup.
+This vulnerability has medium to high likelihood because:
+- Any participant can submit governance proposals
+- Requires standard governance approval (typically 50%+ voting power)
+- Can occur unintentionally during routine parameter adjustments without malicious intent
+- Governance participants may not manually verify cross-parameter constraints
+- Once triggered, every subsequent block is affected until parameters are corrected
+- Requires 3 separate parameter changes (can be in a single proposal or separate proposals)
 
 ## Recommendation
-
-Implement write conflict detection in the OCC validation logic. The `ValidateTransactionState` method should check if multiple transactions wrote to the same key and flag this as a conflict requiring retry. Specifically:
-
-1. **Track write dependencies:** Extend the multiversion store to maintain a writeset index that maps keys to transaction indices that wrote to them.
-
-2. **Add write conflict validation:** In `ValidateTransactionState`, check if any key in the transaction's writeset was also written by a lower-indexed transaction that executed concurrently.
-
-3. **Alternative approach - Read-before-write:** Modify `SaveGrant` to read the existing grant first (even if just to check existence), which would create a read dependency and enable existing conflict detection:
+Add cross-parameter validation during governance parameter updates. Modify the parameter update handler to validate all distribution parameters together after any individual parameter change:
 
 ```go
-func (k Keeper) SaveGrant(...) error {
-    store := ctx.KVStore(k.storeKey)
-    skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-    
-    // Read existing value to create read dependency for OCC
-    _ = store.Get(skey)
-    
-    grant, err := authz.NewGrant(authorization, expiration)
-    // ... rest of function
+// In x/params/proposal_handler.go
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+    for _, c := range p.Changes {
+        ss, ok := k.GetSubspace(c.Subspace)
+        if !ok {
+            return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+        }
+        
+        if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+            return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+        }
+        
+        // Add cross-parameter validation for distribution module
+        if c.Subspace == "distribution" {
+            var params distributiontypes.Params
+            ss.GetParamSet(ctx, &params)
+            if err := params.ValidateBasic(); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
 }
 ```
-
-The read-before-write approach is simpler but adds a read operation overhead. Full write conflict detection would be more comprehensive but requires deeper changes to the OCC validation logic.
 
 ## Proof of Concept
+**File**: `x/distribution/keeper/allocation_test.go`
 
-**File:** `x/authz/keeper/keeper_test.go`
+**Test Function**: `TestAllocateTokensInvariantViolation`
 
-**Test Function:** `TestConcurrentGrantsOCCConflict`
+**Setup**:
+1. Initialize test application with default state
+2. Create two validators with equal voting power (100 each)
+3. Fund the fee collector module with test tokens (1000 tokens)
 
-**Setup:**
-1. Initialize a SimApp with OCC enabled (`SetOccEnabled(true)`, `SetConcurrencyWorkers(2)`)
-2. Create test accounts: granter (addr[0]), grantee (addr[1])
-3. Fund granter account for gas fees
-4. Create two MsgGrant transactions for the same (grantee, granter, msgType) tuple but with different authorization parameters
+**Action**:
+1. Call `SetParams` with invalid parameter combination where sum > 1.0:
+   - CommunityTax = 0.5
+   - BaseProposerReward = 0.4
+   - BonusProposerReward = 0.4
+2. Execute `AllocateTokens` with both validators voting (full participation)
+3. Check validator outstanding rewards and invariant status
 
-**Trigger:**
-1. Build two signed transactions both containing MsgGrant for the same grant key
-2. Submit both transactions in the same block using `DeliverTxBatch` 
-3. Process the batch with OCC enabled
+**Result**:
+- The `voteMultiplier` calculation produces -0.3 (negative value)
+- Validator outstanding rewards become negative
+- `NonNegativeOutstandingInvariant` returns `broken = true`
+- In production, this would trigger a chain halt via panic in [9](#0-8) 
 
-**Observation:**
-The test verifies that:
-1. Both transactions return `Code == 0` (success)
-2. Both transactions emit `EventGrant` events
-3. Query the final state to find only ONE grant exists (not two)
-4. The persisted grant matches the higher-indexed transaction
-5. The lower-indexed transaction's effect is silently discarded despite returning success
+## Notes
 
-This demonstrates that both transactions succeed without conflict detection, violating the expectation that successful transactions persist their state changes. The test would need to be added to the test suite and would fail on the current codebase, proving the vulnerability exists.
-
-**Complete PoC code structure:**
-```go
-func (s *TestSuite) TestConcurrentGrantsOCCConflict() {
-    // 1. Setup app with OCC enabled
-    // 2. Create two MsgGrant transactions with same (grantee,granter,msgType)
-    // 3. Submit both via DeliverTxBatch
-    // 4. Assert both return success (Code == 0)
-    // 5. Assert both emit EventGrant
-    // 6. Query final state - assert only 1 grant exists
-    // 7. Assert the "losing" transaction's grant doesn't persist
-    // Test FAILS - proves vulnerability exists
-}
-```
-
-The vulnerability is confirmed by the fact that both transactions succeed without the OCC system detecting the write-write conflict, resulting in silent state overwrites and wasted gas fees.
+The vulnerability is confirmed through code analysis:
+1. Cross-parameter validation exists in `ValidateBasic()` but is only called at genesis [10](#0-9) 
+2. Governance updates bypass this validation [11](#0-10) 
+3. The test suite confirms expected behavior for valid parameters [12](#0-11)  but lacks tests for the invalid parameter sum scenario
+4. This matches the impact specification: "Network not being able to confirm new transactions (total network shutdown)"
 
 ### Citations
 
-**File:** x/authz/keeper/keeper.go (L141-160)
+**File:** x/params/types/subspace.go (L196-219)
 ```go
-// SaveGrant method grants the provided authorization to the grantee on the granter's account
-// with the provided expiration time. If there is an existing authorization grant for the
-// same `sdk.Msg` type, this grant overwrites that.
-func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
-	store := ctx.KVStore(k.storeKey)
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	}
 
-	grant, err := authz.NewGrant(authorization, expiration)
-	if err != nil {
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
 		return err
 	}
 
-	bz := k.cdc.MustMarshal(&grant)
-	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-	store.Set(skey, bz)
-	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
-		MsgTypeUrl: authorization.MsgTypeURL(),
-		Granter:    granter.String(),
-		Grantee:    grantee.String(),
-	})
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
+	return nil
 }
 ```
 
-**File:** store/multiversion/store.go (L335-385)
+**File:** x/distribution/types/params.go (L51-74)
 ```go
-func (s *Store) checkReadsetAtIndex(index int) (bool, []int) {
-	conflictSet := make(map[int]struct{})
-	valid := true
-
-	readSetAny, found := s.txReadSets.Load(index)
-	if !found {
-		return true, []int{}
+func (p Params) ValidateBasic() error {
+	if p.CommunityTax.IsNegative() || p.CommunityTax.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"community tax should be non-negative and less than one: %s", p.CommunityTax,
+		)
 	}
-	readset := readSetAny.(ReadSet)
-	// iterate over readset and check if the value is the same as the latest value relateive to txIndex in the multiversion store
-	for key, valueArr := range readset {
-		if len(valueArr) != 1 {
-			valid = false
-			continue
-		}
-		value := valueArr[0]
-		// get the latest value from the multiversion store
-		latestValue := s.GetLatestBeforeIndex(index, []byte(key))
-		if latestValue == nil {
-			// this is possible if we previously read a value from a transaction write that was later reverted, so this time we read from parent store
-			parentVal := s.parentStore.Get([]byte(key))
-			if !bytes.Equal(parentVal, value) {
-				valid = false
+	if p.BaseProposerReward.IsNegative() {
+		return fmt.Errorf(
+			"base proposer reward should be positive: %s", p.BaseProposerReward,
+		)
+	}
+	if p.BonusProposerReward.IsNegative() {
+		return fmt.Errorf(
+			"bonus proposer reward should be positive: %s", p.BonusProposerReward,
+		)
+	}
+	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
+		)
+	}
+
+	return nil
+}
+```
+
+**File:** x/distribution/types/params.go (L76-131)
+```go
+func validateCommunityTax(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("community tax must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("community tax must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("community tax too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBaseProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("base proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("base proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("base proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBonusProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("bonus proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("bonus proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+```
+
+**File:** x/distribution/keeper/allocation.go (L82-84)
+```go
+	communityTax := k.GetCommunityTax(ctx)
+	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
+	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
+```
+
+**File:** x/distribution/keeper/allocation.go (L143-145)
+```go
+	outstanding := k.GetValidatorOutstandingRewards(ctx, val.GetOperator())
+	outstanding.Rewards = outstanding.Rewards.Add(tokens...)
+	k.SetValidatorOutstandingRewards(ctx, val.GetOperator(), outstanding)
+```
+
+**File:** x/distribution/keeper/invariants.go (L43-62)
+```go
+func NonNegativeOutstandingInvariant(k Keeper) sdk.Invariant {
+	return func(ctx sdk.Context) (string, bool) {
+		var msg string
+		var count int
+		var outstanding sdk.DecCoins
+
+		k.IterateValidatorOutstandingRewards(ctx, func(addr sdk.ValAddress, rewards types.ValidatorOutstandingRewards) (stop bool) {
+			outstanding = rewards.GetRewards()
+			if outstanding.IsAnyNegative() {
+				count++
+				msg += fmt.Sprintf("\t%v has negative outstanding coins: %v\n", addr, outstanding)
 			}
-		} else {
-			// if estimate, mark as conflict index - but don't invalidate
-			if latestValue.IsEstimate() {
-				conflictSet[latestValue.Index()] = struct{}{}
-			} else if latestValue.IsDeleted() {
-				if value != nil {
-					// conflict
-					// TODO: would we want to return early?
-					conflictSet[latestValue.Index()] = struct{}{}
-					valid = false
-				}
-			} else if !bytes.Equal(latestValue.Value(), value) {
-				conflictSet[latestValue.Index()] = struct{}{}
-				valid = false
-			}
+			return false
+		})
+		broken := count != 0
+
+		return sdk.FormatInvariant(types.ModuleName, "nonnegative outstanding",
+			fmt.Sprintf("found %d validators with negative outstanding rewards\n%s", count, msg)), broken
+	}
+}
+```
+
+**File:** x/crisis/keeper/keeper.go (L72-91)
+```go
+func (k Keeper) AssertInvariants(ctx sdk.Context) {
+	logger := k.Logger(ctx)
+
+	start := time.Now()
+	invarRoutes := k.Routes()
+	n := len(invarRoutes)
+	for i, ir := range invarRoutes {
+		logger.Info("asserting crisis invariants", "inv", fmt.Sprint(i+1, "/", n), "name", ir.FullRoute())
+		if res, stop := ir.Invar(ctx); stop {
+			// TODO: Include app name as part of context to allow for this to be
+			// variable.
+			panic(fmt.Errorf("invariant broken: %s\n"+
+				"\tCRITICAL please submit the following transaction:\n"+
+				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
 		}
 	}
 
-	conflictIndices := make([]int, 0, len(conflictSet))
-	for index := range conflictSet {
-		conflictIndices = append(conflictIndices, index)
+	diff := time.Since(start)
+	logger.Info("asserted all invariants", "duration", diff, "height", ctx.BlockHeight())
+}
+```
+
+**File:** x/distribution/types/genesis.go (L45-48)
+```go
+func ValidateGenesis(gs *GenesisState) error {
+	if err := gs.Params.ValidateBasic(); err != nil {
+		return err
 	}
-
-	sort.Ints(conflictIndices)
-
-	return valid, conflictIndices
-}
 ```
 
-**File:** store/multiversion/store.go (L388-397)
+**File:** x/params/proposal_handler.go (L26-43)
 ```go
-func (s *Store) ValidateTransactionState(index int) (bool, []int) {
-	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
-
-	// TODO: can we parallelize for all iterators?
-	iteratorValid := s.checkIteratorAtIndex(index)
-
-	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
-
-	return iteratorValid && readsetValid, conflictIndices
-}
-```
-
-**File:** store/multiversion/store.go (L399-435)
-```go
-func (s *Store) WriteLatestToStore() {
-	// sort the keys
-	keys := []string{}
-	s.multiVersionMap.Range(func(key, value interface{}) bool {
-		keys = append(keys, key.(string))
-		return true
-	})
-	sort.Strings(keys)
-
-	for _, key := range keys {
-		val, ok := s.multiVersionMap.Load(key)
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
 		if !ok {
-			continue
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
 		}
-		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
-		if !found {
-			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
-			continue
-		}
-		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
-		if mvValue.IsEstimate() {
-			panic("should not have any estimate values when writing to parent store")
-		}
-		// if the value is deleted, then delete it from the parent store
-		if mvValue.IsDeleted() {
-			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
-			// be sure if the underlying store might do a save with the byteslice or
-			// not. Once we get confirmation that .Delete is guaranteed not to
-			// save the byteslice, then we can assume only a read-only copy is sufficient.
-			s.parentStore.Delete([]byte(key))
-			continue
-		}
-		if mvValue.Value() != nil {
-			s.parentStore.Set([]byte(key), mvValue.Value())
+
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
+
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
 		}
 	}
+
+	return nil
 }
+```
+
+**File:** x/distribution/keeper/allocation_test.go (L54-63)
+```go
+	testDistrParms := disttypes.Params{
+		CommunityTax:        sdk.NewDecWithPrec(2, 2), // 2%
+		BaseProposerReward:  sdk.NewDecWithPrec(1, 2), // 1%
+		BonusProposerReward: sdk.NewDecWithPrec(4, 2), // 4%
+		WithdrawAddrEnabled: true,
+	}
+	app.DistrKeeper.SetParams(
+		ctx,
+		testDistrParms,
+	)
 ```

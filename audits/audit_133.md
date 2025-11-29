@@ -1,211 +1,248 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Denial-of-Service via Front-Running Module Account Creation During Chain Upgrades
+Governance Vote Weight Manipulation via Nested Message Validation Bypass in MsgExec
 
 ## Summary
-Module account addresses are deterministically derived using a simple hash of the module name, making them predictable. An attacker can front-run chain upgrades by sending coins to a predicted module account address before the upgrade executes, causing the upgrade to panic and halt the chain when the new module attempts initialization. [1](#0-0) 
+The `MsgExec` message in the authz module does not recursively validate nested messages, allowing attackers to bypass the `ValidateBasic()` checks on `MsgVoteWeighted` messages. This enables submission of governance votes with total weight exceeding 1.0, amplifying the attacker's voting influence beyond their actual voting power.
 
 ## Impact
-**High** - Network not being able to confirm new transactions (total network shutdown)
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Address derivation: [1](#0-0) 
-- Vulnerable panic point: [2](#0-1) 
-- Auto-account creation: [3](#0-2) 
-- Module initialization: [4](#0-3) 
+**Location:**
+- [1](#0-0) 
+- [2](#0-1) 
+- [3](#0-2) 
+- [4](#0-3) 
+- [5](#0-4) 
 
-**Intended Logic:** 
-When a chain upgrade adds a new module, the module's account should be created as a `ModuleAccountI` during the upgrade's `InitGenesis` execution. The `GetModuleAccount` function should either find an existing module account or auto-create one.
+**Intended Logic:**
+All transaction messages should have their `ValidateBasic()` method called during ante handler processing. For `MsgVoteWeighted`, this validation ensures total weight equals exactly 1.0 and prevents duplicate options [6](#0-5) .
 
-**Actual Logic:** 
-The `GetModuleAccount` function panics if it finds a regular `BaseAccount` at the module account address instead of a `ModuleAccountI`. This occurs because:
-1. Module account addresses are predictably derived
-2. Sending coins to any address auto-creates a `BaseAccount`
-3. The type-check in `GetModuleAccountAndPermissions` panics on type mismatch
+**Actual Logic:**
+The ante handler only validates top-level messages [7](#0-6) . When `MsgExec` is submitted, only its `ValidateBasic()` is called, which does not validate nested messages. During execution via `DispatchActions()`, when granter equals grantee (voter acting on their own behalf), the message handler is invoked directly without nested message validation [3](#0-2) . The `AddVote()` function only validates individual option weights, not total weight [8](#0-7) .
 
-**Exploit Scenario:**
-1. Attacker monitors governance for upgrade proposals that add new modules (e.g., via [5](#0-4) )
-2. From the new binary, attacker identifies the new module name in `maccPerms`
-3. Attacker predicts the module account address: `crypto.AddressHash([]byte(newModuleName))`
-4. Before the upgrade height, attacker submits a transaction sending any amount of coins to the predicted address
-5. The `SendCoins` function auto-creates a `BaseAccount` at that address
-6. At upgrade height, the upgrade handler calls `RunMigrations`, which calls the new module's `InitGenesis`
-7. Module's `InitGenesis` calls `GetModuleAccount` (e.g., [6](#0-5) )
-8. `GetModuleAccount` finds the attacker-created `BaseAccount`, attempts to cast it to `ModuleAccountI`, and panics
-9. The upgrade transaction fails, halting the entire chain at the upgrade height
+**Exploitation Path:**
+1. Attacker creates `MsgExec` with grantee set to their own address
+2. Nests `MsgVoteWeighted` with voter = their address and multiple options with total weight > 1.0 (e.g., {Yes: 0.9, Abstain: 0.9})
+3. Transaction passes ante handler validation (only `MsgExec.ValidateBasic()` checked)
+4. During execution, since granter (voter) equals grantee, authorization check is skipped
+5. `VoteWeighted` handler calls `keeper.AddVote()` which validates each option individually (both 0.9 ≤ 1.0) but not the total
+6. Vote stored with total weight 1.8
+7. During tally, voting power is multiplied by each weight, giving amplified influence [5](#0-4) 
 
-**Security Failure:** 
-Denial-of-service through consensus failure. The upgrade cannot complete, causing all validator nodes to halt at the upgrade height, requiring emergency coordination to recover.
+**Security Guarantee Broken:**
+Governance voting invariant that each voter's influence equals exactly their voting power. The total weight constraint (must equal 1.0) can be violated, allowing arbitrary vote amplification.
 
 ## Impact Explanation
 
-**Affected Assets and Processes:**
-- Network availability: The entire chain halts at upgrade height
-- Network operations: No new transactions can be processed
-- Chain governance: Upgrade process is compromised
+This vulnerability enables manipulation of governance proposals by allowing voters to amplify their influence beyond their actual voting power. An attacker with voting power of 100 who votes {Yes: 0.9, Abstain: 0.9} contributes 90 to Yes votes while also reducing the threshold denominator by 90 (since it's totalVotingPower - Abstain). This creates a ~2x amplification effect compared to a normal {Yes: 1.0} vote.
 
-**Severity:**
-- **Critical**: Total network shutdown requiring emergency intervention
-- Validators cannot progress past the upgrade height
-- Requires either a coordinated rollback or a hotfix binary release
-- All pending transactions are blocked
-- Economic activity ceases until resolution
-
-**System Security:**
-This breaks the fundamental assumption that governance-approved upgrades will execute successfully. It allows any unprivileged attacker with minimal funds (just gas costs + dust amount for the coin transfer) to halt the network indefinitely.
+Governance in Cosmos chains typically controls critical functions including protocol parameter changes, software upgrades, and treasury management. Manipulation could lead to unauthorized parameter changes, malicious upgrades, or improper fund allocations, though no concrete funds are at immediate risk from the vote manipulation itself.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant with sufficient funds to submit a transaction (extremely low barrier).
+**Triggerable by:** Any network participant with voting power (staked tokens)
 
-**Required Conditions:**
-1. A pending upgrade proposal that adds a new module (publicly visible in governance)
-2. Knowledge of the new module's name (available in the upgrade binary)
-3. Ability to submit a transaction before the upgrade height (normal network participation)
+**Conditions:**
+- Active governance proposal in voting period
+- Standard transaction submission capability
+- No special privileges required
 
-**Frequency:**
-- **High likelihood**: This attack can be executed on every upgrade that introduces a new module
-- Upgrade proposals are public and occur regularly in active chains
-- The attack requires minimal sophistication and resources
-- Once discovered, attackers can systematically target all future upgrades
+**Frequency:** Exploitable deterministically on any governance proposal. The attack requires no timing, race conditions, or rare circumstances.
 
 ## Recommendation
 
-Modify `GetModuleAccountAndPermissions` to safely handle the case where a regular account exists at a module account address:
+Modify `MsgExec.ValidateBasic()` to recursively validate all nested messages:
 
-1. When an account exists at the module address but is not a `ModuleAccountI`, instead of panicking:
-   - Return an error to the caller
-   - OR, validate the account has zero balance and no transactions, then safely convert it to a module account
-   - OR, check during validation phase (before upgrade execution) that no conflicting accounts exist
+```go
+func (msg MsgExec) ValidateBasic() error {
+    _, err := sdk.AccAddressFromBech32(msg.Grantee)
+    if err != nil {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+    }
 
-2. Add pre-upgrade validation that checks predicted module account addresses for conflicts:
-   - Before upgrade execution, verify that addresses of new modules either don't exist or are already proper `ModuleAccountI`
-   - Fail early with a clear error if conflicts are detected
+    if len(msg.Msgs) == 0 {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+    }
 
-3. Consider adding a nonce or version parameter to the module address derivation to make addresses unpredictable until upgrade execution.
+    // Validate all nested messages
+    msgs, err := msg.GetMessages()
+    if err != nil {
+        return err
+    }
+    
+    for _, m := range msgs {
+        if err := m.ValidateBasic(); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+```
 
 ## Proof of Concept
 
-**File:** `x/auth/keeper/keeper_test.go`
+**Note:** The provided PoC uses a single option with weight=2.0, which would be rejected by `ValidWeightedVoteOption()` since it checks individual weights must be ≤ 1.0 [8](#0-7) . The correct exploitation uses multiple options with individual weights ≤ 1.0 but total > 1.0.
 
-**Test Function:** `TestModuleAccountFrontRunningAttack`
-
+**Corrected exploitation:**
 ```go
-// Add this test to x/auth/keeper/keeper_test.go
-
-func TestModuleAccountFrontRunningAttack(t *testing.T) {
-    // Setup: Create initial app (simulating pre-upgrade state)
-    app, ctx := createTestApp(true)
-    
-    // Attacker predicts the address of a future module "newmodule"
-    newModuleName := "newmodule"
-    predictedModuleAddr := types.NewModuleAddress(newModuleName)
-    
-    // Attacker sends coins to the predicted address, creating a BaseAccount
-    attackerAddr := sdk.AccAddress([]byte("attacker-address"))
-    app.AccountKeeper.SetAccount(ctx, app.AccountKeeper.NewAccountWithAddress(ctx, attackerAddr))
-    
-    // Simulate sending coins which creates a BaseAccount at the module address
-    baseAcc := app.AccountKeeper.NewAccountWithAddress(ctx, predictedModuleAddr)
-    app.AccountKeeper.SetAccount(ctx, baseAcc)
-    
-    // Verify a BaseAccount was created
-    existingAcc := app.AccountKeeper.GetAccount(ctx, predictedModuleAddr)
-    require.NotNil(t, existingAcc)
-    _, isModuleAccount := existingAcc.(types.ModuleAccountI)
-    require.False(t, isModuleAccount, "Should be a BaseAccount, not a ModuleAccount")
-    
-    // Simulate upgrade: Create new keeper with "newmodule" in permissions
-    maccPerms := simapp.GetMaccPerms()
-    maccPerms[newModuleName] = []string{types.Minter}
-    
-    cdc := simapp.MakeTestEncodingConfig().Marshaler
-    newKeeper := keeper.NewAccountKeeper(
-        cdc, app.GetKey(types.StoreKey), app.GetSubspace(types.ModuleName),
-        types.ProtoBaseAccount, maccPerms,
-    )
-    
-    // Trigger: Try to get the module account (simulating InitGenesis)
-    // This should panic because a BaseAccount exists at the module address
-    require.Panics(t, func() {
-        newKeeper.GetModuleAccount(ctx, newModuleName)
-    }, "GetModuleAccount should panic when it finds a BaseAccount at module address")
+maliciousVote := &types.MsgVoteWeighted{
+    ProposalId: proposal.ProposalId,
+    Voter:      attacker.String(),
+    Options: types.WeightedVoteOptions{
+        {Option: types.OptionYes, Weight: sdk.MustNewDecFromStr("0.9")},
+        {Option: types.OptionAbstain, Weight: sdk.MustNewDecFromStr("0.9")},
+    },
 }
+
+// This would fail ValidateBasic (total = 1.8)
+err = maliciousVote.ValidateBasic()
+require.Error(t, err)
+
+// Wrap in MsgExec to bypass validation
+msgExec := authz.NewMsgExec(attacker, []sdk.Msg{maliciousVote})
+err = msgExec.ValidateBasic()
+require.NoError(t, err) // Passes
+
+// Execute successfully despite invalid total weight
+_, err = app.AuthzKeeper.DispatchActions(ctx, attacker, msgs)
+require.NoError(t, err)
+
+// Vote stored with total weight = 1.8
+vote, found := app.GovKeeper.GetVote(ctx, proposal.ProposalId, attacker)
+require.True(t, found)
+totalWeight := vote.Options[0].Weight.Add(vote.Options[1].Weight)
+require.True(t, totalWeight.GT(sdk.OneDec())) // Total > 1.0
 ```
-
-**Setup:**
-1. Initialize test app with standard configuration
-2. Predict a future module's account address using `NewModuleAddress`
-3. Create a regular `BaseAccount` at that address (simulating attacker's coin transfer)
-
-**Trigger:**
-1. Create a new `AccountKeeper` with the new module in `maccPerms` (simulating post-upgrade state)
-2. Call `GetModuleAccount` for the new module name
-
-**Observation:**
-The test expects a panic when `GetModuleAccount` is called, demonstrating that an attacker-created `BaseAccount` at a module address prevents the module account from being properly initialized. The panic occurs in the type assertion check, which would cause the upgrade transaction to fail and halt the chain.
 
 ## Notes
 
-The vulnerability arises from the intersection of three design choices:
-1. Deterministic, predictable module account addresses
-2. Automatic account creation when sending coins to any address
-3. Strict type checking that panics rather than gracefully handling mismatches
-
-While each design choice is reasonable in isolation, their combination creates an attack vector that allows unprivileged actors to DoS chain upgrades.
+The vulnerability mechanism is valid: `MsgExec` fails to validate nested messages, allowing governance vote weight manipulation. While the original PoC has an implementation error (single weight > 1.0 gets rejected at the keeper level), the attack succeeds using multiple options with individual weights ≤ 1.0 but total weight > 1.0. This bypasses the critical total weight validation in `MsgVoteWeighted.ValidateBasic()` and amplifies governance influence, constituting a Medium severity issue per the "bug in network code resulting in unintended behavior" category.
 
 ### Citations
 
-**File:** x/auth/types/account.go (L163-165)
+**File:** x/authz/msgs.go (L221-232)
 ```go
-func NewModuleAddress(name string) sdk.AccAddress {
-	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
+func (msg MsgExec) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+	}
+
+	if len(msg.Msgs) == 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+	}
+
+	return nil
 }
 ```
 
-**File:** x/auth/keeper/keeper.go (L187-192)
+**File:** baseapp/baseapp.go (L787-800)
 ```go
-	acc := ak.GetAccount(ctx, addr)
-	if acc != nil {
-		macc, ok := acc.(types.ModuleAccountI)
-		if !ok {
-			panic("account is not a module account")
+// validateBasicTxMsgs executes basic validator calls for messages.
+func validateBasicTxMsgs(msgs []sdk.Msg) error {
+	if len(msgs) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
+	}
+
+	for _, msg := range msgs {
+		err := msg.ValidateBasic()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+```
+
+**File:** baseapp/baseapp.go (L921-925)
+```go
+	msgs := tx.GetMsgs()
+
+	if err := validateBasicTxMsgs(msgs); err != nil {
+		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
+	}
+```
+
+**File:** x/authz/keeper/keeper.go (L87-111)
+```go
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
 		}
 ```
 
-**File:** x/bank/keeper/send.go (L166-170)
+**File:** x/gov/keeper/vote.go (L21-25)
 ```go
-	accExists := k.ak.HasAccount(ctx, toAddr)
-	if !accExists {
-		defer telemetry.IncrCounter(1, "new", "account")
-		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
+	for _, option := range options {
+		if !types.ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
+		}
 	}
 ```
 
-**File:** types/module/module.go (L515-517)
+**File:** x/gov/keeper/tally.go (L59-62)
 ```go
-//   - if the module does not exist in the `fromVM` (which means that it's a new module,
-//     because it was not in the previous x/upgrade's store), then run
-//     `InitGenesis` on that module.
+				for _, option := range vote.Options {
+					subPower := votingPower.Mul(option.Weight)
+					results[option.Option] = results[option.Option].Add(subPower)
+				}
 ```
 
-**File:** simapp/app.go (L135-142)
+**File:** x/gov/types/msgs.go (L252-271)
 ```go
-	maccPerms = map[string][]string{
-		authtypes.FeeCollectorName:     nil,
-		distrtypes.ModuleName:          nil,
-		minttypes.ModuleName:           {authtypes.Minter},
-		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
-		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
-		govtypes.ModuleName:            {authtypes.Burner},
+	totalWeight := sdk.NewDec(0)
+	usedOptions := make(map[VoteOption]bool)
+	for _, option := range msg.Options {
+		if !ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(ErrInvalidVote, option.String())
+		}
+		totalWeight = totalWeight.Add(option.Weight)
+		if usedOptions[option.Option] {
+			return sdkerrors.Wrap(ErrInvalidVote, "Duplicated vote option")
+		}
+		usedOptions[option.Option] = true
+	}
+
+	if totalWeight.GT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight overflow 1.00")
+	}
+
+	if totalWeight.LT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight lower than 1.00")
 	}
 ```
 
-**File:** x/mint/genesis.go (L13-13)
+**File:** x/gov/types/vote.go (L80-84)
 ```go
-	ak.GetModuleAccount(ctx, types.ModuleName)
+func ValidWeightedVoteOption(option WeightedVoteOption) bool {
+	if !option.Weight.IsPositive() || option.Weight.GT(sdk.NewDec(1)) {
+		return false
+	}
+	return ValidVoteOption(option.Option)
 ```

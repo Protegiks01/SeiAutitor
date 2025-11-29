@@ -1,271 +1,350 @@
 # Audit Report
 
 ## Title
-Unvalidated Pagination Limit Causing Resource Exhaustion in GranteeGrants Query
+MsgGrantAllowance Bypasses Bech32 Address Validation Enabling Fee-Free Resource Consumption
 
 ## Summary
-The `GranteeGrants` gRPC query in the authz module iterates and unmarshals ALL grants in the store regardless of the limit parameter or whether they match the queried grantee. An attacker can exploit this by providing an arbitrarily large limit value, forcing nodes to process the entire grant store and causing resource exhaustion. [1](#0-0) 
+The `MsgGrantAllowance.ValidateBasic()` method in the feegrant module fails to validate Bech32 address format, allowing transactions with malformed addresses to pass initial validation and consume node resources during ante handler execution without paying fees. [1](#0-0) 
 
 ## Impact
-**Medium**
+Low
 
 ## Finding Description
 
-**Location:** The vulnerability exists in the `GranteeGrants` function in `x/authz/keeper/grpc_query.go` (lines 132-178), specifically in how it creates the prefix store and uses pagination.
+**Location:** 
+- Module: `x/feegrant`
+- File: `x/feegrant/msgs.go`
+- Functions: `MsgGrantAllowance.ValidateBasic()` (lines 40-57) and `MsgGrantAllowance.GetSigners()` (lines 60-66)
 
-**Intended Logic:** The pagination mechanism should efficiently limit the number of grants processed and returned, preventing resource exhaustion. Only grants matching the specified grantee should be processed.
+**Intended Logic:**
+The `ValidateBasic()` method should perform comprehensive stateless validation to reject invalid messages early in the transaction pipeline, before resource-intensive operations like signature verification and fee deduction. This is a defense-in-depth mechanism to prevent malformed transactions from consuming node resources.
 
-**Actual Logic:** The function creates a prefix store using only `GrantKey` (the prefix for ALL grants), then calls `GenericFilteredPaginate` which iterates through the entire grant store. The filtering by grantee address occurs AFTER unmarshaling each grant entry. Additionally, there is no upper bound validation on the `limit` parameter in the pagination request. [2](#0-1) 
+**Actual Logic:**
+The current implementation only validates that addresses are non-empty strings and different from each other. It does NOT validate that the addresses are valid Bech32 format. [1](#0-0) 
 
-The pagination implementation unmarshals every grant before applying the filter: [3](#0-2) 
+In contrast, other modules properly validate Bech32 format in their `ValidateBasic()` methods: [2](#0-1) [3](#0-2) 
 
-When the grantee doesn't match, the callback returns nil (size = 0), but the unmarshaling has already occurred: [4](#0-3) 
+**Exploitation Path:**
 
-No upper limit validation exists for the pagination limit: [5](#0-4) 
+1. Attacker submits `MsgGrantAllowance` transaction with invalid Bech32 addresses (e.g., "invalid-granter" and "invalid-grantee")
+2. Transaction enters CheckTx processing pipeline
+3. `validateBasicTxMsgs()` calls `ValidateBasic()` which incorrectly passes [4](#0-3) 
 
-gRPC queries use infinite gas meters, providing no protection against resource exhaustion: [6](#0-5) 
+4. Ante handler chain executes on a cached context, processing through multiple decorators: [5](#0-4) 
 
-**Exploit Scenario:**
-1. An attacker calls the `GranteeGrants` gRPC endpoint with any address (including their own or a random address)
-2. The attacker sets the pagination limit to a very large value (e.g., 10,000,000 or math.MaxUint64)
-3. The node iterates through ALL grants in the authz store, unmarshaling each one
-4. Even if there are millions of grants from/to other addresses, all are processed
-5. This causes excessive CPU usage (protobuf unmarshaling) and memory allocation
-6. The attacker can repeat this attack continuously with multiple concurrent queries
-7. Node resources are exhausted, causing degraded performance or crashes
+5. `DeductFeeDecorator` executes and deducts fees into the cache (line 54)
+6. `SetPubKeyDecorator` executes and calls `GetSigners()` (line 55): [6](#0-5) 
 
-**Security Failure:** This breaks the resource limitation and denial-of-service protection security properties. The pagination mechanism fails to provide actual resource protection because filtering happens after the expensive unmarshaling operation.
+7. `GetSigners()` calls `sdk.AccAddressFromBech32()` which panics on invalid Bech32: [7](#0-6) 
+
+8. Panic is recovered, ante handler returns error, but cached context is never committed: [8](#0-7) 
+
+9. No fees are charged (cache write at line 998 never executes) despite consuming resources through 4+ ante decorators
+
+**Security Guarantee Broken:**
+The defense-in-depth principle is violated. The system design expects `ValidateBasic()` to catch obviously invalid inputs before expensive processing. This vulnerability allows attackers to bypass this guard, consuming node resources without payment.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- Node CPU resources (protobuf unmarshaling for every grant in the store)
-- Node memory resources (allocating memory for all unmarshaled grants)
-- Network availability (nodes becoming slow or crashing)
+This vulnerability enables attackers to submit transactions that consume node resources during CheckTx processing without paying fees. The attack causes network processing nodes to process transactions from the mempool beyond the designed validation parameters.
 
-**Severity of Damage:**
-- If the authz module contains thousands to millions of grants (realistic for a mature chain), processing all of them causes significant resource consumption
-- Multiple concurrent malicious queries can amplify the impact
-- Affected nodes experience degraded performance, potentially becoming unable to process new transactions
-- In severe cases, nodes may crash due to memory exhaustion or CPU overload
-- This can affect 10-30% or more of network nodes, meeting the Medium severity threshold
+**Specific consequences:**
+1. **Fee bypass**: Transactions consume CPU cycles through multiple ante decorators but pay zero fees due to cache rollback
+2. **Resource asymmetry**: Processing cost to nodes exceeds normal invalid transactions that fail at ValidateBasic
+3. **Mempool pollution**: Invalid transactions occupy CheckTx processing capacity that should handle valid transactions
+4. **Difficult detection**: Transactions appear syntactically valid initially, evading simple rate limiting
 
-**System Security Impact:**
-This vulnerability undermines the network's availability and resilience. An unprivileged attacker can degrade network performance without requiring any on-chain resources (no gas fees for queries) or special privileges.
+The impact qualifies as **Low severity** under: "Causing network processing nodes to process transactions from the mempool beyond set parameters" - transactions with invalid addresses should be rejected at ValidateBasic but instead are processed through the full ante handler chain.
 
 ## Likelihood Explanation
 
-**Who can trigger it:** Any network participant with access to the gRPC endpoint. No authentication, authorization, or on-chain resources are required.
+**Trigger Conditions:**
+- Any unprivileged actor can trigger by submitting transactions via standard RPC endpoints
+- No special permissions, tokens, or stake required
+- No authentication needed
+- Trivially exploitable with standard transaction submission tools
 
-**Required conditions:**
-- The authz module must contain grants (which is the normal operational state)
-- The attacker needs network access to the gRPC endpoint (standard for public RPC nodes)
-- No special timing or synchronization is required
+**Frequency:**
+- Immediately exploitable in current codebase
+- Can be repeated continuously
+- Each malformed transaction consumes resources until rejected in ante handler
+- Attack sustainability limited only by node rate limiting (which may not be effective since transactions appear valid initially)
 
-**Frequency:** 
-- Can be exploited continuously and repeatedly
-- Multiple concurrent queries can be sent to amplify impact
-- Attack is trivial to execute (single gRPC call with a large limit parameter)
-- Works against any public RPC endpoint
-- High likelihood of exploitation in a production environment
+**Realistic Exploitation:**
+This is highly likely to be exploited because:
+1. Simple to execute - construct MsgGrantAllowance with arbitrary string addresses
+2. Zero cost to attacker (no fees charged)
+3. Difficult for nodes to distinguish from legitimate traffic without full validation
+4. No blockchain state or special conditions required
 
 ## Recommendation
 
-**Immediate Fix:**
-1. Add an upper bound validation on the pagination limit parameter. Define a reasonable maximum (e.g., 1000) that prevents abuse while allowing legitimate queries:
+Add Bech32 address validation to `MsgGrantAllowance.ValidateBasic()` to align with the validation pattern used in bank and authz modules:
 
 ```go
-const MaxQueryLimit = 1000
+func (msg MsgGrantAllowance) ValidateBasic() error {
+    // Validate granter address format
+    _, err := sdk.AccAddressFromBech32(msg.Granter)
+    if err != nil {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid granter address (%s)", err)
+    }
+    
+    // Validate grantee address format
+    _, err = sdk.AccAddressFromBech32(msg.Grantee)
+    if err != nil {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid grantee address (%s)", err)
+    }
+    
+    // Existing validation
+    if msg.Grantee == msg.Granter {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "cannot self-grant fee authorization")
+    }
 
-if req.Pagination != nil && req.Pagination.Limit > MaxQueryLimit {
-    req.Pagination.Limit = MaxQueryLimit
+    allowance, err := msg.GetFeeAllowanceI()
+    if err != nil {
+        return err
+    }
+
+    return allowance.ValidateBasic()
 }
 ```
 
-2. For `GranteeGrants`, optimize the store iteration to use a grantee-specific prefix instead of iterating all grants. Modify the key structure or indexing to enable efficient grantee-based lookups.
-
-**Long-term Improvements:**
-- Implement rate limiting on expensive query endpoints
-- Add query gas metering even for read-only operations
-- Consider caching mechanisms for frequently accessed data
-- Add monitoring and alerting for excessive query resource consumption
+The same fix should be applied to `MsgRevokeAllowance.ValidateBasic()`: [9](#0-8) 
 
 ## Proof of Concept
 
-**Test File:** `x/authz/keeper/grpc_query_test.go`
-
-**Test Function:** Add the following test function to demonstrate the vulnerability:
+**Test demonstrating the vulnerability:**
 
 ```go
-func (suite *TestSuite) TestGranteeGrantsResourceExhaustion() {
-	require := suite.Require()
-	app, ctx, queryClient, addrs := suite.app, suite.ctx, suite.queryClient, suite.addrs
-	
-	// Setup: Create many grants between different addresses to simulate a populated store
-	// In a real attack, the chain would naturally accumulate grants over time
-	now := ctx.BlockHeader().Time
-	numGrants := 10000 // In production, this could be much higher
-	
-	// Create grants from various granters to various grantees (NOT to the victim address)
-	for i := 0; i < numGrants; i++ {
-		granteeIdx := i % len(addrs)
-		granterIdx := (i + 1) % len(addrs)
-		
-		// Skip if granter and grantee are the same
-		if granteeIdx == granterIdx {
-			continue
-		}
-		
-		newCoins := sdk.NewCoins(sdk.NewInt64Coin("steak", 100))
-		authorization := &banktypes.SendAuthorization{SpendLimit: newCoins}
-		err := app.AuthzKeeper.SaveGrant(ctx, addrs[granteeIdx], addrs[granterIdx], authorization, now.Add(time.Hour))
-		require.NoError(err)
-	}
-	
-	// Create a victim address that has ZERO grants
-	victimAddr := sdk.AccAddress([]byte("victim_address_______"))
-	
-	// Attack: Query with the victim address and an extremely large limit
-	// This will force the node to unmarshal ALL grants in the store,
-	// even though none match the victim address
-	startTime := time.Now()
-	result, err := queryClient.GranteeGrants(gocontext.Background(), &authz.QueryGranteeGrantsRequest{
-		Grantee: victimAddr.String(),
-		Pagination: &query.PageRequest{
-			Limit: 1000000, // Attacker sets very large limit
-		},
-	})
-	elapsed := time.Since(startTime)
-	
-	require.NoError(err)
-	// Result should have zero grants since victim has no grants
-	require.Len(result.Grants, 0)
-	
-	// Observation: Despite returning zero results, the query took significant time
-	// because it had to unmarshal all 10000 grants in the store
-	suite.T().Logf("Query with 0 matching grants but %d total grants took: %v", numGrants, elapsed)
-	
-	// In a real attack with millions of grants, this would cause severe resource exhaustion
-	// The test demonstrates that ALL grants are processed regardless of the result set size
+// Add to x/feegrant/msgs_test.go
+func TestMsgGrantAllowance_InvalidBech32Bypass(t *testing.T) {
+    // Setup: Invalid Bech32 addresses (non-empty, different, but malformed)
+    invalidGranter := "invalid-granter-address"
+    invalidGrantee := "invalid-grantee-address"
+    
+    basic := &feegrant.BasicAllowance{
+        SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("atom", 100)),
+    }
+    
+    any, err := codectypes.NewAnyWithValue(basic)
+    require.NoError(t, err)
+    
+    msg := &feegrant.MsgGrantAllowance{
+        Granter:   invalidGranter,
+        Grantee:   invalidGrantee,
+        Allowance: any,
+    }
+    
+    // Action: Call ValidateBasic with invalid addresses
+    err = msg.ValidateBasic()
+    
+    // Result: ValidateBasic incorrectly passes (vulnerability)
+    require.NoError(t, err)
+    
+    // Demonstrate GetSigners panics (would occur in ante handler)
+    require.Panics(t, func() {
+        msg.GetSigners()
+    })
+    
+    // Contrast: Bank module properly validates
+    bankMsg := &banktypes.MsgSend{
+        FromAddress: invalidGranter,
+        ToAddress:   invalidGrantee,
+        Amount:      sdk.NewCoins(sdk.NewInt64Coin("atom", 100)),
+    }
+    err = bankMsg.ValidateBasic()
+    require.Error(t, err)
+    require.Contains(t, err.Error(), "Invalid")
 }
 ```
 
-**Setup:** The test creates 10,000 grants between various addresses to simulate a populated authz store.
+**Expected behavior:** The test currently demonstrates the vulnerability (ValidateBasic passes with invalid addresses). After applying the fix, ValidateBasic should reject invalid addresses, and the test should be updated to expect an error.
 
-**Trigger:** The test calls `GranteeGrants` with a victim address that has zero grants and a very large limit (1,000,000).
+## Notes
 
-**Observation:** Despite returning zero grants, the query processes all 10,000 grants in the store (unmarshaling each one). The elapsed time demonstrates that significant work is performed. In a production environment with millions of grants, this would cause severe resource exhaustion. The test proves that the number of grants processed is independent of the number of matching results, confirming the vulnerability.
+This vulnerability exists due to inconsistent validation patterns across cosmos-sdk modules. The feegrant module uses weaker validation than bank and authz modules, creating an exploitable gap in the defense-in-depth security model.
+
+The fix is straightforward and follows established patterns from other modules. While the per-transaction overhead is relatively small, the zero-cost nature of the attack (no fees charged) makes it a viable vector for resource exhaustion attacks against network nodes.
 
 ### Citations
 
-**File:** x/authz/keeper/grpc_query.go (L132-178)
+**File:** x/feegrant/msgs.go (L40-57)
 ```go
-func (k Keeper) GranteeGrants(c context.Context, req *authz.QueryGranteeGrantsRequest) (*authz.QueryGranteeGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
+func (msg MsgGrantAllowance) ValidateBasic() error {
+	if msg.Granter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing granter address")
+	}
+	if msg.Grantee == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing grantee address")
+	}
+	if msg.Grantee == msg.Granter {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "cannot self-grant fee authorization")
 	}
 
-	grantee, err := sdk.AccAddressFromBech32(req.Grantee)
+	allowance, err := msg.GetFeeAllowanceI()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	ctx := sdk.UnwrapSDKContext(c)
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
-
-	authorizations, pageRes, err := query.GenericFilteredPaginate(k.cdc, store, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
-		if err != nil {
-			return nil, err
-		}
-
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
-		}
-
-		authorizationAny, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-
-		return &authz.GrantAuthorization{
-			Authorization: authorizationAny,
-			Expiration:    auth.Expiration,
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-		}, nil
-	}, func() *authz.Grant {
-		return &authz.Grant{}
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.QueryGranteeGrantsResponse{
-		Grants:     authorizations,
-		Pagination: pageRes,
-	}, nil
+	return allowance.ValidateBasic()
 }
 ```
 
-**File:** types/query/filtered_pagination.go (L153-158)
+**File:** x/feegrant/msgs.go (L60-66)
 ```go
-	if limit == 0 {
-		limit = DefaultLimit
+func (msg MsgGrantAllowance) GetSigners() []sdk.AccAddress {
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		panic(err)
+	}
+	return []sdk.AccAddress{granter}
+}
+```
 
-		// count total results when the limit is zero/not supplied
-		countTotal = true
+**File:** x/feegrant/msgs.go (L107-119)
+```go
+func (msg MsgRevokeAllowance) ValidateBasic() error {
+	if msg.Granter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing granter address")
+	}
+	if msg.Grantee == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing grantee address")
+	}
+	if msg.Grantee == msg.Granter {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "addresses must be different")
+	}
+
+	return nil
+}
+```
+
+**File:** x/bank/types/msgs.go (L29-38)
+```go
+func (msg MsgSend) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.FromAddress)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid sender address (%s)", err)
+	}
+
+	_, err = sdk.AccAddressFromBech32(msg.ToAddress)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid recipient address (%s)", err)
 	}
 ```
 
-**File:** types/query/filtered_pagination.go (L217-235)
+**File:** x/authz/msgs.go (L54-68)
 ```go
-		protoMsg := constructor()
+func (msg MsgGrant) ValidateBasic() error {
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
+	}
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
+	}
 
-		err := cdc.Unmarshal(iterator.Value(), protoMsg)
-		if err != nil {
-			return nil, nil, err
+	if granter.Equals(grantee) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be same")
+	}
+	return msg.Grant.ValidateBasic()
+}
+```
+
+**File:** baseapp/baseapp.go (L923-925)
+```go
+	if err := validateBasicTxMsgs(msgs); err != nil {
+		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
+	}
+```
+
+**File:** baseapp/baseapp.go (L945-998)
+```go
+		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
+		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
+		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
+
+		if !newCtx.IsZero() {
+			// At this point, newCtx.MultiStore() is a store branch, or something else
+			// replaced by the AnteHandler. We want the original multistore.
+			//
+			// Also, in the case of the tx aborting, we need to track gas consumed via
+			// the instantiated gas meter in the AnteHandler, so we update the context
+			// prior to returning.
+			//
+			// This also replaces the GasMeter in the context where GasUsed was initalized 0
+			// and updated with gas consumed in the ante handler runs
+			// The GasMeter is a pointer and its passed to the RunMsg and tracks the consumed
+			// gas there too.
+			ctx = newCtx.WithMultiStore(ms)
 		}
-
-		val, err := onResult(iterator.Key(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if val.Size() != 0 {
-			// Previously this was the "accumulate" flag
-			if numHits >= offset && numHits < end {
-				results = append(results, val)
+		defer func() {
+			if newCtx.DeliverTxCallback() != nil {
+				newCtx.DeliverTxCallback()(ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx)))
 			}
-			numHits++
+		}()
+
+		events := ctx.EventManager().Events()
+
+		if err != nil {
+			return gInfo, nil, nil, 0, nil, nil, ctx, err
 		}
+		// GasMeter expected to be set in AnteHandler
+		gasWanted = ctx.GasMeter().Limit()
+		gasEstimate = ctx.GasEstimate()
+
+		// Dont need to validate in checkTx mode
+		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
+			storeAccessOpEvents := msCache.GetEvents()
+			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
+
+			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
+			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+			if len(missingAccessOps) != 0 {
+				for op := range missingAccessOps {
+					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
+					op.EmitValidationFailMetrics()
+				}
+				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
+				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
+			}
+		}
+
+		priority = ctx.Priority()
+		pendingTxChecker = ctx.PendingTxChecker()
+		expireHandler = ctx.ExpireTxHandler()
+		msCache.Write()
 ```
 
-**File:** store/types/gas.go (L70-93)
+**File:** x/auth/ante/ante.go (L47-60)
 ```go
-func (g *basicGasMeter) Limit() Gas {
-	g.lock.Lock()
-	defer g.lock.Unlock()
-
-	return g.limit
-}
-
-func (g *basicGasMeter) GasConsumedToLimit() Gas {
-	g.lock.Lock()
-	defer g.lock.Unlock()
-
-	if g.consumed > g.limit {
-		return g.limit
+	anteDecorators := []sdk.AnteFullDecorator{
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
+		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
+		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
+		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+		NewIncrementSequenceDecorator(options.AccountKeeper),
 	}
-	return g.consumed
-}
+```
 
-// addUint64Overflow performs the addition operation on two uint64 integers and
-// returns a boolean on whether or not the result overflows.
-func addUint64Overflow(a, b uint64) (uint64, bool) {
-	if math.MaxUint64-a < b {
-		return 0, true
+**File:** x/auth/ante/sigverify.go (L59-69)
+```go
+func (spkd SetPubKeyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+	sigTx, ok := tx.(authsigning.SigVerifiableTx)
+	if !ok {
+		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
 	}
 
+	pubkeys, err := sigTx.GetPubKeys()
+	if err != nil {
+		return ctx, err
+	}
+	signers := sigTx.GetSigners()
 ```

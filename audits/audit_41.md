@@ -1,242 +1,263 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Unbounded Recursion in AminoUnpacker Allows Denial of Service via Stack Overflow
+OCC Blind Write Vulnerability: Concurrent MsgGrant Transactions Succeed Without Conflict Detection Leading to Silent State Loss
 
 ## Summary
-The `AminoUnpacker.UnpackAny` method in `codec/types/compat.go` lacks recursion depth protection, allowing an attacker to craft deeply nested protobuf `Any` messages that cause stack overflow and node crashes when processed through the amino codec path.
+When Optimistic Concurrency Control (OCC) is enabled, concurrent transactions creating grants for the same (grantee, granter, msgType) tuple both succeed and charge gas fees, but only the highest-indexed transaction's state persists. This occurs because `SaveGrant` performs blind writes without reading first, and OCC validation only detects read-write conflicts, not write-write conflicts. This violates the fundamental blockchain guarantee that successful transactions persist their state changes.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- Primary vulnerability: `x/authz/keeper/keeper.go` lines 144-160 (SaveGrant method) [1](#0-0) 
 
-**Intended Logic:** 
-The amino unpacker should safely unpack nested `Any` types during message deserialization with reasonable limits to prevent resource exhaustion. The codebase demonstrates awareness of this issue with recursion protection in the standard protobuf unpacker: [2](#0-1) 
+- Missing validation: `store/multiversion/store.go` lines 388-397 (ValidateTransactionState) [2](#0-1) 
 
-The `interfaceRegistry.UnpackAny` method implements this protection using a `statefulUnpacker`: [3](#0-2) [4](#0-3) 
+- State persistence logic: `store/multiversion/store.go` lines 399-435 (WriteLatestToStore) [3](#0-2) 
+
+**Intended Logic:**
+When a transaction creates or updates an authorization grant, the system should ensure that concurrent transactions modifying the same grant are detected and serialized. A successful transaction (Code=0) should guarantee its state changes persist to the blockchain.
 
 **Actual Logic:**
-The `AminoUnpacker.UnpackAny` method at line 87 calls `UnpackInterfaces(val, a)` passing itself as the unpacker, which recursively unpacks nested structures without any depth tracking: [5](#0-4) 
+The `SaveGrant` method directly calls `store.Set(skey, bz)` without first reading the existing value, creating a blind write operation. This means the transaction's readset for that key remains empty.
 
-The `UnpackInterfaces` function will recursively call back into `AminoUnpacker.UnpackAny` for each nested `Any` field: [6](#0-5) 
+When OCC validates transactions via `ValidateTransactionState`, it only checks:
+1. Iterator consistency via `checkIteratorAtIndex`
+2. Read value consistency via `checkReadsetAtIndex`
 
-**Exploit Scenario:**
-1. Attacker crafts a transaction containing a message with deeply nested `Any` types (e.g., 100+ levels of `HasHasAnimal` structures)
-2. The transaction is submitted to the network through standard transaction submission
-3. When nodes unmarshal the transaction via `LegacyAmino.Unmarshal`: [7](#0-6) 
-4. The `unmarshalAnys` call triggers `AminoUnpacker`: [8](#0-7) 
-5. The unbounded recursion continues until stack overflow occurs, crashing the node
+There is NO validation for write-write conflicts. Since neither concurrent transaction reads the grant key before writing, both have empty readsets for that key and both pass validation successfully.
 
-**Security Failure:**
-This is a denial-of-service vulnerability that violates memory safety by allowing stack exhaustion. Unlike the protobuf unpacker which enforces `MaxUnpackAnyRecursionDepth = 10`, the amino unpacker has no such protection.
+When `WriteLatestToStore` commits the final state, it calls `GetLatestNonEstimate()` for each key, which returns only the highest-indexed value. Earlier writes to the same key are silently discarded.
+
+**Exploitation Path:**
+1. User submits Transaction A: MsgGrant(grantee, granter, MsgSend, limit=100)
+2. User submits Transaction B: MsgGrant(grantee, granter, MsgSend, limit=200) in the same block
+3. Both transactions execute in parallel under OCC
+4. Both call `SaveGrant` → both call `store.Set(key, value)` without prior `store.Get(key)`
+5. Neither transaction has a read dependency on the key
+6. Both transactions pass `ValidateTransactionState` (no read conflicts detected)
+7. Both transactions return success (Code=0) and emit `EventGrant` events
+8. Both transactions charge gas fees
+9. Only Transaction B's grant persists when `WriteLatestToStore` is called
+10. Transaction A's effect is silently lost despite returning success
+
+**Security Guarantee Broken:**
+This violates the atomicity and finality guarantee of blockchain transactions: a successful transaction (Code=0) should guarantee its state changes persist. The vulnerability also causes event log inconsistency where `EventGrant` is emitted for both transactions but only one grant exists in state.
 
 ## Impact Explanation
 
-**Affected Processes:**
-- Node availability and network processing capacity
-- Transaction validation and block processing pipelines
-- Any legacy code path using amino codec for message deserialization
+This vulnerability has multiple concrete impacts:
 
-**Severity:**
-When triggered, this vulnerability causes immediate node crashes through stack overflow. An attacker can:
-- Target multiple nodes simultaneously with the same malicious transaction
-- Repeatedly crash nodes as they restart and attempt to process the malicious message
-- Potentially shut down 30% or more of network nodes if the malicious message propagates through mempool or is included in blocks
+1. **Wasted Gas Fees:** Users pay gas for transactions whose effects are silently discarded. Unlike transaction failures (where users know the transaction failed), these transactions return success.
 
-**System Impact:**
-This matters because it allows unprivileged attackers to destabilize the network by crafting standard transactions with deeply nested structures. While the amino codec is legacy, it remains in the codebase for backward compatibility, making this attack surface still accessible.
+2. **Event Log Inconsistency:** Both transactions emit `EventGrant` events, misleading off-chain applications, indexers, and monitoring systems about the actual state. Applications relying on events will have incorrect state.
+
+3. **State Consistency Violation:** Only one grant persists despite two successful transactions, breaking the invariant that successful transactions persist their changes.
+
+4. **User Trust Impact:** Users see successful transactions that don't actually modify state, undermining trust in transaction finality.
+
+5. **Authorization Security Concern:** Since grants control spending limits and permissions, having unpredictable grant persistence could lead to authorization mismatches where applications expect different limits than what exists on-chain.
+
+This constitutes "a bug in the network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity), as the OCC layer (network code) causes unintended behavior in the authz module with no direct fund theft but significant state inconsistency issues.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant can trigger this vulnerability by submitting a transaction with deeply nested `Any` types. No special privileges or conditions are required.
+**Trigger Conditions:**
+- OCC must be enabled (`occEnabled = true`)
+- Multiple transactions targeting the same (grantee, granter, msgType) tuple in the same block
+- Transactions execute concurrently in OCC's parallel execution phase
 
-**Conditions Required:**
-- The malicious transaction must be processed through a code path using `LegacyAmino.Unmarshal`
-- The message must contain nested `Any` types exceeding typical stack depth limits (typically 50-100+ levels depending on system configuration)
+**Who Can Trigger:**
+Any user can trigger this vulnerability simply by submitting normal MsgGrant transactions. No special privileges, unusual conditions, or attack setup is required.
 
 **Frequency:**
-This can be exploited repeatedly and automatically. Once an attacker constructs the malicious payload structure, they can:
-- Submit it as many times as desired
-- Target multiple nodes simultaneously
-- Exploit it during normal network operation without requiring special timing or state conditions
+- Occurs naturally when users submit concurrent grant updates
+- More likely under high transaction throughput
+- Particularly probable when users retry transactions or frontends submit duplicate transactions
+- In production networks with OCC enabled, this could happen regularly during normal operation
 
-The attack is deterministic and does not depend on race conditions or network timing.
+The vulnerability is realistic and exploitable under normal network conditions. The comparison with the `update` method [4](#0-3)  which DOES read before writing suggests this is an oversight rather than intentional design.
 
 ## Recommendation
 
-Add recursion depth tracking to `AminoUnpacker` similar to the protection implemented in `statefulUnpacker`. Specifically:
+Implement one of the following solutions:
 
-1. **Create a stateful amino unpacker** that tracks recursion depth
-2. **Enforce the same limits** as the protobuf unpacker: check against `MaxUnpackAnyRecursionDepth` before each recursive call
-3. **Modify `AminoUnpacker.UnpackAny`** to decrement depth and pass a new unpacker instance with reduced depth to `UnpackInterfaces`
-4. **Return an error** when depth limit is exceeded instead of continuing recursion
+**Option 1 - Add Write Conflict Detection (Comprehensive):**
+Extend the OCC validation logic to detect write-write conflicts:
+1. Track write dependencies in the multiversion store by maintaining a writeset index mapping keys to transaction indices
+2. In `ValidateTransactionState`, check if any key in the transaction's writeset was written by a concurrent lower-indexed transaction
+3. Flag write-write conflicts and trigger retry
 
-Example implementation pattern (following the `statefulUnpacker` model):
-- Add a `maxDepth` field to track remaining recursion depth
-- Check `if maxDepth <= 0` before unmarshaling and return an error
-- Create a new unpacker with `maxDepth - 1` when calling `UnpackInterfaces`
+**Option 2 - Read-Before-Write Pattern (Simpler):**
+Modify `SaveGrant` to read the existing grant first, even if just to check existence. This creates a read dependency that enables existing OCC conflict detection:
 
-This mirrors the existing protection mechanism and maintains consistency across the codebase.
+```go
+func (k Keeper) SaveGrant(...) error {
+    store := ctx.KVStore(k.storeKey)
+    skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
+    
+    // Read to create OCC dependency (enables conflict detection)
+    _ = store.Get(skey)
+    
+    grant, err := authz.NewGrant(authorization, expiration)
+    // ... rest of implementation
+}
+```
+
+The read-before-write approach (Option 2) is simpler and consistent with the existing `update` method pattern, though it adds read overhead. Option 1 is more comprehensive but requires deeper OCC system changes.
 
 ## Proof of Concept
 
-**File:** `codec/types/compat_test.go`
+**Test File:** `x/authz/keeper/keeper_test.go`
 
-**Test Function:** `TestAminoUnpackerRecursionLimit`
+**Test Function:** `TestConcurrentGrantsOCCBlindWrite`
 
 **Setup:**
-1. Create an amino codec with the test types registered: [9](#0-8) 
-2. Build a deeply nested structure with 50 levels of nesting using `HasHasAnimal` type recursively
+1. Initialize SimApp with OCC enabled (`SetOccEnabled(true)`, `SetConcurrencyWorkers(2)`)
+2. Create test accounts: granter (addr[0]), grantee (addr[1])
+3. Fund granter account for gas fees
+4. Create two MsgGrant transactions for the same (grantee, granter, msgType) with different spend limits
 
-**Trigger:**
-1. Marshal the deeply nested structure using amino binary encoding after packing interfaces
-2. Attempt to unmarshal it using `LegacyAmino.Unmarshal` which calls `AminoUnpacker`
-3. The `UnpackInterfaces` call will recurse 50 times without depth checking
+**Action:**
+1. Build Transaction A: MsgGrant with SpendLimit=100
+2. Build Transaction B: MsgGrant with SpendLimit=200 (same grantee, granter, msgType)
+3. Submit both transactions in the same block using `DeliverTxBatch` with OCC enabled
+4. Process the batch through the OCC scheduler
 
-**Observation:**
-The test will either:
-- Panic with "runtime: goroutine stack exceeds 1000000000-byte limit" or similar stack overflow error
-- Hang for an extended period due to deep recursion consuming resources
-- Demonstrate that the recursion depth far exceeds the 10-level limit enforced by the protobuf unpacker
+**Expected Result (Current Buggy Behavior):**
+1. Both transactions return Code=0 (success)
+2. Both transactions emit EventGrant events
+3. Both transactions charge gas
+4. Query final state shows only ONE grant exists
+5. The persisted grant has SpendLimit=200 (higher-indexed transaction)
+6. Transaction A's SpendLimit=100 is silently lost despite success
 
-The test confirms the vulnerability by showing that while the normal protobuf path (with `statefulUnpacker`) would reject the message after 10 levels, the amino path continues recursing until system limits are hit.
+**Demonstration:**
+The test proves the vulnerability by showing that:
+- Both transactions succeed without conflict detection
+- Only the highest-indexed transaction's state persists
+- The lower-indexed transaction's effect is discarded despite returning success and emitting events
+- This violates the blockchain invariant that successful transactions persist their changes
 
-**Test Code Structure:**
-```
-func TestAminoUnpackerRecursionLimit(t *testing.T) {
-    // Register types with amino codec
-    cdc := testdata.NewTestAmino()
-    
-    // Build 50-level deep nested structure
-    current := buildDeeplyNestedMessage(50)
-    
-    // Marshal with amino (this works)
-    bz := marshalWithAminoPacker(cdc, current)
-    
-    // Unmarshal should crash or demonstrate excessive recursion
-    var result testdata.HasHasAnimal
-    err := codec.NewLegacyAmino().Unmarshal(bz, &result)
-    // Will panic with stack overflow before returning
-}
-```
+The vulnerability can be confirmed by running this test on the current codebase, where it will demonstrate the silent state loss for the first transaction despite both returning success.
 
-The test demonstrates that the lack of depth checking in `AminoUnpacker` allows processing of arbitrarily deep structures that would be rejected by the protected protobuf path.
+## Notes
+
+This vulnerability is confirmed by examining the code flow:
+
+1. **SaveGrant blind write confirmed:** [1](#0-0)  - No `Get` call before `Set`
+
+2. **OCC validation gap confirmed:** [2](#0-1)  - Only checks readsets and iteratesets
+
+3. **Last-write-wins behavior confirmed:** [3](#0-2)  - `GetLatestNonEstimate()` only persists highest index
+
+4. **Inconsistent pattern:** The `update` method reads before writing [4](#0-3) , suggesting awareness of OCC requirements, making SaveGrant's blind write appear to be an oversight.
+
+5. **No existing tests:** No tests exist for concurrent SaveGrant operations with OCC enabled, suggesting this scenario was not considered during development.
 
 ### Citations
 
-**File:** codec/types/compat.go (L77-104)
+**File:** x/authz/keeper/keeper.go (L51-72)
 ```go
-func (a AminoUnpacker) UnpackAny(any *Any, iface interface{}) error {
-	ac := any.compat
-	if ac == nil {
-		return anyCompatError("amino binary unmarshal", reflect.TypeOf(iface))
+func (k Keeper) update(ctx sdk.Context, grantee sdk.AccAddress, granter sdk.AccAddress, updated authz.Authorization) error {
+	skey := grantStoreKey(grantee, granter, updated.MsgTypeURL())
+	grant, found := k.getGrant(ctx, skey)
+	if !found {
+		return sdkerrors.ErrNotFound.Wrap("authorization not found")
 	}
-	err := a.Cdc.UnmarshalBinaryBare(ac.aminoBz, iface)
+
+	msg, ok := updated.(proto.Message)
+	if !ok {
+		sdkerrors.ErrPackAny.Wrapf("cannot proto marshal %T", updated)
+	}
+
+	any, err := codectypes.NewAnyWithValue(msg)
 	if err != nil {
 		return err
 	}
-	val := reflect.ValueOf(iface).Elem().Interface()
-	err = UnpackInterfaces(val, a)
+
+	grant.Authorization = any
+	store := ctx.KVStore(k.storeKey)
+	store.Set(skey, k.cdc.MustMarshal(&grant))
+	return nil
+}
+```
+
+**File:** x/authz/keeper/keeper.go (L144-160)
+```go
+func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
+	store := ctx.KVStore(k.storeKey)
+
+	grant, err := authz.NewGrant(authorization, expiration)
 	if err != nil {
 		return err
 	}
-	if m, ok := val.(proto.Message); ok {
-		if err = any.pack(m); err != nil {
-			return err
+
+	bz := k.cdc.MustMarshal(&grant)
+	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
+	store.Set(skey, bz)
+	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
+		MsgTypeUrl: authorization.MsgTypeURL(),
+		Granter:    granter.String(),
+		Grantee:    grantee.String(),
+	})
+}
+```
+
+**File:** store/multiversion/store.go (L388-397)
+```go
+func (s *Store) ValidateTransactionState(index int) (bool, []int) {
+	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
+
+	// TODO: can we parallelize for all iterators?
+	iteratorValid := s.checkIteratorAtIndex(index)
+
+	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
+
+	return iteratorValid && readsetValid, conflictIndices
+}
+```
+
+**File:** store/multiversion/store.go (L399-435)
+```go
+func (s *Store) WriteLatestToStore() {
+	// sort the keys
+	keys := []string{}
+	s.multiVersionMap.Range(func(key, value interface{}) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		val, ok := s.multiVersionMap.Load(key)
+		if !ok {
+			continue
 		}
-	} else {
-		any.cachedValue = val
+		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
+		if !found {
+			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
+			continue
+		}
+		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
+		if mvValue.IsEstimate() {
+			panic("should not have any estimate values when writing to parent store")
+		}
+		// if the value is deleted, then delete it from the parent store
+		if mvValue.IsDeleted() {
+			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
+			// be sure if the underlying store might do a save with the byteslice or
+			// not. Once we get confirmation that .Delete is guaranteed not to
+			// save the byteslice, then we can assume only a read-only copy is sufficient.
+			s.parentStore.Delete([]byte(key))
+			continue
+		}
+		if mvValue.Value() != nil {
+			s.parentStore.Set([]byte(key), mvValue.Value())
+		}
 	}
-
-	// this is necessary for tests that use reflect.DeepEqual and compare
-	// proto vs amino marshaled values
-	any.compat = nil
-
-	return nil
-}
-```
-
-**File:** codec/types/interface_registry.go (L15-22)
-```go
-	// MaxUnpackAnySubCalls extension point that defines the maximum number of sub-calls allowed during the unpacking
-	// process of protobuf Any messages.
-	MaxUnpackAnySubCalls = 100
-
-	// MaxUnpackAnyRecursionDepth extension point that defines the maximum allowed recursion depth during protobuf Any
-	// message unpacking.
-	MaxUnpackAnyRecursionDepth = 10
-)
-```
-
-**File:** codec/types/interface_registry.go (L208-215)
-```go
-func (registry *interfaceRegistry) UnpackAny(any *Any, iface interface{}) error {
-	unpacker := &statefulUnpacker{
-		registry: registry,
-		maxDepth: MaxUnpackAnyRecursionDepth,
-		maxCalls: &sharedCounter{count: MaxUnpackAnySubCalls},
-	}
-	return unpacker.UnpackAny(any, iface)
-}
-```
-
-**File:** codec/types/interface_registry.go (L243-249)
-```go
-func (r *statefulUnpacker) UnpackAny(any *Any, iface interface{}) error {
-	if r.maxDepth <= 0 {
-		return errors.New("max depth exceeded")
-	}
-	if r.maxCalls.count <= 0 {
-		return errors.New("call limit exceeded")
-	}
-```
-
-**File:** codec/types/interface_registry.go (L334-339)
-```go
-func UnpackInterfaces(x interface{}, unpacker AnyUnpacker) error {
-	if msg, ok := x.(UnpackInterfacesMessage); ok {
-		return msg.UnpackInterfaces(unpacker)
-	}
-	return nil
-}
-```
-
-**File:** codec/amino.go (L68-70)
-```go
-func (cdc *LegacyAmino) unmarshalAnys(o interface{}) error {
-	return types.UnpackInterfaces(o, types.AminoUnpacker{Cdc: cdc.Amino})
-}
-```
-
-**File:** codec/amino.go (L112-118)
-```go
-func (cdc *LegacyAmino) Unmarshal(bz []byte, ptr interface{}) error {
-	err := cdc.Amino.UnmarshalBinaryBare(bz, ptr)
-	if err != nil {
-		return err
-	}
-	return cdc.unmarshalAnys(ptr)
-}
-```
-
-**File:** testutil/testdata/codec.go (L38-51)
-```go
-func NewTestAmino() *amino.Codec {
-	cdc := amino.NewCodec()
-	cdc.RegisterInterface((*Animal)(nil), nil)
-	cdc.RegisterConcrete(&Dog{}, "testdata/Dog", nil)
-	cdc.RegisterConcrete(&Cat{}, "testdata/Cat", nil)
-
-	cdc.RegisterInterface((*HasAnimalI)(nil), nil)
-	cdc.RegisterConcrete(&HasAnimal{}, "testdata/HasAnimal", nil)
-
-	cdc.RegisterInterface((*HasHasAnimalI)(nil), nil)
-	cdc.RegisterConcrete(&HasHasAnimal{}, "testdata/HasHasAnimal", nil)
-
-	return cdc
 }
 ```

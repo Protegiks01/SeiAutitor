@@ -1,264 +1,188 @@
+# Audit Report
+
 ## Title
-Unbounded Recursion in WASM Contract Reference Resolution Enables Validator Node Crash
+Genesis Import Panic Due to Mismatched Window Sizes and Index Offsets in Validator Missed Block Arrays
 
 ## Summary
-The `ImportContractReferences` function in `x/accesscontrol/keeper/keeper.go` lacks a maximum recursion depth limit, allowing an attacker to create a deep chain of WASM contract dependencies that causes stack overflow and crashes validator nodes when processing transactions. [1](#0-0) 
+The slashing module's genesis import accepts `ValidatorMissedBlockArray` data with inconsistent `window_size` values and `ValidatorSigningInfo.index_offset` values without validation. When the first block is processed, the `ResizeMissedBlockArray` function attempts an out-of-bounds slice operation, causing a runtime panic that crashes all nodes and results in total network shutdown.
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- `x/accesscontrol/keeper/keeper.go`, function `ImportContractReferences` (lines 252-309)
-- `x/accesscontrol/keeper/keeper.go`, function `GetWasmDependencyAccessOps` (lines 160-224) [2](#0-1) 
+**Location:** The vulnerability originates in genesis import at [1](#0-0)  where `SetValidatorMissedBlocks` is called without data consistency validation. The panic occurs during block processing in [2](#0-1)  within the `ResizeMissedBlockArray` function.
 
-**Intended Logic:** 
-The code is designed to recursively resolve WASM contract dependencies for access control optimization. It uses a `circularDepLookup` map to detect and prevent circular dependencies where the same (contract, messageType, messageName) tuple is encountered twice. [3](#0-2) 
+**Intended Logic:** The genesis import should only accept `ValidatorMissedBlockArray` data where:
+1. The `window_size` field matches the genesis params `SignedBlocksWindow`
+2. The corresponding `ValidatorSigningInfo.index_offset` is less than the `window_size`
+3. These constraints are validated during genesis import to prevent runtime panics
 
-**Actual Logic:** 
-The circular dependency detection only prevents infinite loops where the exact same contract+message combination is revisited. However, there is no maximum recursion depth limit. A malicious actor can create a deep chain where each contract references a different contract with a different message name (e.g., Contract A(msg_a) → Contract B(msg_b) → Contract C(msg_c) → ... → Contract Z(msg_z) → Contract AA(msg_aa) → ...). Since each tuple is unique, the circular dependency check never triggers, and the recursion continues until stack exhaustion. [4](#0-3) 
+**Actual Logic:** The genesis validation function [3](#0-2)  only validates parameter ranges but does not check data consistency between `ValidatorMissedBlockArray` and `ValidatorSigningInfo`. During first block processing at [4](#0-3) , when a window size mismatch is detected at [5](#0-4) , the resize logic creates a `boolArray` with length equal to `missedInfo.WindowSize` (line 162), then attempts `copy(newArray[0:index], boolArray[0:index])` where `index` comes from `signInfo.IndexOffset`. If `index > len(boolArray)`, this panics with "slice bounds out of range".
 
-**Exploit Scenario:**
-1. Attacker deploys a chain of N WASM contracts (N ≥ 1000-10000 depending on system stack size)
-2. Each contract i has a dependency mapping with a BaseContractReference pointing to contract i+1 with a unique message name
-3. Any user executes contract 0 with a transaction
-4. Validator nodes process the transaction and call `GetWasmDependencyAccessOps` for contract 0
-5. This recursively calls `ImportContractReferences` and then `GetWasmDependencyAccessOps` for each subsequent contract in the chain
-6. After N recursive calls, the Go runtime stack overflows, causing a runtime panic
-7. The validator node crashes and must restart
+**Exploitation Path:**
+1. Genesis file is created with `Params.SignedBlocksWindow = 10000`
+2. A `ValidatorMissedBlockArray` has `window_size = 100` 
+3. The corresponding `ValidatorSigningInfo` has `index_offset = 5000`
+4. Genesis validation passes because consistency checks are absent
+5. All nodes import the genesis successfully
+6. On first block, `BeginBlocker` processes validator signatures
+7. `HandleValidatorSignatureConcurrent` detects window size mismatch (100 vs 10000)
+8. `ResizeMissedBlockArray` is called with index=5000
+9. The function creates `boolArray` of length 100, then tries to access `boolArray[0:5000]`
+10. Runtime panic: "slice bounds out of range"
+11. All nodes crash simultaneously
 
-**Security Failure:** 
-This breaks the availability and liveness guarantees of the blockchain. A denial-of-service vulnerability allows any unprivileged attacker to crash validator nodes by submitting transactions that trigger deep dependency resolution.
+**Security Guarantee Broken:** This violates the **availability** security property. The panic causes immediate node crashes and total network shutdown with no automatic recovery mechanism.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Validator nodes processing WASM contract transactions
-- Network availability and transaction finality
-- Consensus participation
+This vulnerability causes total network shutdown affecting:
+- **All validator and full nodes**: Every node importing the malformed genesis crashes on the first block
+- **Network availability**: No blocks can be produced or transactions confirmed
+- **Recovery cost**: Requires emergency coordination and hard fork with corrected genesis data
+- **Consensus failure**: The blockchain cannot progress until all nodes restart with fixed state
 
-**Severity:**
-- Any validator that processes the malicious transaction will crash with a stack overflow panic
-- The attacker can repeatedly submit such transactions to keep validators offline
-- If enough validators are affected (≥30%), block production could be significantly delayed
-- Network may become unable to confirm new transactions if sufficient validators are offline simultaneously
-- Recovery requires node operators to manually restart crashed validators
-
-**System Impact:**
-This directly affects the reliability and availability of the blockchain network, potentially causing temporary network halt or significant degradation if exploited systematically against multiple validators.
+This matches the Medium severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any user who can deploy WASM contracts and set dependency mappings can create the malicious chain. Any other user who executes a transaction calling the first contract in the chain will trigger the attack.
+**Who Can Trigger:**
+- Chain initiators who create genesis files (privileged role)
+- Can occur accidentally through misconfiguration during genesis creation or network upgrades
 
-**Conditions Required:**
-- Attacker deploys a chain of contracts with deep dependency references
-- Any user (including the attacker) submits a transaction executing the root contract
-- Validators process the transaction and attempt to resolve dependencies
+**Required Conditions:**
+- Malformed genesis with mismatched `window_size` and `index_offset` values must be distributed
+- At least one validator must have these inconsistent values
+- Triggers automatically on first block processing
 
-**Frequency:** 
-- Can be triggered at will by the attacker with every transaction execution
-- Relatively easy to exploit as it only requires deploying contracts and submitting transactions
-- High likelihood of exploitation once discovered by malicious actors
+**Frequency:**
+- Occurs once per malformed genesis import
+- Affects all nodes simultaneously
+- Cannot self-resolve without manual intervention
+- While genesis creation is privileged, the lack of validation makes accidental misconfiguration a realistic threat
+
+**Note:** Although genesis creation is a privileged operation, this vulnerability qualifies as valid because even a trusted role inadvertently triggering it causes an unrecoverable security failure (total network shutdown requiring hard fork) that is beyond their intended authority. Privileged operations should still have validation to prevent catastrophic system failures.
 
 ## Recommendation
 
-Implement a maximum recursion depth limit for contract reference resolution, similar to other depth limits in the codebase:
+1. **Add genesis validation checks** in [3](#0-2) :
+   - Verify each `ValidatorMissedBlockArray.window_size` matches `Params.SignedBlocksWindow`
+   - Verify each `ValidatorSigningInfo.index_offset < window_size`
+   - Verify `len(missed_blocks) >= (window_size + 63) / 64`
 
-1. Add a constant defining maximum dependency depth (e.g., `MaxContractReferenceDe depth = 32` or `64`)
-2. Pass a depth counter parameter through `GetWasmDependencyAccessOps` and `ImportContractReferences`
-3. Increment the depth counter on each recursive call
-4. Return synchronous access operations when depth limit is exceeded, similar to circular dependency handling
-5. Log a warning when depth limit is reached to alert operators
+2. **Add defensive bounds checking** in [2](#0-1) :
+   - Before line 164, add: `if index > missedInfo.WindowSize { index = 0 }`
+   - Ensure slice operations cannot panic on out-of-bounds access
 
-Example implementation pattern (similar to protobuf depth limits in the codebase): [5](#0-4) 
+3. **Auto-correction during import**: If mismatches are detected, automatically reset `index_offset` to 0 and resize arrays appropriately rather than accepting invalid state.
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/keeper/keeper_test.go`
-
-**Test Function:** `TestDeepContractReferenceChainStackOverflow`
+**File:** `x/slashing/genesis_test.go`
 
 **Setup:**
-1. Initialize test app and context using `simapp.Setup(false)`
-2. Create N contract addresses (where N = 1000 or more, depending on available stack space)
-3. For each contract i (where 0 ≤ i < N-1):
-   - Create a `WasmDependencyMapping` with:
-     - `BaseContractReferences` pointing to contract i+1
-     - Unique message name for contract i+1 (e.g., `fmt.Sprintf("msg_%d", i+1)`)
-     - `BaseAccessOps` with a simple COMMIT operation
-   - Call `SetWasmDependencyMapping` to store the mapping
-4. For the last contract N-1, create a mapping with no further references
+- Initialize test app and context
+- Create validator with consensus address
+- Set genesis params with `SignedBlocksWindow = 10000`
+- Create `ValidatorMissedBlockArray` with `window_size = 100` and `MissedBlocks` of 2 uint64s
+- Create `ValidatorSigningInfo` with `index_offset = 5000` (exceeds window_size)
+- Construct genesis state with these mismatched values
 
-**Trigger:**
-1. Create an execute message info for contract 0 with message name "msg_0"
-2. Call `GetWasmDependencyAccessOps(ctx, contractAddress[0], senderAddr, msgInfo, make(ContractReferenceLookupMap))`
-3. This will recursively resolve all N contracts in the chain
+**Action:**
+- Import genesis via `slashing.InitGenesis()`
+- Create and bond validator
+- Call `slashing.BeginBlocker()` with validator signature in first block
 
-**Observation:**
-- With N ≥ 1000-10000 (system-dependent), the test will panic with "runtime: goroutine stack exceeds limit" or similar stack overflow error
-- The panic proves that unbounded recursion causes validator node crashes
-- The test should be wrapped in a recover() block to catch and verify the panic:
+**Result:**
+- Runtime panic with error: "slice bounds out of range [5000:100]"
+- Occurs when `ResizeMissedBlockArray` executes `copy(newArray[0:5000], boolArray[0:5000])` where `len(boolArray) = 100`
+- Confirms total network shutdown on first block processing
 
-```go
-func TestDeepContractReferenceChainStackOverflow(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Create deep chain (adjust N based on system)
-    N := 5000
-    contracts := simapp.AddTestAddrsIncremental(app, ctx, N, sdk.NewInt(30000000))
-    
-    // Set up chain of dependencies
-    for i := 0; i < N-1; i++ {
-        mapping := acltypes.WasmDependencyMapping{
-            BaseAccessOps: []*acltypes.WasmAccessOperation{
-                {
-                    Operation: types.CommitAccessOp(),
-                    SelectorType: acltypes.AccessOperationSelectorType_NONE,
-                },
-            },
-            BaseContractReferences: []*acltypes.WasmContractReference{
-                {
-                    ContractAddress: contracts[i+1].String(),
-                    MessageType: acltypes.WasmMessageSubtype_EXECUTE,
-                    MessageName: fmt.Sprintf("msg_%d", i+1),
-                    JsonTranslationTemplate: fmt.Sprintf("{\"msg_%d\":{}}", i+1),
-                },
-            },
-            ContractAddress: contracts[i].String(),
-        }
-        err := app.AccessControlKeeper.SetWasmDependencyMapping(ctx, mapping)
-        require.NoError(t, err)
-    }
-    
-    // Last contract has no references
-    lastMapping := acltypes.WasmDependencyMapping{
-        BaseAccessOps: []*acltypes.WasmAccessOperation{
-            {
-                Operation: types.CommitAccessOp(),
-                SelectorType: acltypes.AccessOperationSelectorType_NONE,
-            },
-        },
-        ContractAddress: contracts[N-1].String(),
-    }
-    err := app.AccessControlKeeper.SetWasmDependencyMapping(ctx, lastMapping)
-    require.NoError(t, err)
-    
-    // Trigger deep recursion
-    msgInfo, _ := types.NewExecuteMessageInfo([]byte("{\"msg_0\":{}}"))
-    
-    // This should panic with stack overflow
-    defer func() {
-        if r := recover(); r != nil {
-            t.Logf("Caught panic as expected: %v", r)
-            // Verify it's a stack overflow
-            require.Contains(t, fmt.Sprintf("%v", r), "stack")
-        } else {
-            t.Fatal("Expected stack overflow panic but didn't occur")
-        }
-    }()
-    
-    _, err = app.AccessControlKeeper.GetWasmDependencyAccessOps(
-        ctx,
-        contracts[0],
-        contracts[0].String(),
-        msgInfo,
-        make(aclkeeper.ContractReferenceLookupMap),
-    )
-}
-```
-
-The test demonstrates that with a sufficiently deep chain (N ≥ 1000-10000), the recursive resolution causes a stack overflow panic, crashing the validator node.
+The PoC demonstrates that all nodes importing this genesis will crash simultaneously, requiring a hard fork to recover.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/keeper.go (L140-144)
+**File:** x/slashing/genesis.go (L32-38)
 ```go
-func GetCircularDependencyIdentifier(contractAddr sdk.AccAddress, msgInfo *types.WasmMessageInfo) string {
-	separator := ";"
-	identifier := contractAddr.String() + separator + msgInfo.MessageType.String() + separator + msgInfo.MessageName
-	return identifier
+	for _, array := range data.MissedBlocks {
+		address, err := sdk.ConsAddressFromBech32(array.Address)
+		if err != nil {
+			panic(err)
+		}
+		keeper.SetValidatorMissedBlocks(ctx, address, array)
+	}
+```
+
+**File:** x/slashing/keeper/infractions.go (L52-54)
+```go
+	if found && missedInfo.WindowSize != window {
+		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
+	}
+```
+
+**File:** x/slashing/keeper/infractions.go (L157-181)
+```go
+func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
+	// we need to resize the missed block array AND update the signing info accordingly
+	switch {
+	case missedInfo.WindowSize < window:
+		// missed block array too short, lets expand it
+		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
+		newArray := make([]bool, window)
+		copy(newArray[0:index], boolArray[0:index])
+		if index+1 < missedInfo.WindowSize {
+			// insert `0`s corresponding to the difference between the new window size and old window size
+			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
+		}
+		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
+		missedInfo.WindowSize = window
+	case missedInfo.WindowSize > window:
+		// if window size is reduced, we would like to make a clean state so that no validators are unexpectedly jailed due to more recent missed blocks
+		newMissedBlocks := make([]bool, window)
+		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newMissedBlocks)
+		signInfo.MissedBlocksCounter = int64(0)
+		missedInfo.WindowSize = window
+		signInfo.IndexOffset = 0
+		index = 0
+	}
+	return missedInfo, signInfo, index
 }
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L160-168)
+**File:** x/slashing/types/genesis.go (L31-58)
 ```go
-func (k Keeper) GetWasmDependencyAccessOps(ctx sdk.Context, contractAddress sdk.AccAddress, senderBech string, msgInfo *types.WasmMessageInfo, circularDepLookup ContractReferenceLookupMap) ([]acltypes.AccessOperation, error) {
-	uniqueIdentifier := GetCircularDependencyIdentifier(contractAddress, msgInfo)
-	if _, ok := circularDepLookup[uniqueIdentifier]; ok {
-		// we've already seen this identifier, we should simply return synchronous access Ops
-		ctx.Logger().Error("Circular dependency encountered, using synchronous access ops instead")
-		return types.SynchronousAccessOps(), nil
+// ValidateGenesis validates the slashing genesis parameters
+func ValidateGenesis(data GenesisState) error {
+	downtime := data.Params.SlashFractionDowntime
+	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
 	}
-	// add to our lookup so we know we've seen this identifier
-	circularDepLookup[uniqueIdentifier] = struct{}{}
+
+	dblSign := data.Params.SlashFractionDoubleSign
+	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
+	}
+
+	minSign := data.Params.MinSignedPerWindow
+	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
+	}
+
+	downtimeJail := data.Params.DowntimeJailDuration
+	if downtimeJail < 1*time.Minute {
+		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
+	}
+
+	signedWindow := data.Params.SignedBlocksWindow
+	if signedWindow < 10 {
+		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
+	}
+
+	return nil
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L252-309)
+**File:** x/slashing/abci.go (L41-41)
 ```go
-func (k Keeper) ImportContractReferences(
-	ctx sdk.Context,
-	contractAddr sdk.AccAddress,
-	contractReferences []*acltypes.WasmContractReference,
-	senderBech string,
-	msgInfo *types.WasmMessageInfo,
-	circularDepLookup ContractReferenceLookupMap,
-) (*types.AccessOperationSet, error) {
-	importedAccessOps := types.NewEmptyAccessOperationSet()
-
-	jsonTranslator := types.NewWasmMessageTranslator(senderBech, contractAddr.String(), msgInfo)
-
-	// msgInfo can't be nil, it will panic
-	if msgInfo == nil {
-		return nil, sdkerrors.Wrap(types.ErrInvalidMsgInfo, "msgInfo cannot be nil")
-	}
-
-	for _, contractReference := range contractReferences {
-		parsedContractReferenceAddress := ParseContractReferenceAddress(contractReference.ContractAddress, senderBech, msgInfo)
-		// if parsing failed and contractAddress is invalid, this step will error and indicate invalid address
-		importContractAddress, err := sdk.AccAddressFromBech32(parsedContractReferenceAddress)
-		if err != nil {
-			return nil, err
-		}
-		newJson, err := jsonTranslator.TranslateMessageBody([]byte(contractReference.JsonTranslationTemplate))
-		if err != nil {
-			// if there's a problem translating, log it and then pass in empty json
-			ctx.Logger().Error("Error translating JSON body", err)
-			newJson = []byte(fmt.Sprintf("{\"%s\":{}}", contractReference.MessageName))
-		}
-		var msgInfo *types.WasmMessageInfo
-		if contractReference.MessageType == acltypes.WasmMessageSubtype_EXECUTE {
-			msgInfo, err = types.NewExecuteMessageInfo(newJson)
-			if err != nil {
-				return nil, err
-			}
-		} else if contractReference.MessageType == acltypes.WasmMessageSubtype_QUERY {
-			msgInfo, err = types.NewQueryMessageInfo(newJson)
-			if err != nil {
-				return nil, err
-			}
-		}
-		// We use this to import the dependencies from another contract address
-		wasmDeps, err := k.GetWasmDependencyAccessOps(ctx, importContractAddress, contractAddr.String(), msgInfo, circularDepLookup)
-
-		if err != nil {
-			// if we have an error fetching the dependency mapping or the mapping is disabled,
-			// we want to return the error and the fallback behavior can be defined in the caller function
-			// recommended fallback behavior is to use synchronous wasm access ops
-			return nil, err
-		} else {
-			// if we did get deps properly and they are enabled, now we want to add them to our access operations
-			importedAccessOps.AddMultiple(wasmDeps)
-		}
-	}
-	// if we imported all relevant contract references properly, we can return the access ops generated
-	return importedAccessOps, nil
-}
-```
-
-**File:** codec/types/interface_registry.go (L0-0)
-```go
-
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
 ```

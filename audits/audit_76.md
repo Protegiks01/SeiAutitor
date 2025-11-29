@@ -1,298 +1,186 @@
+# Audit Report
+
 ## Title
-Privilege Escalation Through Unrestricted MsgExec Authorization Allowing Unauthorized Re-delegation
+Commission Rate Decrease Bypass - MaxChangeRate Validation Only Enforced for Increases
 
 ## Summary
-The authz module lacks protection against granting authorization for `MsgExec` and `MsgGrant` message types, enabling privilege escalation through delegation chains. This allows grantees to re-delegate authorizations to third parties without the original granter's explicit consent, breaking the trust model and enabling unauthorized access to accounts and funds. [1](#0-0) 
+The `ValidateNewRate()` function in the staking module only validates `MaxChangeRate` limits for commission rate increases, allowing validators to decrease their commission by any amount regardless of the configured `MaxChangeRate` parameter. This bypasses the intended gradual rate change mechanism.
 
 ## Impact
-**High** - Direct loss of funds
+Medium
 
 ## Finding Description
 
-**Location:** The vulnerability exists in the `Grant` method in `x/authz/keeper/msg_server.go` and the overall authorization validation flow in the authz module. [2](#0-1) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:** The authz module should enforce that authorizations are explicit and non-transitive. When Alice grants Bob authorization to perform actions on her behalf, this should only allow Bob to execute those actions directly, not enable Bob to re-delegate Alice's authorization to third parties like Charlie. Each authorization relationship should require explicit consent from the granter.
+**Intended Logic:** The `MaxChangeRate` parameter is designed to enforce that commission rate changes (in either direction) cannot exceed a specified limit within a 24-hour period. The code comment explicitly states "new rate % points change cannot be greater than the max change rate" [2](#0-1) , indicating that the absolute value of any change should be validated.
 
-**Actual Logic:** The `Grant` method only validates that (1) the authorization is present and (2) a handler exists for the message type. There is no check preventing the authorization of `MsgExec` or `MsgGrant` message types themselves. This allows a grantee to grant another party the ability to execute `MsgExec`, which effectively enables unlimited re-delegation chains. [3](#0-2) 
+**Actual Logic:** The validation uses `newRate.Sub(c.Rate).GT(c.MaxChangeRate)` which performs: `(newRate - currentRate) > MaxChangeRate`. This only catches cases where the result is positive and exceeds the limit. When validators decrease their rate (newRate < currentRate), the subtraction yields a negative value. Since negative values are never greater than positive `MaxChangeRate` values [3](#0-2) , the validation always passes for decreases regardless of magnitude.
 
-The `GenericAuthorization` type always accepts any message without validation, making it trivial to grant unrestricted `MsgExec` authorization.
+**Exploitation Path:**
+1. Any validator sends a `MsgEditValidator` transaction with a new commission rate [4](#0-3) 
+2. The transaction is processed through `UpdateValidatorCommission` [5](#0-4) 
+3. `ValidateNewRate()` is called to validate the change [6](#0-5) 
+4. For rate decreases, the check at line 97 passes regardless of how large the decrease is
+5. The commission rate is updated, bypassing the intended `MaxChangeRate` restriction
 
-**Exploit Scenario:**
-1. Alice grants Bob a `SendAuthorization` to send up to 100 tokens from Alice's account
-2. Bob grants Charlie a `GenericAuthorization` for the `MsgExec` message type
-3. Charlie creates a nested `MsgExec`: `MsgExec{grantee: Charlie, msgs: [MsgExec{grantee: Bob, msgs: [MsgSend{from: Alice, amount: 100}]}]}`
-4. When processed by `DispatchActions`, the outer `MsgExec` validates that Charlie has authorization from Bob for `MsgExec` (step 2 grant)
-5. The inner `MsgExec` then validates that Bob has authorization from Alice for `MsgSend` (step 1 grant)
-6. The `MsgSend` executes, transferring 100 tokens from Alice's account to an address controlled by Charlie
-7. Alice never authorized Charlie, yet Charlie successfully accessed Alice's funds through Bob's re-delegation [4](#0-3) 
-
-**Security Failure:** This breaks the authorization security model by allowing transitive delegation without explicit consent. The system fails to enforce the principle that authorizations are personal and non-transferable, enabling privilege escalation through delegation chains.
+**Security Guarantee Broken:** The invariant that commission rate changes must be gradual and limited by `MaxChangeRate` is violated for decreases. The existing test suite confirms this: a validator with rate 0.40 and MaxChangeRate 0.10 can decrease to 0.10 (a 0.30 or 30% decrease, 3x the limit) [7](#0-6) .
 
 ## Impact Explanation
 
-**Assets Affected:** All assets controlled by accounts that grant authorizations, including tokens, staking positions, governance votes, and any other blockchain operations that can be authorized.
+This vulnerability allows validators to manipulate the delegation market by:
 
-**Severity of Damage:** 
-- Unauthorized parties can gain access to funds and execute transactions on behalf of accounts they were never authorized to access
-- The trust relationship between granter and grantee is broken, as grantees can re-delegate to arbitrary third parties
-- This can lead to direct theft of funds, unauthorized staking operations, malicious governance votes, and other unauthorized actions
-- The damage scales with the number of authorization chains, as each intermediate party can re-delegate further
+1. **Market Manipulation:** Validators can suddenly drop their commission to 0% to attract delegators, then gradually increase it back up (respecting the limit for increases), effectively luring delegators with artificially low rates
+2. **Unfair Competition:** Creates an asymmetric competitive advantage where validators can rapidly decrease rates but competitors cannot respond as quickly
+3. **Delegator Protection Bypass:** The `MaxChangeRate` mechanism is designed to protect delegators from sudden rate changes, but this protection only applies to increases
+4. **Validator Set Instability:** Large sudden commission drops can trigger rapid delegation shifts, potentially destabilizing the validator set distribution
 
-**Why This Matters:** The authz module is designed to enable delegation of specific capabilities while maintaining security through explicit authorization. This vulnerability undermines the entire security model by allowing implicit transitive delegation, effectively making any authorization grant potentially accessible to unlimited third parties. This is a fundamental breach of the authorization trust model.
+This qualifies as Medium severity under: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any user who has received any authorization grant can exploit this vulnerability by granting `MsgExec` authorization to another party, thereby enabling re-delegation chains.
+**Exploitability:** High
+- Any validator can trigger this through normal `MsgEditValidator` transactions
+- No special privileges or conditions required beyond being a validator
+- Can be executed once every 24 hours (after the standard cooldown period)
 
-**Conditions Required:** 
-- An initial authorization grant must exist (e.g., Alice grants Bob some authorization)
-- The intermediate party (Bob) must create a grant for `MsgExec` to a third party (Charlie)
-- This is trivially achievable through normal transaction submission; no special conditions are required
+**Motivation:** Validators have direct financial incentives to attract more delegations to increase their rewards. The ability to bypass rate change restrictions provides a competitive advantage that rational validators would exploit.
 
-**Frequency:** This can be exploited at any time during normal network operation. Once an authorization grant exists, any grantee can immediately exploit this by granting `MsgExec` authorization to others. The vulnerability is persistent and does not require any race conditions or timing-specific attacks.
+**Frequency:** Can be exploited repeatedly by any validator in the network once per 24-hour period.
 
 ## Recommendation
 
-Add validation in the `Grant` method to explicitly reject authorization grants for `MsgExec` and `MsgGrant` message types. Specifically:
+Modify the validation logic in `ValidateNewRate()` to check the absolute value of the rate change:
 
-1. In `x/authz/keeper/msg_server.go`, modify the `Grant` method to check if the authorization's `MsgTypeURL()` is for `MsgExec` or `MsgGrant` and reject such grants
-2. Add a constant or list of disallowed authorization message types
-3. Return an error if someone attempts to grant authorization for these recursive/re-delegation message types
+Replace line 97 with:
+```go
+case newRate.Sub(c.Rate).Abs().GT(c.MaxChangeRate):
+    // new rate % points change cannot be greater than the max change rate
+    return ErrCommissionGTMaxChangeRate
+```
 
-Example pseudocode:
-```
-func (k Keeper) Grant(...) {
-    ...
-    t := authorization.MsgTypeURL()
-    
-    // Prevent authorization for MsgExec and MsgGrant to avoid re-delegation chains
-    if t == sdk.MsgTypeURL(&authz.MsgExec{}) || t == sdk.MsgTypeURL(&authz.MsgGrant{}) {
-        return nil, sdkerrors.ErrUnauthorized.Wrap("cannot grant authorization for MsgExec or MsgGrant")
-    }
-    
-    if k.router.HandlerByTypeURL(t) == nil {
-        return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
-    }
-    ...
-}
-```
+This ensures both increases and decreases are subject to the `MaxChangeRate` limit, maintaining the intended invariant that commission changes must be gradual regardless of direction. The `Abs()` method is already available in the decimal type [8](#0-7) .
 
 ## Proof of Concept
 
-**File:** `x/authz/keeper/keeper_test.go`
-**Test Function:** `TestPrivilegeEscalationThroughNestedMsgExec` (add as a new test)
+**Test Setup:** The vulnerability is already demonstrated in the existing test suite.
 
-**Setup:**
-1. Initialize SimApp with three test accounts: Alice (granter), Bob (intermediate grantee), Charlie (final attacker)
-2. Fund Alice's account with 10,000 tokens
-3. Create a recipient account to receive the stolen funds
+**Existing Test Evidence:**
+From `x/staking/types/commission_test.go` lines 40-62:
+- Commission c1 is created with: Rate=0.40 (40%), MaxRate=0.80 (80%), MaxChangeRate=0.10 (10%)
+- Test case at line 62: `{c1, sdk.MustNewDecFromStr("0.10"), now.Add(48 * time.Hour), false}`
+- This tests changing from 0.40 to 0.10 with expectErr=false
 
-**Trigger:**
-1. Alice grants Bob a `SendAuthorization` with a 100 token spend limit via `MsgGrant`
-2. Bob grants Charlie a `GenericAuthorization` for `MsgExec` message type via `MsgGrant`
-3. Charlie constructs a nested `MsgExec`:
-   - Outer: `MsgExec{grantee: Charlie, msgs: [innerMsgExec]}`
-   - Inner: `MsgExec{grantee: Bob, msgs: [MsgSend{from: Alice, to: recipient, amount: 100}]}`
-4. Submit Charlie's transaction containing the nested `MsgExec`
+**Action:** The change from 0.40 to 0.10 represents a 0.30 decrease (30%)
 
-**Observation:**
-The test should observe that:
-- The nested `MsgExec` transaction succeeds without error
-- 100 tokens are transferred from Alice's account to the recipient
-- Alice never granted Charlie any authorization
-- The balance changes confirm unauthorized fund transfer
+**Result:** Despite MaxChangeRate being only 0.10 (10%), this 3x bypass is expected to pass validation (expectErr=false), confirming the vulnerability
 
-This demonstrates that Charlie successfully escalated privileges through Bob's intermediate authorization, accessing Alice's funds without Alice's explicit consent to Charlie. The test would add assertions checking:
-- Alice's balance decreased by 100 tokens
-- Recipient's balance increased by 100 tokens
-- No direct authorization grant exists from Alice to Charlie
-- The transaction executed successfully despite the lack of direct authorization
+**Additional PoC:** A validator could:
+1. Set commission to 50% with MaxChangeRate of 1%
+2. After 24 hours, decrease commission to 0% in a single transaction (bypassing the 1% limit)
+3. Attract delegators with 0% commission
+4. Gradually increase commission back to desired level (respecting the 1% limit for increases)
 
-The test code would follow the pattern established in existing tests like `TestKeeperFees` (lines 126-197 of keeper_test.go), using `simapp.FundAccount`, `app.AuthzKeeper.SaveGrant`, and `app.AuthzKeeper.DispatchActions` to set up and execute the attack scenario. [5](#0-4)
+## Notes
+
+The code comment at line 98 clearly states "new rate % points **change**" (emphasis added), not "increase", indicating that the validation should apply to changes in both directions. The asymmetric enforcement creates an exploitable loophole that violates the intended design of gradual, predictable commission rate changes.
 
 ### Citations
 
-**File:** x/authz/keeper/msg_server.go (L14-42)
+**File:** x/staking/types/commission.go (L81-103)
 ```go
-func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+// ValidateNewRate performs basic sanity validation checks of a new commission
+// rate. If validation fails, an SDK error is returned.
+func (c Commission) ValidateNewRate(newRate sdk.Dec, blockTime time.Time) error {
+	switch {
+	case blockTime.Sub(c.UpdateTime).Hours() < 24:
+		// new rate cannot be changed more than once within 24 hours
+		return ErrCommissionUpdateTime
+
+	case newRate.IsNegative():
+		// new rate cannot be negative
+		return ErrCommissionNegative
+
+	case newRate.GT(c.MaxRate):
+		// new rate cannot be greater than the max rate
+		return ErrCommissionGTMaxRate
+
+	case newRate.Sub(c.Rate).GT(c.MaxChangeRate):
+		// new rate % points change cannot be greater than the max change rate
+		return ErrCommissionGTMaxChangeRate
+	}
+
+	return nil
+}
+```
+
+**File:** types/decimal.go (L211-211)
+```go
+func (d Dec) GT(d2 Dec) bool    { return (d.i).Cmp(d2.i) > 0 }        // greater than
+```
+
+**File:** types/decimal.go (L216-216)
+```go
+func (d Dec) Abs() Dec          { return Dec{new(big.Int).Abs(d.i)} } // absolute value
+```
+
+**File:** x/staking/keeper/msg_server.go (L130-160)
+```go
+func (k msgServer) EditValidator(goCtx context.Context, msg *types.MsgEditValidator) (*types.MsgEditValidatorResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
+	if err != nil {
+		return nil, err
+	}
+	// validator must already be registered
+	validator, found := k.GetValidator(ctx, valAddr)
+	if !found {
+		return nil, types.ErrNoValidatorFound
+	}
+
+	// replace all editable fields (clients should autofill existing values)
+	description, err := validator.Description.UpdateDescription(msg.Description)
 	if err != nil {
 		return nil, err
 	}
 
-	granter, err := sdk.AccAddressFromBech32(msg.Granter)
-	if err != nil {
-		return nil, err
-	}
+	validator.Description = description
 
-	authorization := msg.GetAuthorization()
-	if authorization == nil {
-		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
-	}
-
-	t := authorization.MsgTypeURL()
-	if k.router.HandlerByTypeURL(t) == nil {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
-	}
-
-	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgGrantResponse{}, nil
-}
-```
-
-**File:** x/authz/generic_authorization.go (L23-26)
-```go
-// Accept implements Authorization.Accept.
-func (a GenericAuthorization) Accept(ctx sdk.Context, msg sdk.Msg) (AcceptResponse, error) {
-	return AcceptResponse{Accept: true}, nil
-}
-```
-
-**File:** x/authz/keeper/keeper.go (L76-139)
-```go
-func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
-	results := make([][]byte, len(msgs))
-
-	for i, msg := range msgs {
-		signers := msg.GetSigners()
-		if len(signers) != 1 {
-			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
-		}
-
-		granter := signers[0]
-
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
-			}
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
-
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
-		}
-
-		handler := k.router.Handler(msg)
-		if handler == nil {
-			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
-		}
-
-		msgResp, err := handler(ctx, msg)
+	if msg.CommissionRate != nil {
+		commission, err := k.UpdateValidatorCommission(ctx, validator, *msg.CommissionRate)
 		if err != nil {
-			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
+			return nil, err
 		}
 
-		results[i] = msgResp.Data
+		// call the before-modification hook since we're about to update the commission
+		k.BeforeValidatorModified(ctx, valAddr)
 
-		// emit the events from the dispatched actions
-		events := msgResp.Events
-		sdkEvents := make([]sdk.Event, 0, len(events))
-		for _, event := range events {
-			e := event
-			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
-
-			sdkEvents = append(sdkEvents, sdk.Event(e))
-		}
-
-		ctx.EventManager().EmitEvents(sdkEvents)
+		validator.Commission = commission
 	}
-
-	return results, nil
-}
 ```
 
-**File:** x/authz/keeper/keeper_test.go (L126-197)
+**File:** x/staking/keeper/validator.go (L131-147)
 ```go
-func (s *TestSuite) TestKeeperFees() {
-	app, addrs := s.app, s.addrs
+// An error is returned if the new commission rate is invalid.
+func (k Keeper) UpdateValidatorCommission(ctx sdk.Context,
+	validator types.Validator, newRate sdk.Dec) (types.Commission, error) {
+	commission := validator.Commission
+	blockTime := ctx.BlockHeader().Time
 
-	granterAddr := addrs[0]
-	granteeAddr := addrs[1]
-	recipientAddr := addrs[2]
-	s.Require().NoError(simapp.FundAccount(app.BankKeeper, s.ctx, granterAddr, sdk.NewCoins(sdk.NewInt64Coin("steak", 10000))))
-	now := s.ctx.BlockHeader().Time
-	s.Require().NotNil(now)
+	if err := commission.ValidateNewRate(newRate, blockTime); err != nil {
+		return commission, err
+	}
 
-	smallCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 20))
-	someCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 123))
+	if newRate.LT(k.MinCommissionRate(ctx)) {
+		return commission, fmt.Errorf("cannot set validator commission to less than minimum rate of %s", k.MinCommissionRate(ctx))
+	}
+	commission.Rate = newRate
+	commission.UpdateTime = blockTime
 
-	msgs := authz.NewMsgExec(granteeAddr, []sdk.Msg{
-		&banktypes.MsgSend{
-			Amount:      sdk.NewCoins(sdk.NewInt64Coin("steak", 2)),
-			FromAddress: granterAddr.String(),
-			ToAddress:   recipientAddr.String(),
-		},
-	})
+	return commission, nil
+```
 
-	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
-
-	s.T().Log("verify dispatch fails with invalid authorization")
-	executeMsgs, err := msgs.GetMessages()
-	s.Require().NoError(err)
-	result, err := app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
-
-	s.Require().Nil(result)
-	s.Require().NotNil(err)
-
-	s.T().Log("verify dispatch executes with correct information")
-	// grant authorization
-	err = app.AuthzKeeper.SaveGrant(s.ctx, granteeAddr, granterAddr, &banktypes.SendAuthorization{SpendLimit: smallCoin}, now)
-	s.Require().NoError(err)
-	authorization, _ := app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
-	s.Require().NotNil(authorization)
-
-	s.Require().Equal(authorization.MsgTypeURL(), bankSendAuthMsgType)
-
-	executeMsgs, err = msgs.GetMessages()
-	s.Require().NoError(err)
-
-	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
-	s.Require().NoError(err)
-	s.Require().NotNil(result)
-
-	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
-	s.Require().NotNil(authorization)
-
-	s.T().Log("verify dispatch fails with overlimit")
-	// grant authorization
-
-	msgs = authz.NewMsgExec(granteeAddr, []sdk.Msg{
-		&banktypes.MsgSend{
-			Amount:      someCoin,
-			FromAddress: granterAddr.String(),
-			ToAddress:   recipientAddr.String(),
-		},
-	})
-
-	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
-	executeMsgs, err = msgs.GetMessages()
-	s.Require().NoError(err)
-
-	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
-	s.Require().Nil(result)
-	s.Require().NotNil(err)
-
-	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
-	s.Require().NotNil(authorization)
-}
+**File:** x/staking/types/commission_test.go (L62-62)
+```go
+		{c1, sdk.MustNewDecFromStr("0.10"), now.Add(48 * time.Hour), false},
 ```

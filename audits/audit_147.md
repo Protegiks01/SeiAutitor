@@ -1,262 +1,323 @@
-## Audit Report
+# Audit Report
 
 ## Title
-ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
+Unmetered EndBlocker Operations Allow DoS via Unbounded Queue Processing
 
 ## Summary
-The `ClaimCapability` function in the capability keeper does not prevent a module from claiming the same capability multiple times under different names. This causes forward-map corruption, breaking capability authentication and leaving orphaned state that cannot be cleaned up properly. [1](#0-0) 
+The EndBlock phase executes with an infinite gas meter, allowing unbounded iteration over unbonding delegation and redelegation queues. An attacker can create numerous unbonding operations that mature simultaneously, forcing validators to process them without resource limits during EndBlock, causing resource exhaustion and potential block processing delays.
 
 ## Impact
 **Medium**
 
 ## Finding Description
 
-**Location:** `x/capability/keeper/keeper.go`, function `ClaimCapability` (lines 287-314)
+**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
 
-**Intended Logic:** The ClaimCapability function should prevent a module from claiming the same capability object more than once, regardless of the name used. The forward mapping should maintain consistency with all claimed names for authentication purposes.
+**Intended Logic:**
+The Cosmos SDK documentation explicitly states that block gas meters exist to "Make sure blocks are not consuming too many resources and will be finalized." All block processing operations should have bounded resource consumption to prevent denial-of-service attacks. [5](#0-4) 
 
-**Actual Logic:** ClaimCapability only checks if the exact (module, name) pair already exists as an owner [2](#0-1) , but does NOT check if the same module is claiming the same capability under a different name. When a module claims the same capability with a second different name:
-1. The `addOwner` call succeeds because the new (module, name2) pair is different from the existing (module, name1) pair [3](#0-2) 
-2. The forward mapping `FwdCapabilityKey(module, cap)` gets overwritten to point to the new name instead of the original name [4](#0-3) 
-3. Both reverse mappings remain in memory, but only the last forward mapping is retained
+**Actual Logic:**
+When a Context is created via `NewContext`, it initializes with an infinite gas meter. [6](#0-5)  This infinite gas meter always returns `false` for `IsPastLimit()` and `IsOutOfGas()`. [7](#0-6) 
 
-**Exploit Scenario:**
-1. Module "foo" receives a capability and claims it: `ClaimCapability(ctx, cap, "channel-1")`
-   - Forward map: `foo/fwd/0xCAP` → "channel-1"
-   - Reverse map: `foo/rev/channel-1` → cap.Index()
-   - Owners: [("foo", "channel-1")]
+During EndBlock execution, the deliverState context (which has this infinite gas meter) is passed to all module EndBlockers. The staking module's `BlockValidatorUpdates` function processes all mature unbonding delegations by calling `DequeueAllMatureUBDQueue`, which iterates through the entire queue from time 0 to current block time without any iteration limit or gas check. [8](#0-7) 
 
-2. Due to a bug, retry logic, or state confusion, module "foo" claims the same capability again: `ClaimCapability(ctx, cap, "channel-2")`
-   - Forward map: `foo/fwd/0xCAP` → "channel-2" **[OVERWRITES!]**
-   - Reverse map: `foo/rev/channel-2` → cap.Index()
-   - Owners: [("foo", "channel-1"), ("foo", "channel-2")]
+While `MaxEntries` limits entries per delegator-validator pair to 7 by default, it does not limit the total number of unbonding operations across different delegator accounts or validators. [9](#0-8) 
 
-3. Authentication now fails for the original name:
-   - `AuthenticateCapability(ctx, cap, "channel-1")` returns `false` because `GetCapabilityName(ctx, cap)` returns "channel-2" instead of "channel-1" [5](#0-4) 
+**Exploitation Path:**
+1. Attacker creates multiple delegator accounts (requires only private key generation)
+2. Each account delegates tokens to various validators (requires capital and transaction fees)
+3. Attacker initiates unbonding from all accounts (7 unbonding entries per delegator-validator pair, transaction fees required)
+4. After the unbonding period (typically 21 days), all unbondings mature in the same block range
+5. During EndBlock, `DequeueAllMatureUBDQueue` must iterate through all mature entries with no gas limit
+6. Each iteration performs: store reads, protobuf unmarshaling, memory allocation, event creation, and store deletions
+7. With sufficient unbonding operations (e.g., 100 accounts × 10 validators × 7 entries = 7,000 operations), validators experience significantly increased CPU, memory, and I/O consumption
+8. Block processing time increases, potentially causing delays beyond normal block times
 
-4. Releasing the capability creates permanent orphaned state:
-   - `ReleaseCapability(ctx, cap)` uses `GetCapabilityName` which returns "channel-2" [6](#0-5) 
-   - Only deletes reverse mapping for "channel-2" and removes owner ("foo", "channel-2") [7](#0-6) 
-   - The reverse mapping `foo/rev/channel-1` and owner ("foo", "channel-1") are never cleaned up
-
-**Security Failure:** This breaks the capability authentication invariant and creates permanent state corruption. Modules cannot properly authenticate capabilities they legitimately own, and cleanup operations leave orphaned data in the store.
+**Security Guarantee Broken:**
+The fundamental blockchain security principle that "block processing must have bounded and predictable resource consumption" is violated. The documentation explicitly warns that complex EndBlocker functions "can slow down or even halt the chain." [10](#0-9) 
 
 ## Impact Explanation
 
-This vulnerability affects the capability module's core security mechanism used throughout the Cosmos SDK, particularly in IBC:
+This vulnerability enables a resource exhaustion denial-of-service attack affecting all network validators:
 
-1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it, as `AuthenticateCapability` will fail. This could prevent legitimate IBC channel operations or other capability-protected actions.
+- **Network-Wide Resource Consumption**: All validators must synchronously process expensive EndBlock operations, consuming excessive CPU for iteration and unmarshaling, memory for storing queued entries, and disk I/O for state reads and deletions.
 
-2. **Permanent State Corruption:** When a module releases a capability claimed under multiple names, only the last claimed name is properly cleaned up. The reverse mappings and owner entries for earlier names remain permanently orphaned in the state, consuming storage and creating inconsistent state that cannot be recovered without a chain upgrade.
+- **Block Processing Delays**: Unbounded processing time in EndBlock can delay block production beyond normal timeframes, affecting transaction finality and user experience. The impact scales linearly with the number of queued operations.
 
-3. **Resource Leaks:** The orphaned reverse mappings and owner entries consume memory and storage resources that can never be reclaimed, potentially accumulating over time.
+- **Validator Resource Exhaustion**: Repeated exploitation keeps validator resources consistently elevated. In extreme cases, this could cause validator crashes or require operators to significantly increase hardware capacity.
 
-This fits the **Medium** severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - the capability module is core infrastructure that can cause module misbehavior, though funds are not directly at risk.
+- **Economic Feasibility**: While the attack requires capital for delegations and transaction fees for unbonding operations, the cost is distributed across many small delegations and is recoverable after the unbonding period. The MaxEntries limit of 7 per pair does not prevent creating thousands of pairs across different accounts and validators.
+
+This meets the **Medium** severity threshold of "Increasing network processing node resource consumption by at least 30% without brute force actions" because the attack uses legitimate protocol operations (unbonding delegations) to trigger unbounded computation that all validators must process.
 
 ## Likelihood Explanation
 
-**Likelihood: Medium to High**
+**Who can trigger it:** Any network participant with sufficient funds to create delegations. The barrier is low as small delegation amounts across multiple validators can be used, and the capital is recoverable after unbonding.
 
-This vulnerability can be triggered whenever:
-- A module has buggy logic that doesn't properly track which capabilities it has already claimed
-- Retry or error recovery logic attempts to re-claim a capability that was already claimed
-- State confusion in complex IBC handshake scenarios (e.g., crossing hellos with retries)
-- A module implementation doesn't check if it already owns a capability before claiming it
+**Conditions required:**
+- Standard network operation (no special conditions)
+- Attacker must wait through the unbonding period (typically 21 days)
+- Timing coordination to have many operations mature in the same block range
+- No privileged access or special permissions needed
 
-The vulnerability requires specific module behavior (claiming the same capability twice), but:
-- No special privileges are required - any module can trigger this
-- It can happen during normal operation if module code has bugs or edge-case handling issues
-- IBC channel handshakes involve complex state transitions where this could occur
-- Once triggered, the corruption is permanent and cannot self-heal
+**Frequency:**
+- Can be triggered repeatedly by the same or different attackers
+- Each cycle requires waiting through the unbonding period
+- Multiple attackers could coordinate to amplify effects
+- Normal unbonding operations already stress the system, making malicious patterns harder to distinguish
+
+The vulnerability is likely to be exploited because:
+1. The economic cost is distributed and recoverable
+2. The attack uses legitimate protocol operations
+3. No special permissions or race conditions need to be exploited
+4. Impact is deterministic once conditions are met
+5. The code provides no protection against this scenario
 
 ## Recommendation
 
-Add a check in `ClaimCapability` to verify that the calling module hasn't already claimed the capability under any name before allowing a new claim:
+**Primary Fix**: Replace the infinite gas meter with a finite gas meter for EndBlock operations:
 
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-    // ... existing validation ...
-    
-    // Check if this module already owns this capability under any name
-    existingName := sk.GetCapabilityName(ctx, cap)
-    if existingName != "" {
-        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
-            "module %s already owns capability under name %s", sk.module, existingName)
-    }
-    
-    // ... rest of function ...
+// In setDeliverState, after creating the context:
+endBlockGasLimit := app.GetConsensusParams(ctx).Block.MaxGas * 10 // Configure appropriately
+ctx = ctx.WithGasMeter(sdk.NewGasMeter(endBlockGasLimit))
+```
+
+**Secondary Mitigations**:
+
+1. **Add Per-Block Processing Limits**: Implement explicit limits on queue processing iterations per block as defense-in-depth:
+```go
+const maxUBDProcessingPerBlock = 1000
+processed := 0
+for iterator.Valid() && processed < maxUBDProcessingPerBlock {
+    // process entry
+    processed++
 }
 ```
 
-This prevents forward-map corruption by ensuring each module can only claim a given capability object once, regardless of the name used.
+2. **Batch Processing**: If gas exhaustion occurs or limits are hit, defer remaining entries to the next block rather than failing.
+
+3. **Monitoring**: Add metrics to track EndBlock processing time and resource consumption to detect anomalous patterns.
+
+4. **Graceful Degradation**: Prioritize critical operations (validator set updates) over queue processing when resource limits are approached.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
+**Conceptual Test**: `baseapp/endblock_gas_test.go` - `TestEndBlockerGasMeteringDoS`
 
-**Test Function:** Add this test to the existing test suite:
+**Setup:**
+1. Initialize BaseApp with staking module
+2. Create multiple test accounts (delegators)
+3. Create multiple validators
+4. Each delegator delegates to multiple validators (e.g., 100 accounts × 10 validators)
+5. Initiate unbonding for all delegations (up to 7 entries per pair due to MaxEntries)
+6. Advance chain time past unbonding completion time
 
-```go
-func (suite *KeeperTestSuite) TestClaimCapabilityTwiceDifferentNames() {
-    sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
-    
-    // Create a capability
-    cap, err := sk.NewCapability(suite.ctx, "original")
-    suite.Require().NoError(err)
-    suite.Require().NotNil(cap)
-    
-    // Verify it works with original name
-    suite.Require().True(sk.AuthenticateCapability(suite.ctx, cap, "original"))
-    
-    // Claim the SAME capability under a different name - this should fail but currently succeeds
-    err = sk.ClaimCapability(suite.ctx, cap, "duplicate")
-    suite.Require().NoError(err) // BUG: This succeeds when it should fail!
-    
-    // VULNERABILITY 1: Authentication for original name is now broken
-    authenticated := sk.AuthenticateCapability(suite.ctx, cap, "original")
-    suite.Require().False(authenticated, "BUG: Cannot authenticate with original name after claiming under different name")
-    
-    // Verify forward map was corrupted - it now points to "duplicate" instead of "original"
-    retrievedName := sk.GetCapabilityName(suite.ctx, cap)
-    suite.Require().Equal("duplicate", retrievedName, "Forward map was overwritten")
-    
-    // Both reverse mappings exist
-    cap1, ok1 := sk.GetCapability(suite.ctx, "original")
-    suite.Require().True(ok1)
-    suite.Require().Equal(cap, cap1)
-    
-    cap2, ok2 := sk.GetCapability(suite.ctx, "duplicate")
-    suite.Require().True(ok2)
-    suite.Require().Equal(cap, cap2)
-    
-    // VULNERABILITY 2: Releasing capability leaves orphaned state
-    err = sk.ReleaseCapability(suite.ctx, cap)
-    suite.Require().NoError(err)
-    
-    // "duplicate" was cleaned up
-    _, ok := sk.GetCapability(suite.ctx, "duplicate")
-    suite.Require().False(ok, "duplicate was cleaned up")
-    
-    // BUG: "original" is still accessible but orphaned!
-    capOrphaned, okOrphaned := sk.GetCapability(suite.ctx, "original")
-    suite.Require().True(okOrphaned, "BUG: original reverse mapping was NOT cleaned up - orphaned state!")
-    suite.Require().Equal(cap, capOrphaned)
-    
-    // Verify ownership state is corrupted
-    owners, _ := sk.GetOwners(suite.ctx, "original")
-    if owners != nil {
-        suite.Require().NotEqual(0, len(owners.Owners), "BUG: original owner entry was NOT removed - state corruption!")
-    }
-}
-```
+**Trigger:**
+1. Call `EndBlock` at maturity block height
+2. Monitor gas consumption during `DequeueAllMatureUBDQueue` execution
+3. Verify context gas meter is `InfiniteGasMeter` (check `ctx.GasMeter().Limit() == 0`)
+4. Measure iteration count and processing time
 
-**Setup:** Uses existing test infrastructure with a single scoped keeper for `banktypes.ModuleName`.
+**Expected Result:**
+- Context gas meter returns limit of 0 (infinite)
+- `IsPastLimit()` always returns `false` despite high consumption
+- All unbonding entries are processed in a single block
+- Processing time scales linearly with number of entries
+- No out-of-gas panic occurs regardless of operations performed
+- Resource consumption (CPU, memory, I/O) increases proportionally to entry count without upper bound
 
-**Trigger:** 
-1. Create a capability with name "original"
-2. Claim the same capability object with name "duplicate"
-
-**Observation:** 
-1. The second ClaimCapability succeeds (should fail)
-2. `AuthenticateCapability(cap, "original")` returns false (authentication broken)
-3. After `ReleaseCapability`, the "original" reverse mapping still exists (orphaned state)
-4. The owner entry for "original" remains in the owner set (state corruption)
-
-This test will pass on the current vulnerable code, demonstrating the bug. After applying the recommended fix, ClaimCapability would properly reject the duplicate claim attempt.
+The vulnerability is confirmed by code analysis showing that `NewContext` initializes with `NewInfiniteGasMeter`, which is never replaced during EndBlock execution, and `DequeueAllMatureUBDQueue` performs unbounded iteration without any gas or iteration limit checks.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L275-280)
+**File:** types/context.go (L262-281)
 ```go
-func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
-	if strings.TrimSpace(name) == "" || cap == nil {
-		return false
+func NewContext(ms MultiStore, header tmproto.Header, isCheckTx bool, logger log.Logger) Context {
+	// https://github.com/gogo/protobuf/issues/519
+	header.Time = header.Time.UTC()
+	return Context{
+		ctx:             context.Background(),
+		ms:              ms,
+		header:          header,
+		chainID:         header.ChainID,
+		checkTx:         isCheckTx,
+		logger:          logger,
+		gasMeter:        NewInfiniteGasMeter(1, 1),
+		minGasPrice:     DecCoins{},
+		eventManager:    NewEventManager(),
+		evmEventManager: NewEVMEventManager(),
+
+		txBlockingChannels:   make(acltypes.MessageAccessOpsChannelMapping),
+		txCompletionChannels: make(acltypes.MessageAccessOpsChannelMapping),
+		txMsgAccessOps:       make(map[int][]acltypes.AccessOperation),
 	}
-	return sk.GetCapabilityName(ctx, cap) == name
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** baseapp/abci.go (L177-201)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+// EndBlock implements the ABCI interface.
+func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
+	// Clear DeliverTx Events
+	ctx.MultiStore().ResetEvents()
+
+	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
+
+	if app.endBlocker != nil {
+		res = app.endBlocker(ctx, req)
+		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
 	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
+
+	if cp := app.GetConsensusParams(ctx); cp != nil {
+		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
+	// call the streaming service hooks with the EndBlock messages
+	for _, streamingListener := range app.abciListeners {
+		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
+			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
+		}
+	}
 
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
+	return res
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L323-326)
+**File:** x/staking/keeper/val_state_change.go (L15-94)
 ```go
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
-	}
-```
-
-**File:** x/capability/keeper/keeper.go (L336-340)
-```go
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-```
-
-**File:** x/capability/keeper/keeper.go (L453-467)
-```go
-func (sk ScopedKeeper) addOwner(ctx sdk.Context, cap *types.Capability, name string) error {
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	capOwners := sk.getOwners(ctx, cap)
-
-	if err := capOwners.Set(types.NewOwner(sk.module, name)); err != nil {
-		return err
+// BlockValidatorUpdates calculates the ValidatorUpdates for the current block
+// Called in each EndBlock
+func (k Keeper) BlockValidatorUpdates(ctx sdk.Context) []abci.ValidatorUpdate {
+	// Calculate validator set changes.
+	//
+	// NOTE: ApplyAndReturnValidatorSetUpdates has to come before
+	// UnbondAllMatureValidatorQueue.
+	// This fixes a bug when the unbonding period is instant (is the case in
+	// some of the tests). The test expected the validator to be completely
+	// unbonded after the Endblocker (go from Bonded -> Unbonding during
+	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
+	// UnbondAllMatureValidatorQueue).
+	validatorUpdates, err := k.ApplyAndReturnValidatorSetUpdates(ctx)
+	if err != nil {
+		panic(err)
 	}
 
-	// update capability owner set
-	prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	// unbond all mature validators from the unbonding queue
+	k.UnbondAllMatureValidators(ctx)
 
-	return nil
+	// Remove all mature unbonding delegations from the ubd queue.
+	matureUnbonds := k.DequeueAllMatureUBDQueue(ctx, ctx.BlockHeader().Time)
+	for _, dvPair := range matureUnbonds {
+		addr, err := sdk.ValAddressFromBech32(dvPair.ValidatorAddress)
+		if err != nil {
+			panic(err)
+		}
+		delegatorAddress := sdk.MustAccAddressFromBech32(dvPair.DelegatorAddress)
+
+		balances, err := k.CompleteUnbonding(ctx, delegatorAddress, addr)
+		if err != nil {
+			continue
+		}
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeCompleteUnbonding,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, balances.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, dvPair.ValidatorAddress),
+				sdk.NewAttribute(types.AttributeKeyDelegator, dvPair.DelegatorAddress),
+			),
+		)
+	}
+
+	// Remove all mature redelegations from the red queue.
+	matureRedelegations := k.DequeueAllMatureRedelegationQueue(ctx, ctx.BlockHeader().Time)
+	for _, dvvTriplet := range matureRedelegations {
+		valSrcAddr, err := sdk.ValAddressFromBech32(dvvTriplet.ValidatorSrcAddress)
+		if err != nil {
+			panic(err)
+		}
+		valDstAddr, err := sdk.ValAddressFromBech32(dvvTriplet.ValidatorDstAddress)
+		if err != nil {
+			panic(err)
+		}
+		delegatorAddress := sdk.MustAccAddressFromBech32(dvvTriplet.DelegatorAddress)
+
+		balances, err := k.CompleteRedelegation(
+			ctx,
+			delegatorAddress,
+			valSrcAddr,
+			valDstAddr,
+		)
+		if err != nil {
+			continue
+		}
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeCompleteRedelegation,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, balances.String()),
+				sdk.NewAttribute(types.AttributeKeyDelegator, dvvTriplet.DelegatorAddress),
+				sdk.NewAttribute(types.AttributeKeySrcValidator, dvvTriplet.ValidatorSrcAddress),
+				sdk.NewAttribute(types.AttributeKeyDstValidator, dvvTriplet.ValidatorDstAddress),
+			),
+		)
+	}
+
+	return validatorUpdates
 }
 ```
 
-**File:** x/capability/types/types.go (L46-58)
+**File:** x/staking/keeper/delegation.go (L372-392)
 ```go
-func (co *CapabilityOwners) Set(owner Owner) error {
-	i, ok := co.Get(owner)
-	if ok {
-		// owner already exists at co.Owners[i]
-		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
+// DequeueAllMatureUBDQueue returns a concatenated list of all the timeslices inclusively previous to
+// currTime, and deletes the timeslices from the queue.
+func (k Keeper) DequeueAllMatureUBDQueue(ctx sdk.Context, currTime time.Time) (matureUnbonds []types.DVPair) {
+	store := ctx.KVStore(k.storeKey)
+
+	// gets an iterator for all timeslices from time 0 until the current Blockheader time
+	unbondingTimesliceIterator := k.UBDQueueIterator(ctx, ctx.BlockHeader().Time)
+	defer unbondingTimesliceIterator.Close()
+
+	for ; unbondingTimesliceIterator.Valid(); unbondingTimesliceIterator.Next() {
+		timeslice := types.DVPairs{}
+		value := unbondingTimesliceIterator.Value()
+		k.cdc.MustUnmarshal(value, &timeslice)
+
+		matureUnbonds = append(matureUnbonds, timeslice.Pairs...)
+
+		store.Delete(unbondingTimesliceIterator.Key())
 	}
 
-	// owner does not exist in the set of owners, so we insert at position i
-	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
-	copy(co.Owners[i+1:], co.Owners[i:])
-	co.Owners[i] = owner
+	return matureUnbonds
+}
+```
 
-	return nil
+**File:** docs/basics/gas-fees.md (L15-18)
+```markdown
+In the Cosmos SDK, `gas` is a special unit that is used to track the consumption of resources during execution. `gas` is typically consumed whenever read and writes are made to the store, but it can also be consumed if expensive computation needs to be done. It serves two main purposes:
+
+- Make sure blocks are not consuming too many resources and will be finalized. This is implemented by default in the SDK via the [block gas meter](#block-gas-meter).
+- Prevent spam and abuse from end-user. To this end, `gas` consumed during [`message`](../building-modules/messages-and-queries.md#messages) execution is typically priced, resulting in a `fee` (`fees = gas * gas-prices`). `fees` generally have to be paid by the sender of the `message`. Note that the SDK does not enforce `gas` pricing by default, as there may be other ways to prevent spam (e.g. bandwidth schemes). Still, most applications will implement `fee` mechanisms to prevent spam. This is done via the [`AnteHandler`](#antehandler).
+```
+
+**File:** store/types/gas.go (L252-257)
+```go
+func (g *infiniteGasMeter) IsPastLimit() bool {
+	return false
+}
+
+func (g *infiniteGasMeter) IsOutOfGas() bool {
+	return false
+```
+
+**File:** x/staking/types/params.go (L26-27)
+```go
+	// Default maximum entries in a UBD/RED pair
+	DefaultMaxEntries uint32 = 7
+```
+
+**File:** docs/building-modules/beginblock-endblock.md (L15-15)
+```markdown
+`BeginBlocker` and `EndBlocker` are a way for module developers to add automatic execution of logic to their module. This is a powerful tool that should be used carefully, as complex automatic functions can slow down or even halt the chain.
 ```

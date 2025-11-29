@@ -1,321 +1,207 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Unrecovered Panic in State Sync Snapshot Restoration Crashes Nodes Processing Malformed Peer Data
+Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
 
 ## Summary
-The storev2 snapshot restoration code spawns a goroutine that panics without recovery when processing malformed snapshot data from peers. When a node attempts state sync and receives crafted snapshot chunks from a malicious peer, the `ssStore.Import` method may fail, triggering an unrecovered panic that crashes the entire node. [1](#0-0) 
+The `TrackHistoricalInfo` function in the staking module contains a critical logic flaw in its pruning mechanism. The function uses a break statement that exits the pruning loop upon encountering the first missing historical entry, violating the storage bound invariant when gaps exist in the historical entry sequence. [1](#0-0) 
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:** The vulnerability exists in the `storev2/rootmulti/store.go` file within the `restore()` method. Specifically, a goroutine spawned to handle state store imports panics without any recovery mechanism when the import operation fails. [2](#0-1) 
+- **Location**: `x/staking/keeper/historical_info.go`, lines 78-85 in the `TrackHistoricalInfo` function, specifically the pruning loop with the break condition
 
-**Intended Logic:** During snapshot restoration via ABCI state sync, the system should gracefully handle errors in snapshot data processing and return appropriate error responses to Tendermint, allowing the node to reject the malformed snapshot and request data from a different peer.
+- **Intended Logic**: The function should maintain exactly `HistoricalEntries` number of recent historical info entries by pruning all entries older than `currentHeight - HistoricalEntries`. The storage should be bounded to prevent resource exhaustion.
 
-**Actual Logic:** When `ssConfig.Enable` is true (storev2 state store is enabled), the `restore()` method spawns an asynchronous goroutine that calls `ssStore.Import()`. If this import operation encounters an error—such as malformed data, constraint violations, or invalid node structures in the snapshot chunks—the goroutine directly calls `panic(err)` without any defer/recover mechanism. Since this panic occurs in a goroutine, it propagates to the Go runtime and crashes the entire application. [3](#0-2) 
+- **Actual Logic**: The pruning loop iterates downward from `currentHeight - HistoricalEntries` and breaks immediately upon encountering the first missing entry (line 83). [1](#0-0)  The code comment incorrectly assumes "the entries to be deleted are always in a continuous range" (line 75), but this assumption is violated when `HistoricalEntries` is changed from non-zero to 0 and back. [2](#0-1) 
 
-**Exploit Scenario:**
-1. An attacker sets up a malicious node that participates in Tendermint's peer-to-peer network
-2. A victim node begins state sync to catch up with the blockchain (common during initial sync or after being offline)
-3. Tendermint's state sync protocol discovers the attacker's node as a snapshot provider
-4. The attacker's node offers a snapshot with valid metadata that passes initial validation
-5. When the victim calls `ApplySnapshotChunk` to process chunks from the attacker, the chunks contain subtly malformed data (e.g., invalid key-value structures, constraint violations, or corrupted node heights)
-6. The malformed data passes through the protobuf unmarshaling layer but fails deeper validation in `ssStore.Import`
-7. The goroutine panics, crashing the victim node [4](#0-3) 
+- **Exploitation Path**:
+  1. Network operates normally with `HistoricalEntries=100`, accumulating 100 historical entries (blocks 1-100)
+  2. Through governance proposal, `HistoricalEntries` is changed to 0 for blocks 101-110
+  3. During this period, no new entries are saved (early return when `entryNum == 0` at line 88), but existing entries 1-100 remain in storage [3](#0-2) 
+  4. Through another governance proposal, `HistoricalEntries` is changed to 5 at block 111
+  5. The pruning loop starts at height 106 (111-5), finds no entry (gap period), immediately breaks
+  6. Old entries 1-100 are never deleted, new entry 111 is saved
+  7. Each subsequent block adds a new entry without deleting old ones
+  8. Storage grows unboundedly: {1-100, 111, 112, 113, ...}
 
-**Security Failure:** This breaks the availability and fault-tolerance properties of the system. The state sync mechanism, designed to help nodes efficiently join the network, becomes an attack vector for denial-of-service. The panic is not recovered, violating the principle that external untrusted input should never crash the application.
+- **Security Guarantee Broken**: The storage bound invariant is violated. The system should maintain exactly `HistoricalEntries` entries, but instead accumulates entries without bound, causing resource exhaustion.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Nodes attempting state sync with storev2 enabled (when `ssConfig.Enable = true`)
-- Network availability during periods of high sync activity (e.g., after network upgrades, during validator onboarding)
+Each `HistoricalInfo` entry contains a complete block header and full validator set. [4](#0-3)  With the default 35 validators [5](#0-4) , each entry represents substantial data (multiple kilobytes).
 
-**Severity of Damage:**
-- **Node Crash:** Each affected node crashes completely and must be manually restarted
-- **Repeated DoS:** The malicious peer can repeatedly crash nodes attempting to sync, preventing them from ever joining the network
-- **Network Degradation:** If multiple nodes are syncing simultaneously (common after upgrades), an attacker can crash 30% or more of processing nodes, meeting the **Medium** severity threshold for "Shutdown of greater than or equal to 30% of network processing nodes"
-- **Validator Impact:** New validators or validators recovering from downtime cannot join consensus
+After the vulnerability is triggered:
+- Expected storage with `HistoricalEntries=5`: ~5 entries
+- Actual storage: 100 old entries + continuously growing new entries (8,640+ per day assuming 10-second blocks)
+- Within 24 hours: increases from 100 to 8,740+ entries = 87x increase (8,640% increase)
+- This clearly exceeds the 30% threshold for Medium severity resource consumption impact
 
-**Why This Matters:**
-State sync is a critical feature for network scalability and recovery. If attackers can weaponize it to crash nodes, they can:
-- Prevent new nodes from joining the network
-- Target specific nodes during critical periods
-- Degrade overall network resilience
-- Force operators to disable state sync, undermining one of the blockchain's key features
+Over time, this leads to:
+- **Storage exhaustion**: Thousands of entries accumulate, consuming gigabytes of disk space
+- **Node crashes**: When disk space is exhausted, nodes fail to write new blocks
+- **Network degradation**: If sufficient nodes run out of storage, network stability is compromised
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any network participant can run a peer node that participates in Tendermint's P2P network and offers snapshots. No special privileges, stake, or authentication is required.
+**Who can trigger**: Any network participant through the standard governance process. The `HistoricalEntries` parameter is governance-controlled and can be modified via parameter change proposals. [6](#0-5) 
 
-**Conditions Required:**
-- Storev2 must be enabled on victim nodes (`ssConfig.Enable = true`)
-- Victim node must be performing state sync (initial sync, catching up after downtime, or recovering from corruption)
-- Attacker's peer must be discovered by Tendermint's peer discovery
-- Attacker must craft snapshot chunks that pass protobuf unmarshaling but fail `ssStore.Import` validation [5](#0-4) 
+**Conditions required**:
+1. A governance proposal changes `HistoricalEntries` from non-zero to 0
+2. After several blocks, another proposal changes it back to a non-zero value
 
-**Frequency:** This can be triggered repeatedly during any state sync operation. Given that:
-- New nodes frequently join networks
-- Validators may need to resync after upgrades or issues  
-- State sync is a standard feature enabled on many nodes
-- The attack can be repeated with minimal cost
+**Why realistic**:
+- The validation function explicitly allows `HistoricalEntries=0` as valid (only checks type, not value) [7](#0-6) 
+- The simulation code confirms 0 is an intended valid value [8](#0-7) 
+- Non-IBC chains may legitimately set `HistoricalEntries=0` to save resources, as noted in the default value comment [9](#0-8) 
+- This is not a malicious attack but a legitimate governance operation that triggers a code bug
 
-The likelihood is **HIGH** for networks with storev2 enabled.
+**Frequency**: Once triggered through normal governance operations, the effect compounds with every subsequent block. The storage grows continuously at a rate of 1 entry per block, making it inevitable that storage issues will occur over the network's lifetime.
 
 ## Recommendation
 
-Add panic recovery to the goroutine handling state store imports. The error should be propagated through a channel or stored in a shared error variable, then checked and returned by the main restoration logic.
+Modify the pruning logic to delete all entries older than the retention threshold, regardless of gaps. Remove the break condition and iterate through all possible heights:
 
-**Specific Fix:**
 ```go
-// Recommended changes to storev2/rootmulti/store.go
-
-if rs.ssStore != nil {
-    ssImporter = make(chan sstypes.SnapshotNode, 10000)
-    ssImportErr := make(chan error, 1)  // Add error channel
-    
-    go func() {
-        defer func() {  // Add panic recovery
-            if r := recover(); r != nil {
-                ssImportErr <- fmt.Errorf("panic in ssStore.Import: %v", r)
-            }
-        }()
-        
-        err := rs.ssStore.Import(height, ssImporter)
-        if err != nil {
-            ssImportErr <- err  // Send error instead of panicking
-            return
-        }
-        close(ssImportErr)
-    }()
-    
-    // Later, check ssImportErr before completing restoration
-    select {
-    case err := <-ssImportErr:
-        if err != nil {
-            return snapshottypes.SnapshotItem{}, err
-        }
-    default:
+// Prune all entries older than retention height, regardless of gaps
+pruneHeight := ctx.BlockHeight() - int64(entryNum)
+for i := pruneHeight; i >= 0; i-- {
+    _, found := k.GetHistoricalInfo(ctx, i)
+    if found {
+        k.DeleteHistoricalInfo(ctx, i)
     }
+    // Remove the break statement - continue checking all heights
 }
 ```
 
-Additionally, ensure proper cleanup of the goroutine when the main restoration loop exits early due to errors.
+Alternatively, track the oldest and newest entry heights in state to enable efficient range-based deletion without relying on the "continuous range" assumption.
 
 ## Proof of Concept
 
-**Test File:** `storev2/rootmulti/store_test.go` (or create new file `storev2/rootmulti/snapshot_panic_test.go`)
+**File**: `x/staking/keeper/historical_info_test.go`
 
-**Test Function:**
-```go
-func TestSnapshotRestorePanicOnMalformedData(t *testing.T) {
-    // Setup: Create a storev2 Store with ssStore enabled
-    // This would require:
-    // 1. Initialize a temporary directory for the store
-    // 2. Create ssConfig with Enable = true
-    // 3. Initialize the Store using NewStore()
-    // 4. Prepare a mock or real ssStore that will fail on Import
-    
-    // Trigger:
-    // 1. Create a StreamReader that provides malformed snapshot chunks
-    // 2. The chunks should unmarshal successfully as protobuf
-    //    but contain data that causes ssStore.Import to fail
-    // 3. Call store.Restore() with this malformed data
-    
-    // Observation:
-    // The test should detect that the goroutine panicked by:
-    // - Setting up a recover handler in the test
-    // - Or observing that the process crashes
-    // - Or using testing.T.FailNow() when panic is detected
-    
-    // Expected: Without the fix, this test would cause a panic
-    // With the fix, the error should be returned gracefully
-}
-```
+**Test Function**: `TestTrackHistoricalInfoUnboundedGrowth`
 
-**Concrete Test Steps:**
-1. Initialize storev2 Store with a temporary directory and ssStore enabled
-2. Create a mock `protoReader` that returns `SnapshotItem` messages with leaf nodes (Height = 0)
-3. Inject data that will cause `ssStore.Import` to fail (e.g., duplicate keys, invalid versions, or corrupt values)
-4. Call `store.Restore()` 
-5. Verify that either:
-   - The panic occurs (demonstrating the vulnerability), OR
-   - After applying the fix, an error is properly returned
+**Setup**:
+- Initialize staking keeper with validators
+- Set `HistoricalEntries=100`
+- Generate 100 blocks, creating 100 historical entries
 
-The test confirms the vulnerability by demonstrating that malformed snapshot data from an untrusted peer can crash the node through an unrecovered panic in the import goroutine.
+**Action**:
+1. Change `HistoricalEntries` to 0
+2. Generate 10 blocks (101-110), creating a gap
+3. Change `HistoricalEntries` to 5
+4. Generate block 111
+5. Continue generating blocks 112-120
+
+**Result**:
+- Expected after block 111: 5 entries (107-111)
+- Actual after block 111: 101 entries (1-100 + 111)
+- Expected after block 120: 5 entries (116-120)
+- Actual after block 120: 110 entries (1-100 + 111-120)
+
+The test assertions will fail, proving that old entries are never pruned when a gap exists, leading to unbounded storage growth that violates the intended `HistoricalEntries` bound.
+
+**Notes**
+
+This vulnerability is called every block through `BeginBlocker` [10](#0-9) , making it a production-critical issue. The flaw stems from an incorrect assumption documented in the code comments that entries form a "continuous range," which is violated by legitimate governance operations that temporarily set `HistoricalEntries=0`.
 
 ### Citations
 
-**File:** storev2/rootmulti/store.go (L61-95)
+**File:** x/staking/keeper/historical_info.go (L71-77)
 ```go
-func NewStore(
-	homeDir string,
-	logger log.Logger,
-	scConfig config.StateCommitConfig,
-	ssConfig config.StateStoreConfig,
-	migrateIavl bool,
-) *Store {
-	scStore := sc.NewCommitStore(homeDir, logger, scConfig)
-	store := &Store{
-		logger:         logger,
-		scStore:        scStore,
-		storesParams:   make(map[types.StoreKey]storeParams),
-		storeKeys:      make(map[string]types.StoreKey),
-		ckvStores:      make(map[types.StoreKey]types.CommitKVStore),
-		pendingChanges: make(chan VersionedChangesets, 1000),
-	}
-	if ssConfig.Enable {
-		ssStore, err := ss.NewStateStore(logger, homeDir, ssConfig)
-		if err != nil {
-			panic(err)
-		}
-		// Check whether SC was enabled before but SS was not
-		ssVersion, _ := ssStore.GetLatestVersion()
-		scVersion, _ := scStore.GetLatestVersion()
-		if ssVersion <= 0 && scVersion > 0 && !migrateIavl {
-			panic("Enabling SS store without state sync could cause data corruption")
-		}
-		if err = ss.RecoverStateStore(logger, homeDir, ssStore); err != nil {
-			panic(err)
-		}
-		store.ssStore = ssStore
-		go store.StateStoreCommit()
-	}
-	return store
-
+	// Prune store to ensure we only have parameter-defined historical entries.
+	// In most cases, this will involve removing a single historical entry.
+	// In the rare scenario when the historical entries gets reduced to a lower value k'
+	// from the original value k. k - k' entries must be deleted from the store.
+	// Since the entries to be deleted are always in a continuous range, we can iterate
+	// over the historical entries starting from the most recent version to be pruned
+	// and then return at the first empty entry.
 ```
 
-**File:** storev2/rootmulti/store.go (L714-803)
+**File:** x/staking/keeper/historical_info.go (L78-85)
 ```go
-func (rs *Store) restore(height int64, protoReader protoio.Reader) (snapshottypes.SnapshotItem, error) {
-	var (
-		ssImporter   chan sstypes.SnapshotNode
-		snapshotItem snapshottypes.SnapshotItem
-		storeKey     string
-		restoreErr   error
-	)
-	scImporter, err := rs.scStore.Importer(height)
-	if err != nil {
-		return snapshottypes.SnapshotItem{}, err
-	}
-	if rs.ssStore != nil {
-		ssImporter = make(chan sstypes.SnapshotNode, 10000)
-		go func() {
-			err := rs.ssStore.Import(height, ssImporter)
-			if err != nil {
-				panic(err)
-			}
-		}()
-	}
-loop:
-	for {
-		snapshotItem = snapshottypes.SnapshotItem{}
-		err = protoReader.ReadMsg(&snapshotItem)
-		if err == io.EOF {
+	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
+		_, found := k.GetHistoricalInfo(ctx, i)
+		if found {
+			k.DeleteHistoricalInfo(ctx, i)
+		} else {
 			break
-		} else if err != nil {
-			restoreErr = errors.Wrap(err, "invalid protobuf message")
-			break loop
-		}
-
-		switch item := snapshotItem.Item.(type) {
-		case *snapshottypes.SnapshotItem_Store:
-			storeKey = item.Store.Name
-			if err = scImporter.AddTree(storeKey); err != nil {
-				restoreErr = err
-				break loop
-			}
-			rs.logger.Info(fmt.Sprintf("Start restoring store: %s", storeKey))
-		case *snapshottypes.SnapshotItem_IAVL:
-			if item.IAVL.Height > math.MaxInt8 {
-				restoreErr = errors.Wrapf(sdkerrors.ErrLogic, "node height %v cannot exceed %v",
-					item.IAVL.Height, math.MaxInt8)
-				break loop
-			}
-			node := &sctypes.SnapshotNode{
-				Key:     item.IAVL.Key,
-				Value:   item.IAVL.Value,
-				Height:  int8(item.IAVL.Height),
-				Version: item.IAVL.Version,
-			}
-			// Protobuf does not differentiate between []byte{} as nil, but fortunately IAVL does
-			// not allow nil keys nor nil values for leaf nodes, so we can always set them to empty.
-			if node.Key == nil {
-				node.Key = []byte{}
-			}
-			if node.Height == 0 && node.Value == nil {
-				node.Value = []byte{}
-			}
-			scImporter.AddNode(node)
-
-			// Check if we should also import to SS store
-			if rs.ssStore != nil && node.Height == 0 && ssImporter != nil {
-				ssImporter <- sstypes.SnapshotNode{
-					StoreKey: storeKey,
-					Key:      node.Key,
-					Value:    node.Value,
-				}
-			}
-		default:
-			// unknown element, could be an extension
-			break loop
 		}
 	}
+```
 
-	if err = scImporter.Close(); err != nil {
-		if restoreErr == nil {
-			restoreErr = err
-		}
+**File:** x/staking/keeper/historical_info.go (L87-90)
+```go
+	// if there is no need to persist historicalInfo, return
+	if entryNum == 0 {
+		return
 	}
-	if ssImporter != nil {
-		close(ssImporter)
-	}
-	// initialize the earliest version for SS store
-	if rs.ssStore != nil {
-		rs.ssStore.SetEarliestVersion(height, false)
-	}
+```
 
-	return snapshotItem, restoreErr
+**File:** x/staking/types/historical_info.go (L15-27)
+```go
+// NewHistoricalInfo will create a historical information struct from header and valset
+// it will first sort valset before inclusion into historical info
+func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
+	// Must sort in the same way that tendermint does
+	sort.SliceStable(valSet, func(i, j int) bool {
+		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
+	})
+
+	return HistoricalInfo{
+		Header: header,
+		Valset: valSet,
+	}
 }
 ```
 
-**File:** baseapp/abci.go (L628-661)
+**File:** x/staking/types/params.go (L24-24)
 ```go
-func (app *BaseApp) ApplySnapshotChunk(context context.Context, req *abci.RequestApplySnapshotChunk) (*abci.ResponseApplySnapshotChunk, error) {
-	if app.snapshotManager == nil {
-		app.logger.Error("snapshot manager not configured")
-		return &abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ABORT}, nil
+	DefaultMaxValidators uint32 = 35
+```
+
+**File:** x/staking/types/params.go (L29-32)
+```go
+	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
+	// value by not adding the staking module to the application module manager's
+	// SetOrderBeginBlockers.
+	DefaultHistoricalEntries uint32 = 10000
+```
+
+**File:** x/staking/types/params.go (L242-249)
+```go
+func validateHistoricalEntries(i interface{}) error {
+	_, ok := i.(uint32)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	done, err := app.snapshotManager.RestoreChunk(req.Chunk)
-	switch {
-	case err == nil:
-		if done {
-			if app.interBlockCache != nil {
-				app.interBlockCache.Reset()
-			}
-		}
-		return &abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil
-
-	case errors.Is(err, snapshottypes.ErrChunkHashMismatch):
-		app.logger.Error(
-			"chunk checksum mismatch; rejecting sender and requesting refetch",
-			"chunk", req.Index,
-			"sender", req.Sender,
-			"err", err,
-		)
-		return &abci.ResponseApplySnapshotChunk{
-			Result:        abci.ResponseApplySnapshotChunk_RETRY,
-			RefetchChunks: []uint32{req.Index},
-			RejectSenders: []string{req.Sender},
-		}, nil
-
-	default:
-		app.logger.Error("failed to restore snapshot", "err", err)
-		return &abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ABORT}, nil
-	}
+	return nil
 }
+```
+
+**File:** x/staking/keeper/params.go (L82-84)
+```go
+// set the params
+func (k Keeper) SetParams(ctx sdk.Context, params types.Params) {
+	k.paramstore.SetParamSet(ctx, &params)
+```
+
+**File:** x/staking/simulation/genesis.go (L34-37)
+```go
+// getHistEntries returns randomized HistoricalEntries between 0-100.
+func getHistEntries(r *rand.Rand) uint32 {
+	return uint32(r.Intn(int(types.DefaultHistoricalEntries + 1)))
+}
+```
+
+**File:** x/staking/abci.go (L15-18)
+```go
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+
+	k.TrackHistoricalInfo(ctx)
 ```

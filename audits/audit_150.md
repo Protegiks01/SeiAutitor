@@ -1,289 +1,350 @@
+# Audit Report
+
 ## Title
-Capability Ownership Theft via Name Collision in RevCapabilityKey
+Permanent Token Lock Due to Unbonding Completion Failure with Silent Error Handling
 
 ## Summary
-The `RevCapabilityKey` function in `x/capability/types/keys.go` generates lookup keys by concatenating module and capability names with a "/rev/" separator, but does not validate against special characters in the inputs. This allows crafted module or capability names containing "/rev/" to create key collisions, enabling one module to steal capabilities owned by another module.
+The unbonding completion mechanism in the staking module contains a critical error handling flaw that can result in permanent token freezing. When mature unbonding delegations are processed during `BlockValidatorUpdates`, entries are permanently removed from the time-based processing queue before token transfer completion is verified. If the transfer fails, the unbonding entry remains in storage but is no longer queued for processing, resulting in tokens being locked indefinitely with no recovery mechanism.
 
 ## Impact
-**High**
+Critical
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- Primary: `x/staking/keeper/val_state_change.go` lines 36-57 in `BlockValidatorUpdates` function
+- Secondary: `x/staking/keeper/delegation.go` lines 862-906 in `CompleteUnbonding` function
+- Related: `x/staking/keeper/delegation.go` lines 374-392 in `DequeueAllMatureUBDQueue` function [1](#0-0) [2](#0-1) [3](#0-2) 
 
-The vulnerability exists in the capability key generation and validation logic across:
-- Key generation: [1](#0-0) 
-- Module scoping: [2](#0-1) 
-- Capability creation: [3](#0-2) 
-- Capability claiming: [4](#0-3) 
+**Intended Logic:**
+The unbonding completion flow should atomically: (1) retrieve mature entries from the queue, (2) transfer tokens from NotBondedPool to delegators, and (3) remove completed entries from storage. If any step fails, the system should either retry or maintain the entry in the queue for future processing.
 
-**Intended Logic:** 
-The `RevCapabilityKey` function is designed to create unique lookup keys mapping from (module, capability_name) pairs to capability indices in the memory store. Each module should have its own isolated namespace for capability names, preventing modules from accessing or manipulating each other's capabilities.
+**Actual Logic:**
+The implementation has a non-atomic error handling pattern that creates a critical vulnerability:
 
-**Actual Logic:** 
-The function creates keys using string concatenation: `module/rev/name`. However, neither module names nor capability names are validated to prevent "/" characters. This creates ambiguous keys when:
-- Module "A" with capability "B/rev/C" generates key: "A/rev/B/rev/C"
-- Module "A/rev/B" with capability "C" generates key: "A/rev/B/rev/C"
+1. `DequeueAllMatureUBDQueue` permanently deletes mature entries from the time-based queue via `store.Delete()` before processing begins
+2. For each dequeued entry, `CompleteUnbonding` is called, but if it returns an error, the code simply continues with no recovery mechanism
+3. Inside `CompleteUnbonding`, the entry is removed from the `ubd.Entries` array at line 881 BEFORE attempting the token transfer at line 887
+4. If `UndelegateCoinsFromModuleToAccount` fails, the function returns immediately at line 890 without saving the modified unbonding delegation
+5. The save/remove operations at lines 899-903 are only reached if no error occurs
 
-These identical keys cause the second module to retrieve and potentially claim ownership of the first module's capability.
+**Exploitation Path:**
+This is not an "attacker exploit" but a protocol-level failure that occurs during normal operations:
 
-The validation only checks for empty strings: [5](#0-4) [6](#0-5) 
+1. User initiates unbonding through standard `MsgUndelegate` transaction
+2. Unbonding delegation is created with tokens moved to NotBondedPool
+3. During the unbonding period, slashing operations may burn tokens from NotBondedPool [4](#0-3) 
+4. When unbonding matures, `BlockValidatorUpdates` is called in EndBlock
+5. `DequeueAllMatureUBDQueue` permanently removes the entry from the queue
+6. `CompleteUnbonding` attempts to transfer tokens but fails due to insufficient pool balance or other errors [5](#0-4) 
+7. Error is silently ignored, entry remains in storage but not in queue
+8. No retry mechanism exists - tokens are permanently locked
 
-**Exploit Scenario:**
-1. During application initialization, module "ibc" is scoped and creates a capability named "transfer/rev/port-1"
-2. Later, the app developer adds a new module with name "ibc/rev/transfer" (perhaps from a third-party package or auto-generated naming)
-3. Module "ibc/rev/transfer" calls `GetCapability(ctx, "port-1")`, which successfully retrieves the capability created by module "ibc"
-4. Module "ibc/rev/transfer" calls `ClaimCapability(ctx, cap, "port-1")` and becomes a co-owner
-5. The malicious module now has authenticated access to capabilities intended only for the "ibc" module
-
-**Security Failure:** 
-This breaks the isolation and authentication properties of the capability system. Capabilities are the fundamental security primitive for inter-module authentication in Cosmos SDK, particularly for IBC port and channel ownership. A module stealing another module's capabilities can impersonate that module and perform unauthorized actions.
+**Security Guarantee Broken:**
+- **Liveness**: The protocol promises that mature unbonding delegations will be completed and tokens returned
+- **Fund Safety**: User tokens become permanently inaccessible
+- **Accounting Integrity**: System state becomes inconsistent (entry exists in storage but not in processing queue)
 
 ## Impact Explanation
 
-**Affected Assets:**
-- IBC port and channel capabilities used for cross-chain token transfers
-- Module-specific capabilities controlling access to privileged operations
-- Any capability-protected resources in the blockchain
+This vulnerability results in **permanent freezing of user funds** with no recovery mechanism:
 
-**Severity:**
-- **Direct loss of funds:** A malicious module could steal IBC transfer capabilities and redirect cross-chain token transfers to attacker-controlled addresses
-- **Authorization bypass:** Modules could bypass intended access controls by stealing capabilities from privileged modules
-- **Protocol integrity:** The capability authentication system, which is fundamental to Cosmos SDK security architecture, becomes unreliable
+- **Assets Affected**: Delegator tokens in mature unbonding delegations where transfer completion fails
+- **Permanent Lock**: Once the entry is removed from the queue but transfer fails, there is no automatic retry mechanism. The tokens remain locked in the unbonding delegation entry forever
+- **No User Recovery**: Users cannot cancel, restart, or manually trigger completion. No message type or RPC exists to force completion outside automatic EndBlock processing
+- **Systemic Risk**: If NotBondedPool experiences accounting issues or is depleted by slashing, multiple unbonding delegations could fail simultaneously, affecting many users in a single block
+- **Hard Fork Required**: Recovery requires a governance-driven chain upgrade or hard fork to manually fix affected storage entries
 
-**Why This Matters:**
-Capabilities in Cosmos SDK serve the same role as capabilities in object-capability security models—they are unforgeable tokens proving authorization. If capabilities can be stolen through name manipulation, the entire security model collapses. This is particularly critical for IBC, where capability ownership determines who can send tokens across chains.
+This violates the core promise of the staking system that users can retrieve their tokens after the unbonding period.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-- Application developers integrating third-party modules with crafted names
-- Modules creating capabilities with "/" in names (no validation prevents this)
-- Attackers who can influence module naming through configuration or package names
+**Trigger Conditions:**
+- Any delegator who initiates unbonding is at risk
+- Triggered automatically during EndBlock when unbonding matures
+- Requires `UndelegateCoinsFromModuleToAccount` to fail, which can occur due to:
+  - Insufficient balance in NotBondedPool (from slashing, accounting bugs, or race conditions)
+  - Account-related errors in delegator account
+  - Balance check failures when pool's spendable balance is insufficient
 
-**Conditions Required:**
-1. A module creates a capability with "/" characters in the name
-2. A module is registered with a name containing "/rev/" that creates a collision
-3. OR vice versa: a module with "/" in its name exists, and another module creates a capability that collides
+**Frequency Assessment:**
+- **Moderate to Low Probability** under normal operations, as slashing properly reduces entry balances
+- **High Impact When Occurs**: Consequences are permanent and catastrophic for affected users
+- **Realistic Scenarios**: Complex interactions between multiple unbondings, redelegations, validator state changes, and slashing events could create edge cases where pool balance doesn't match expectations
+- **Not Attacker-Driven**: This is a protocol bug triggered by normal operations, not malicious action
 
-**Frequency:**
-- Low immediate likelihood due to conventional naming practices (modules typically use simple names like "bank", "staking")
-- However, hierarchical naming schemes (e.g., "ibc/transfer", "x/bank/keeper") are conceptually reasonable and could be adopted
-- No warnings or validation prevent this, making it a latent vulnerability
-- Risk increases as the ecosystem grows and more third-party modules are integrated
+The combination of moderate likelihood with catastrophic impact (permanent fund loss matching the "Permanent freezing of funds (fix requires hard fork)" impact criterion) makes this a valid critical vulnerability.
 
 ## Recommendation
 
-Add validation to prevent "/" characters in both module names and capability names:
+Implement atomic error handling for unbonding completion:
 
-1. In `ScopeToModule`, add validation:
+**Recommended Fix (Approach 1 - Atomic Operation):**
+Move the `RemoveEntry` call to AFTER successful token transfer in `CompleteUnbonding`:
+
 ```go
-if strings.Contains(moduleName, "/") {
-    panic("module name cannot contain '/' character")
+// In CompleteUnbonding function
+for i := 0; i < len(ubd.Entries); i++ {
+    entry := ubd.Entries[i]
+    if entry.IsMature(ctxTime) {
+        // Transfer tokens BEFORE removing entry
+        if !entry.Balance.IsZero() {
+            amt := sdk.NewCoin(bondDenom, entry.Balance)
+            if err := k.bankKeeper.UndelegateCoinsFromModuleToAccount(
+                ctx, types.NotBondedPoolName, delegatorAddress, sdk.NewCoins(amt),
+            ); err != nil {
+                return nil, err  // Return without modifying ubd
+            }
+            balances = balances.Add(amt)
+        }
+        // Only remove entry AFTER successful transfer
+        ubd.RemoveEntry(int64(i))
+        i--
+    }
 }
 ```
 
-2. In `NewCapability` and `ClaimCapability`, add validation:
+**Alternative Approach - Re-queue on Failure:**
+Modify `BlockValidatorUpdates` to re-insert failed entries back into the queue:
+
 ```go
-if strings.Contains(name, "/") {
-    return nil, sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot contain '/' character")
+// In BlockValidatorUpdates
+matureUnbonds := k.DequeueAllMatureUBDQueue(ctx, ctx.BlockHeader().Time)
+for _, dvPair := range matureUnbonds {
+    // ... address parsing ...
+    balances, err := k.CompleteUnbonding(ctx, delegatorAddress, addr)
+    if err != nil {
+        // Re-queue the entry instead of silently continuing
+        k.InsertUBDQueue(ctx, ubd, completionTime.Add(time.Hour))
+        continue
+    }
+    // ... emit event ...
 }
 ```
 
-3. Add a genesis validation check to ensure no existing capabilities violate this constraint: [7](#0-6) 
-
-Modify to check:
-```go
-if strings.Contains(owner.Module, "/") {
-    return fmt.Errorf("owner's module cannot contain '/': %s", owner)
-}
-if strings.Contains(owner.Name, "/") {
-    return fmt.Errorf("owner's name cannot contain '/': %s", owner)
-}
-```
+**Additional Recommendations:**
+- Emit error events when unbonding completion fails for monitoring
+- Add invariant checks to detect stuck unbonding entries
+- Implement governance mechanism to manually force completion of stuck entries
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
+**Test Location:** `x/staking/keeper/delegation_test.go`
 
-**Test Function:** Add the following test to demonstrate the collision:
+**Test Function:** `TestUnbondingCompletionFailureLocksFunds`
 
-```go
-func (suite *KeeperTestSuite) TestCapabilityNameCollision() {
-    // Create first module and capability with slash in name
-    sk1 := suite.keeper.ScopeToModule("alice")
-    cap1, err := sk1.NewCapability(suite.ctx, "bob/rev/charlie")
-    suite.Require().NoError(err)
-    suite.Require().NotNil(cap1)
-    
-    // Verify alice owns the capability
-    got1, ok := sk1.GetCapability(suite.ctx, "bob/rev/charlie")
-    suite.Require().True(ok)
-    suite.Require().Equal(cap1, got1)
-    
-    // Create second module with name containing /rev/
-    sk2 := suite.keeper.ScopeToModule("alice/rev/bob")
-    
-    // VULNERABILITY: sk2 can retrieve sk1's capability using a different name!
-    got2, ok := sk2.GetCapability(suite.ctx, "charlie")
-    suite.Require().True(ok)
-    suite.Require().Equal(cap1, got2, "Module 'alice/rev/bob' retrieved capability owned by 'alice'")
-    
-    // VULNERABILITY: sk2 can claim ownership of sk1's capability!
-    err = sk2.ClaimCapability(suite.ctx, got2, "charlie")
-    suite.Require().NoError(err, "Module 'alice/rev/bob' successfully claimed 'alice' module's capability")
-    
-    // Verify both modules now own the same capability
-    owners, ok := sk1.GetOwners(suite.ctx, "bob/rev/charlie")
-    suite.Require().True(ok)
-    suite.Require().Equal(2, len(owners.Owners), "Capability should have 2 owners after theft")
-    
-    // The collision key demonstrates the vulnerability
-    key1 := types.RevCapabilityKey("alice", "bob/rev/charlie")
-    key2 := types.RevCapabilityKey("alice/rev/bob", "charlie")
-    suite.Require().Equal(key1, key2, "Keys collide: both resolve to 'alice/rev/bob/rev/charlie'")
-}
-```
+**Setup:**
+1. Create test app with staking and bank keepers
+2. Create validator and delegator accounts with initial tokens
+3. Perform delegation from delegator to validator
+4. Initiate unbonding to create unbonding delegation entry
+5. Fund NotBondedPool appropriately
+6. Advance block time to maturity
 
-**Setup:** 
-The test uses the existing test suite infrastructure with a fresh keeper instance per test.
+**Trigger:**
+1. Drain NotBondedPool to simulate insufficient balance (representing slashing/accounting depletion)
+2. Call `BlockValidatorUpdates` to process mature unbondings
 
-**Trigger:** 
-1. Create module "alice" and have it create capability "bob/rev/charlie"
-2. Create module "alice/rev/bob"
-3. Module "alice/rev/bob" calls `GetCapability("charlie")`
+**Expected Results:**
+1. `CompleteUnbonding` returns error and is silently ignored
+2. Unbonding entry still exists in storage (via `GetUnbondingDelegation`)
+3. Entry no longer in queue (subsequent `DequeueAllMatureUBDQueue` returns empty)
+4. Delegator balance unchanged (tokens not received)
+5. No recovery possible - subsequent `BlockValidatorUpdates` calls do nothing
 
-**Observation:** 
-The test demonstrates that:
-- Module "alice/rev/bob" successfully retrieves a capability it never created
-- The retrieved capability is the same object (same memory address and index) as module "alice"'s capability
-- Module "alice/rev/bob" can claim ownership using `ClaimCapability`
-- Both RevCapabilityKey calls produce identical byte arrays, proving the collision
-- The capability ends up with two owners despite being created by only one module
+This demonstrates permanent token lock when unbonding completion fails, violating the protocol guarantee that mature unbondings will complete and return tokens to users.
 
-This proves the vulnerability allows capability theft through name collision, violating the isolation guarantees of the capability system.
+## Notes
+
+This vulnerability explicitly matches the "Permanent freezing of funds (fix requires hard fork)" impact criterion from the provided impact list. While the likelihood is moderate under normal operations, the catastrophic and permanent nature of the impact when it occurs makes this a valid critical vulnerability. The issue can be triggered through normal protocol operations (unbonding + slashing) without requiring any attacker or privileged access, and there is no recovery mechanism short of a hard fork.
 
 ### Citations
 
-**File:** x/capability/types/keys.go (L35-37)
+**File:** x/staking/keeper/val_state_change.go (L36-57)
 ```go
-func RevCapabilityKey(module, name string) []byte {
-	return []byte(fmt.Sprintf("%s/rev/%s", module, name))
+	matureUnbonds := k.DequeueAllMatureUBDQueue(ctx, ctx.BlockHeader().Time)
+	for _, dvPair := range matureUnbonds {
+		addr, err := sdk.ValAddressFromBech32(dvPair.ValidatorAddress)
+		if err != nil {
+			panic(err)
+		}
+		delegatorAddress := sdk.MustAccAddressFromBech32(dvPair.DelegatorAddress)
+
+		balances, err := k.CompleteUnbonding(ctx, delegatorAddress, addr)
+		if err != nil {
+			continue
+		}
+
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeCompleteUnbonding,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, balances.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, dvPair.ValidatorAddress),
+				sdk.NewAttribute(types.AttributeKeyDelegator, dvPair.DelegatorAddress),
+			),
+		)
+	}
+```
+
+**File:** x/staking/keeper/delegation.go (L374-392)
+```go
+func (k Keeper) DequeueAllMatureUBDQueue(ctx sdk.Context, currTime time.Time) (matureUnbonds []types.DVPair) {
+	store := ctx.KVStore(k.storeKey)
+
+	// gets an iterator for all timeslices from time 0 until the current Blockheader time
+	unbondingTimesliceIterator := k.UBDQueueIterator(ctx, ctx.BlockHeader().Time)
+	defer unbondingTimesliceIterator.Close()
+
+	for ; unbondingTimesliceIterator.Valid(); unbondingTimesliceIterator.Next() {
+		timeslice := types.DVPairs{}
+		value := unbondingTimesliceIterator.Value()
+		k.cdc.MustUnmarshal(value, &timeslice)
+
+		matureUnbonds = append(matureUnbonds, timeslice.Pairs...)
+
+		store.Delete(unbondingTimesliceIterator.Key())
+	}
+
+	return matureUnbonds
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L69-90)
+**File:** x/staking/keeper/delegation.go (L862-906)
 ```go
-func (k *Keeper) ScopeToModule(moduleName string) ScopedKeeper {
-	if k.sealed {
-		panic("cannot scope to module via a sealed capability keeper")
-	}
-	if strings.TrimSpace(moduleName) == "" {
-		panic("cannot scope to an empty module name")
+func (k Keeper) CompleteUnbonding(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) (sdk.Coins, error) {
+	ubd, found := k.GetUnbondingDelegation(ctx, delAddr, valAddr)
+	if !found {
+		return nil, types.ErrNoUnbondingDelegation
 	}
 
-	if _, ok := k.scopedModules[moduleName]; ok {
-		panic(fmt.Sprintf("cannot create multiple scoped keepers for the same module name: %s", moduleName))
-	}
+	bondDenom := k.GetParams(ctx).BondDenom
+	balances := sdk.NewCoins()
+	ctxTime := ctx.BlockHeader().Time
 
-	k.scopedModules[moduleName] = struct{}{}
-
-	return ScopedKeeper{
-		cdc:      k.cdc,
-		storeKey: k.storeKey,
-		memKey:   k.memKey,
-		capMap:   k.capMap,
-		module:   moduleName,
-	}
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L225-265)
-```go
-func (sk ScopedKeeper) NewCapability(ctx sdk.Context, name string) (*types.Capability, error) {
-	if strings.TrimSpace(name) == "" {
-		return nil, sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	store := ctx.KVStore(sk.storeKey)
-
-	if _, ok := sk.GetCapability(ctx, name); ok {
-		return nil, sdkerrors.Wrapf(types.ErrCapabilityTaken, fmt.Sprintf("module: %s, name: %s", sk.module, name))
-	}
-
-	// create new capability with the current global index
-	index := types.IndexFromKey(store.Get(types.KeyIndex))
-	cap := types.NewCapability(index)
-
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
+	delegatorAddress, err := sdk.AccAddressFromBech32(ubd.DelegatorAddress)
+	if err != nil {
 		return nil, err
 	}
 
-	// increment global index
-	store.Set(types.KeyIndex, types.IndexToKey(index+1))
+	// loop through all the entries and complete unbonding mature entries
+	for i := 0; i < len(ubd.Entries); i++ {
+		entry := ubd.Entries[i]
+		if entry.IsMature(ctxTime) {
+			ubd.RemoveEntry(int64(i))
+			i--
 
-	memStore := ctx.KVStore(sk.memKey)
+			// track undelegation only when remaining or truncated shares are non-zero
+			if !entry.Balance.IsZero() {
+				amt := sdk.NewCoin(bondDenom, entry.Balance)
+				if err := k.bankKeeper.UndelegateCoinsFromModuleToAccount(
+					ctx, types.NotBondedPoolName, delegatorAddress, sdk.NewCoins(amt),
+				); err != nil {
+					return nil, err
+				}
 
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(index))
-
-	// Set the mapping from index from index to in-memory capability in the go map
-	sk.capMap[index] = cap
-
-	logger(ctx).Info("created new capability", "module", sk.module, "name", name)
-
-	return cap, nil
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L287-314)
-```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
-}
-```
-
-**File:** x/capability/types/genesis.go (L37-45)
-```go
-		for _, owner := range genOwner.IndexOwners.Owners {
-			if strings.TrimSpace(owner.Module) == "" {
-				return fmt.Errorf("owner's module cannot be blank: %s", owner)
-			}
-
-			if strings.TrimSpace(owner.Name) == "" {
-				return fmt.Errorf("owner's name cannot be blank: %s", owner)
+				balances = balances.Add(amt)
 			}
 		}
+	}
+
+	// set the unbonding delegation or remove it if there are no more entries
+	if len(ubd.Entries) == 0 {
+		k.RemoveUnbondingDelegation(ctx, ubd)
+	} else {
+		k.SetUnbondingDelegation(ctx, ubd)
+	}
+
+	return balances, nil
+}
+```
+
+**File:** x/staking/keeper/slash.go (L166-210)
+```go
+func (k Keeper) SlashUnbondingDelegation(ctx sdk.Context, unbondingDelegation types.UnbondingDelegation,
+	infractionHeight int64, slashFactor sdk.Dec) (totalSlashAmount sdk.Int) {
+	now := ctx.BlockHeader().Time
+	totalSlashAmount = sdk.ZeroInt()
+	burnedAmount := sdk.ZeroInt()
+
+	// perform slashing on all entries within the unbonding delegation
+	for i, entry := range unbondingDelegation.Entries {
+		// If unbonding started before this height, stake didn't contribute to infraction
+		if entry.CreationHeight < infractionHeight {
+			continue
+		}
+
+		if entry.IsMature(now) {
+			// Unbonding delegation no longer eligible for slashing, skip it
+			continue
+		}
+
+		// Calculate slash amount proportional to stake contributing to infraction
+		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+		slashAmount := slashAmountDec.TruncateInt()
+		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+
+		// Don't slash more tokens than held
+		// Possible since the unbonding delegation may already
+		// have been slashed, and slash amounts are calculated
+		// according to stake held at time of infraction
+		unbondingSlashAmount := sdk.MinInt(slashAmount, entry.Balance)
+
+		// Update unbonding delegation if necessary
+		if unbondingSlashAmount.IsZero() {
+			continue
+		}
+
+		burnedAmount = burnedAmount.Add(unbondingSlashAmount)
+		entry.Balance = entry.Balance.Sub(unbondingSlashAmount)
+		unbondingDelegation.Entries[i] = entry
+		k.SetUnbondingDelegation(ctx, unbondingDelegation)
+	}
+
+	if err := k.burnNotBondedTokens(ctx, burnedAmount); err != nil {
+		panic(err)
+	}
+
+	return totalSlashAmount
+```
+
+**File:** x/bank/keeper/send.go (L209-246)
+```go
+func (k BaseSendKeeper) SubUnlockedCoins(ctx sdk.Context, addr sdk.AccAddress, amt sdk.Coins, checkNeg bool) error {
+	if !amt.IsValid() {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
+	}
+
+	lockedCoins := k.LockedCoins(ctx, addr)
+
+	for _, coin := range amt {
+		balance := k.GetBalance(ctx, addr, coin.Denom)
+		if checkNeg {
+			locked := sdk.NewCoin(coin.Denom, lockedCoins.AmountOf(coin.Denom))
+			spendable := balance.Sub(locked)
+
+			_, hasNeg := sdk.Coins{spendable}.SafeSub(sdk.Coins{coin})
+			if hasNeg {
+				return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, "%s is smaller than %s", spendable, coin)
+			}
+		}
+
+		var newBalance sdk.Coin
+		if checkNeg {
+			newBalance = balance.Sub(coin)
+		} else {
+			newBalance = balance.SubUnsafe(coin)
+		}
+
+		err := k.setBalance(ctx, addr, newBalance, checkNeg)
+		if err != nil {
+			return err
+		}
+	}
+
+	// emit coin spent event
+	ctx.EventManager().EmitEvent(
+		types.NewCoinSpentEvent(addr, amt),
+	)
+	return nil
+}
 ```

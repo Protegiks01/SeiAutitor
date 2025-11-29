@@ -1,253 +1,216 @@
 # Audit Report
 
 ## Title
-DisableSeqnoCheck Parameter Enables Transaction Replay Attacks Leading to Direct Loss of Funds
+Missing Validation for IAVL Items Before Store Items in StoreV2 Snapshot Restoration Causes Node Crash
 
 ## Summary
-The `DisableSeqnoCheck` parameter in the auth module can be enabled via governance proposals without any validation, which completely disables sequence number verification for transactions. When combined with the SIGN_MODE_DIRECT signing mode (the default), this allows identical transaction bytes to be replayed multiple times, as the signature does not include the sequence number. This results in direct loss of funds as any transaction (e.g., fund transfers) can be executed repeatedly.
+The StoreV2 snapshot restoration implementation in `storev2/rootmulti/store.go` lacks a critical validation check that exists in the traditional store implementation. It does not verify that a `SnapshotItem_Store` has been received before processing `SnapshotItem_IAVL` items, allowing malicious peers to craft snapshot data that crashes nodes during state sync via an uncaught panic.
 
 ## Impact
-**High** - Direct loss of funds
+Low to Medium
 
 ## Finding Description
 
-**Location:** 
-- Parameter registration: [1](#0-0) 
-- Sequence check bypass: [2](#0-1) 
-- Signature construction (missing sequence): [3](#0-2) 
-- Governance parameter change handler: [4](#0-3) 
+**Location:** [1](#0-0) 
 
 **Intended Logic:** 
-Account sequence numbers are meant to provide replay protection by ensuring each transaction from an account can only be executed once. The sequence check verifies that the transaction's sequence matches the account's current sequence. After execution, the account sequence is incremented. [5](#0-4) 
+During snapshot restoration, the system expects to receive `SnapshotItem_Store` items first to initialize store trees via `AddTree()`, followed by `SnapshotItem_IAVL` items to populate those stores. This ordering ensures proper initialization before data insertion.
 
 **Actual Logic:** 
-The `DisableSeqnoCheck` parameter registration has no validation function (returns `nil`), allowing any value to be set. [1](#0-0)  When this parameter is set to `true`, the sequence verification is completely bypassed. [2](#0-1) 
+The StoreV2 implementation initializes `storeKey` as an empty string and processes items without validating the ordering. When an IAVL item arrives before any Store item:
+- The empty `storeKey` is used when creating `SnapshotNode` structures
+- If `ssStore` is enabled, nodes with empty `StoreKey` are sent to the import goroutine [2](#0-1) 
+- The goroutine has an uncaught `panic(err)` that crashes the entire process [3](#0-2) 
 
-Critically, for SIGN_MODE_DIRECT (the default signing mode), the signature only covers BodyBytes, AuthInfoBytes, ChainID, and AccountNumber - but NOT the sequence number. [3](#0-2)  This means that even after the account sequence is incremented, the original signature remains valid because it never included the sequence in the first place.
+In contrast, the traditional store explicitly validates this: [4](#0-3) 
 
-**Exploit Scenario:**
-1. An attacker observes a legitimate transaction in the mempool (e.g., a MsgSend transferring 1000 tokens)
-2. A governance proposal is submitted and passes to set `DisableSeqnoCheck = true` via ParameterChangeProposal [4](#0-3) 
-3. The attacker captures the exact transaction bytes (including the original signature)
-4. The attacker resubmits these identical transaction bytes multiple times
-5. Each submission:
-   - Bypasses sequence check due to `DisableSeqnoCheck = true` [2](#0-1) 
-   - Passes signature verification because the signature doesn't include sequence [3](#0-2) 
-   - Executes the transaction again (transfers 1000 tokens again)
-   - Increments the account sequence [5](#0-4) 
-6. The victim loses funds equal to the original amount multiplied by the number of replays
+**Exploitation Path:**
+1. Malicious peer offers snapshot during state sync discovery
+2. Attacker crafts chunks with `SnapshotItem_IAVL` before `SnapshotItem_Store`
+3. Chunks include correct SHA256 hashes (calculated by attacker) so they pass validation [5](#0-4) 
+4. Target node processes chunks through `RestoreChunk()` which feeds data to restore stream
+5. StoreV2 `restore()` receives IAVL items with `storeKey` still empty
+6. If ssStore enabled, `SnapshotNode` with empty `StoreKey` sent to Import goroutine
+7. `ssStore.Import()` likely fails on invalid data, triggering `panic(err)`
+8. Uncaught panic in goroutine terminates the entire node process
 
-**Security Failure:** 
-The replay protection mechanism is completely broken. The fundamental security invariant that each signed transaction can only be executed once is violated, leading to unauthorized repeated execution of transactions.
+**Security Guarantee Broken:** 
+Denial of service through malformed state sync data. The snapshot restoration protocol assumes well-formed data ordering but lacks validation to enforce this assumption in StoreV2.
 
 ## Impact Explanation
 
-**Assets Affected:** All user funds on the blockchain, particularly any tokens being transferred via MsgSend or similar operations.
+This vulnerability enables denial-of-service attacks against nodes using StoreV2 with ssStore enabled during state sync. When exploited:
+- Target nodes crash completely and cannot complete state sync
+- New nodes or nodes catching up cannot join/rejoin the network through the malicious peer
+- Network resilience is reduced as node recovery/growth is hindered
+- No fund loss occurs, but node availability is compromised
 
-**Severity of Damage:** 
-- Attackers can drain user accounts by replaying any observed transfer transaction
-- The damage scales with transaction volume - higher value transactions result in greater losses
-- All users who transact while `DisableSeqnoCheck = true` are vulnerable
-- Funds are directly stolen with no recovery mechanism
+The impact is limited to:
+1. Nodes using StoreV2 (appears to be alternative to traditional store based on codebase structure)
+2. Nodes with ssStore enabled (opt-in via configuration)
+3. Nodes actively performing state sync (temporary state)
 
-**System Impact:** This completely undermines the security model of the blockchain. Users cannot safely transact, as any transaction they submit can be replayed indefinitely by observers (including validators, full nodes, or anyone monitoring the mempool). This represents a catastrophic failure of the transaction security model.
+This affects a subset of network nodes rather than the entire network, qualifying as a low-to-medium severity DoS vulnerability.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any network participant who can observe transactions (mempool monitoring, block explorers, or running a full node) can capture and replay transactions once `DisableSeqnoCheck` is enabled.
+**Who can trigger:** Any network participant can exploit this by running a node that responds to snapshot requests with malformed data. No special privileges, stake, or resources required.
 
-**Required Conditions:** 
-- A governance proposal to set `DisableSeqnoCheck = true` must pass
-- The victim must submit a transaction while this parameter is enabled
-- The attacker must be able to submit transactions to the network
+**Conditions required:**
+- Target nodes must use StoreV2 with ssStore enabled
+- Target nodes must be performing state sync
+- Malicious peer must be selected as snapshot provider
 
-**Frequency:** Once enabled via governance, this vulnerability can be exploited continuously against every transaction submitted to the network. Given that governance proposals can be submitted by any token holder meeting the minimum deposit requirement, and that the parameter has no validation, this is a realistic attack scenario.
-
-The test at [6](#0-5)  demonstrates that this behavior is intentionally testable and working as coded, confirming the vulnerability is exploitable.
+**Frequency:** Can be triggered whenever qualifying nodes perform state sync. More impactful during network upgrades or growth periods when many nodes sync simultaneously. Nodes can recover by restarting and selecting different peers, but repeated attacks can significantly delay network participation.
 
 ## Recommendation
 
-1. **Immediate:** Remove the `DisableSeqnoCheck` parameter entirely, or make it non-governable and only settable at chain genesis for specific testing purposes
-2. **Short-term:** If the parameter must exist, add strict validation that prevents it from being set to `true` on production networks:
-   ```go
-   func validateDisableSeqnoCheck(i interface{}) error {
-       v, ok := i.(bool)
-       if !ok {
-           return fmt.Errorf("invalid parameter type: %T", i)
-       }
-       if v {
-           return fmt.Errorf("DisableSeqnoCheck cannot be enabled on production networks")
-       }
-       return nil
-   }
-   ```
-   Replace the empty validator at [1](#0-0)  with this function.
+Add validation matching the traditional store implementation:
 
-3. **Long-term:** Review all governable parameters to ensure they have proper validation functions that prevent security-compromising values.
+```go
+case *snapshottypes.SnapshotItem_IAVL:
+    if storeKey == "" {
+        restoreErr = errors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
+        break loop
+    }
+    // ... rest of IAVL processing
+```
+
+Additionally, implement proper error propagation in the ssStore import goroutine instead of using `panic()`, or add a `recover()` mechanism to prevent uncaught panics from terminating the process.
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/ante_test.go`
-
-**Test Function:** Add a new test function `TestDisableSeqnoCheckReplayAttack`
+**Test Structure:** A test in `storev2/rootmulti/store_test.go` demonstrating the vulnerability:
 
 **Setup:**
-1. Initialize test environment with `DisableSeqnoCheck = true`
-2. Create two test accounts: sender and recipient
-3. Fund the sender account with sufficient tokens
-4. Record the initial balances of both accounts
+- Create StoreV2 instance with `StateStoreConfig{Enable: true}`
+- Prepare protobuf stream with `SnapshotItem_IAVL` before any `SnapshotItem_Store`
+- Create StreamReader from malformed chunks
 
-**Trigger:**
-1. Create a MsgSend transaction transferring tokens from sender to recipient
-2. Sign and submit the transaction - it should succeed
-3. Capture the exact transaction bytes (including signature)
-4. Submit the exact same transaction bytes again without re-signing
-5. Verify the second submission also succeeds (demonstrating replay)
-6. Optionally repeat step 4-5 multiple times
+**Action:**
+- Call `restore()` with the malformed stream
+- IAVL items processed before Store items
 
-**Observation:**
-- The first transaction succeeds and transfers X tokens
-- The second transaction (with identical bytes) also succeeds and transfers X tokens again
-- The recipient's balance increases by 2X (or more with additional replays)
-- The sender's balance decreases by 2X (or more)
-- The account sequence increments each time, but this doesn't prevent replay since the signature doesn't include the sequence
+**Expected Result:**
+- Current implementation: node crashes via uncaught panic (when ssStore.Import fails on empty StoreKey)
+- With fix: returns error "received IAVL node item before store item"
 
-This confirms that when `DisableSeqnoCheck = true`, the same transaction can be executed multiple times, leading to unauthorized fund transfers and direct loss of funds for the transaction sender.
+The vulnerability is demonstrated by comparing StoreV2's missing check [6](#0-5)  against the traditional store's validation [4](#0-3) .
 
-The existing test [6](#0-5)  already demonstrates this behavior partially, showing that transactions with sequence 0 can be submitted twice when `DisableSeqnoCheck = true`. A complete PoC would use actual fund transfers (MsgSend) instead of test messages to demonstrate the direct financial impact.
+## Notes
+
+The severity classification (Low to Medium) reflects uncertainty about StoreV2 deployment statistics. The vulnerability is technically valid and exploitable, but the percentage of affected nodes depends on StoreV2 adoption rates and ssStore configuration prevalence, which cannot be determined from the codebase alone. If StoreV2 with ssStore is widely deployed (≥30% of nodes), this would be Medium severity; if less widespread (10-30%), it would be Low severity.
 
 ### Citations
 
-**File:** x/auth/types/params.go (L59-59)
+**File:** storev2/rootmulti/store.go (L714-803)
 ```go
-		paramtypes.NewParamSetPair(KeyDisableSeqnoCheck, &p.DisableSeqnoCheck, func(i interface{}) error { return nil }),
-```
-
-**File:** x/auth/ante/sigverify.go (L270-278)
-```go
-		if sig.Sequence != acc.GetSequence() {
-			params := svd.ak.GetParams(ctx)
-			if !params.GetDisableSeqnoCheck() {
-				return ctx, sdkerrors.Wrapf(
-					sdkerrors.ErrWrongSequence,
-					"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-				)
-			}
-		}
-```
-
-**File:** x/auth/ante/sigverify.go (L352-369)
-```go
-func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
-	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
-	}
-
-	// increment sequence of all signers
-	for _, addr := range sigTx.GetSigners() {
-		acc := isd.ak.GetAccount(ctx, addr)
-		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
-			panic(err)
-		}
-
-		isd.ak.SetAccount(ctx, acc)
-	}
-
-	return next(ctx, tx, simulate)
-}
-```
-
-**File:** x/auth/tx/direct.go (L47-54)
-```go
-func DirectSignBytes(bodyBytes, authInfoBytes []byte, chainID string, accnum uint64) ([]byte, error) {
-	signDoc := types.SignDoc{
-		BodyBytes:     bodyBytes,
-		AuthInfoBytes: authInfoBytes,
-		ChainId:       chainID,
-		AccountNumber: accnum,
-	}
-	return signDoc.Marshal()
-```
-
-**File:** x/params/proposal_handler.go (L26-42)
-```go
-func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
-	for _, c := range p.Changes {
-		ss, ok := k.GetSubspace(c.Subspace)
-		if !ok {
-			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
-		}
-
-		k.Logger(ctx).Info(
-			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
-		)
-
-		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
-			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
-		}
-	}
-
-	return nil
-```
-
-**File:** x/auth/ante/ante_test.go (L1156-1212)
-```go
-func (suite *AnteTestSuite) TestDisableSeqNo() {
-	suite.SetupTest(false) // setup
-	authParams := types.Params{
-		MaxMemoCharacters:      types.DefaultMaxMemoCharacters,
-		TxSigLimit:             types.DefaultTxSigLimit,
-		TxSizeCostPerByte:      types.DefaultTxSizeCostPerByte,
-		SigVerifyCostED25519:   types.DefaultSigVerifyCostED25519,
-		SigVerifyCostSecp256k1: types.DefaultSigVerifyCostSecp256k1,
-		DisableSeqnoCheck:      true,
-	}
-	suite.app.AccountKeeper.SetParams(suite.ctx, authParams)
-
-	// Same data for every test cases
-	accounts := suite.CreateTestAccounts(1)
-	feeAmount := testdata.NewTestFeeAmount()
-	gasLimit := testdata.NewTestGasLimit()
-
-	// Variable data per test case
+func (rs *Store) restore(height int64, protoReader protoio.Reader) (snapshottypes.SnapshotItem, error) {
 	var (
-		accNums []uint64
-		msgs    []sdk.Msg
-		privs   []cryptotypes.PrivKey
-		accSeqs []uint64
+		ssImporter   chan sstypes.SnapshotNode
+		snapshotItem snapshottypes.SnapshotItem
+		storeKey     string
+		restoreErr   error
 	)
-
-	testCases := []TestCase{
-		{
-			"good tx from one signer",
-			func() {
-				msg := testdata.NewTestMsg(accounts[0].acc.GetAddress())
-				msgs = []sdk.Msg{msg}
-
-				privs, accNums, accSeqs = []cryptotypes.PrivKey{accounts[0].priv}, []uint64{0}, []uint64{0}
-			},
-			false,
-			true,
-			nil,
-		},
-		{
-			"test sending it again succeeds (disable seqno check is true)",
-			func() {
-				privs, accNums, accSeqs = []cryptotypes.PrivKey{accounts[0].priv}, []uint64{0}, []uint64{0}
-			},
-			false,
-			true,
-			nil,
-		},
+	scImporter, err := rs.scStore.Importer(height)
+	if err != nil {
+		return snapshottypes.SnapshotItem{}, err
 	}
-	for _, tc := range testCases {
-		suite.Run(fmt.Sprintf("Case %s", tc.desc), func() {
-			suite.txBuilder = suite.clientCtx.TxConfig.NewTxBuilder()
-			tc.malleate()
-
-			suite.RunTestCase(privs, msgs, feeAmount, gasLimit, accNums, accSeqs, suite.ctx.ChainID(), tc)
-		})
+	if rs.ssStore != nil {
+		ssImporter = make(chan sstypes.SnapshotNode, 10000)
+		go func() {
+			err := rs.ssStore.Import(height, ssImporter)
+			if err != nil {
+				panic(err)
+			}
+		}()
 	}
+loop:
+	for {
+		snapshotItem = snapshottypes.SnapshotItem{}
+		err = protoReader.ReadMsg(&snapshotItem)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			restoreErr = errors.Wrap(err, "invalid protobuf message")
+			break loop
+		}
+
+		switch item := snapshotItem.Item.(type) {
+		case *snapshottypes.SnapshotItem_Store:
+			storeKey = item.Store.Name
+			if err = scImporter.AddTree(storeKey); err != nil {
+				restoreErr = err
+				break loop
+			}
+			rs.logger.Info(fmt.Sprintf("Start restoring store: %s", storeKey))
+		case *snapshottypes.SnapshotItem_IAVL:
+			if item.IAVL.Height > math.MaxInt8 {
+				restoreErr = errors.Wrapf(sdkerrors.ErrLogic, "node height %v cannot exceed %v",
+					item.IAVL.Height, math.MaxInt8)
+				break loop
+			}
+			node := &sctypes.SnapshotNode{
+				Key:     item.IAVL.Key,
+				Value:   item.IAVL.Value,
+				Height:  int8(item.IAVL.Height),
+				Version: item.IAVL.Version,
+			}
+			// Protobuf does not differentiate between []byte{} as nil, but fortunately IAVL does
+			// not allow nil keys nor nil values for leaf nodes, so we can always set them to empty.
+			if node.Key == nil {
+				node.Key = []byte{}
+			}
+			if node.Height == 0 && node.Value == nil {
+				node.Value = []byte{}
+			}
+			scImporter.AddNode(node)
+
+			// Check if we should also import to SS store
+			if rs.ssStore != nil && node.Height == 0 && ssImporter != nil {
+				ssImporter <- sstypes.SnapshotNode{
+					StoreKey: storeKey,
+					Key:      node.Key,
+					Value:    node.Value,
+				}
+			}
+		default:
+			// unknown element, could be an extension
+			break loop
+		}
+	}
+
+	if err = scImporter.Close(); err != nil {
+		if restoreErr == nil {
+			restoreErr = err
+		}
+	}
+	if ssImporter != nil {
+		close(ssImporter)
+	}
+	// initialize the earliest version for SS store
+	if rs.ssStore != nil {
+		rs.ssStore.SetEarliestVersion(height, false)
+	}
+
+	return snapshotItem, restoreErr
 }
+```
+
+**File:** store/rootmulti/store.go (L906-909)
+```go
+		case *snapshottypes.SnapshotItem_IAVL:
+			if importer == nil {
+				return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
+			}
+```
+
+**File:** snapshots/manager.go (L363-368)
+```go
+	hash := sha256.Sum256(chunk)
+	expected := m.restoreChunkHashes[m.restoreChunkIndex]
+	if !bytes.Equal(hash[:], expected) {
+		return false, sdkerrors.Wrapf(types.ErrChunkHashMismatch,
+			"expected %x, got %x", hash, expected)
+	}
 ```

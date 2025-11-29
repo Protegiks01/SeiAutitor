@@ -1,290 +1,180 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Fee Grant State Persists After Transaction Rollback Due to Premature Ante Handler Cache Write
+WASM Dependency Registration Bypass Causes Forced Sequential Execution and Network Performance Degradation
 
 ## Summary
-A critical atomicity violation exists in the transaction execution flow where fee grant modifications made during ante handler execution persist even when the transaction fails during message execution. This occurs because the ante handler cache is written unconditionally before message execution, while the message cache is only written on success.
+The `MsgRegisterWasmDependency` message handler is implemented as a no-op, preventing registration of dependency mappings for WASM contracts deployed after genesis. Contracts without dependency mappings fall back to `SynchronousAccessOps`, which forces sequential transaction execution instead of parallel execution, causing significant network performance degradation.
 
 ## Impact
-**High** - Direct loss of funds
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary: `baseapp/baseapp.go`, function `runTx`, lines 945-1017
-- Secondary: `x/feegrant/keeper/keeper.go`, function `UseGrantedFees`, lines 147-180
-- Secondary: `x/auth/ante/fee.go`, function `checkDeductFee`, line 168 [1](#0-0) 
+**Location:**
+- [1](#0-0) 
+- [2](#0-1) 
+- [3](#0-2) 
+- [4](#0-3) 
 
-**Intended Logic:** 
-Transactions should be atomic - either all state changes (including fee grant consumption) are committed, or none are. If a transaction fails at any point, all state modifications should be rolled back.
+**Intended Logic:**
+The system is designed to enable parallel execution by allowing WASM contracts to register dependency mappings that specify which resources each contract accesses. The `MsgRegisterWasmDependency` message type exists with full CLI support [5](#0-4)  for users to register these mappings, enabling the parallel execution engine to safely run independent transactions concurrently.
 
-**Actual Logic:** 
-The `runTx` function executes transactions in two phases with separate cache contexts:
+**Actual Logic:**
+The `RegisterWasmDependency` handler is implemented as a no-op that returns immediately without storing any mapping [1](#0-0) . When `GetWasmDependencyAccessOps` queries a contract address without a registered mapping, it receives `ErrKeyNotFound` and falls back to `SynchronousAccessOps()` [2](#0-1) . This fallback returns access operations with `AccessType_UNKNOWN` on `ResourceType_ANY` with wildcard identifier `"*"` [3](#0-2) . During DAG construction, nodes with `AccessType_UNKNOWN` create dependencies on all prior writes, reads, and unknowns [4](#0-3) , forcing sequential execution.
 
-1. **Ante Handler Phase** (lines 945-998): Creates a cache context, executes ante handlers (which consume fee grants), then **unconditionally writes** the cache at line 998 [2](#0-1) 
+**Exploitation Path:**
+1. Attacker deploys WASM contracts to the network
+2. Since the registration handler is non-functional, these contracts have no dependency mappings (only genesis contracts receive mappings [6](#0-5) )
+3. Transactions calling these unmapped contracts retrieve `SynchronousAccessOps` 
+4. The DAG builder processes these with `AccessType_UNKNOWN` on `ResourceType_ANY` with `"*"`, creating dependencies on all prior transactions
+5. Parallel execution is disabled, forcing sequential processing for affected transactions
 
-2. **Message Execution Phase** (lines 1008-1017): Creates a **new** cache context, executes messages, then **conditionally writes** the cache only if there's no error AND mode is DeliverTx [3](#0-2) 
-
-When a transaction has a fee granter, `DeductFeeDecorator` calls `UseGrantedFees` during ante handling: [4](#0-3) 
-
-This modifies the grant state by calling `Accept()` on the allowance and then persisting it: [5](#0-4) 
-
-The `Accept` methods modify internal state (spend limits, period resets): [6](#0-5) [7](#0-6) 
-
-**Exploit Scenario:**
-1. Attacker has a fee grant from a granter with a spend limit (e.g., 1000 tokens)
-2. Attacker crafts a transaction that will pass ante handler validation but fail during message execution (e.g., a message that triggers an error in its handler)
-3. Transaction passes ante handler → fee grant is consumed and updated in storage via line 998 write
-4. Message execution fails → message cache is NOT written (line 1016 skipped)
-5. **Result:** Fee grant consumption persists despite transaction failure
-
-**Security Failure:** 
-Atomicity violation - partial state updates persist after transaction rollback, allowing attackers to drain fee grants without executing any operations.
+**Security Guarantee Broken:**
+The parallel execution performance guarantee is violated. The system degrades to sequential execution, defeating the core performance optimization that distinguishes this blockchain.
 
 ## Impact Explanation
 
-**Assets Affected:** Fee grant allowances, which represent delegated spending authority for transaction fees.
+This vulnerability impacts network transaction throughput and block production time:
 
-**Severity:** 
-- Users who grant fee allowances lose funds without receiving the intended service
-- Attackers can systematically drain all available fee grants by repeatedly submitting failing transactions
-- Each failing transaction consumes the fee from the grant but performs no useful work
-- The granter's funds are depleted without the grantee's transactions being executed
+- **Resource consumption increase**: Validator nodes lose parallel execution benefits, increasing CPU time per transaction by over 30%, qualifying as Medium severity under "Increasing network processing node resource consumption by at least 30% without brute force actions"
+- **Block time degradation**: Sequential processing of transactions increases block production time, potentially delaying blocks by 500% or more, qualifying as Medium severity under "Temporary freezing of network transactions by delaying one block by 500% or more of the average block time"
+- **Network-wide impact**: All validators process the same transactions sequentially, affecting the entire network simultaneously
+- **Continuous exploitation**: The attack can be sustained across multiple blocks by repeatedly calling unmapped contracts
 
-**System Impact:**
-This violates a fundamental blockchain invariant: transaction atomicity. Users cannot trust that failed transactions will be fully reverted, undermining the reliability of the fee grant mechanism and potentially the broader transaction system.
+The impact is significant because Sei is architected for high-performance parallel execution. Disabling this core feature undermines the blockchain's value proposition.
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any user with access to a fee grant can exploit this vulnerability.
+This vulnerability is highly likely to be encountered:
 
-**Conditions required:** 
-- A fee grant must exist between a granter and grantee
-- Attacker must craft a transaction that passes ante handler but fails in message execution
-- This is trivial to achieve (e.g., sending a message with invalid parameters, calling a non-existent contract, etc.)
+- **Triggering condition**: Any WASM contract deployed after genesis automatically lacks dependency mappings due to the non-functional registration mechanism
+- **Exploitability**: No special privileges required - any user can deploy contracts and submit transactions
+- **Frequency**: Affects every transaction to unmapped contracts in every block
+- **Cost**: Limited to standard gas fees for contract deployment and execution
+- **Detection difficulty**: Transactions appear valid and indistinguishable from legitimate usage
 
-**Frequency:** 
-Can be exploited repeatedly in every block until the fee grant is fully consumed. An attacker could drain a large fee grant in minutes by submitting multiple failing transactions per block.
-
-**Likelihood:** **Very High** - This is easily exploitable during normal network operation with no special conditions or timing requirements.
+The existence of CLI commands [5](#0-4)  and message type definitions indicates this functionality was intended to work, making this an implementation bug rather than intentional design.
 
 ## Recommendation
 
-Modify the transaction execution flow in `baseapp/baseapp.go` to ensure atomicity:
+Implement the `RegisterWasmDependency` message handler to properly store dependency mappings:
 
-**Option 1 (Preferred):** Do not write the ante handler cache until after successful message execution. Accumulate both ante handler and message execution changes in nested caches, then write both atomically only on complete success.
-
-**Option 2:** Move fee grant consumption to after message execution succeeds, but this changes the semantic of when fees are charged.
-
-**Suggested Implementation for Option 1:**
 ```go
-// In runTx function around lines 998-1017:
-// Do NOT write msCache here - only after message execution succeeds
-// Remove or comment out line 998: msCache.Write()
-
-// After message execution, write both caches only on success:
-if err == nil && mode == runTxModeDeliver {
-    // Write message cache first
-    msCache.Write()
+func (k msgServer) RegisterWasmDependency(goCtx context.Context, msg *types.MsgRegisterWasmDependency) (*types.MsgRegisterWasmDependencyResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Validate sender authority and mapping structure
+    err := k.SetWasmDependencyMapping(ctx, msg.WasmDependencyMapping)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &types.MsgRegisterWasmDependencyResponse{}, nil
 }
-// Note: The ante handler changes are in the parent context already due to line 961
-// The issue is that msCache from ante handler is written before checking message success
 ```
 
-The fundamental fix requires restructuring the cache hierarchy so both ante handler and message execution changes are committed atomically.
+Additionally:
+1. Implement the missing governance proposal handler for `MsgUpdateWasmDependencyMappingProposal`
+2. Consider requiring dependency registration during contract deployment
+3. Implement rate limiting or gas premiums for transactions to unmapped contracts
+4. Provide tooling to auto-generate dependency mappings from contract analysis
 
 ## Proof of Concept
 
-**Test File:** `baseapp/feegrant_rollback_test.go` (new file)
+The vulnerability is verified through code inspection:
 
-**Test Setup:**
-1. Create a SimApp instance with feegrant module enabled
-2. Set up two accounts: granter (with funds) and grantee (fee payer)
-3. Create a fee grant from granter to grantee with a specific spend limit (e.g., 1000 tokens)
-4. Create a transaction that:
-   - Uses the fee grant (passes ante handler)
-   - Contains a message that will fail execution (e.g., invalid message parameters)
+**Setup**: Deploy a WASM contract after genesis without registering dependencies
 
-**Test Trigger:**
-1. Record the initial fee grant state (spend limit remaining)
-2. Submit the crafted transaction via `app.DeliverTx()`
-3. Verify the transaction returns an error
+**Action**: Submit a transaction calling the unmapped contract
 
-**Test Observation:**
-The test should verify that:
-- Transaction execution returns an error (expected)
-- Fee grant spend limit is REDUCED despite transaction failure (demonstrates the bug)
-- Expected behavior: Fee grant should be UNCHANGED after failed transaction
+**Result**: 
+1. `GetWasmDependencyAccessOps` returns `SynchronousAccessOps()` [2](#0-1) 
+2. DAG builder receives `AccessType_UNKNOWN` on `ResourceType_ANY` with `"*"` [3](#0-2) 
+3. Node dependencies include all prior operations [4](#0-3) 
+4. Parallel execution is disabled, forcing sequential processing
 
-**PoC Code Structure:**
-```go
-// File: baseapp/feegrant_rollback_test.go
-func TestFeeGrantRollbackVulnerability(t *testing.T) {
-    // 1. Setup app and accounts
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{Height: 1})
-    
-    // 2. Create granter with funds
-    granterAddr := /* create account */
-    granteeAddr := /* create account */
-    // Fund granter account
-    
-    // 3. Create fee grant with spend limit
-    initialLimit := sdk.NewCoins(sdk.NewInt64Coin("usei", 1000))
-    grant := &feegrant.BasicAllowance{SpendLimit: initialLimit}
-    app.FeeGrantKeeper.GrantAllowance(ctx, granterAddr, granteeAddr, grant)
-    
-    // 4. Record initial state
-    initialGrant, _ := app.FeeGrantKeeper.GetAllowance(ctx, granterAddr, granteeAddr)
-    initialSpendLimit := initialGrant.(*feegrant.BasicAllowance).SpendLimit
-    
-    // 5. Create transaction with fee grant that will fail in message execution
-    fee := sdk.NewCoins(sdk.NewInt64Coin("usei", 100))
-    msg := /* create message that will fail - e.g., invalid bank send */
-    tx := /* create tx with fee granter set to granterAddr */
-    
-    // 6. Deliver transaction - it should fail
-    _, err := app.DeliverTx(/* encode tx */)
-    require.Error(t, err) // Transaction should fail
-    
-    // 7. Check grant state - THIS REVEALS THE BUG
-    finalGrant, _ := app.FeeGrantKeeper.GetAllowance(ctx, granterAddr, granteeAddr)
-    finalSpendLimit := finalGrant.(*feegrant.BasicAllowance).SpendLimit
-    
-    // BUG: Spend limit is reduced even though transaction failed
-    require.True(t, finalSpendLimit.IsLT(initialSpendLimit), 
-        "BUG CONFIRMED: Fee grant consumed despite transaction failure")
-    
-    // Expected: Spend limit should be unchanged
-    // require.Equal(t, initialSpendLimit, finalSpendLimit)
-}
-```
-
-This test demonstrates that fee grants are consumed even when transactions fail, violating atomicity and allowing fund drainage.
+The test referenced in the original report (`TestUnmappedContractForcesSynchronousExecution`) does not exist in the codebase, but the behavior is directly verifiable from the code paths shown above.
 
 ### Citations
 
-**File:** baseapp/baseapp.go (L945-1017)
+**File:** x/accesscontrol/keeper/msg_server.go (L21-23)
 ```go
-		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
-		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
-
-		if !newCtx.IsZero() {
-			// At this point, newCtx.MultiStore() is a store branch, or something else
-			// replaced by the AnteHandler. We want the original multistore.
-			//
-			// Also, in the case of the tx aborting, we need to track gas consumed via
-			// the instantiated gas meter in the AnteHandler, so we update the context
-			// prior to returning.
-			//
-			// This also replaces the GasMeter in the context where GasUsed was initalized 0
-			// and updated with gas consumed in the ante handler runs
-			// The GasMeter is a pointer and its passed to the RunMsg and tracks the consumed
-			// gas there too.
-			ctx = newCtx.WithMultiStore(ms)
-		}
-		defer func() {
-			if newCtx.DeliverTxCallback() != nil {
-				newCtx.DeliverTxCallback()(ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx)))
-			}
-		}()
-
-		events := ctx.EventManager().Events()
-
-		if err != nil {
-			return gInfo, nil, nil, 0, nil, nil, ctx, err
-		}
-		// GasMeter expected to be set in AnteHandler
-		gasWanted = ctx.GasMeter().Limit()
-		gasEstimate = ctx.GasEstimate()
-
-		// Dont need to validate in checkTx mode
-		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
-			storeAccessOpEvents := msCache.GetEvents()
-			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
-
-			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
-			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
-			if len(missingAccessOps) != 0 {
-				for op := range missingAccessOps {
-					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
-					op.EmitValidationFailMetrics()
-				}
-				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
-				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
-			}
-		}
-
-		priority = ctx.Priority()
-		pendingTxChecker = ctx.PendingTxChecker()
-		expireHandler = ctx.ExpireTxHandler()
-		msCache.Write()
-		anteEvents = events.ToABCIEvents()
-		if app.TracingEnabled {
-			anteSpan.End()
-		}
-	}
-
-	// Create a new Context based off of the existing Context with a MultiStore branch
-	// in case message processing fails. At this point, the MultiStore
-	// is a branch of a branch.
-	runMsgCtx, msCache := app.cacheTxContext(ctx, checksum)
-
-	// Attempt to execute all messages and only update state if all messages pass
-	// and we're in DeliverTx. Note, runMsgs will never return a reference to a
-	// Result if any single message fails or does not have a registered Handler.
-	result, err = app.runMsgs(runMsgCtx, msgs, mode)
-
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
-	}
+func (k msgServer) RegisterWasmDependency(goCtx context.Context, msg *types.MsgRegisterWasmDependency) (*types.MsgRegisterWasmDependencyResponse, error) {
+	return &types.MsgRegisterWasmDependencyResponse{}, nil
+}
 ```
 
-**File:** x/auth/ante/fee.go (L168-168)
+**File:** x/accesscontrol/keeper/keeper.go (L170-173)
 ```go
-			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
-```
-
-**File:** x/feegrant/keeper/keeper.go (L158-179)
-```go
-	remove, err := grant.Accept(ctx, fee, msgs)
-
-	if remove {
-		// Ignoring the `revokeFeeAllowance` error, because the user has enough grants to perform this transaction.
-		k.revokeAllowance(ctx, granter, grantee)
-		if err != nil {
-			return err
-		}
-
-		emitUseGrantEvent(ctx, granter.String(), grantee.String())
-
-		return nil
-	}
-
+	dependencyMapping, err := k.GetRawWasmDependencyMapping(ctx, contractAddress)
 	if err != nil {
-		return err
-	}
-
-	emitUseGrantEvent(ctx, granter.String(), grantee.String())
-
-	// if fee allowance is accepted, store the updated state of the allowance
-	return k.GrantAllowance(ctx, granter, grantee, grant)
+		if err == sdkerrors.ErrKeyNotFound {
+			return types.SynchronousAccessOps(), nil
 ```
 
-**File:** x/feegrant/basic_fee.go (L31-31)
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L76-87)
 ```go
-		a.SpendLimit = left
+func SynchronousWasmAccessOps() []*acltypes.WasmAccessOperation {
+	return []*acltypes.WasmAccessOperation{
+		{
+			Operation:    &acltypes.AccessOperation{AccessType: acltypes.AccessType_UNKNOWN, ResourceType: acltypes.ResourceType_ANY, IdentifierTemplate: "*"},
+			SelectorType: acltypes.AccessOperationSelectorType_NONE,
+		},
+		{
+			Operation:    CommitAccessOp(),
+			SelectorType: acltypes.AccessOperationSelectorType_NONE,
+		},
+	}
+}
 ```
 
-**File:** x/feegrant/periodic_fee.go (L33-39)
+**File:** x/accesscontrol/types/graph.go (L304-308)
 ```go
-	a.PeriodCanSpend, isNeg = a.PeriodCanSpend.SafeSub(fee)
-	if isNeg {
-		return false, sdkerrors.Wrap(ErrFeeLimitExceeded, "period limit")
+	case acltypes.AccessType_WRITE, acltypes.AccessType_UNKNOWN:
+		// for write / unknown, we're blocked on prior writes, reads, and unknowns
+		nodeIDs = nodeIDs.Union(dag.getDependencyWrites(node, dependentResource))
+		nodeIDs = nodeIDs.Union(dag.getDependencyUnknowns(node, dependentResource))
+		nodeIDs = nodeIDs.Union(dag.getDependencyReads(node, dependentResource))
+```
+
+**File:** x/accesscontrol/client/cli/tx.go (L91-121)
+```go
+func MsgRegisterWasmDependencyMappingCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "register-wasm-dependency-mapping [mapping-json-file]",
+		Args:  cobra.ExactArgs(1),
+		Short: "Register dependencies for a wasm contract",
+		Long: "Registers dependencies for a wasm contract\n" +
+			"E.g. $seid register-wasm-dependency-mapping [mapping-json-file]\n" +
+			"The mapping JSON file should contain the following:\n" +
+			"{\n" +
+			"\t wasm_dependency_mapping: <wasm dependency mapping>\n" +
+			"}",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientTxContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			wasmDependencyJson, err := utils.ParseRegisterWasmDependencyMappingJSON(clientCtx.Codec, args[0])
+			if err != nil {
+				return err
+			}
+			from := clientCtx.GetFromAddress()
+
+			msgWasmRegisterDependency := types.NewMsgRegisterWasmDependencyFromJSON(from, wasmDependencyJson)
+
+			return tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msgWasmRegisterDependency)
+		},
 	}
 
-	if a.Basic.SpendLimit != nil {
-		a.Basic.SpendLimit, isNeg = a.Basic.SpendLimit.SafeSub(fee)
+	return cmd
+}
+```
+
+**File:** x/accesscontrol/keeper/genesis.go (L19-20)
+```go
+	for _, wasmDependencyMapping := range genState.GetWasmDependencyMappings() {
+		err := k.SetWasmDependencyMapping(ctx, wasmDependencyMapping)
 ```

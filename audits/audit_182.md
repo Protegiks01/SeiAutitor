@@ -1,259 +1,249 @@
 # Audit Report
 
 ## Title
-Transaction Rollback Inconsistency in Capability Module Causes Node Panic and Consensus Failure
+Missing Duplicate Validator Validation in Genesis Transaction Collection Causes Total Network Shutdown
 
 ## Summary
-The `GetCapability` function in the capability keeper panics when a capMap entry is missing after retrieving its index from the memstore. This occurs due to a transaction rollback inconsistency: when `ReleaseCapability` is called within a failing transaction, the in-memory Go map deletion persists while the memstore deletions are rolled back, creating an inconsistent state that causes subsequent `GetCapability` calls to panic. [1](#0-0) 
+The `CollectTxs` function in the genutil module lacks validation for duplicate validator keys (operator addresses or consensus public keys) when collecting genesis transactions. This allows duplicate validators to be included in genesis.json, which causes all network nodes to panic during chain initialization, resulting in complete network failure before the blockchain can start.
 
 ## Impact
-**High** - This vulnerability can cause network processing nodes to crash (panic), leading to shutdown of greater than 30% of network nodes and potential consensus failures.
+High
 
 ## Finding Description
 
-**Location:** 
-- Module: `x/capability`
-- File: `x/capability/keeper/keeper.go`
-- Function: `ScopedKeeper.GetCapability()` at lines 382-385
-- Related function: `ScopedKeeper.ReleaseCapability()` at line 349
+**Location:** `x/genutil/collect.go` (lines 70-184), specifically the loop at lines 101-178
 
-**Intended Logic:**
-The capability module maintains consistency between three storage layers:
-1. Persistent store (for capability owners)
-2. Memory store (for name-to-index and index-to-name mappings)
-3. In-memory Go map `capMap` (for index-to-capability pointer mappings)
+**Intended Logic:** 
+During genesis ceremony, the `collect-gentxs` command should validate all genesis transactions to ensure they can be successfully applied during chain initialization. This includes verifying that no two validators use the same operator address or consensus public key, as validators must be uniquely identifiable. Invalid genesis transactions should be rejected during collection, before being committed to genesis.json.
 
-When transactions use `CacheContext()`, store operations should be atomic - either all changes commit or all revert on transaction failure. [2](#0-1) 
+**Actual Logic:** 
+The `CollectTxs` function only validates account balances but does NOT check for duplicate validator operator addresses or consensus public keys across multiple gentx files. [1](#0-0)  The function extracts each `MsgCreateValidator` message at line 139 but never maintains a map of seen validator addresses or pubkeys to detect duplicates. The duplicate validation only occurs later during `DeliverGenTxs` when transactions are actually applied.
 
-**Actual Logic:**
-The `capMap` is a shared Go map that is NOT part of the transactional store system. When `ReleaseCapability` deletes from `capMap`, this deletion is NOT rolled back if the transaction fails. However, the memstore deletions ARE rolled back because they use the cached context. [3](#0-2) 
+**Exploitation Path:**
+1. During genesis ceremony, multiple validators generate gentxs independently
+2. Attacker (malicious genesis participant) creates a gentx using the same validator operator address OR consensus public key as another validator
+3. Genesis coordinator runs `collect-gentxs` which calls `CollectTxs`
+4. `CollectTxs` validates both gentxs successfully (only checks account balances)
+5. Both gentxs are included in the final genesis.json
+6. All validators download genesis.json and start their nodes
+7. During `InitChain`, genesis transactions are delivered via `DeliverGenTxs`
+8. First gentx creates validator successfully
+9. Second gentx (duplicate) attempts to create validator, but the handler detects the duplicate and returns `ErrValidatorOwnerExists` or `ErrValidatorPubKeyExists` [2](#0-1) 
+10. In `DeliverGenTxs`, any non-OK result triggers a panic [3](#0-2) 
+11. All nodes crash during initialization - total network shutdown
 
-The code acknowledges this issue in a TODO comment but only handles one direction (extra entries from failed `NewCapability`), not the opposite (missing entries from failed `ReleaseCapability`). [4](#0-3) 
-
-**Exploit Scenario:**
-1. A capability exists (both in memStore and capMap)
-2. A transaction starts with a cached context (e.g., IBC channel close transaction)
-3. `ReleaseCapability` is called, which deletes from memStore (lines 332, 336) and from capMap (line 349)
-4. Later in the transaction, an error occurs (gas exhaustion, validation failure, or any error)
-5. Transaction fails - the write cache is not committed
-6. MemStore deletions are reverted (part of cached store), but capMap deletion persists (just a Go map)
-7. Later, `GetCapability` is called with the same capability name:
-   - Retrieves index from memStore (line 368) - succeeds because deletion was reverted
-   - Accesses `capMap[index]` (line 382) - returns nil because deletion was NOT reverted
-   - Panics with "capability found in memstore is missing from map" (line 384) [5](#0-4) 
-
-**Security Failure:**
-This breaks the **availability** and **consensus consistency** properties. When different nodes process the same sequence of transactions but experience different transaction failures or timing, their capMap states diverge. Subsequent operations cause some nodes to panic while others continue, leading to consensus failure and network partition.
+**Security Guarantee Broken:** 
+The network availability guarantee is violated. A single malicious or misconfigured genesis participant can prevent the entire network from ever becoming operational, constituting a denial-of-service attack at the genesis level.
 
 ## Impact Explanation
 
-**Affected Assets/Processes:**
-- Network availability: Nodes crash and cannot process further blocks
-- Consensus integrity: Different nodes may have different capMap states
-- IBC functionality: Channel operations use capabilities extensively
-- Any module using the capability system
+**Affected Systems:** 
+All network nodes fail to complete chain initialization. The blockchain cannot start, meaning no blocks can be produced, no transactions can be processed, and the network remains completely non-operational.
 
-**Severity:**
-- **Node Crashes**: The panic at line 384 terminates the node immediately
-- **Consensus Failures**: If >33% of validators crash, the network halts
-- **Non-deterministic Failures**: Different nodes may crash at different times depending on their transaction processing history
-- **Cascading Impact**: Once capMap is corrupted, all future operations on that capability will panic
+**Severity:** 
+This represents a total network shutdown scenario that:
+- Prevents the chain from ever becoming operational
+- Affects 100% of network nodes simultaneously  
+- Occurs before any normal consensus or transaction processing begins
+- Cannot self-recover without manual intervention
+- Requires coordinated manual remediation: identifying the malicious gentx, removing it, regenerating genesis.json, redistributing to all validators, and restarting the process
 
-**Systemic Risk:**
-This is not a theoretical issue. The code comment at lines 372-377 explicitly acknowledges that Go maps don't automatically revert on transaction failure. Any transaction that calls `ReleaseCapability` and then fails (which can happen during normal operation due to gas limits, validation errors, or other failures) will trigger this vulnerability.
+This matches the specified High severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any user or module that can cause a transaction containing `ReleaseCapability` to fail. This includes:
-- IBC relayers closing channels
-- Any module using capabilities (e.g., IBC, port binding)
-- Normal users if transaction fails due to gas exhaustion
-- No special privileges required
+**Who can trigger it:** 
+Any participant in the genesis ceremony who submits a gentx. While this is a "privileged" role, the likelihood is significant because:
 
-**Conditions Required:**
-1. A capability must exist
-2. `ReleaseCapability` is called within a transaction
-3. The transaction must fail after `ReleaseCapability` but before commit
-4. Later, `GetCapability` is called for the same capability
+**Conditions required:** 
+- Attacker must participate in genesis ceremony (or compromise one validator's gentx submission)
+- Genesis coordinator runs `collect-gentxs` which includes the malicious/duplicate gentx
+- No additional validation occurs before distributing genesis.json
 
-**Frequency:**
-- Can occur during normal operations (failed IBC channel closes are common)
-- Each occurrence corrupts one capability in capMap permanently
-- Cumulative effect: As more capabilities become corrupted, more operations panic
-- High likelihood in production environments with active IBC usage
+**Likelihood Assessment:**
+While requiring genesis participant access, this is realistic in:
+- Public/permissionless chain launches with many genesis validators
+- Testnets where validator vetting may be less rigorous  
+- Contentious forks where participants may want to sabotage the launch
+- Accidental scenarios: key generation bugs, configuration errors, copy-paste mistakes
+
+Once genesis.json contains duplicate validators, the attack succeeds with 100% reliability - every node will fail to start. The impact (total network shutdown) far exceeds the intended authority of a genesis participant, who should be able to submit their gentx without preventing the entire network from starting.
 
 ## Recommendation
 
-Implement a transactional wrapper for capMap operations that can be rolled back with the store cache. Options include:
+Add duplicate validator validation to the `CollectTxs` function before genesis transactions are included in genesis.json:
 
-1. **Deferred capMap Updates**: Track capMap changes in the cached context and only apply them on successful commit:
-   - Store pending capMap operations in the context
-   - Apply them in a hook after successful cache write
-   - Discard them if cache is not written
+1. Create maps to track seen validator operator addresses and consensus public keys outside the loop (before line 101)
+2. During the loop that processes each gentx file, after extracting the `MsgCreateValidator` at line 139:
+   - Check if `msg.ValidatorAddress` already exists in the validator address map
+   - Extract the consensus public key and check if it already exists in the pubkey map
+   - Return an error if a duplicate is detected, preventing the gentx from being included
+3. Add both the validator address and consensus pubkey to their respective maps after validation
 
-2. **Rebuild from Store**: On transaction rollback, reconstruct the capMap entry from persistent store:
-   - Check if the capability still exists in persistent store
-   - If yes, recreate the capMap entry
-   - If no, confirm deletion
-
-3. **Lazy Deletion**: Instead of deleting from capMap immediately, mark for deletion and clean up during next successful operation:
-   - Add a "deleted" flag to capabilities
-   - Check this flag in GetCapability
-   - Clean up during successful transactions
-
-The first option is most robust and aligns with the transactional semantics of the store system.
+This ensures duplicate validators are caught during collection (where they should fail gracefully with an error) rather than during chain initialization (where they cause a panic and total network failure).
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
-
-**Test Function:** Add this test to the existing test suite:
-
-```go
-func (suite *KeeperTestSuite) TestReleaseCapabilityPanicOnTransactionRollback() {
-    // Setup: Create a capability
-    sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
-    
-    cap, err := sk.NewCapability(suite.ctx, "transfer")
-    suite.Require().NoError(err)
-    suite.Require().NotNil(cap)
-    
-    // Verify capability exists
-    got, ok := sk.GetCapability(suite.ctx, "transfer")
-    suite.Require().True(ok)
-    suite.Require().Equal(cap, got)
-    
-    // Trigger: Create a cached context (simulating a transaction)
-    ms := suite.ctx.MultiStore()
-    msCache := ms.CacheMultiStore()
-    cacheCtx := suite.ctx.WithMultiStore(msCache)
-    
-    // Release the capability in the cached context
-    err = sk.ReleaseCapability(cacheCtx, cap)
-    suite.Require().NoError(err)
-    
-    // Verify capability is deleted in cached context
-    got, ok = sk.GetCapability(cacheCtx, "transfer")
-    suite.Require().False(ok)
-    suite.Require().Nil(got)
-    
-    // Simulate transaction failure by NOT calling msCache.Write()
-    // This means memStore changes are reverted, but capMap deletion persists
-    
-    // Observation: Attempting to get the capability from the original context
-    // will panic because:
-    // 1. The index exists in memStore (deletion was reverted)
-    // 2. But capMap[index] is nil (deletion was NOT reverted)
-    // 3. Line 382-384 will panic with "capability found in memstore is missing from map"
-    
-    suite.Require().Panics(func() {
-        sk.GetCapability(suite.ctx, "transfer")
-    }, "Expected panic: capability found in memstore is missing from map")
-}
-```
+The report provides comprehensive test cases in `TestDuplicateValidatorInGenTxsCausesPanic` and `TestDuplicateValidatorPubKeyInGenTxsCausesPanic` that demonstrate:
 
 **Setup:**
-- Creates a new capability using `NewCapability` (establishes entries in both memStore and capMap)
-- Verifies the capability can be retrieved successfully
+- Create two different accounts with sufficient balances
+- Create two `MsgCreateValidator` messages with the same validator operator address (first test) or same consensus pubkey (second test)  
+- Encode both as genesis transactions
 
-**Trigger:**
-- Creates a cached context using `CacheMultiStore()` to simulate transaction isolation
-- Calls `ReleaseCapability` in the cached context (deletes from capMap at line 349)
-- Does NOT call `msCache.Write()` to simulate transaction failure/rollback
-- This creates the inconsistent state: memStore entries restored, but capMap entry deleted
+**Action:**
+- Call `DeliverGenTxs` with both transactions (simulating what happens during `InitChain`)
 
-**Observation:**
-- Calls `GetCapability` from the original (non-cached) context
-- The test expects a panic with message "capability found in memstore is missing from map"
-- This confirms the vulnerability: the code reaches line 382 where `capMap[index]` returns nil, triggering the panic at line 384
+**Result:**
+- First gentx succeeds in creating the validator
+- Second gentx fails with `ErrValidatorOwnerExists` or `ErrValidatorPubKeyExists`
+- `DeliverGenTxs` panics on the error (line 115: `panic(res.Log)`)
+- Test confirms the panic with `require.Panics()`
 
-This test will reliably reproduce the panic on the current codebase, demonstrating the vulnerability is real and exploitable under normal transaction processing conditions.
+The tests would run with: `cd x/genutil && go test -v -run TestDuplicateValidator`
+
+These tests confirm that duplicate validators in gentxs cause chain initialization failure through a panic, validating the vulnerability claim.
+
+## Notes
+
+The vulnerability exists because validation is improperly split between two phases:
+1. **Collection phase** (`CollectTxs`) - only validates account balances
+2. **Delivery phase** (`DeliverGenTxs`) - validates validator uniqueness but uses panic on failure
+
+This creates a critical gap where malicious gentxs pass collection but trigger a panic during delivery. The appropriate fix is to perform validator uniqueness validation during collection, using proper error returns rather than panics. The `ValidateGenesis` function at [4](#0-3)  also lacks duplicate checking, only verifying that each gentx contains a `MsgCreateValidator`.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L319-356)
+**File:** x/genutil/collect.go (L101-178)
 ```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	for _, fo := range fos {
+		if fo.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(fo.Name(), ".json") {
+			continue
+		}
+
+		// get the genTx
+		jsonRawTx, err := ioutil.ReadFile(filepath.Join(genTxsDir, fo.Name()))
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		var genTx sdk.Tx
+		if genTx, err = txJSONDecoder(jsonRawTx); err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		appGenTxs = append(appGenTxs, genTx)
+
+		// the memo flag is used to store
+		// the ip and node-id, for example this may be:
+		// "528fd3df22b31f4969b05652bfe8f0fe921321d5@192.168.2.37:26656"
+
+		memoTx, ok := genTx.(sdk.TxWithMemo)
+		if !ok {
+			return appGenTxs, persistentPeers, fmt.Errorf("expected TxWithMemo, got %T", genTx)
+		}
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
+		}
+
+		// genesis transactions must be single-message
+		msgs := genTx.GetMsgs()
+
+		// TODO abstract out staking message validation back to staking
+		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
+
+		// validate delegator and validator addresses and funds against the accounts in the state
+		delAddr := msg.DelegatorAddress
+		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		delBal, delOk := balancesMap[delAddr]
+		if !delOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
+			}
+
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
+		}
+
+		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
+		if !valOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
+			}
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
+		}
+
+		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
+			return appGenTxs, persistentPeers, fmt.Errorf(
+				"insufficient fund for delegation %v: %v < %v",
+				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
+			)
+		}
+
+		// exclude itself from persistent peers
+		if msg.Description.Moniker != moniker {
+			addressesIPs = append(addressesIPs, nodeAddrIP)
+		}
 	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+```
+
+**File:** x/staking/keeper/msg_server.go (L42-54)
+```go
+	// check to see if the pubkey or sender has been registered before
+	if _, found := k.GetValidator(ctx, valAddr); found {
+		return nil, types.ErrValidatorOwnerExists
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
-	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	pk, ok := msg.Pubkey.GetCachedValue().(cryptotypes.PubKey)
+	if !ok {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "Expecting cryptotypes.PubKey, got %T", pk)
 	}
 
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
+	}
+```
+
+**File:** x/genutil/gentx.go (L113-116)
+```go
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
+		}
+```
+
+**File:** x/genutil/types/genesis_state.go (L98-120)
+```go
+// ValidateGenesis validates GenTx transactions
+func ValidateGenesis(genesisState *GenesisState, txJSONDecoder sdk.TxDecoder) error {
+	for i, genTx := range genesisState.GenTxs {
+		var tx sdk.Tx
+		tx, err := txJSONDecoder(genTx)
+		if err != nil {
+			return err
+		}
+
+		msgs := tx.GetMsgs()
+		if len(msgs) != 1 {
+			return errors.New(
+				"must provide genesis Tx with exactly 1 CreateValidator message")
+		}
+
+		// TODO: abstract back to staking
+		if _, ok := msgs[0].(*stakingtypes.MsgCreateValidator); !ok {
+			return fmt.Errorf(
+				"genesis transaction %v does not contain a MsgCreateValidator", i)
+		}
+	}
 	return nil
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L361-388)
-```go
-func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
-	if strings.TrimSpace(name) == "" {
-		return nil, false
-	}
-	memStore := ctx.KVStore(sk.memKey)
-
-	key := types.RevCapabilityKey(sk.module, name)
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-
-	if len(indexBytes) == 0 {
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-
-		return nil, false
-	}
-
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
-	}
-
-	return cap, true
-}
-```
-
-**File:** types/context.go (L586-593)
-```go
-// CacheContext returns a new Context with the multi-store cached and a new
-// EventManager. The cached context is written to the context when writeCache
-// is called.
-func (c Context) CacheContext() (cc Context, writeCache func()) {
-	cms := c.MultiStore().CacheMultiStore()
-	cc = c.WithMultiStore(cms).WithEventManager(NewEventManager())
-	return cc, cms.Write
 }
 ```

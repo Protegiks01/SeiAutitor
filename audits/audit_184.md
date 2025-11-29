@@ -1,212 +1,258 @@
-# Audit Report
+# NoVulnerability found for this question.
 
-## Title
-Transaction Rollback in ReleaseCapability Causes Permanent capMap Deletion Leading to Chain Halt
+After thorough analysis of the code and claim, this report fails to meet the strict validation criteria for the following reasons:
 
-## Summary
-The `ReleaseCapability` function in the capability keeper contains a critical vulnerability where a transaction rollback leaves the system in an inconsistent state. When `ReleaseCapability` is called in a transaction that subsequently fails, the deletion from the in-memory `capMap` (a Go map) is permanent and cannot be rolled back, while all other state changes (memStore and persistent store) are properly reverted. This inconsistency causes a panic when any module attempts to retrieve the capability via `GetCapability`, resulting in a complete chain halt. [1](#0-0) 
+## Analysis
 
-## Impact
-**High** - This vulnerability causes a total network shutdown, preventing the chain from confirming new transactions and requiring a hard fork to resolve.
+**1. Privileged Actor Requirement**
 
-## Finding Description
+The attack scenario explicitly requires a **malicious genesis validator** who intentionally modifies their gentx JSON file after generation. Genesis validators are a trusted/privileged role - they are specifically selected to participate in the genesis ceremony, not open to the general public. [1](#0-0) 
 
-**Location:** 
-- Primary issue: `x/capability/keeper/keeper.go`, lines 319-356 (ReleaseCapability function)
-- Secondary location: `x/capability/keeper/keeper.go`, lines 361-388 (GetCapability function)
+The platform acceptance rules state: *"The issue requires an admin/privileged misconfiguration or uses privileged keys (assume privileged roles are trusted) — unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority."*
 
-**Intended Logic:**
-The `ReleaseCapability` function is designed to allow a module to release ownership of a capability. When the last owner releases a capability, it should be completely removed from all stores (memStore mappings, persistent owner set, and the in-memory capMap). All these operations should be atomic within a transaction - either all succeed or all fail together.
+The report's primary scenario is **intentional malicious modification**: "the attacker modifies the transaction to include an extremely large memo field" - this is not inadvertent behavior. Code4rena explicitly states: "No credit for scenarios that require malicious privileged actors."
 
-**Actual Logic:**
-The function performs deletions across three different storage types:
-1. memStore (transient, will rollback on tx failure) [2](#0-1) 
-2. Persistent store (will rollback on tx failure) [3](#0-2) 
-3. Go map `capMap` (will NOT rollback on tx failure) [4](#0-3) 
+**2. Lack of Concrete Proof of Concept**
 
-When a transaction containing `ReleaseCapability` fails and rolls back, the memStore and persistent store changes are reverted, but the Go map deletion at line 349 is permanent.
+While the report describes a test structure, no actual runnable Go test code is provided that demonstrates:
+- Actual node crashes or initialization failures
+- Memory exhaustion occurring
+- System becoming unresponsive [2](#0-1) 
 
-**Exploit Scenario:**
-1. A module owns a capability (e.g., IBC port capability)
-2. The module calls `ReleaseCapability` within a transaction
-3. After `ReleaseCapability` executes, the transaction fails due to:
-   - Gas limit exceeded
-   - Another state transition failure in the same transaction
-   - Application logic error
-4. Transaction rollback occurs:
-   - memStore mappings are restored
-   - Persistent owner set is restored
-   - **capMap deletion cannot be undone** - the entry is permanently deleted
-5. System is now in inconsistent state:
-   - Reverse mapping exists pointing to capability index
-   - capMap has no entry for that index
-6. Any subsequent call to `GetCapability` for that capability name triggers the panic at line 384 [5](#0-4) 
-7. Chain halts completely
+The existing test file shows only basic directory handling, not memo size validation. Without a concrete PoC proving that large memos actually cause the claimed DoS, the severity remains speculative.
 
-**Security Failure:**
-This breaks the atomicity invariant of transactions and causes a denial-of-service through chain halt. The panic in `GetCapability` is explicitly checking for this inconsistent state with the message "capability found in memstore is missing from map".
+**3. Limited Attack Window and Practical Mitigations**
 
-## Impact Explanation
+This vulnerability can only occur during the one-time genesis ceremony, not during normal network operation. In practice:
+- Genesis coordinators manually review gentx submissions
+- Abnormally large gentx files would be immediately noticeable
+- Suspicious gentxs can be rejected before running `collect-gentxs`
+- The genesis can be recreated with only valid gentxs
 
-**Affected Assets/Processes:**
-- Entire blockchain network availability
-- All transaction processing capability
-- Consensus finality
+**4. Validation Gap Confirmed But Impact Questionable**
 
-**Severity of Damage:**
-- Complete chain halt requiring hard fork to recover
-- All network nodes will panic when attempting to retrieve the affected capability
-- No new transactions can be confirmed
-- The issue persists across node restarts since memStore is rebuilt from persistent storage (which was rolled back and still contains the capability)
+While it's true that `CollectTxs` only checks for empty memo (not size): [3](#0-2) 
 
-**System Reliability:**
-This vulnerability completely undermines the reliability guarantees of the blockchain. Once triggered, the chain cannot progress without manual intervention and a coordinated hard fork, affecting all users and applications built on the network.
+And normal transactions have size validation: [4](#0-3) 
 
-## Likelihood Explanation
+The actual impact on modern systems is questionable. A 100MB string (10 validators × 10MB) is manageable for typical node hardware and wouldn't necessarily cause crashes or DoS.
 
-**Who Can Trigger:**
-Any module that has claimed a capability and can cause its own transaction to fail after calling `ReleaseCapability`. This includes:
-- IBC transfer module
-- IBC connection/channel modules  
-- Any custom application modules using capabilities
+**5. Out of Scope Per Platform Rules**
 
-**Required Conditions:**
-- Module must be the last owner of a capability (or become the last owner through the release)
-- Transaction containing `ReleaseCapability` must fail after the function executes
-- This can happen through:
-  - Intentional gas limit manipulation
-  - Crafted transactions with multiple operations where later ones fail
-  - Complex transaction flows with error conditions
-  - Out of gas scenarios
+The scenario fundamentally requires:
+- Trusted/privileged genesis validator role  
+- Intentional malicious action (manual file modification)
+- Coordination among multiple malicious validators for significant impact
+- Occurs only during one-time initialization event
 
-**Frequency:**
-While not trivial to exploit intentionally, this can also occur accidentally during:
-- Complex multi-step transactions
-- IBC packet handling with subsequent failures
-- Module upgrade scenarios
-- Gas estimation errors
+These factors place it outside the scope of valid vulnerability reports per the platform acceptance rules provided.
 
-The likelihood is **Medium to High** because capability releases are common in IBC operations, and transaction failures are a normal part of blockchain operation.
+## Conclusion
 
-## Recommendation
-
-The fix requires ensuring `capMap` modifications are transactional or deferring them until after transaction commit. Recommended approaches:
-
-1. **Short-term fix:** Track `capMap` deletions separately and only apply them in `Commit` hooks or after successful transaction completion.
-
-2. **Medium-term fix:** Modify `ReleaseCapability` to NOT delete from `capMap` when releasing. Instead, rely on `GetCapability`'s existing cleanup logic (lines 372-379) to handle orphaned `capMap` entries. Change line 349 to be conditional or removed entirely.
-
-3. **Long-term fix:** Implement a transactional wrapper around the `capMap` that can track additions/deletions and rollback on transaction failure, as mentioned in the TODO comment. [6](#0-5) 
-
-The immediate mitigation is to remove the `capMap` deletion from `ReleaseCapability` and let the existing cleanup logic in `GetCapability` handle orphaned entries.
-
-## Proof of Concept
-
-**File:** `x/capability/keeper/keeper_test.go`
-
-**Test Function:** `TestReleaseCapabilityTransactionRollbackPanic`
-
-**Setup:**
-1. Create a scoped keeper for a test module
-2. Create a new capability that the module owns (making it the sole owner)
-3. Create a cached context (simulating a transaction)
-
-**Trigger:**
-1. Call `ReleaseCapability` on the cached context to delete the capability
-2. Do NOT commit the cached context (simulating transaction rollback)
-3. Verify that `capMap` has been permanently modified (capability deleted)
-4. Verify that memStore still has the reverse mapping (due to rollback)
-
-**Observation:**
-1. After rollback, calling `GetCapability` with the capability name will panic with "capability found in memstore is missing from map"
-2. This demonstrates the inconsistent state and chain halt scenario
-
-**Test Code Structure:**
-```
-func (suite *KeeperTestSuite) TestReleaseCapabilityTransactionRollbackPanic() {
-    // Create scoped keeper and capability
-    sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
-    cap, err := sk.NewCapability(suite.ctx, "transfer")
-    
-    // Create cached context for transaction
-    ms := suite.ctx.MultiStore()
-    msCache := ms.CacheMultiStore()
-    cacheCtx := suite.ctx.WithMultiStore(msCache)
-    
-    // Release capability in transaction context
-    err = sk.ReleaseCapability(cacheCtx, cap)
-    suite.Require().NoError(err)
-    
-    // Verify capability cannot be retrieved in cache (normal behavior)
-    _, ok := sk.GetCapability(cacheCtx, "transfer")
-    suite.Require().False(ok)
-    
-    // Simulate transaction rollback by NOT calling msCache.Write()
-    // memStore changes rollback, but capMap deletion is permanent
-    
-    // VULNERABILITY: This will panic because memStore has mapping but capMap doesn't
-    suite.Require().Panics(func() {
-        sk.GetCapability(suite.ctx, "transfer")
-    })
-}
-```
-
-This test will panic at the `GetCapability` call, demonstrating the vulnerability. The panic occurs because the reverse mapping was restored by the rollback, but the `capMap` entry remains deleted.
+While there is indeed a lack of memo size validation during gentx collection, exploiting this requires malicious behavior by trusted genesis validators and lacks concrete proof of significant impact. Under the strict validation criteria, this does not constitute a valid security vulnerability.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L319-356)
+**File:** x/genutil/client/cli/gentx.go (L58-204)
 ```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+		RunE: func(cmd *cobra.Command, args []string) error {
+			serverCtx := server.GetServerContextFromCmd(cmd)
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+			cdc := clientCtx.Codec
+
+			config := serverCtx.Config
+			config.SetRoot(clientCtx.HomeDir)
+
+			nodeID, valPubKey, err := genutil.InitializeNodeValidatorFiles(serverCtx.Config)
+			if err != nil {
+				return errors.Wrap(err, "failed to initialize node validator files")
+			}
+
+			// read --nodeID, if empty take it from priv_validator.json
+			if nodeIDString, _ := cmd.Flags().GetString(cli.FlagNodeID); nodeIDString != "" {
+				nodeID = nodeIDString
+			}
+
+			// read --pubkey, if empty take it from priv_validator.json
+			if pkStr, _ := cmd.Flags().GetString(cli.FlagPubKey); pkStr != "" {
+				if err := clientCtx.Codec.UnmarshalInterfaceJSON([]byte(pkStr), &valPubKey); err != nil {
+					return errors.Wrap(err, "failed to unmarshal validator public key")
+				}
+			}
+
+			genDoc, err := tmtypes.GenesisDocFromFile(config.GenesisFile())
+			if err != nil {
+				return errors.Wrapf(err, "failed to read genesis doc file %s", config.GenesisFile())
+			}
+
+			var genesisState map[string]json.RawMessage
+			if err = json.Unmarshal(genDoc.AppState, &genesisState); err != nil {
+				return errors.Wrap(err, "failed to unmarshal genesis state")
+			}
+
+			if err = mbm.ValidateGenesis(cdc, txEncCfg, genesisState); err != nil {
+				return errors.Wrap(err, "failed to validate genesis state")
+			}
+
+			inBuf := bufio.NewReader(cmd.InOrStdin())
+
+			name := args[0]
+			key, err := clientCtx.Keyring.Key(name)
+			if err != nil {
+				return errors.Wrapf(err, "failed to fetch '%s' from the keyring", name)
+			}
+
+			moniker := config.Moniker
+			if m, _ := cmd.Flags().GetString(cli.FlagMoniker); m != "" {
+				moniker = m
+			}
+
+			// set flags for creating a gentx
+			createValCfg, err := cli.PrepareConfigForTxCreateValidator(cmd.Flags(), moniker, nodeID, genDoc.ChainID, valPubKey)
+			if err != nil {
+				return errors.Wrap(err, "error creating configuration to create validator msg")
+			}
+
+			amount := args[1]
+			coins, err := sdk.ParseCoinsNormalized(amount)
+			if err != nil {
+				return errors.Wrap(err, "failed to parse coins")
+			}
+
+			err = genutil.ValidateAccountInGenesis(genesisState, genBalIterator, key.GetAddress(), coins, cdc)
+			if err != nil {
+				return errors.Wrap(err, "failed to validate account in genesis")
+			}
+
+			txFactory := tx.NewFactoryCLI(clientCtx, cmd.Flags())
+			if err != nil {
+				return errors.Wrap(err, "error creating tx builder")
+			}
+
+			clientCtx = clientCtx.WithInput(inBuf).WithFromAddress(key.GetAddress())
+
+			// The following line comes from a discrepancy between the `gentx`
+			// and `create-validator` commands:
+			// - `gentx` expects amount as an arg,
+			// - `create-validator` expects amount as a required flag.
+			// ref: https://github.com/cosmos/cosmos-sdk/issues/8251
+			// Since gentx doesn't set the amount flag (which `create-validator`
+			// reads from), we copy the amount arg into the valCfg directly.
+			//
+			// Ideally, the `create-validator` command should take a validator
+			// config file instead of so many flags.
+			// ref: https://github.com/cosmos/cosmos-sdk/issues/8177
+			createValCfg.Amount = amount
+
+			// create a 'create-validator' message
+			txBldr, msg, err := cli.BuildCreateValidatorMsg(clientCtx, createValCfg, txFactory, true)
+			if err != nil {
+				return errors.Wrap(err, "failed to build create-validator message")
+			}
+
+			if key.GetType() == keyring.TypeOffline || key.GetType() == keyring.TypeMulti {
+				cmd.PrintErrln("Offline key passed in. Use `tx sign` command to sign.")
+				return authclient.PrintUnsignedStdTx(txBldr, clientCtx, []sdk.Msg{msg})
+			}
+
+			// write the unsigned transaction to the buffer
+			w := bytes.NewBuffer([]byte{})
+			clientCtx = clientCtx.WithOutput(w)
+
+			if err = msg.ValidateBasic(); err != nil {
+				return err
+			}
+
+			if err = authclient.PrintUnsignedStdTx(txBldr, clientCtx, []sdk.Msg{msg}); err != nil {
+				return errors.Wrap(err, "failed to print unsigned std tx")
+			}
+
+			// read the transaction
+			stdTx, err := readUnsignedGenTxFile(clientCtx, w)
+			if err != nil {
+				return errors.Wrap(err, "failed to read unsigned gen tx file")
+			}
+
+			// sign the transaction and write it to the output file
+			txBuilder, err := clientCtx.TxConfig.WrapTxBuilder(stdTx)
+			if err != nil {
+				return fmt.Errorf("error creating tx builder: %w", err)
+			}
+
+			err = authclient.SignTx(txFactory, clientCtx, name, txBuilder, true, true)
+			if err != nil {
+				return errors.Wrap(err, "failed to sign std tx")
+			}
+
+			outputDocument, _ := cmd.Flags().GetString(flags.FlagOutputDocument)
+			if outputDocument == "" {
+				outputDocument, err = makeOutputFilepath(config.RootDir, nodeID)
+				if err != nil {
+					return errors.Wrap(err, "failed to create output file path")
+				}
+			}
+
+			if err := writeSignedGenTx(clientCtx, outputDocument, stdTx); err != nil {
+				return errors.Wrap(err, "failed to write signed gen tx")
+			}
+
+			cmd.PrintErrf("Genesis transaction written to %q\n", outputDocument)
+			return nil
+		},
+```
+
+**File:** x/genutil/collect_test.go (L39-68)
+```go
+// a directory during traversal of the first level. See issue https://github.com/cosmos/cosmos-sdk/issues/6788.
+func TestCollectTxsHandlesDirectories(t *testing.T) {
+	testDir, err := ioutil.TempDir(os.TempDir(), "testCollectTxs")
+	if err != nil {
+		t.Fatal(err)
 	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	defer os.RemoveAll(testDir)
+
+	// 1. We'll insert a directory as the first element before JSON file.
+	subDirPath := filepath.Join(testDir, "_adir")
+	if err := os.MkdirAll(subDirPath, 0755); err != nil {
+		t.Fatal(err)
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
+	txDecoder := types.TxDecoder(func(txBytes []byte) (types.Tx, error) {
+		return nil, nil
+	})
 
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+	// 2. Ensure that we don't encounter any error traversing the directory.
+	srvCtx := server.NewDefaultContext()
+	_ = srvCtx
+	cdc := codec.NewProtoCodec(cdctypes.NewInterfaceRegistry())
+	gdoc := tmtypes.GenesisDoc{AppState: []byte("{}")}
+	balItr := new(doNothingIterator)
 
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
-	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	dnc := &doNothingUnmarshalJSON{cdc}
+	if _, _, err := genutil.CollectTxs(dnc, txDecoder, "foo", testDir, gdoc, balItr); err != nil {
+		t.Fatal(err)
 	}
-
-	return nil
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L376-377)
+**File:** x/genutil/collect.go (L130-133)
 ```go
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
+		}
 ```
 
-**File:** x/capability/keeper/keeper.go (L382-385)
+**File:** x/auth/ante/basic.go (L62-68)
 ```go
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
+	memoLength := len(memoTx.GetMemo())
+	if uint64(memoLength) > params.MaxMemoCharacters {
+		return ctx, sdkerrors.Wrapf(sdkerrors.ErrMemoTooLarge,
+			"maximum number of characters is %d but received %d characters",
+			params.MaxMemoCharacters, memoLength,
+		)
 	}
 ```

@@ -1,304 +1,288 @@
+# Audit Report
+
 ## Title
-Non-Transactional capMap Deletion Allows Index Re-claiming Leading to Node Crash
+Authentication Bypass via Zero-Threshold Multisig Public Key Deserialization
 
 ## Summary
-The `ReleaseCapability` function in `x/capability/keeper/keeper.go` (lines 319-356) contains a critical timing vulnerability where the non-transactional deletion from the in-memory `capMap` (line 349) can be exploited to re-claim a capability index within the same transaction, creating an inconsistent state that causes node crashes when the capability is subsequently accessed. [1](#0-0) 
+The `LegacyAminoPubKey` protobuf deserialization bypasses constructor validation that enforces threshold > 0, allowing creation of multisig accounts that accept transactions without any valid signatures. This results in complete authentication bypass and enables creation of "anyone can spend" addresses.
 
 ## Impact
-**High** - This vulnerability causes node crashes, resulting in shutdown of network processing nodes without brute force actions.
+High - Direct loss of funds
 
 ## Finding Description
 
-**Location:** 
-- Module: `x/capability/keeper`
-- File: `keeper.go`
-- Primary vulnerability: Lines 347-349 in `ReleaseCapability` function
-- Crash point: Line 384 in `GetCapability` function [2](#0-1) [3](#0-2) 
+**Location:** [1](#0-0) [2](#0-1) 
 
-**Intended Logic:** 
-When a module releases a capability, all ownership data should be atomically removed from both transactional stores (memStore, persistent store) and the non-transactional in-memory map (capMap). The system expects these operations to maintain consistency - either the capability exists everywhere or nowhere.
+**Intended Logic:**
+The constructor enforces that multisig threshold must be greater than 0 to ensure at least one signature is required for transaction authorization. [3](#0-2) 
 
-**Actual Logic:** 
-The `capMap` deletion at line 349 is immediate and non-transactional (direct Go map operation), while the persistent store deletion at line 347 and memStore deletions at lines 332-336 are transactional (cached). This creates a timing window within the same transaction where:
-1. capMap no longer contains the capability (permanently deleted)
-2. But transactional stores still reflect the pre-deletion state (due to caching)
-3. `ClaimCapability` can be called with the capability pointer, successfully recreating ownership entries
-4. The capability index is "re-claimed" in persistent/memStore while absent from capMap [4](#0-3) 
+**Actual Logic:**
+The protobuf `Unmarshal` method directly deserializes the `Threshold` field without any validation. When `threshold=0`, the signature verification checks at lines 60 and 64 become:
+- `len(sigs) < int(0)` → always false (length is non-negative)
+- `bitarray.NumTrueBitsBefore(size) < int(0)` → always false
 
-**Exploit Scenario:**
-1. Module A creates a capability and passes the pointer to Module B (normal inter-module communication)
-2. Module B stores the capability pointer but doesn't immediately claim it
-3. Within a single transaction:
-   - Module A (sole owner) calls `ReleaseCapability(capability)`
-   - Line 347: Deletes from persistent store (cached deletion)
-   - Line 349: Deletes from capMap (immediate, permanent deletion)
-   - Module B calls `ClaimCapability(capability, "name")` using its stored pointer
-   - `getOwners` (line 473) sees the cached deletion, returns empty owners (line 476)
-   - `addOwner` successfully adds Module B as new owner to persistent store (line 464)
-   - memStore mappings are created (lines 303, 309 via ClaimCapability)
-4. Transaction commits with persistent store and memStore containing Module B's ownership
-5. Module B attempts `GetCapability("name")`
-6. Line 368: Successfully retrieves index from memStore
-7. Line 382: Attempts lookup in capMap → returns nil
-8. Line 384: **PANIC** "capability found in memstore is missing from map"
-9. **Node crashes** [5](#0-4) [6](#0-5) [7](#0-6) 
+This allows transactions to pass verification with zero signatures.
 
-**Security Failure:** 
-This breaks the consistency invariant between capMap and the transactional stores. The system enters a state where ownership metadata exists in persistent storage and memStore, but the actual capability object is missing from capMap. This violates memory safety and causes denial-of-service through node crashes.
+**Exploitation Path:**
+1. Attacker creates a `LegacyAminoPubKey` with `Threshold: 0` by directly instantiating the struct or marshaling/unmarshaling via protobuf
+2. Attacker computes the address derived from this malicious key
+3. Victim sends funds to this address (via exchange withdrawal, user error, or social engineering)
+4. Attacker creates a transaction with the threshold=0 pubkey in SignerInfo and a `MultiSignatureData` containing zero signatures
+5. Transaction passes `ValidateBasic` (checks only that `len(sigs) > 0`, not signature content) [4](#0-3) 
+6. `SetPubKeyDecorator` sets the malicious pubkey on the account without validation [5](#0-4) [6](#0-5) 
+7. `SigVerificationDecorator` calls `VerifyMultisignature`, which passes all checks due to threshold=0
+8. Transaction executes without any valid signatures, enabling fund theft
+
+**Security Guarantee Broken:**
+Transactions must be cryptographically signed by authorized private key holders. This vulnerability creates addresses where NO private keys are needed—anyone who knows the public keys can spend funds.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Node availability: Nodes crash when attempting to retrieve the re-claimed capability
-- Capability system integrity: Creates permanently broken capability references
-- Transaction processing: Any transaction attempting to use the re-claimed capability crashes the node
+This vulnerability enables:
+- **Direct fund theft**: Anyone who knows the public keys of a threshold=0 multisig can steal all funds sent to that address without possessing any private keys
+- **Social engineering attacks**: Attackers can promote "secure multisig addresses" that are actually threshold=0 and completely insecure
+- **Systemic authentication failure**: Violates the core blockchain security property that transactions require valid signatures
 
-**Damage Severity:**
-- **Node crashes:** Any validator or full node processing a transaction that uses the re-claimed capability will panic and crash
-- **Network disruption:** If multiple nodes process such transactions, >= 30% of network nodes could crash simultaneously
-- **Persistent DoS vector:** The broken capability state persists across restarts, making nodes repeatedly crash on the same operation
-
-**System Impact:**
-This directly threatens network reliability by providing an exploitable path to crash nodes. In a blockchain network, node crashes reduce decentralization, increase centralization risks, and can halt consensus if enough validators crash. The vulnerability is particularly dangerous because the broken state persists in the database, requiring manual intervention to recover.
+All funds sent to threshold=0 multisig addresses are at risk of immediate theft by anyone who discovers the public key composition.
 
 ## Likelihood Explanation
 
-**Triggering Actors:**
-Any two modules that interact with capabilities can trigger this vulnerability. Common scenarios include:
-- IBC port/channel management between multiple modules
-- Cross-module capability sharing in custom chains
-- Module upgrades where capabilities are transferred
+**Who Can Trigger:** Any unprivileged user can create transactions with threshold=0 multisig keys.
 
-**Required Conditions:**
-- Module A must release a capability it owns
-- Module B must retain a pointer to that capability
-- Both operations must occur within the same transaction (achievable through normal module interactions)
-- No privileged access required - standard module operations
+**Conditions Required:**
+- Attacker creates a threshold=0 multisig key and computes its address
+- Someone sends funds to this address (through exchange, user transfer, or social engineering)
+- No special timing, network conditions, or privileges required
 
-**Frequency:**
-- **Moderate to High:** Can occur during normal operations whenever modules coordinate capability lifecycle
-- **Exploitable:** An attacker controlling two modules (or exploiting module logic bugs) can deliberately trigger this
-- **Persistent:** Once triggered, the broken state persists indefinitely, causing repeated crashes
-
-The vulnerability is realistic because capability pointers are routinely passed between modules, and transaction boundaries often contain multiple module calls. The timing window exists in every `ReleaseCapability` call, making it a systemic issue rather than a rare edge case.
+**Frequency:** Exploitable on-demand during normal network operation. The attack is deterministic and reliable—once funds arrive at a threshold=0 address, they can be stolen immediately.
 
 ## Recommendation
 
-**Immediate Fix:**
-Modify `ReleaseCapability` to make capMap operations transactional by deferring the deletion until after store operations succeed:
+Add post-deserialization validation for `LegacyAminoPubKey`:
 
-1. **Option A - Deferred Deletion:** Store capabilities to be deleted in a temporary list and only delete from capMap after the transaction successfully commits (use a commit hook or defer the deletion)
-
-2. **Option B - Transactional Guard:** Add the capability back to capMap if any subsequent operation in the transaction needs it, or maintain a "pending deletion" flag that's checked before deleting
-
-3. **Option C - Validation Check:** Before allowing `ClaimCapability`, verify the capability exists in capMap, not just in persistent store
-
-**Recommended Implementation (Option C - Simplest):**
-In `ClaimCapability` (line 287), add a check after line 289:
+1. **Implement validation method:**
 ```go
-if sk.capMap[cap.GetIndex()] == nil {
-    return sdkerrors.Wrap(types.ErrCapabilityNotFound, "capability not in memory")
+func (m *LegacyAminoPubKey) Validate() error {
+    if m.Threshold == 0 {
+        return fmt.Errorf("threshold must be greater than 0")
+    }
+    if int(m.Threshold) > len(m.PubKeys) {
+        return fmt.Errorf("threshold cannot exceed number of pubkeys")
+    }
+    return nil
 }
 ```
 
-This prevents re-claiming capabilities that have been deleted from capMap, breaking the exploit chain.
+2. **Call validation in:**
+   - `BaseAccount.SetPubKey()` before accepting any public key
+   - `VerifyMultisignature()` at the beginning of signature verification
+   - Transaction `ValidateBasic()` to check all public keys in SignerInfo structures
 
-**Long-term Solution:**
-Refactor the capability system to make capMap transactional by implementing a proper cache layer for Go map operations, or redesign to not rely on non-transactional memory for critical state.
+3. **Add a `Validate()` method to the `cryptotypes.PubKey` interface** that all implementations must provide for structural validation.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
-
-**Test Function:** `TestTimingAttackReclaimIndexAfterRelease`
+**Test Location:** `crypto/keys/multisig/multisig_test.go`
 
 **Setup:**
-1. Initialize keeper with two scoped modules ("module1" and "module2")
-2. Module1 creates a capability and stores the pointer
-3. Module2 receives the capability pointer (simulating inter-module communication)
+- Create a `LegacyAminoPubKey` directly with `Threshold: 0` (bypassing constructor)
+- Generate one secp256k1 public key for the multisig
+- Create an empty `MultiSignatureData` via `multisig.NewMultisig(1)` (zero signatures)
 
-**Trigger:**
-1. Within the same transaction context:
-   - Module1 (sole owner) calls `ReleaseCapability` to delete the capability
-   - Immediately after, Module2 calls `ClaimCapability` with the stored pointer
-2. Verify ClaimCapability succeeds (no error returned)
-3. Attempt to retrieve the capability via `GetCapability`
+**Action:**
+- Marshal and unmarshal the threshold=0 key to simulate network deserialization
+- Call `VerifyMultisignature` with the zero-signature MultiSignatureData
 
-**Observation:**
-- The test will panic at line 384 with message: "capability found in memstore is missing from map"
-- This confirms the capability index was successfully "re-claimed" (ownership recreated) while capMap no longer contains it
-- The node crashes when trying to use the re-claimed capability
+**Result:**
+- Verification returns `nil` (success) instead of error
+- Confirms that threshold=0 bypasses all signature checks
+- Demonstrates complete authentication bypass
 
-**Test Code:**
-```go
-func (suite *KeeperTestSuite) TestTimingAttackReclaimIndexAfterRelease() {
-    sk1 := suite.keeper.ScopeToModule("module1")
-    sk2 := suite.keeper.ScopeToModule("module2")
+The provided test code structure in the claim accurately demonstrates the vulnerability by showing signature verification succeeds with zero signatures when threshold=0.
 
-    // Module1 creates capability
-    cap, err := sk1.NewCapability(suite.ctx, "original")
-    suite.Require().NoError(err)
-    suite.Require().NotNil(cap)
-    
-    capIndex := cap.GetIndex()
+## Notes
 
-    // Module1 releases capability (as sole owner)
-    // This deletes from capMap immediately (line 349)
-    err = sk1.ReleaseCapability(suite.ctx, cap)
-    suite.Require().NoError(err)
-
-    // Module2 (with stored pointer) attempts to claim the released capability
-    // This should fail but currently succeeds, re-claiming the index
-    err = sk2.ClaimCapability(suite.ctx, cap, "reclaimed")
-    suite.Require().NoError(err) // ClaimCapability succeeds!
-
-    // Verify the inconsistent state: capability is in stores but not capMap
-    // This will panic: "capability found in memstore is missing from map"
-    got, ok := sk2.GetCapability(suite.ctx, "reclaimed")
-    
-    // This line is never reached due to panic at line 384
-    suite.Require().True(ok)
-    suite.Require().NotNil(got)
-    suite.Require().Equal(capIndex, got.GetIndex())
-}
-```
-
-**Expected Behavior on Vulnerable Code:**
-- The test will panic at the `GetCapability` call
-- Panic message: "capability found in memstore is missing from map"
-- This proves the capability was re-claimed in stores but is missing from capMap
-- Demonstrates the node crash vulnerability
-
-**Running the Test:**
-```bash
-cd x/capability/keeper
-go test -run TestTimingAttackReclaimIndexAfterRelease -v
-```
-
-The test will crash the test runner, confirming the vulnerability. After the fix (adding the validation check in `ClaimCapability`), the test should fail gracefully with `ErrCapabilityNotFound` instead of panicking.
+This vulnerability stems from the mismatch between constructor validation and protobuf deserialization. The constructor's panic on `threshold <= 0` clearly indicates this was never intended behavior. The issue affects the core authentication mechanism and represents a critical security failure that violates blockchain's fundamental trust model—transactions must be cryptographically authorized.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** crypto/keys/multisig/keys.pb.go (L173-274)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+func (m *LegacyAminoPubKey) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowKeys
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: LegacyAminoPubKey: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: LegacyAminoPubKey: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Threshold", wireType)
+			}
+			m.Threshold = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowKeys
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Threshold |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PubKeys", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowKeys
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthKeys
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthKeys
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.PubKeys = append(m.PubKeys, &types.Any{})
+			if err := m.PubKeys[len(m.PubKeys)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipKeys(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthKeys
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
 	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
 	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
 	return nil
+```
+
+**File:** crypto/keys/multisig/multisig.go (L21-33)
+```go
+func NewLegacyAminoPubKey(threshold int, pubKeys []cryptotypes.PubKey) *LegacyAminoPubKey {
+	if threshold <= 0 {
+		panic("threshold k of n multisignature: k <= 0")
+	}
+	if len(pubKeys) < threshold {
+		panic("threshold k of n multisignature: len(pubKeys) < k")
+	}
+	anyPubKeys, err := packPubKeys(pubKeys)
+	if err != nil {
+		panic(err)
+	}
+	return &LegacyAminoPubKey{Threshold: uint32(threshold), PubKeys: anyPubKeys}
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L319-356)
+**File:** crypto/keys/multisig/multisig.go (L50-66)
 ```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
+	bitarray := sig.BitArray
+	sigs := sig.Signatures
+	size := bitarray.Count()
+	pubKeys := m.GetPubKeys()
+	// ensure bit array is the correct size
+	if len(pubKeys) != size {
+		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
 	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	// ensure size of signature list
+	if len(sigs) < int(m.Threshold) || len(sigs) > size {
+		return fmt.Errorf("signature size is incorrect %d", len(sigs))
 	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
-	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	// ensure at least k signatures are set
+	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
+		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
 	}
-
-	return nil
-}
 ```
 
-**File:** x/capability/keeper/keeper.go (L361-388)
+**File:** types/tx/types.go (L88-92)
 ```go
-func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
-	if strings.TrimSpace(name) == "" {
-		return nil, false
+	sigs := t.Signatures
+
+	if len(sigs) == 0 {
+		return sdkerrors.ErrNoSignatures
 	}
-	memStore := ctx.KVStore(sk.memKey)
-
-	key := types.RevCapabilityKey(sk.module, name)
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-
-	if len(indexBytes) == 0 {
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-
-		return nil, false
-	}
-
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
-	}
-
-	return cap, true
-}
 ```
 
-**File:** x/capability/keeper/keeper.go (L469-482)
+**File:** x/auth/ante/sigverify.go (L89-97)
 ```go
-func (sk ScopedKeeper) getOwners(ctx sdk.Context, cap *types.Capability) *types.CapabilityOwners {
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
+		// account already has pubkey set,no need to reset
+		if acc.GetPubKey() != nil {
+			continue
+		}
+		err = acc.SetPubKey(pk)
+		if err != nil {
+			return ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidPubKey, err.Error())
+		}
+		spkd.ak.SetAccount(ctx, acc)
+```
 
-	bz := prefixStore.Get(indexKey)
-
-	if len(bz) == 0 {
-		return types.NewCapabilityOwners()
+**File:** x/auth/types/account.go (L87-97)
+```go
+func (acc *BaseAccount) SetPubKey(pubKey cryptotypes.PubKey) error {
+	if pubKey == nil {
+		acc.PubKey = nil
+		return nil
 	}
-
-	var capOwners types.CapabilityOwners
-	sk.cdc.MustUnmarshal(bz, &capOwners)
-	return &capOwners
+	any, err := codectypes.NewAnyWithValue(pubKey)
+	if err == nil {
+		acc.PubKey = any
+	}
+	return err
 }
 ```

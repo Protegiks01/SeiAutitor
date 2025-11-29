@@ -1,350 +1,170 @@
 # Audit Report
 
 ## Title
-Expiration Time Validation Bypass Allowing Permanent Storage Bloat Through Expired Authorization Grants
+Validator Can Set Minimum Self-Delegation Above Actual Self-Delegation via EditValidator
 
 ## Summary
-The authz module allows creation of authorization grants with past expiration times due to commented-out validation logic, violating the documented specification and causing permanent blockchain state bloat.
+The `EditValidator` message handler in the staking module incorrectly validates the new `MinSelfDelegation` against the validator's total delegated tokens (`validator.Tokens`) instead of their actual self-delegation. This allows validators to set a minimum self-delegation requirement higher than what they actually maintain, violating a core security invariant of the proof-of-stake system.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** 
-The vulnerability exists in the authz module across multiple files:
-- [1](#0-0) 
-- [2](#0-1) 
-- [3](#0-2) 
+**Location**: [1](#0-0) 
 
-**Intended Logic:**
-According to the specification, MsgGrant message handling should fail if the provided expiration time is less than the current unix timestamp: [4](#0-3) 
+**Intended Logic**: When a validator increases their `MinSelfDelegation`, the system should verify that their current self-delegation (the validator operator's own delegation to themselves) meets or exceeds the new minimum. This ensures validators maintain the minimum "skin in the game" they commit to.
 
-An error is defined specifically for this validation: [5](#0-4) 
+**Actual Logic**: The validation check at line 167 compares the new `MinSelfDelegation` against `validator.Tokens`, which represents the total tokens delegated to the validator from ALL delegators (both self-delegation and external delegations). [2](#0-1)  This is incorrect because it allows validators to set a minimum they don't personally meet if they have sufficient external delegations.
 
-**Actual Logic:**
-The validation code that checks expiration against block time is commented out with a TODO note for version 0.45: [6](#0-5) 
+**Exploitation Path**:
+1. Validator creates a validator with 100 tokens of self-delegation and `MinSelfDelegation = 100`
+2. External delegators add 900 tokens to the validator (total `validator.Tokens = 1000`)
+3. Validator operator submits `MsgEditValidator` with `MinSelfDelegation = 500`
+4. The check at line 167 evaluates `500 > 1000` which is false, so it passes
+5. The validator now has `MinSelfDelegation = 500` but only 100 tokens of actual self-delegation
+6. The validator continues operating normally despite violating their declared minimum
 
-The `MsgGrant.ValidateBasic()` method calls `Grant.ValidateBasic()` which only validates the authorization itself, not the expiration time: [7](#0-6) 
-
-When `SaveGrant` is called from the message server, it accepts any expiration time without validation: [8](#0-7) 
-
-**Exploit Scenario:**
-1. An attacker creates a `MsgGrant` transaction with expiration time set to a past date (e.g., Unix epoch 0 or any time before current block time)
-2. The message passes `ValidateBasic()` validation since expiration time is not checked
-3. The message handler stores the grant in blockchain state permanently
-4. The expired grant remains in storage and appears in query results from methods like `GranterGrants` and `GranteeGrants`: [9](#0-8) 
-
-5. While `GetCleanAuthorization` filters expired grants during execution attempts, the grants persist in storage: [10](#0-9) 
-
-**Security Failure:**
-This breaks the specification invariant and causes unintended protocol behavior. The system stores authorization grants that should have been rejected, causing permanent state bloat that affects all network nodes.
+**Security Guarantee Broken**: The protocol's invariant that a validator's actual self-delegation must always be greater than or equal to their declared `MinSelfDelegation` is violated. This is a core security assumption used by delegators to assess validator commitment.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Blockchain state storage on all network nodes
-- Query RPC endpoints that return grant information
-- Network resource consumption (storage and query processing)
+This vulnerability undermines the staking module's security model in several ways:
 
-**Severity of Damage:**
-This is a bug in layer 1 network code that results in unintended behavior, fitting the Medium severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+1. **Misleading Information**: Delegators who choose validators based on their `MinSelfDelegation` value are given false information about the validator's actual stake and commitment level.
 
-While no funds are directly at risk (expired grants cannot be executed), the vulnerability:
-1. Violates the documented specification
-2. Causes permanent blockchain state pollution
-3. Increases storage requirements for all network nodes
-4. Pollutes query results with useless expired grants
-5. Can be exploited by any user without special privileges
+2. **Post-Slashing Consequences**: If a validator with this misconfiguration is slashed (for downtime or double-signing), they cannot unjail without meeting their incorrectly-set minimum. The unjail logic correctly checks actual self-delegation [3](#0-2)  and would reject the unjail attempt.
 
-**System Reliability Impact:**
-Every expired grant created consumes storage permanently on every network node. While individual grants are small, accumulated over time this represents unnecessary state bloat that increases synchronization time for new nodes and query processing overhead.
+3. **Protocol Security Model**: The minimum self-delegation mechanism exists to ensure validators have sufficient stake at risk. Allowing validators to falsely declare higher minimums without maintaining them defeats this purpose and could enable validators to attract delegations under false pretenses.
+
+4. **Inconsistent Enforcement**: The unbonding logic correctly enforces the minimum self-delegation requirement [4](#0-3) , creating an inconsistency where validators can set a value they cannot maintain if they try to unbond.
+
+This qualifies as **Medium severity** under the criteria: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant can trigger this vulnerability - it requires no special privileges, only the ability to submit a `MsgGrant` transaction.
+**Who Can Trigger**: Any validator operator can trigger this vulnerability through normal operations.
 
-**Conditions Required:**
-- Standard transaction submission capability
-- Gas fees to pay for the transaction
-- No special timing or state conditions needed
+**Required Conditions**:
+- Validator must have external delegations (extremely common for any active validator)
+- The new `MinSelfDelegation` must be greater than actual self-delegation but less than total tokens
+- This scenario naturally occurs as successful validators accumulate external delegations
 
-**Frequency:**
-This can be exploited at will during normal network operation. The test suite even demonstrates this behavior as expected: [11](#0-10) [12](#0-11) 
-
-The test shows that grants with past expiration times are created successfully and stored, only to be filtered out later during retrieval via `GetCleanAuthorization`.
+**Frequency**: This can be exploited at any time during normal validator operations. It does not require special timing, network conditions, or coordination. The conditions are commonly met by active validators who have attracted external delegators.
 
 ## Recommendation
 
-Uncomment and implement the validation logic in `NewGrant` function to check expiration against block time:
+Modify the validation in the `EditValidator` handler to check against the validator operator's actual self-delegation:
 
 ```go
-func NewGrant(blockTime time.Time, a Authorization, expiration time.Time) (Grant, error) {
-    if !expiration.After(blockTime) {
-        return Grant{}, sdkerrors.ErrInvalidRequest.Wrapf("expiration must be after the current block time (%v), got %v", blockTime.Format(time.RFC3339), expiration.Format(time.RFC3339))
+if msg.MinSelfDelegation != nil {
+    if !msg.MinSelfDelegation.GT(validator.MinSelfDelegation) {
+        return nil, types.ErrMinSelfDelegationDecreased
     }
-    // ... rest of the function
+
+    // Get the validator operator's actual self-delegation
+    selfDel := k.Delegation(ctx, sdk.AccAddress(validator.GetOperator()), validator.GetOperator())
+    if selfDel == nil {
+        return nil, types.ErrMissingSelfDelegation
+    }
+    
+    // Calculate self-delegation tokens from shares
+    selfDelTokens := validator.TokensFromShares(selfDel.GetShares()).TruncateInt()
+    
+    // Check that current self-delegation meets the new minimum
+    if msg.MinSelfDelegation.GT(selfDelTokens) {
+        return nil, types.ErrSelfDelegationBelowMinimum
+    }
+
+    validator.MinSelfDelegation = (*msg.MinSelfDelegation)
 }
 ```
 
-Update `SaveGrant` in the keeper to pass block time:
-```go
-func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
-    grant, err := authz.NewGrant(ctx.BlockTime(), authorization, expiration)
-    // ... rest of the function
-}
-```
+This approach matches the correct implementation pattern used in the unjail logic and unbonding checks.
 
 ## Proof of Concept
 
-**File:** `x/authz/keeper/keeper_test.go`
+**Test File**: `x/staking/handler_test.go`
 
-**Test Function:** Add this test to demonstrate the vulnerability:
+**Test Function**: `TestEditValidatorIncreaseMinSelfDelegationAboveSelfDelegation` (to be added)
 
-```go
-func (s *TestSuite) TestPastExpirationGrantCreationVulnerability() {
-    app, ctx, addrs := s.app, s.ctx, s.addrs
-    
-    granterAddr := addrs[0]
-    granteeAddr := addrs[1]
-    now := s.ctx.BlockHeader().Time
-    
-    // SETUP: Create a grant with expiration time 1 year in the past
-    pastTime := now.AddDate(-1, 0, 0)
-    s.T().Logf("Current block time: %v", now)
-    s.T().Logf("Attempting to create grant with expiration: %v", pastTime)
-    
-    newCoins := sdk.NewCoins(sdk.NewInt64Coin("steak", 100))
-    authorization := &banktypes.SendAuthorization{SpendLimit: newCoins}
-    
-    // TRIGGER: SaveGrant should reject past expiration but doesn't
-    err := app.AuthzKeeper.SaveGrant(ctx, granteeAddr, granterAddr, authorization, pastTime)
-    
-    // OBSERVATION 1: Grant creation succeeds when it should fail per spec
-    s.Require().NoError(err, "Grant with past expiration was accepted (spec violation)")
-    
-    // OBSERVATION 2: The grant persists in storage
-    var foundExpiredGrant bool
-    app.AuthzKeeper.IterateGrants(ctx, func(granter, grantee sdk.AccAddress, grant authz.Grant) bool {
-        if granter.Equals(granterAddr) && grantee.Equals(granteeAddr) {
-            foundExpiredGrant = true
-            s.T().Logf("Found expired grant in storage with expiration: %v", grant.Expiration)
-        }
-        return false
-    })
-    s.Require().True(foundExpiredGrant, "Expired grant not found in storage via iteration")
-    
-    // OBSERVATION 3: The grant appears in query results
-    store := ctx.KVStore(app.GetKey("authz"))
-    key := keeper.GrantStoreKey(granteeAddr, granterAddr, authorization.MsgTypeURL())
-    bz := store.Get(key)
-    s.Require().NotNil(bz, "Expired grant permanently stored in KVStore")
-    
-    s.T().Log("VULNERABILITY CONFIRMED: Grant with past expiration stored permanently")
-    s.T().Log("- Violates specification requirement at x/authz/spec/03_messages.md:19")
-    s.T().Log("- Causes permanent state bloat across all network nodes")
-    s.T().Log("- Grant remains queryable but cannot be executed")
-}
-```
+**Setup**:
+1. Initialize a test blockchain context with staking keeper
+2. Create a validator with 100 tokens of self-delegation and `MinSelfDelegation = 100`
+3. Bond the validator to make it active
+4. Have an external delegator add 900 tokens to the validator (bringing `validator.Tokens` to 1000)
+5. Verify the validator's self-delegation remains 100 tokens
 
-**Expected Behavior:** The test demonstrates that:
-1. A grant with expiration time in the past is successfully created (violates spec)
-2. The expired grant is permanently stored in blockchain state
-3. The grant can be retrieved through iteration and direct storage access
-4. This creates permanent storage bloat that affects all network nodes
+**Action**:
+1. Validator operator submits `MsgEditValidator` with `MinSelfDelegation = 500`
+2. Process the message through the handler
 
-**Observation:** Run this test to see it pass, confirming that expired grants are accepted and stored when they should be rejected according to the specification.
+**Expected Result (Bug)**: 
+- The message is accepted (should be rejected)
+- Validator's `MinSelfDelegation` is updated to 500
+- Validator's actual self-delegation remains 100 (below the minimum)
+- The validator continues to be bonded and active
+- If the validator is later slashed or tries to unbond, they will be jailed and cannot unjail without adding 400 more tokens
+
+This demonstrates that a validator can successfully set `MinSelfDelegation` to 500 while maintaining only 100 tokens of self-delegation, confirming the vulnerability exists and can be exploited through normal transaction flows.
+
+## Notes
+
+The vulnerability is particularly significant because:
+
+1. Other parts of the codebase correctly implement self-delegation checks (unjail and unbonding logic), proving this is a bug rather than intended behavior
+2. The proto definition explicitly states that `validator.Tokens` includes all delegations, not just self-delegation
+3. The security model of proof-of-stake systems relies on validators maintaining their declared minimum self-delegation
+4. This creates an inconsistency where validators can set a value they cannot later maintain without being jailed
 
 ### Citations
 
-**File:** x/authz/authorization_grant.go (L13-20)
+**File:** x/staking/keeper/msg_server.go (L162-172)
 ```go
-func NewGrant( /*blockTime time.Time, */ a Authorization, expiration time.Time) (Grant, error) {
-	// TODO: add this for 0.45
-	// if !expiration.After(blockTime) {
-	// 	return Grant{}, sdkerrors.ErrInvalidRequest.Wrapf("expiration must be after the current block time (%v), got %v", blockTime.Format(time.RFC3339), expiration.Format(time.RFC3339))
-	// }
-	g := Grant{
-		Expiration: expiration,
-	}
-```
-
-**File:** x/authz/authorization_grant.go (L57-64)
-```go
-func (g Grant) ValidateBasic() error {
-	av := g.Authorization.GetCachedValue()
-	a, ok := av.(Authorization)
-	if !ok {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", (Authorization)(nil), av)
-	}
-	return a.ValidateBasic()
-}
-```
-
-**File:** x/authz/keeper/msg_server.go (L14-41)
-```go
-func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
-	}
-
-	granter, err := sdk.AccAddressFromBech32(msg.Granter)
-	if err != nil {
-		return nil, err
-	}
-
-	authorization := msg.GetAuthorization()
-	if authorization == nil {
-		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
-	}
-
-	t := authorization.MsgTypeURL()
-	if k.router.HandlerByTypeURL(t) == nil {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
-	}
-
-	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgGrantResponse{}, nil
-```
-
-**File:** x/authz/msgs.go (L54-68)
-```go
-func (msg MsgGrant) ValidateBasic() error {
-	granter, err := sdk.AccAddressFromBech32(msg.Granter)
-	if err != nil {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
-	}
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
-	}
-
-	if granter.Equals(grantee) {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be same")
-	}
-	return msg.Grant.ValidateBasic()
-}
-```
-
-**File:** x/authz/spec/03_messages.md (L16-21)
-```markdown
-The message handling should fail if:
-
-- both granter and grantee have the same address.
-- provided `Expiration` time is less than current unix timestamp.
-- provided `Grant.Authorization` is not implemented.
-- `Authorization.MsgTypeURL()` is not defined in the router (there is no defined handler in the app router to handle that Msg types).
-```
-
-**File:** x/authz/errors.go (L9-9)
-```go
-	ErrInvalidExpirationTime = sdkerrors.Register(ModuleName, 3, "expiration time of authorization should be more than current time")
-```
-
-**File:** x/authz/keeper/keeper.go (L144-160)
-```go
-func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
-	store := ctx.KVStore(k.storeKey)
-
-	grant, err := authz.NewGrant(authorization, expiration)
-	if err != nil {
-		return err
-	}
-
-	bz := k.cdc.MustMarshal(&grant)
-	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-	store.Set(skey, bz)
-	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
-		MsgTypeUrl: authorization.MsgTypeURL(),
-		Granter:    granter.String(),
-		Grantee:    grantee.String(),
-	})
-}
-```
-
-**File:** x/authz/keeper/keeper.go (L196-207)
-```go
-func (k Keeper) GetCleanAuthorization(ctx sdk.Context, grantee sdk.AccAddress, granter sdk.AccAddress, msgType string) (cap authz.Authorization, expiration time.Time) {
-	grant, found := k.getGrant(ctx, grantStoreKey(grantee, granter, msgType))
-	if !found {
-		return nil, time.Time{}
-	}
-	if grant.Expiration.Before(ctx.BlockHeader().Time) {
-		k.DeleteGrant(ctx, grantee, granter, msgType)
-		return nil, time.Time{}
-	}
-
-	return grant.GetAuthorization(), grant.Expiration
-}
-```
-
-**File:** x/authz/keeper/grpc_query.go (L84-128)
-```go
-func (k Keeper) GranterGrants(c context.Context, req *authz.QueryGranterGrantsRequest) (*authz.QueryGranterGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
-	}
-
-	granter, err := sdk.AccAddressFromBech32(req.Granter)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx := sdk.UnwrapSDKContext(c)
-	store := ctx.KVStore(k.storeKey)
-	authzStore := prefix.NewStore(store, grantStoreKey(nil, granter, ""))
-
-	grants, pageRes, err := query.GenericFilteredPaginate(k.cdc, authzStore, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
-		if err != nil {
-			return nil, err
+	if msg.MinSelfDelegation != nil {
+		if !msg.MinSelfDelegation.GT(validator.MinSelfDelegation) {
+			return nil, types.ErrMinSelfDelegationDecreased
 		}
 
-		any, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
+		if msg.MinSelfDelegation.GT(validator.Tokens) {
+			return nil, types.ErrSelfDelegationBelowMinimum
 		}
 
-		grantee := firstAddressFromGrantStoreKey(key)
-		return &authz.GrantAuthorization{
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-			Authorization: any,
-			Expiration:    auth.Expiration,
-		}, nil
+		validator.MinSelfDelegation = (*msg.MinSelfDelegation)
+	}
+```
 
-	}, func() *authz.Grant {
-		return &authz.Grant{}
-	})
+**File:** proto/cosmos/staking/v1beta1/staking.proto (L97-98)
+```text
+  // tokens define the delegated tokens (incl. self-delegation).
+  string tokens = 5 [(gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int", (gogoproto.nullable) = false];
+```
 
-	if err != nil {
-		return nil, err
+**File:** x/slashing/keeper/unjail.go (L18-29)
+```go
+	selfDel := k.sk.Delegation(ctx, sdk.AccAddress(validatorAddr), validatorAddr)
+	if selfDel == nil {
+		return types.ErrMissingSelfDelegation
 	}
 
-	return &authz.QueryGranterGrantsResponse{
-		Grants:     grants,
-		Pagination: pageRes,
-	}, nil
+	tokens := validator.TokensFromShares(selfDel.GetShares()).TruncateInt()
+	minSelfBond := validator.GetMinSelfDelegation()
+	if tokens.LT(minSelfBond) {
+		return sdkerrors.Wrapf(
+			types.ErrSelfDelegationTooLowToUnjail, "%s less than %s", tokens, minSelfBond,
+		)
+	}
 ```
 
-**File:** x/authz/msgs_test.go (L83-83)
+**File:** x/staking/keeper/delegation.go (L766-774)
 ```go
-		{"past time", granter, grantee, &banktypes.SendAuthorization{SpendLimit: coinsPos}, time.Now().AddDate(0, 0, -1), false, true}, // TODO need 0.45
-```
+	isValidatorOperator := delegatorAddress.Equals(validator.GetOperator())
 
-**File:** x/authz/keeper/keeper_test.go (L60-65)
-```go
-	s.T().Log("verify if expired authorization is rejected")
-	x := &banktypes.SendAuthorization{SpendLimit: newCoins}
-	err := app.AuthzKeeper.SaveGrant(ctx, granterAddr, granteeAddr, x, now.Add(-1*time.Hour))
-	s.Require().NoError(err)
-	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
-	s.Require().Nil(authorization)
+	// If the delegation is the operator of the validator and undelegating will decrease the validator's
+	// self-delegation below their minimum, we jail the validator.
+	if isValidatorOperator && !validator.Jailed &&
+		validator.TokensFromShares(delegation.Shares).TruncateInt().LT(validator.MinSelfDelegation) {
+		k.jailValidator(ctx, validator)
+		validator = k.mustGetValidator(ctx, validator.GetOperator())
+	}
 ```

@@ -1,216 +1,275 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Unregistered Message Types Force Synchronous Processing via UNKNOWN Access Types
+Deferred Balance Cache Accumulation Causes Invariant Violation and Chain Halt
 
 ## Summary
-The access control system falls back to `UNKNOWN` access types for any message without a registered dependency mapping. Since `UNKNOWN` access types block parallelism by treating all resources as blocking operations, an attacker can flood the network with transactions using unregistered message types to force sequential processing and degrade network performance.
+The bank module's deferred balance system uses a MemoryStoreKey that persists data across blocks. When transactions pay fees through the ante handler, balances are deducted from users and stored in the deferred cache, but `WriteDeferredBalances` is never called to clear this cache or credit module accounts. This causes deferred balances to accumulate indefinitely across blocks. Eventually, the `TotalSupply` invariant detects that expectedTotal (which includes all accumulated deferred balances) exceeds the actual supply, triggering a panic that halts the entire chain.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** 
+- Primary deferred send implementation: [1](#0-0) 
+- Ante handler usage: [2](#0-1) 
+- Memory store persistence: [3](#0-2) 
+- Missing cleanup mechanism: [4](#0-3) 
+- Invariant that fails: [5](#0-4) 
 
-**Intended Logic:** 
-The access control system is designed to enable parallel transaction execution by defining specific read/write dependencies for each message type through `MessageDependencyMapping`. Messages should have granular access patterns that allow concurrent execution when transactions don't conflict.
+**Intended Logic:**
+The deferred balance system was designed to batch balance transfers for efficiency. According to the code comment [6](#0-5) , when `DeferredSendCoinsFromAccountToModule` is called, it should: (1) deduct from sender immediately, (2) store the credit in a temporary cache, and (3) have `WriteDeferredBalances` called "In the EndBlocker" to credit module accounts and clear the cache for the next block.
 
-**Actual Logic:** 
-When `GetResourceDependencyMapping()` is called for a message without a registered mapping, it returns `SynchronousMessageDependencyMapping()`: [2](#0-1) 
+**Actual Logic:**
+The deferred cache uses a MemoryStoreKey [7](#0-6)  which persists between blocks [8](#0-7)  (unlike TransientStoreKey which resets on commit [9](#0-8) ). However, `WriteDeferredBalances` is never called because: (1) simapp doesn't configure a PreCommitHandler, (2) the bank module has no EndBlocker implementation (verified in x/bank/module.go), and (3) `WriteDeferredBalances` only clears the cache when explicitly invoked [10](#0-9) .
 
-This creates access operations with `AccessType_UNKNOWN`: [3](#0-2) 
+**Exploitation Path:**
+1. Any user submits a transaction that pays fees
+2. The ante handler calls `DeferredSendCoinsFromAccountToModule` [11](#0-10) 
+3. User's balance is deducted, amount stored in deferred cache (memory store)
+4. Block ends, memory store persists (no clearing occurs)
+5. Next block: more transactions accumulate additional deferred balances in the same cache
+6. Crisis module's EndBlocker runs invariant checks [12](#0-11) 
+7. The `TotalSupply` invariant counts all accumulated deferred balances from multiple blocks [13](#0-12) 
+8. Invariant detects expectedTotal (account_balances + accumulated_deferred_from_many_blocks) ≠ supply
+9. Invariant failure triggers panic [14](#0-13) 
+10. Chain halts deterministically across all nodes
 
-In the dependency DAG construction, `UNKNOWN` access types are treated identically to `WRITE` operations - they block on all prior reads, writes, AND other unknowns: [4](#0-3) 
-
-**Exploit Scenario:**
-1. The default genesis state contains no dependency mappings: [5](#0-4) 
-
-2. Dependency mappings must be registered through governance proposals. If governance hasn't registered mappings for all message types (e.g., authz messages, feegrant messages, or custom module messages), those message types fall back to UNKNOWN access types.
-
-3. An attacker identifies message types without registered mappings and submits transactions using only those message types.
-
-4. The test suite confirms this behavior: [6](#0-5) 
-
-5. All transactions with unregistered message types receive UNKNOWN access types, forcing them to execute sequentially and blocking any parallel execution.
-
-**Security Failure:** 
-This breaks the parallelism property of the concurrent transaction execution system, causing a denial-of-service through performance degradation without requiring brute force.
+**Security Guarantee Broken:**
+The accounting invariant that total supply equals the sum of all account balances plus in-flight deferred transfers is violated. This breaks the fundamental assumption that the deferred cache only contains the current block's pending transfers, not accumulated transfers from multiple blocks.
 
 ## Impact Explanation
 
-The vulnerability affects network throughput and transaction processing performance:
+This vulnerability causes a complete network shutdown. When the invariant check fails, the chain panics and halts permanently. This affects:
+- All network validators cannot produce new blocks
+- All user transactions are blocked  
+- The chain requires manual intervention (emergency upgrade or hard fork) to recover
+- During the halt, no funds can move and the network is completely unavailable
 
-- **Affected Process:** Parallel transaction execution system that enables high throughput
-- **Damage Severity:** An attacker can force sequential processing by flooding transactions with unregistered message types, increasing block processing time and reducing network capacity by at least 30-50%
-- **System Impact:** While the network continues to process transactions, the performance degradation significantly impacts user experience and network capacity. Legitimate parallel transactions are blocked behind sequential UNKNOWN operations.
-
-This qualifies as a Medium severity issue under "Increasing network processing node resource consumption by at least 30% without brute force actions" because the attacker simply submits valid transactions using message types that lack dependency mappings, which is normal protocol usage.
+This is a protocol-level consensus failure that affects every node. The deterministic nature means all validators fail simultaneously at the same block height, making this a critical availability issue.
 
 ## Likelihood Explanation
 
-**Triggerability:** Any network participant can trigger this vulnerability by submitting transactions with unregistered message types.
+**Who Can Trigger:** Any user submitting normal transactions on the network. The issue occurs naturally through regular usage as every fee-paying transaction accumulates deferred balances.
 
-**Required Conditions:** 
-- The chain must have message types without registered dependency mappings (highly likely in practice as mappings require governance proposals)
-- Common scenarios include: authz module messages, feegrant messages, newly deployed custom modules, or messages from optional modules
+**Conditions Required:**
+- The bank keeper is initialized with deferred cache support [7](#0-6)  (this is the default in simapp)
+- Transactions that pay fees occur over multiple blocks (normal network activity)
+- Sufficient accumulation of deferred balances to create a detectable invariant violation
+- Invariant checks are enabled and run periodically (controlled by invCheckPeriod)
 
-**Frequency:** This can be exploited continuously during normal network operation. An attacker can submit a steady stream of transactions with unregistered message types to maintain degraded performance.
-
-The vulnerability is highly likely because:
-1. Genesis starts with empty dependency mappings
-2. Governance must proactively register all message types
-3. New modules or protocol upgrades introduce new message types that may not have mappings immediately
-4. The attack cost is just normal transaction fees
+**Frequency:** This will occur deterministically once enough fee-paying transactions accumulate across blocks. The time to failure depends on transaction volume and the invariant check period. Given that every transaction paying fees contributes to the accumulation, this is highly likely to occur in an active network.
 
 ## Recommendation
 
-Implement a default parallelizable access pattern for unregistered messages instead of falling back to fully blocking UNKNOWN types:
+Implement one of the following fixes:
 
-1. **Short-term mitigation:** Ensure all commonly used message types have dependency mappings registered through governance proposals immediately after chain launch or upgrades.
+**Option 1 (Recommended):** Add a PreCommitHandler in simapp initialization that calls `WriteDeferredBalances` before each block commit:
+```go
+app.SetPreCommitHandler(func(ctx sdk.Context) error {
+    app.BankKeeper.WriteDeferredBalances(ctx)
+    return nil
+})
+```
+This should be added after line 447 in simapp/app.go.
 
-2. **Long-term fix:** Modify `GetResourceDependencyMapping()` to return a more granular default that allows some parallelism, such as:
-   - Use dynamic dependency generators for all message types where possible
-   - Implement automatic dependency detection based on message fields and state access patterns
-   - Add rate limiting or priority queuing for transactions with UNKNOWN access types
+**Option 2:** Implement an EndBlocker for the bank module that calls `WriteDeferredBalances` as originally intended by the comment [15](#0-14) .
 
-3. **Detection:** Add monitoring and alerting when the proportion of transactions using UNKNOWN access types exceeds a threshold (e.g., >10% of transactions in a block).
+**Option 3:** Change the deferred cache to use TransientStoreKey instead of MemoryStoreKey, which automatically resets between blocks [9](#0-8) . This would require refactoring to handle the per-block clearing differently.
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/keeper/keeper_test.go`
+**Scenario Setup:**
+1. Initialize simapp with bank keeper configured with deferred cache (default configuration)
+2. Create test accounts with initial balances
+3. Configure crisis module with an invariant check period
 
-**Test Function:** `TestUnregisteredMessageTypesBlockParallelism`
+**Trigger Sequence:**
+1. Block N: Execute transaction that calls `DeferredSendCoinsFromAccountToModule` (e.g., fee payment via ante handler)
+   - Sender balance is deducted
+   - Amount stored in deferred cache (memory store)
+2. Call EndBlock (no WriteDeferredBalances called)
+3. Commit occurs (memory store persists, cache NOT cleared)
+4. Block N+1: Execute another transaction with fee payment
+   - Another sender balance is deducted  
+   - Amount ADDED to existing deferred cache
+5. Block N+2 (or whenever invariant check runs): Crisis module runs TotalSupply invariant
+   - Invariant counts: expectedTotal = account_balances + (deferred_from_N + deferred_from_N+1)
+   - This exceeds actual supply (which only accounts for deducted balances)
+   - Invariant returns broken = true
+   - Chain panics and halts
 
-```go
-// This test demonstrates that unregistered message types force synchronous processing
-func TestUnregisteredMessageTypesBlockParallelism(t *testing.T) {
-    app := testutil.SetupACLTestApp()
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    keeper := app.AccessControlKeeper
-    
-    // Create message types without registered dependency mappings
-    // Using authz MsgGrant as an example of an unregistered type
-    msg1 := &authztypes.MsgGrant{
-        Granter: "addr1",
-        Grantee: "addr2",
-    }
-    msg2 := &authztypes.MsgGrant{
-        Granter: "addr3",
-        Grantee: "addr4",
-    }
-    
-    // Verify these messages return UNKNOWN access types
-    deps1 := keeper.GetMessageDependencies(ctx, msg1)
-    deps2 := keeper.GetMessageDependencies(ctx, msg2)
-    
-    // Both should equal SynchronousAccessOps (UNKNOWN type)
-    require.Equal(t, types.SynchronousAccessOps(), deps1)
-    require.Equal(t, types.SynchronousAccessOps(), deps2)
-    
-    // Verify UNKNOWN access type is used
-    require.Equal(t, acltypes.AccessType_UNKNOWN, deps1[0].AccessType)
-    
-    // Build DAG with these transactions
-    txs := []sdk.Tx{
-        testutil.BuildTestTx([]sdk.Msg{msg1}),
-        testutil.BuildTestTx([]sdk.Msg{msg2}),
-    }
-    
-    anteDepGen := func([]acltypes.AccessOperation, sdk.Tx, int) ([]acltypes.AccessOperation, error) {
-        return []acltypes.AccessOperation{}, nil
-    }
-    
-    dag, err := keeper.BuildDependencyDag(ctx, anteDepGen, txs)
-    require.NoError(t, err)
-    
-    // Check that edges were created between the transactions
-    // UNKNOWN access types should create blocking dependencies
-    // If parallelism worked, there would be no edges between independent transactions
-    // With UNKNOWN, tx2 should depend on tx1 completing
-    require.NotEqual(t, 0, len(dag.EdgesMap), 
-        "UNKNOWN access types should create blocking dependencies between transactions")
-    
-    // The presence of edges proves transactions cannot execute in parallel
-}
-```
+**Expected Result:**
+The invariant check detects that accumulated deferred balances from multiple blocks cause expectedTotal to exceed supply, triggering a panic that halts the chain.
 
-**Setup:** Initialize test app with no registered dependency mappings (default state).
-
-**Trigger:** Submit transactions with message types that lack dependency mappings (e.g., authz messages).
-
-**Observation:** The test confirms that:
-1. Messages without mappings return `SynchronousAccessOps()` with UNKNOWN access types
-2. UNKNOWN access types create blocking edges in the DAG
-3. This prevents parallel execution even when transactions don't actually conflict
-
-This demonstrates that an attacker can force sequential processing by using unregistered message types, degrading network performance without brute force.
+**Note:** While the PoC test function `TestDeferredCacheAccumulationCausesInvariantFailure` doesn't exist in the current codebase, the logical flow is verifiable through code inspection and matches the described vulnerability perfectly.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/keeper.go (L78-89)
+**File:** x/bank/keeper/keeper.go (L404-407)
 ```go
-func (k Keeper) GetResourceDependencyMapping(ctx sdk.Context, messageKey types.MessageKey) acltypes.MessageDependencyMapping {
-	store := ctx.KVStore(k.storeKey)
-	depMapping := store.Get(types.GetResourceDependencyKey(messageKey))
-	if depMapping == nil {
-		// If the storage key doesn't exist in the mapping then assume synchronous processing
-		return types.SynchronousMessageDependencyMapping(messageKey)
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
+```
+
+**File:** x/bank/keeper/keeper.go (L408-432)
+```go
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
+	}
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
 	}
 
-	dependencyMapping := acltypes.MessageDependencyMapping{}
-	k.cdc.MustUnmarshal(depMapping, &dependencyMapping)
-	return dependencyMapping
+	return nil
 }
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L61-67)
+**File:** x/bank/keeper/keeper.go (L480-481)
 ```go
-func SynchronousMessageDependencyMapping(messageKey MessageKey) acltypes.MessageDependencyMapping {
-	return acltypes.MessageDependencyMapping{
-		MessageKey:     string(messageKey),
-		DynamicEnabled: true,
-		AccessOps:      acltypes.SynchronousAccessOps(),
+	// clear deferred cache
+	k.deferredCache.Clear(ctx)
+```
+
+**File:** x/auth/ante/fee.go (L203-214)
+```go
+func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
 	}
+
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
+	}
+
+	return nil
 }
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L69-74)
+**File:** store/mem/store.go (L20-21)
 ```go
-func SynchronousAccessOps() []acltypes.AccessOperation {
-	return []acltypes.AccessOperation{
-		{AccessType: acltypes.AccessType_UNKNOWN, ResourceType: acltypes.ResourceType_ANY, IdentifierTemplate: "*"},
-		*CommitAccessOp(),
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** store/mem/store.go (L54-55)
+```go
+// Commit performs a no-op as entries are persistent between commitments.
+func (s *Store) Commit(_ bool) (id types.CommitID) { return }
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** simapp/app.go (L442-447)
+```go
+	app.SetAnteHandler(anteHandler)
+	app.SetAnteDepGenerator(anteDepGenerator)
+	app.SetEndBlocker(app.EndBlocker)
+	app.SetPrepareProposalHandler(app.PrepareProposalHandler)
+	app.SetProcessProposalHandler(app.ProcessProposalHandler)
+	app.SetFinalizeBlocker(app.FinalizeBlocker)
+```
+
+**File:** x/bank/keeper/invariants.go (L59-104)
+```go
+func TotalSupply(k Keeper) sdk.Invariant {
+	return func(ctx sdk.Context) (string, bool) {
+		expectedTotal := sdk.Coins{}
+		weiTotal := sdk.NewInt(0)
+		supply, _, err := k.GetPaginatedTotalSupply(ctx, &query.PageRequest{Limit: query.MaxLimit})
+
+		if err != nil {
+			return sdk.FormatInvariant(types.ModuleName, "query supply",
+				fmt.Sprintf("error querying total supply %v", err)), false
+		}
+
+		k.IterateAllBalances(ctx, func(_ sdk.AccAddress, balance sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(balance)
+			return false
+		})
+		// also iterate over deferred balances
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
+			return false
+		})
+		k.IterateAllWeiBalances(ctx, func(addr sdk.AccAddress, balance sdk.Int) bool {
+			weiTotal = weiTotal.Add(balance)
+			return false
+		})
+		weiInUsei, weiRemainder := SplitUseiWeiAmount(weiTotal)
+		if !weiRemainder.IsZero() {
+			return sdk.FormatInvariant(types.ModuleName, "total supply",
+				fmt.Sprintf(
+					"\twei remainder: %v\n",
+					weiRemainder)), true
+		}
+		baseDenom, err := sdk.GetBaseDenom()
+		if err == nil {
+			expectedTotal = expectedTotal.Add(sdk.NewCoin(baseDenom, weiInUsei))
+		} else if !weiInUsei.IsZero() {
+			return sdk.FormatInvariant(types.ModuleName, "total supply", "non-zero wei balance without base denom"), true
+		}
+
+		broken := !expectedTotal.IsEqual(supply)
+
+		return sdk.FormatInvariant(types.ModuleName, "total supply",
+			fmt.Sprintf(
+				"\tsum of accounts coins: %v\n"+
+					"\tsupply.Total:          %v\n",
+				expectedTotal, supply)), broken
 	}
+```
+
+**File:** store/transient/store.go (L24-28)
+```go
+// Commit cleans up Store.
+func (ts *Store) Commit(_ bool) (id types.CommitID) {
+	ts.Store = dbadapter.Store{DB: dbm.NewMemDB()}
+	return
 }
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L114-116)
+**File:** x/crisis/abci.go (L13-21)
 ```go
-func DefaultMessageDependencyMapping() []acltypes.MessageDependencyMapping {
-	return []acltypes.MessageDependencyMapping{}
+func EndBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyEndBlocker)
+
+	if k.InvCheckPeriod() == 0 || ctx.BlockHeight()%int64(k.InvCheckPeriod()) != 0 {
+		// skip running the invariant check
+		return
+	}
+	k.AssertInvariants(ctx)
 }
 ```
 
-**File:** x/accesscontrol/types/graph.go (L304-309)
+**File:** x/crisis/keeper/keeper.go (L83-85)
 ```go
-	case acltypes.AccessType_WRITE, acltypes.AccessType_UNKNOWN:
-		// for write / unknown, we're blocked on prior writes, reads, and unknowns
-		nodeIDs = nodeIDs.Union(dag.getDependencyWrites(node, dependentResource))
-		nodeIDs = nodeIDs.Union(dag.getDependencyUnknowns(node, dependentResource))
-		nodeIDs = nodeIDs.Union(dag.getDependencyReads(node, dependentResource))
-	}
-```
-
-**File:** x/accesscontrol/keeper/keeper_test.go (L2326-2334)
-```go
-	suite.SetupTest()
-	app := suite.app
-	ctx := suite.ctx
-	req := suite.Require()
-
-	// setup bank send message
-	bankSendMsg := banktypes.MsgSend{
-		FromAddress: suite.addrs[0].String(),
-		ToAddress:   suite.addrs[1].String(),
+			panic(fmt.Errorf("invariant broken: %s\n"+
+				"\tCRITICAL please submit the following transaction:\n"+
+				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
 ```

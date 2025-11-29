@@ -1,234 +1,211 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Integer Overflow in Fee Calculation Causes Node Crash via Unsafe uint64 to int64 Cast
+Chain Fails to Start When Genesis Contains Wei Balances Due to Missing Base Denom Registration
 
 ## Summary
-The fee calculation logic in `CheckTxFeeWithValidatorMinGasPrices` performs an unsafe cast from `uint64` to `int64` when converting the transaction's gas limit to a `Dec` type. When a transaction specifies a gas limit greater than `math.MaxInt64`, this cast causes integer overflow, producing a negative value that ultimately triggers a panic when attempting to create a coin with a negative amount, resulting in a denial-of-service crash of the validator node.
+The bank keeper's `InitGenesis` function panics during chain initialization when the genesis state contains wei balances but `sdk.RegisterDenom()` has never been called. Since `RegisterDenom()` is only invoked in test setup functions and never in the production application startup sequence, any genesis file containing wei balances will cause total network shutdown, preventing all validators from starting the chain. [1](#0-0) 
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- Primary: `x/bank/keeper/genesis.go`, lines 39-46 in the `InitGenesis` function
+- Secondary: `types/denom.go`, lines 48-54 in the `GetBaseDenom` function [1](#0-0) [2](#0-1) 
 
-**Intended Logic:** 
-The code is intended to calculate the required fees for a transaction by multiplying the minimum gas price by the transaction's gas limit, then validate that the provided fees meet this requirement. The calculation should handle all valid uint64 gas limit values safely without causing panics or crashes.
+**Intended logic:** 
+The code expects that `sdk.RegisterDenom()` is called during application startup to register the base denomination before `InitGenesis` processes wei balances. Wei balances (with 18-decimal precision) should be converted to the base denomination during genesis initialization for EVM compatibility. [3](#0-2) 
 
-**Actual Logic:** 
-The vulnerable code performs an unsafe type conversion from `uint64` to `int64` without checking for overflow. When a transaction's gas limit exceeds `math.MaxInt64` (9,223,372,036,854,775,807), the cast wraps around to a large negative number. This negative value is then used in fee calculations, producing a negative fee amount. When attempting to create a coin with this negative amount, the `NewCoin` function validates the amount and panics, crashing the node.
+**Actual logic:**
+`sdk.RegisterDenom()` is never called in the production startup path. The function only appears in test setup code. The package-level variable `baseDenom` remains an empty string. When `InitGenesis` processes wei balances:
+1. Wei balances are accumulated into `weiInUsei`
+2. The code calls `sdk.GetBaseDenom()` which returns an error ("no denom is registered") because `baseDenom` is empty
+3. Since `weiInUsei` is non-zero, the panic condition triggers
+4. All validator nodes fail with: "base denom is not registered ... yet there exists wei balance" [4](#0-3) [5](#0-4) [6](#0-5) 
 
-The transaction's gas limit field is defined as `uint64`: [2](#0-1) 
+**Exploitation path:**
+1. Chain operators prepare a genesis file with wei balances (a documented feature for EVM compatibility)
+2. Validators execute normal chain startup (`simd start`)
+3. During ABCI `InitChain`, the module manager calls `bank.InitGenesis`
+4. InitGenesis processes wei balances but panics due to unregistered base denomination
+5. All validator nodes crash before producing any blocks [7](#0-6) [8](#0-7) 
 
-The protobuf unmarshaling accepts any valid uint64 value without upper bound restrictions beyond the uint64 maximum: [3](#0-2) 
-
-The `NewCoin` function validates that amounts are non-negative and panics if they are negative: [4](#0-3) [5](#0-4) 
-
-**Exploit Scenario:**
-1. An attacker crafts a transaction with a gas limit set to `math.MaxInt64 + 1` (9,223,372,036,854,775,808) or any value greater than `math.MaxInt64`
-2. The transaction is submitted to a validator node's mempool
-3. During `CheckTx` validation, `CheckTxFeeWithValidatorMinGasPrices` is invoked
-4. At line 36, the gas value (uint64) is cast to int64: `sdk.NewDec(int64(gas))` - this causes overflow, producing `-9,223,372,036,854,775,808` (MinInt64)
-5. At line 38, the negative value is multiplied by the minimum gas price, producing a negative fee
-6. At line 39, `sdk.NewCoin` is called with the negative amount
-7. `NewCoin` validates the coin and panics due to the negative amount
-8. The panic is not caught by the recovery mechanism in `SetUpContextDecorator` (which only handles `sdk.ErrorOutOfGas` panics gracefully)
-9. The node crashes
-
-The panic recovery in SetUpContextDecorator only handles specific error types: [6](#0-5) 
-
-**Security Failure:** 
-This is a denial-of-service vulnerability. Any unprivileged user can crash validator nodes by submitting transactions with gas limits exceeding `math.MaxInt64`. This breaks the availability and reliability properties of the blockchain network.
+**Security guarantee broken:**
+Network availability - the chain cannot initialize and produce blocks despite using documented features correctly.
 
 ## Impact Explanation
 
-**Affected Assets/Processes:**
-- Validator nodes accepting transactions into their mempools
-- Network availability and transaction processing capability
-- Block production and consensus if sufficient validators are affected
+This vulnerability causes complete network shutdown. When a genesis file contains wei balances:
+- 100% of validator nodes panic on startup with identical errors
+- The chain cannot produce any blocks or process transactions (zero throughput)
+- Network is completely non-functional until codebase is patched or genesis is modified
+- All users, validators, and applications depending on the network are affected
 
-**Severity of Damage:**
-- Immediate crash of any validator node that receives and attempts to validate the malicious transaction during `CheckTx`
-- If an attacker broadcasts such transactions to multiple validators simultaneously, it could cause widespread node shutdowns
-- Potential for 30% or more of network processing nodes to be shut down, meeting the "Medium" severity threshold for in-scope impact
-- In extreme cases, if enough validators are affected, this could lead to network inability to produce blocks, meeting the "High" severity threshold
-
-**System Security/Reliability Impact:**
-This vulnerability directly threatens the network's liveness property. Blockchain networks depend on continuous operation of validator nodes to process transactions and produce blocks. A coordinated attack could severely disrupt or halt network operations, preventing legitimate users from conducting transactions and undermining confidence in the protocol's reliability.
+Wei balances are a core feature providing 18-decimal precision for EVM compatibility (similar to Ethereum's wei system with `OneUseiInWei = 1,000,000,000,000`). The feature is properly implemented throughout the banking module but the initialization sequence is broken. [9](#0-8) 
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any unprivileged user or attacker with the ability to submit transactions to the network. No special permissions, keys, or privileges are required.
+The likelihood is HIGH for any chain attempting to use wei balances in genesis:
 
-**Required Conditions:**
-- The attacker must be able to construct and broadcast a transaction (standard capability for any network participant)
-- The transaction must have a gas limit field set to a value greater than `math.MaxInt64`
-- The transaction must reach a validator's mempool for `CheckTx` validation
-- Minimum gas prices must be configured (non-zero) on the validator
+**Triggering conditions:**
+- Genesis file contains non-zero wei balances in the bank module's `WeiBalances` field
+- Chain performs initial startup or restarts from genesis (e.g., during upgrades)
+- Normal chain startup procedure is followed
 
-**Frequency:**
-- Can be triggered at any time during normal network operation
-- Multiple transactions can be crafted and broadcast simultaneously to affect multiple validators
-- No rate limiting or retry delays prevent repeated exploitation
-- Once discovered, this vulnerability can be exploited repeatedly until patched
+**Probability factors:**
+- Wei balances are documented in the proto definition as a standard feature
+- EVM compatibility is a key feature of Sei (requiring wei precision)
+- Genesis files commonly initialize balances for token distribution
+- This will trigger 100% of the time when wei balances are present
+- Every validator is affected identically
 
-The likelihood is **HIGH** - this is trivially exploitable by any network participant with no restrictions or barriers to entry.
+While controlled by chain operators (trusted role), using wei balances is a legitimate, documented use case - not misconfiguration. The resulting unrecoverable failure extends beyond the operators' intended authority.
 
 ## Recommendation
 
-Add an explicit overflow check before casting the gas limit from `uint64` to `int64`. If the gas limit exceeds `math.MaxInt64`, return an appropriate error rather than proceeding with the calculation.
+Add `sdk.RegisterDenom()` call in the application initialization before modules are initialized. Implement in `simapp/simd/cmd/root.go` in the `initRootCmd` function before `cfg.Seal()`:
 
-**Specific Fix:**
-In `x/auth/ante/validator_tx_fee.go`, before line 36, add:
 ```go
-if gas > uint64(math.MaxInt64) {
-    return nil, 0, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
-        "gas limit %d exceeds maximum allowed value %d", gas, math.MaxInt64)
+func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
+    cfg := sdk.GetConfig()
+    // Register the base denomination before sealing config
+    if err := sdk.RegisterDenom(sdk.DefaultBondDenom, sdk.OneDec()); err != nil {
+        panic(err)
+    }
+    cfg.Seal()
+    // ... rest of function
 }
 ```
 
-Alternatively, validate this constraint earlier in the transaction validation pipeline, potentially during transaction unmarshaling or basic validation, to prevent such transactions from entering the mempool at all.
+This ensures the base denomination is registered before any module initialization occurs, matching the pattern used in all test files. [10](#0-9) 
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/validator_tx_fee_test.go`
-
-**Test Function:** Add a new test function `TestCheckTxFeeWithOverflowGasLimit`
-
 **Setup:**
-1. Create a test context with `IsCheckTx` set to `true` to trigger the mempool fee validation
-2. Configure non-zero minimum gas prices (e.g., "0.01usei") to ensure fee calculation is performed
-3. Create a mock transaction that implements the `FeeTx` interface with a gas limit set to `math.MaxInt64 + 1`
-4. Provide valid but minimal fee amounts to ensure the issue is triggered in the fee calculation logic
+Create a genesis state with wei balances without calling `sdk.RegisterDenom()` to simulate production startup behavior.
 
-**Trigger:**
-1. Call `CheckTxFeeWithValidatorMinGasPrices` with the crafted transaction
-2. The function will attempt to cast the gas limit from uint64 to int64, causing overflow
-3. The negative value will be used in multiplication, producing a negative fee
-4. `NewCoin` will be called with the negative amount
+**Action:**
+Call `InitGenesis` with the genesis state containing wei balances through the normal chain initialization sequence (ABCI `InitChain` → `app.InitChainer` → `app.mm.InitGenesis` → `bank.InitGenesis`). [11](#0-10) 
 
-**Observation:**
-The test should observe a panic occurring when `NewCoin` validates the negative amount. The panic message will indicate "negative coin amount". This confirms that the overflow occurred and the validation detected the resulting invalid state. Without the fix, the node would crash; with the fix, an error should be returned instead of a panic.
+**Result:**
+The function panics with error: "base denom is not registered no denom is registered yet there exists wei balance X", preventing the chain from starting. This can be verified by examining the existing test suite which always calls `sdk.RegisterDenom()` before testing genesis with wei balances, demonstrating awareness of this dependency.
 
-**Example Test Code Structure:**
-```go
-func TestCheckTxFeeWithOverflowGasLimit(t *testing.T) {
-    // Setup: Create context with CheckTx mode and minimum gas prices
-    ctx := sdk.Context{}.WithIsCheckTx(true).WithMinGasPrices(
-        sdk.NewDecCoins(sdk.NewDecCoinFromDec("usei", sdk.NewDecWithPrec(1, 2))))
-    
-    // Create mock FeeTx with gas limit > MaxInt64
-    gasLimit := uint64(math.MaxInt64) + 1
-    
-    // Create mock transaction with overflow gas limit
-    // (Implementation details depend on test framework)
-    
-    // Trigger: Call the fee checker - this should panic on vulnerable code
-    // Expected: Should return error instead of panicking on patched code
-    defer func() {
-        if r := recover(); r != nil {
-            // Panic occurred - vulnerability confirmed
-            require.Contains(t, fmt.Sprintf("%v", r), "negative coin amount")
-        }
-    }()
-    
-    _, _, err := CheckTxFeeWithValidatorMinGasPrices(ctx, tx, false, paramsKeeper)
-    
-    // On patched code, should receive error instead of panic
-    require.Error(t, err)
-    require.Contains(t, err.Error(), "exceeds maximum allowed value")
-}
-```
-
-This proof of concept demonstrates that the vulnerability is real and exploitable, causing a panic that crashes the node when a transaction with an overflowing gas limit is processed during mempool validation.
+The vulnerability is reproducible 100% of the time when genesis contains wei balances and proves that production chains would experience total startup failure when attempting to use this documented feature.
 
 ### Citations
 
-**File:** x/auth/ante/validator_tx_fee.go (L36-39)
+**File:** x/bank/keeper/genesis.go (L39-46)
 ```go
-			glDec := sdk.NewDec(int64(gas))
-			for i, gp := range minGasPrices {
-				fee := gp.Amount.Mul(glDec)
-				requiredFees[i] = sdk.NewCoin(gp.Denom, fee.Ceil().RoundInt())
-```
-
-**File:** types/tx/tx.pb.go (L675-675)
-```go
-	GasLimit uint64 `protobuf:"varint,2,opt,name=gas_limit,json=gasLimit,proto3" json:"gas_limit,omitempty"`
-```
-
-**File:** types/tx/tx.pb.go (L2940-2958)
-```go
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field GasLimit", wireType)
-			}
-			m.GasLimit = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowTx
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.GasLimit |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-```
-
-**File:** types/coin.go (L14-27)
-```go
-// NewCoin returns a new coin with a denomination and amount. It will panic if
-// the amount is negative or if the denomination is invalid.
-func NewCoin(denom string, amount Int) Coin {
-	coin := Coin{
-		Denom:  denom,
-		Amount: amount,
+	baseDenom, err := sdk.GetBaseDenom()
+	if err != nil {
+		if !weiInUsei.IsZero() {
+			panic(fmt.Errorf("base denom is not registered %s yet there exists wei balance %s", err, weiInUsei))
+		}
+	} else {
+		totalSupply = totalSupply.Add(sdk.NewCoin(baseDenom, weiInUsei))
 	}
-
-	if err := coin.Validate(); err != nil {
-		panic(err)
-	}
-
-	return coin
-}
 ```
 
-**File:** types/coin.go (L42-52)
+**File:** types/denom.go (L14-31)
 ```go
-func (coin Coin) Validate() error {
-	if err := ValidateDenom(coin.Denom); err != nil {
+// RegisterDenom registers a denomination with a corresponding unit. If the
+// denomination is already registered, an error will be returned.
+func RegisterDenom(denom string, unit Dec) error {
+	if err := ValidateDenom(denom); err != nil {
 		return err
 	}
 
-	if coin.Amount.IsNegative() {
-		return fmt.Errorf("negative coin amount: %v", coin.Amount)
+	if _, ok := denomUnits[denom]; ok {
+		return fmt.Errorf("denom %s already registered", denom)
 	}
 
+	denomUnits[denom] = unit
+
+	if baseDenom == "" || unit.LT(denomUnits[baseDenom]) {
+		baseDenom = denom
+	}
 	return nil
 }
 ```
 
-**File:** x/auth/ante/setup.go (L66-79)
+**File:** types/denom.go (L48-54)
 ```go
-	defer func() {
-		if r := recover(); r != nil {
-			switch rType := r.(type) {
-			case sdk.ErrorOutOfGas:
-				log := fmt.Sprintf(
-					"out of gas in location: %v; gasWanted: %d, gasUsed: %d",
-					rType.Descriptor, gasTx.GetGas(), newCtx.GasMeter().GasConsumed())
+// GetBaseDenom returns the denom of smallest unit registered
+func GetBaseDenom() (string, error) {
+	if baseDenom == "" {
+		return "", fmt.Errorf("no denom is registered")
+	}
+	return baseDenom, nil
+}
+```
 
-				err = sdkerrors.Wrap(sdkerrors.ErrOutOfGas, log)
-			default:
-				panic(r)
-			}
+**File:** simapp/simd/cmd/root.go (L149-152)
+```go
+func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
+	cfg := sdk.GetConfig()
+	cfg.Seal()
+
+```
+
+**File:** simapp/simd/main.go (L12-24)
+```go
+func main() {
+	rootCmd, _ := cmd.NewRootCmd()
+
+	if err := svrcmd.Execute(rootCmd, simapp.DefaultNodeHome); err != nil {
+		switch e := err.(type) {
+		case server.ErrorCode:
+			os.Exit(e.Code)
+
+		default:
+			os.Exit(1)
 		}
-	}()
+	}
+}
+```
+
+**File:** x/bank/keeper/keeper_test.go (L100-101)
+```go
+func (suite *IntegrationTestSuite) SetupTest() {
+	sdk.RegisterDenom(sdk.DefaultBondDenom, sdk.OneDec())
+```
+
+**File:** simapp/app.go (L591-599)
+```go
+// InitChainer application update at chain initialization
+func (app *SimApp) InitChainer(ctx sdk.Context, req abci.RequestInitChain) abci.ResponseInitChain {
+	var genesisState GenesisState
+	if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
+		panic(err)
+	}
+	app.UpgradeKeeper.SetModuleVersionMap(ctx, app.mm.GetVersionMap())
+	return app.mm.InitGenesis(ctx, app.appCodec, genesisState, genesistypes.GenesisImportConfig{})
+}
+```
+
+**File:** proto/cosmos/bank/v1beta1/genesis.proto (L26-28)
+```text
+  // wei balances
+  repeated WeiBalance wei_balances = 5 [(gogoproto.nullable) = false];
+}
+```
+
+**File:** x/bank/keeper/send.go (L52-52)
+```go
+var OneUseiInWei sdk.Int = sdk.NewInt(1_000_000_000_000)
+```
+
+**File:** types/staking.go (L7-7)
+```go
+	DefaultBondDenom = "usei"
+```
+
+**File:** x/bank/keeper/genesis_test.go (L86-89)
+```go
+	weiBalances := []types.WeiBalance{
+		{Amount: sdk.OneInt(), Address: "cosmos1f9xjhxm0plzrh9cskf4qee4pc2xwp0n0556gh0"},
+		{Amount: keeper.OneUseiInWei.Sub(sdk.OneInt()), Address: "cosmos1m3h30wlvsf8llruxtpukdvsy0km2kum8g38c8q"},
+	}
 ```

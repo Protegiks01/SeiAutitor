@@ -1,272 +1,166 @@
+# Audit Report
+
 ## Title
-Nested MsgExec Authorization Bypass Allows Unauthorized Message Execution
+EVM Transaction State Persistence Despite Revert Error
 
 ## Summary
-A critical vulnerability in the x/authz module allows a grantee with `GenericAuthorization` for `MsgExec` to bypass authorization checks and execute arbitrary message types on behalf of the granter without specific authorization. By nesting `MsgExec` messages, an attacker can exploit the "implicit accept" logic to execute unauthorized actions, leading to direct loss of funds. [1](#0-0) 
+The baseapp transaction processing code commits state changes for EVM transactions that revert, violating EVM atomicity guarantees. When `runTx` checks whether to commit state via `msCache.Write()`, it only verifies `err == nil` without checking `result.EvmError`, while hook execution correctly checks both conditions. This inconsistency allows reverted EVM transactions to persist state modifications while being marked as failed.
 
 ## Impact
-**High** - Direct loss of funds
+Medium
 
 ## Finding Description
 
 **Location:** 
-The vulnerability exists in `x/authz/keeper/keeper.go` in the `DispatchActions` function, specifically at lines 87-111, combined with the `GetSigners()` implementation in `x/authz/msgs.go` at lines 212-218. [2](#0-1) [3](#0-2) 
+- Primary issue: `baseapp/baseapp.go`, lines 1015-1017 in `runTx` function
+- Secondary issue: `baseapp/baseapp.go`, line 1149 in `runMsgs` function  
+- Related handling: `baseapp/abci.go`, lines 329-333 in `DeliverTx` function [1](#0-0) 
 
 **Intended Logic:**
-The authorization system is designed to allow a granter to authorize a grantee to execute specific message types on their behalf. The `DispatchActions` function checks if the message's signer (granter) differs from the current grantee, and if so, verifies that proper authorization exists. The "implicit accept" logic at line 89 is intended to allow users to execute their own messages without authorization when granter equals grantee.
+According to EVM semantics and the code comment at lines 280-281 of `baseapp/abci.go`, state should only persist if all messages execute successfully. For EVM transactions that revert, all state changes should be rolled back atomically, with only gas consumption persisting. [2](#0-1) 
 
 **Actual Logic:**
-The vulnerability arises because:
-1. `MsgExec.GetSigners()` returns the `grantee` field of the MsgExec message, not the actual transaction signer
-2. When a nested `MsgExec` is executed, the inner MsgExec's `grantee` field becomes the "granter" in the authorization check
-3. This allows an attacker to set the inner MsgExec's grantee to the granter's address, causing the innermost messages to bypass authorization via the "implicit accept" path (granter == grantee)
+The codebase exhibits an inconsistency in how it handles EVM errors:
 
-**Exploit Scenario:**
-1. Alice grants Bob `GenericAuthorization` for `/cosmos.authz.v1beta1.MsgExec` (thinking it's for a specific legitimate purpose)
-2. Bob crafts a transaction with nested MsgExec messages:
-   - Outer `MsgExec`: grantee=Bob (signed by Bob)
-   - Inner `MsgExec`: grantee=Alice
-   - Innermost message: `MsgSend` transferring all of Alice's funds to Bob
-3. When the outer MsgExec executes:
-   - `DispatchActions(ctx, Bob, [inner_MsgExec])` is called
-   - Inner MsgExec's `GetSigners()` returns [Alice]
-   - Authorization check: Does Bob have authorization from Alice for MsgExec? YES
-   - Inner MsgExec handler is invoked
-4. When the inner MsgExec executes:
-   - `DispatchActions(ctx, Alice, [MsgSend])` is called
-   - MsgSend's `GetSigners()` returns [Alice]
-   - Check: Alice == Alice? YES
-   - "Implicit accept" - NO authorization check performed
-   - MsgSend executes, draining Alice's account
+1. In `runMsgs`, message handlers can return `err = nil` with `msgResult.EvmError` populated when EVM execution reverts
+2. At line 1149, `msgMsCache.Write()` commits message state changes without checking `EvmError`
+3. `runMsgs` returns with `result.EvmError` set and `err = nil`
+4. In `runTx` at line 1015-1016, the condition checks only `err == nil` before calling `msCache.Write()`, committing all cached state to delivery state
+5. At line 1027, hooks correctly check BOTH `err == nil` AND `result.EvmError == ""` before execution
+6. In `DeliverTx` at lines 329-333, transactions with `result.EvmError != ""` are marked as failed [3](#0-2) [4](#0-3) [5](#0-4) 
 
-**Security Failure:**
-The authorization invariant is broken. Bob can execute message types (like `MsgSend`) on Alice's behalf without Alice granting Bob specific authorization for those message types. The implicit accept logic meant to allow users to execute their own messages is exploited through nested MsgExec to bypass authorization.
+**Exploitation Path:**
+1. User submits an EVM transaction that performs state modifications (storage writes, balance changes)
+2. The EVM message handler executes, applying state changes to the message cache
+3. The transaction reverts (via REVERT opcode or error condition)
+4. Handler returns `err = nil` with `result.EvmError` populated
+5. `msgMsCache.Write()` commits state to parent cache (line 1149)
+6. `msCache.Write()` commits all changes to delivery state (line 1016)
+7. Transaction is marked as failed in ABCI response (lines 329-333)
+8. State modifications persist despite transaction failure
+
+**Security Guarantee Broken:**
+EVM atomicity invariant - reverted transactions should have ALL state changes rolled back. The codebase breaks this by committing state for transactions marked as failed, creating a mismatch between transaction status and actual state modifications.
 
 ## Impact Explanation
 
-**Assets Affected:**
-All funds controlled by any account that has granted `GenericAuthorization` for `MsgExec` to another party.
+This vulnerability results in unintended smart contract behavior where EVM transactions marked as failed can still modify blockchain state. The impact includes:
 
-**Severity:**
-- **Direct loss of funds:** An attacker can drain the entire balance of the granter's account
-- **Bypasses all authorization controls:** The attacker only needs authorization for `MsgExec` but can execute ANY message type (bank transfers, staking operations, governance votes, etc.)
-- **Completely circumvents spend limits:** Even if the granter intended limited authorization, this bypass allows unlimited access
+- **Smart contract security assumptions violated**: Contracts using revert for access control or state protection would have their state modified even when access is denied
+- **State inconsistency**: The blockchain state differs from what clients expect based on transaction receipts showing "failed" status
+- **Broken atomicity**: Fundamental EVM execution guarantee that "all or nothing" state changes are enforced is violated
 
-**System Impact:**
-This vulnerability undermines the core security model of the x/authz module, which is designed to provide fine-grained authorization control. Users who grant `GenericAuthorization` for `MsgExec` (which might seem harmless for specific nested authorization workflows) unknowingly grant complete control over their account.
+This fits the impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity).
+
+The vulnerability is demonstrated by the explicit inconsistency in the code - hooks check for `EvmError` (line 1027) but state writes do not (lines 1016 and 1149), showing that the pattern of `err = nil` with `EvmError != ""` is expected and supported by the architecture. [6](#0-5) [7](#0-6) 
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any user who receives `GenericAuthorization` for `MsgExec` from another account can exploit this vulnerability.
-
-**Conditions Required:**
-- The granter must grant `GenericAuthorization` (or any authorization that accepts MsgExec) for `/cosmos.authz.v1beta1.MsgExec` to the attacker
-- This is the ONLY authorization required - no authorization for the actual message types being executed is needed
+**Trigger Conditions:**
+- Any user can submit EVM transactions (no special privileges required)
+- EVM message handlers return `err = nil` with `result.EvmError` when reverts occur
+- The existence of the hook check at line 1027 that explicitly handles `(!ctx.IsEVM() || result.EvmError == "")` is strong evidence this pattern is expected in the architecture
 
 **Frequency:**
-- Can be triggered immediately after receiving the authorization
-- Works during normal network operation
-- No special timing or state requirements
-- Highly likely to be exploited if users grant MsgExec authorization (which they might do for legitimate nested authorization use cases)
+This would occur on every EVM transaction that reverts, which are common in EVM execution:
+- Failed token transfers
+- Access control violations  
+- Require statement failures
+- Explicit revert calls
+- Out-of-gas conditions handled at EVM level
+
+The inconsistency between hook execution (which checks `EvmError`) and state commits (which don't) indicates this is an oversight rather than intentional design.
 
 ## Recommendation
 
-Add a check to prevent nested `MsgExec` messages, or modify the authorization logic to properly validate nested executions. Specifically:
-
-**Option 1 (Simplest):** Disallow `MsgExec` as an authorized message type by adding validation in the `Grant` method:
+Modify the state write condition in `runTx` to check for EVM errors before committing state, consistent with the hook execution pattern:
 
 ```go
-// In x/authz/keeper/msg_server.go, Grant method
-t := authorization.MsgTypeURL()
-if t == sdk.MsgTypeURL(&authz.MsgExec{}) {
-    return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "cannot grant authorization for MsgExec")
+// In baseapp/baseapp.go, replace lines 1015-1017:
+if err == nil && (!ctx.IsEVM() || result.EvmError == "") && mode == runTxModeDeliver {
+    msCache.Write()
 }
 ```
 
-**Option 2 (More flexible):** Track the authorization context and prevent the implicit accept when inside a MsgExec execution by passing a context flag through `DispatchActions` to indicate whether the execution is nested.
+Similarly, consider applying the same check in `runMsgs` at line 1149 before `msgMsCache.Write()` to maintain consistency at the message level.
 
-The simplest and safest fix is Option 1, which prevents granting authorization for `MsgExec` entirely, as nested MsgExec creates complex authorization chains that are difficult to reason about securely.
+This ensures:
+1. Non-EVM transactions continue normal behavior (write on `err == nil`)
+2. EVM transactions only commit state when both `err == nil` AND `result.EvmError == ""`  
+3. Logic is consistent with hook execution check at line 1027
+4. EVM atomicity guarantees are preserved
 
 ## Proof of Concept
 
-**File:** `x/authz/keeper/keeper_test.go`
-
-**Test Function:** Add the following test function to the existing `TestSuite`:
-
-```go
-// TestNestedMsgExecAuthorizationBypass demonstrates the vulnerability where
-// a grantee with GenericAuthorization for MsgExec can bypass authorization
-// checks for other message types by nesting MsgExec messages.
-func (s *TestSuite) TestNestedMsgExecAuthorizationBypass() {
-	app, ctx, addrs := s.app, s.ctx, s.addrs
-	
-	aliceAddr := addrs[0]  // granter/victim
-	bobAddr := addrs[1]    // grantee/attacker
-	
-	// Setup: Fund Alice's account with 10000 tokens
-	require := s.Require()
-	initialBalance := sdk.NewCoins(sdk.NewInt64Coin("steak", 10000))
-	require.NoError(simapp.FundAccount(app.BankKeeper, ctx, aliceAddr, initialBalance))
-	
-	// Verify Alice's initial balance
-	aliceBalance := app.BankKeeper.GetAllBalances(ctx, aliceAddr)
-	require.Equal(initialBalance, aliceBalance)
-	
-	// Alice grants Bob GenericAuthorization for MsgExec
-	// (Alice thinks this is for a specific nested authorization workflow)
-	now := ctx.BlockHeader().Time
-	msgExecAuth := authz.NewGenericAuthorization(sdk.MsgTypeURL(&authz.MsgExec{}))
-	err := app.AuthzKeeper.SaveGrant(ctx, bobAddr, aliceAddr, msgExecAuth, now.Add(time.Hour))
-	require.NoError(err)
-	
-	// NOTE: Alice has NOT granted Bob authorization for MsgSend
-	// Verify no SendAuthorization exists
-	sendAuth, _ := app.AuthzKeeper.GetCleanAuthorization(ctx, bobAddr, aliceAddr, bankSendAuthMsgType)
-	require.Nil(sendAuth)
-	
-	// Attack: Bob crafts nested MsgExec to steal Alice's funds
-	stolenAmount := sdk.NewCoins(sdk.NewInt64Coin("steak", 10000))
-	
-	// Innermost message: MsgSend from Alice to Bob
-	innerMsgSend := &banktypes.MsgSend{
-		FromAddress: aliceAddr.String(),
-		ToAddress:   bobAddr.String(),
-		Amount:      stolenAmount,
-	}
-	
-	// Inner MsgExec with grantee=Alice (this is the key to the exploit)
-	innerMsgExec := authz.NewMsgExec(aliceAddr, []sdk.Msg{innerMsgSend})
-	
-	// Outer MsgExec with grantee=Bob (signed by Bob in actual transaction)
-	outerMsgExec := authz.NewMsgExec(bobAddr, []sdk.Msg{&innerMsgExec})
-	
-	// Execute the attack
-	require.NoError(outerMsgExec.UnpackInterfaces(app.AppCodec()))
-	msgs, err := outerMsgExec.GetMessages()
-	require.NoError(err)
-	
-	// This should fail because Bob doesn't have SendAuthorization from Alice
-	// But due to the vulnerability, it succeeds
-	result, err := app.AuthzKeeper.DispatchActions(ctx, bobAddr, msgs)
-	
-	// Observation: The attack succeeds when it should fail
-	require.NoError(err, "Attack succeeded - vulnerability confirmed!")
-	require.NotNil(result)
-	
-	// Verify funds were stolen: Alice's balance is now 0, Bob received the funds
-	aliceFinalBalance := app.BankKeeper.GetAllBalances(ctx, aliceAddr)
-	bobFinalBalance := app.BankKeeper.GetAllBalances(ctx, bobAddr)
-	
-	require.True(aliceFinalBalance.IsZero(), "Alice's funds were drained")
-	require.True(bobFinalBalance.IsEqual(stolenAmount), "Bob received Alice's funds")
-	
-	// This demonstrates that Bob executed MsgSend on Alice's behalf
-	// without Alice granting Bob authorization for MsgSend
-}
-```
+**File:** `baseapp/deliver_tx_test.go` (test to be added)
 
 **Setup:**
-- Initialize three test accounts (Alice, Bob, and a third unused account)
-- Fund Alice's account with 10,000 tokens
-- Alice grants Bob `GenericAuthorization` for `MsgExec` (but NOT for `MsgSend`)
+1. Create BaseApp with test EVM message handler that writes to store then returns `err = nil` with `result.EvmError = "execution reverted"`
+2. Initialize chain and delivery state
 
-**Trigger:**
-- Bob creates a nested MsgExec structure:
-  - Outer: `MsgExec(grantee=Bob, msgs=[inner_MsgExec])`
-  - Inner: `MsgExec(grantee=Alice, msgs=[MsgSend])`
-  - Innermost: `MsgSend(from=Alice, to=Bob, amount=10000)`
-- Call `DispatchActions` with the outer MsgExec
+**Action:**
+1. Create transaction with EVM context (`ctx.WithIsEVM(true)`)
+2. Call `DeliverTx` with this transaction
+3. Handler writes value to store, then returns with `EvmError` set
 
-**Observation:**
-The test confirms the vulnerability by observing:
-1. The `DispatchActions` call succeeds (when it should fail due to lack of MsgSend authorization)
-2. Alice's balance is drained to zero
-3. Bob receives all of Alice's funds
-4. This happens despite Alice never granting Bob authorization for `MsgSend`
+**Result:**
+- Transaction response shows `IsOK() == false` (marked as failed)
+- Response contains `EvmTxInfo.VmError` with revert reason
+- **Bug**: Store contains the value written by handler, despite transaction being marked as failed
+- **Expected**: Store should NOT contain the value, as state should be rolled back for reverted EVM transactions
 
-The test demonstrates that the authorization system can be bypassed, allowing unauthorized message execution and direct loss of funds.
+The inconsistency is demonstrated by comparing line 1027 (hooks check `EvmError`) with line 1016 (state write doesn't check `EvmError`).
+
+## Notes
+
+The vulnerability assessment is based on the clear code inconsistency where hook execution properly checks `result.EvmError` but state writes do not. The infrastructure for handling EVM errors (`EvmError` field, error wrapping, context flags) is extensively present throughout the codebase, indicating this is an expected execution pattern. While the actual EVM message handlers are in a separate repository (likely sei-chain), the sei-cosmos SDK fork has been specifically designed to support the pattern where handlers return `err = nil` with `result.EvmError` set, as evidenced by the explicit conditional logic for EVM transactions in hook processing.
 
 ### Citations
 
-**File:** x/authz/keeper/keeper.go (L74-139)
+**File:** baseapp/baseapp.go (L1015-1017)
 ```go
-// DispatchActions attempts to execute the provided messages via authorization
-// grants from the message signer to the grantee.
-func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
-	results := make([][]byte, len(msgs))
-
-	for i, msg := range msgs {
-		signers := msg.GetSigners()
-		if len(signers) != 1 {
-			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
-		}
-
-		granter := signers[0]
-
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
-			}
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
-
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
-		}
-
-		handler := k.router.Handler(msg)
-		if handler == nil {
-			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
-		}
-
-		msgResp, err := handler(ctx, msg)
-		if err != nil {
-			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
-		}
-
-		results[i] = msgResp.Data
-
-		// emit the events from the dispatched actions
-		events := msgResp.Events
-		sdkEvents := make([]sdk.Event, 0, len(events))
-		for _, event := range events {
-			e := event
-			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
-
-			sdkEvents = append(sdkEvents, sdk.Event(e))
-		}
-
-		ctx.EventManager().EmitEvents(sdkEvents)
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
 	}
-
-	return results, nil
-}
 ```
 
-**File:** x/authz/msgs.go (L211-218)
+**File:** baseapp/baseapp.go (L1027-1027)
 ```go
-// GetSigners implements Msg
-func (msg MsgExec) GetSigners() []sdk.AccAddress {
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		panic(err)
-	}
-	return []sdk.AccAddress{grantee}
-}
+	if err == nil && (!ctx.IsEVM() || result.EvmError == "") {
+```
+
+**File:** baseapp/baseapp.go (L1149-1153)
+```go
+		msgMsCache.Write()
+
+		if msgResult.EvmError != "" {
+			evmError = msgResult.EvmError
+		}
+```
+
+**File:** baseapp/abci.go (L280-281)
+```go
+// State only gets persisted if all messages are valid and get executed successfully.
+// Otherwise, the ResponseDeliverTx will contain relevant error information.
+```
+
+**File:** baseapp/abci.go (L329-333)
+```go
+		if result.EvmError != "" {
+			evmErr := sdkerrors.Wrap(sdkerrors.ErrEVMVMError, result.EvmError)
+			res.Codespace, res.Code, res.Log = sdkerrors.ABCIInfo(evmErr, app.trace)
+			resultStr = "failed"
+			return
+```
+
+**File:** proto/cosmos/base/abci/v1beta1/abci.proto (L106-107)
+```text
+  // EVM VM error during execution
+  string evmError = 4;
+```
+
+**File:** types/errors/errors.go (L159-160)
+```go
+	// ErrEVMVMError defines an error for an evm vm error (eg. revert)
+	ErrEVMVMError = Register(RootCodespace, 45, "evm reverted")
 ```

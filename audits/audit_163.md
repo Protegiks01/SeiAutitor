@@ -1,211 +1,198 @@
 # Audit Report
 
 ## Title
-Capability Migration Panic During IBC Upgrades Due to Uninitialized capMap
+Vote Deletion Causes Vote Loss When Expedited Proposals Convert to Regular Proposals
 
 ## Summary
-The `ClaimCapability` function in the capability keeper does not populate the in-memory capability map (`capMap`) when claiming capabilities. During chain upgrades, if an upgrade handler attempts to claim and immediately retrieve a capability before the capability module's `BeginBlocker` initializes the memory store, the system will panic, causing complete network shutdown.
+The governance module's `Tally` function deletes all votes immediately after processing them. When an expedited proposal fails to meet the higher voting threshold and converts to a regular proposal with an extended voting period, all votes cast during the expedited period are permanently lost. When the regular voting period ends and `Tally` is called again, there are no votes to count, causing the proposal to fail due to lack of quorum despite having received legitimate votes.
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary issue: `x/capability/keeper/keeper.go` lines 287-314 (`ClaimCapability` function)
-- Related code: `x/capability/keeper/keeper.go` lines 361-388 (`GetCapability` function)
-- BeginBlock ordering: `simapp/app.go` line 366 [1](#0-0) 
+**Location:**
+- Vote deletion: `x/gov/keeper/tally.go` line 69 [1](#0-0) 
+- Expedited proposal conversion logic: `x/gov/abci.go` lines 95-106 [2](#0-1) 
+- Initial tally call: `x/gov/abci.go` line 51 [3](#0-2) 
 
-**Intended Logic:** 
-During capability migration in IBC upgrades, modules should be able to reclaim existing capabilities that were persisted in the capability store before the upgrade. The capability module's `InitMemStore` is supposed to load all capabilities from persistent storage into the in-memory `capMap` before any module attempts to use them.
+**Intended Logic:**
+When an expedited proposal fails to meet the higher voting threshold, it should be converted to a regular proposal with an extended voting period. The code comment explicitly states "Once the regular voting period expires again, the tally is repeated according to the regular proposal rules" [4](#0-3) , implying that votes from the expedited period should be counted in the final tally.
 
 **Actual Logic:**
-The `ClaimCapability` function updates the persistent store and sets forward/reverse mappings in the memory store, but critically does NOT add the capability object to the shared `capMap` (line 287-314 shows no `capMap` assignment). [1](#0-0) 
+The `Tally` function iterates over all votes and deletes each one during processing [5](#0-4) . When an expedited proposal's voting period ends, `EndBlocker` calls `Tally`, which processes and deletes all votes. If the proposal fails to pass the expedited threshold, it gets converted to a regular proposal [2](#0-1) , but all votes have already been deleted. When the extended voting period ends and `Tally` is called again, there are no votes to count, causing the proposal to fail the quorum check.
 
-When `GetCapability` is subsequently called, it retrieves the capability index from memStore but then attempts to fetch the actual capability object from `capMap`. If the capability is not in `capMap`, the code panics with "capability found in memstore is missing from map". [2](#0-1) 
+**Exploitation Path:**
+1. Any user submits an expedited proposal with the required deposit
+2. Validators and users vote on the proposal during the expedited voting period
+3. The expedited voting period ends with insufficient votes to meet the expedited threshold (e.g., 55% YES but needs 67%)
+4. `EndBlocker` calls `Tally`, which processes all votes and deletes them via `deleteVote`
+5. The proposal is converted to a regular proposal with extended `VotingEndTime`
+6. Voters assume their votes still count and wait for the extended period to end
+7. When the regular voting period ends, `Tally` is called again but finds zero votes
+8. The proposal fails due to lack of quorum (line 102-103 of tally.go), despite having received valid votes
 
-The BeginBlock execution order shows upgrade module runs before capability module: [3](#0-2) 
-
-This means upgrade handlers execute before `InitMemStore` populates `capMap`. [4](#0-3) 
-
-**Exploit Scenario:**
-1. A chain schedules an upgrade that includes IBC capability migration logic
-2. At the upgrade height, nodes restart with the new binary
-3. The upgrade BeginBlocker executes first, running the upgrade handler
-4. The upgrade handler attempts to claim an existing IBC port/channel capability (common during IBC migrations)
-5. `ClaimCapability` succeeds and sets memStore mappings, but doesn't populate `capMap`
-6. The handler immediately tries to retrieve or validate the capability using `GetCapability`
-7. `GetCapability` finds the memStore entry but `capMap[index]` returns `nil`
-8. The code panics at line 384, halting all nodes on the network
-
-**Security Failure:**
-This is a denial-of-service vulnerability that breaks network availability. The panic during upgrade execution causes all validator nodes to halt simultaneously, resulting in total network shutdown. The network cannot process blocks or finalize transactions until the upgrade logic is fixed and redeployed.
+**Security Guarantee Broken:**
+The governance protocol's integrity is compromised by disenfranchising voters. Votes that were legitimately cast are lost and not counted in the final tally, violating the documented behavior and governance design.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Network availability: Complete halt of block production
-- IBC functionality: Cannot complete IBC upgrades requiring capability migration
-- Chain governance: Upgrade mechanism becomes unreliable
+This vulnerability affects the core governance mechanism of the Cosmos SDK L1 blockchain:
 
-**Severity:**
-All validator nodes will panic simultaneously during the upgrade, causing:
-- Complete network shutdown (0% uptime)
-- No new blocks confirmed
-- All transactions frozen
-- Requires emergency rollback or hotfix deployment
-- Potential loss of validator rewards during downtime
-- Reputational damage to the chain
+- **Affected Process:** The governance voting system, specifically for expedited proposals that convert to regular proposals
+- **Severity:** All votes cast during the expedited voting period are permanently lost when the proposal converts to regular, effectively nullifying voter participation
+- **Protocol Impact:** Proposals that should pass (when considering all votes from both periods) will instead fail, or vice versa, leading to incorrect governance outcomes that could affect protocol parameters, upgrades, or other governance-controlled features
 
-This directly matches the in-scope "High: Network not being able to confirm new transactions (total network shutdown)" impact criterion.
+The code explicitly preserves deposits when expedited proposals convert to regular [6](#0-5) , showing the intent to preserve state for the second tally. However, votes are not similarly preserved, creating an inconsistency in the implementation.
+
+This matches the **Medium** severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-This vulnerability is triggered automatically during chain upgrades if the upgrade handler contains IBC capability migration logic. No attacker action is required - it's triggered by the upgrade itself.
+**Who can trigger:** Any user can submit an expedited proposal and vote on it. This is normal governance participation requiring no special privileges.
 
-**Conditions Required:**
-- A scheduled chain upgrade with an upgrade handler
-- The handler attempts to claim and retrieve a capability before `InitMemStore` runs
-- Common scenario: IBC module upgrades that need to reclaim port/channel capabilities
+**Conditions required:**
+- An expedited proposal must be submitted and reach the voting period
+- The proposal must receive votes during the expedited period
+- The proposal must fail to meet the expedited threshold but still be valid enough to convert to regular
 
-**Frequency:**
-- Occurs during every upgrade that involves IBC capability migration
-- Guaranteed to trigger if the upgrade handler pattern described above is used
-- High likelihood given that IBC upgrades are common in Cosmos chains
+**Frequency:** This will occur every time an expedited proposal fails to meet its threshold and converts to regular, which is an expected and documented feature of the governance system. The existing test suite demonstrates this scenario [7](#0-6) , but the test works around the issue by adding new votes after conversion (line 521) rather than relying on votes from the expedited period [8](#0-7) .
 
 ## Recommendation
 
-**Immediate Fix:**
-Modify `ClaimCapability` to add the capability to `capMap` after setting memStore mappings:
+Modify the `Tally` function to accept a boolean parameter indicating whether this is a final tally or an intermediate tally:
 
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-    // ... existing validation and persistent store updates ...
-    
-    memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-    
-    // ADD THIS LINE: Ensure capability is in capMap
-    sk.capMap[cap.GetIndex()] = cap
-    
-    logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-    return nil
-}
+func (keeper Keeper) Tally(ctx sdk.Context, proposal types.Proposal, deleteVotes bool) (passes bool, burnDeposits bool, tallyResults types.TallyResult)
 ```
 
-**Additional Safeguards:**
-1. Add documentation warning that upgrade handlers should not interact with capabilities before `InitMemStore` runs
-2. Consider enforcing that capability BeginBlocker runs before upgrade BeginBlocker
-3. Add a check in `GetCapability` to provide a clearer error message instead of panic
+For intermediate tallies (expedited proposals that may convert to regular), skip the vote deletion step. In `EndBlocker`:
+- Call `Tally(ctx, proposal, false)` for expedited proposals (don't delete votes)
+- Only delete votes if the proposal is not being converted to regular, or after the final tally of the regular proposal
+
+Alternatively, refactor the vote deletion logic to only call `deleteVote` when the proposal reaches a terminal state (passed, rejected, or failed), not during intermediate tallies for proposals that will continue voting.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
+**Test Scenario:**
+The provided PoC test would demonstrate that:
+1. A vote is cast during the expedited voting period and exists in storage
+2. `EndBlocker` is called when the expedited period ends, triggering the first tally
+3. The proposal converts from expedited to regular with extended voting period
+4. The vote from the expedited period has been deleted from storage (can be verified with `GetVote`)
+5. When the regular voting period ends and `EndBlocker` is called again, there are no votes to tally
+6. The proposal fails due to lack of quorum, despite having received a legitimate vote
 
-**Test Function:** Add `TestClaimCapabilityBeforeInitMemStore`
+**Evidence from existing test:**
+The test `TestExpeditedProposalPassAndConvertToRegular` in `x/gov/abci_test.go` demonstrates this behavior by working around it. After the proposal converts to regular (line 461), the test adds a NEW vote (line 521) for the regular proposal to potentially pass [8](#0-7) . This indicates that votes from the expedited period are not available for the regular tally, confirming the vulnerability.
 
-**Setup:**
-1. Create a new keeper with fresh stores
-2. Manually set up a capability in the persistent store (simulating pre-upgrade state)
-3. Create a capability object with the same index
-4. Do NOT call `InitMemStore` (simulating upgrade handler running before capability BeginBlocker)
+## Notes
 
-**Trigger:**
-1. Call `ClaimCapability` with the manually created capability object
-2. Immediately call `GetCapability` to retrieve it
+The vulnerability is confirmed by examining:
+1. The vote deletion in the `Tally` function [1](#0-0) 
+2. The expedited-to-regular conversion logic that extends the voting period [2](#0-1) 
+3. The code comment stating the tally should be "repeated" [4](#0-3) 
+4. The preservation of deposits but not votes during conversion [6](#0-5) 
+5. The existing test's workaround of adding new votes after conversion [8](#0-7) 
 
-**Observation:**
-The test will panic at line 384 of `keeper.go` with message "capability found in memstore is missing from map", demonstrating that the capability was set in memStore by `ClaimCapability` but not added to `capMap`, causing `GetCapability` to fail.
-
-**Test Code:**
-```go
-func (suite *KeeperTestSuite) TestClaimCapabilityBeforeInitMemStore() {
-    // Setup: Create a fresh keeper to simulate post-upgrade state
-    app := simapp.Setup(false)
-    cdc := app.AppCodec()
-    keeper := keeper.NewKeeper(cdc, app.GetKey(types.StoreKey), app.GetMemKey(types.MemStoreKey))
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{Height: 1})
-    
-    // Simulate existing capability in persistent store (from before upgrade)
-    index := uint64(1)
-    owner := types.NewOwner("ibc", "port")
-    owners := types.NewCapabilityOwners()
-    owners.Set(owner)
-    keeper.SetOwners(ctx, index, *owners)
-    
-    // Create scoped keeper for IBC module
-    sk := keeper.ScopeToModule("ibc")
-    
-    // Simulate upgrade handler claiming the capability before InitMemStore runs
-    // This mimics the vulnerability scenario
-    cap := types.NewCapability(index)
-    err := sk.ClaimCapability(ctx, cap, "port")
-    suite.Require().NoError(err, "ClaimCapability should succeed")
-    
-    // Now try to retrieve the capability - this should panic
-    // because capMap was not populated by ClaimCapability
-    suite.Require().Panics(func() {
-        _, _ = sk.GetCapability(ctx, "port")
-    }, "GetCapability should panic when capability not in capMap")
-}
-```
-
-The test demonstrates that `ClaimCapability` successfully completes but leaves the system in an inconsistent state where the capability is in memStore but not in `capMap`, causing subsequent `GetCapability` calls to panic. This exact scenario occurs during chain upgrades when the upgrade handler runs before the capability module's `InitMemStore`.
+This is a valid Medium severity vulnerability that breaks the governance protocol's integrity through an implementation inconsistency.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** x/gov/keeper/tally.go (L36-71)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
+	keeper.IterateVotes(ctx, proposal.ProposalId, func(vote types.Vote) bool {
+		// if validator, just record it in the map
+		voter := sdk.MustAccAddressFromBech32(vote.Voter)
 
-	memStore := ctx.KVStore(sk.memKey)
+		valAddrStr := sdk.ValAddress(voter.Bytes()).String()
+		if val, ok := currValidators[valAddrStr]; ok {
+			val.Vote = vote.Options
+			currValidators[valAddrStr] = val
+		}
 
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
+		// iterate over all delegations from voter, deduct from any delegated-to validators
+		keeper.sk.IterateDelegations(ctx, voter, func(index int64, delegation stakingtypes.DelegationI) (stop bool) {
+			valAddrStr := delegation.GetValidatorAddr().String()
 
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
+			if val, ok := currValidators[valAddrStr]; ok {
+				// There is no need to handle the special case that validator address equal to voter address.
+				// Because voter's voting power will tally again even if there will deduct voter's voting power from validator.
+				val.DelegatorDeductions = val.DelegatorDeductions.Add(delegation.GetShares())
+				currValidators[valAddrStr] = val
 
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
+				// delegation shares * bonded / total shares
+				votingPower := delegation.GetShares().MulInt(val.BondedTokens).Quo(val.DelegatorShares)
 
-	return nil
-}
+				for _, option := range vote.Options {
+					subPower := votingPower.Mul(option.Weight)
+					results[option.Option] = results[option.Option].Add(subPower)
+				}
+				totalVotingPower = totalVotingPower.Add(votingPower)
+			}
+
+			return false
+		})
+
+		keeper.deleteVote(ctx, vote.ProposalId, voter)
+		return false
+	})
 ```
 
-**File:** x/capability/keeper/keeper.go (L382-385)
+**File:** x/gov/abci.go (L51-51)
 ```go
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
-	}
+		passes, burnDeposits, tallyResults := keeper.Tally(ctx, proposal)
 ```
 
-**File:** simapp/app.go (L365-367)
+**File:** x/gov/abci.go (L53-63)
 ```go
-	app.mm.SetOrderBeginBlockers(
-		upgradetypes.ModuleName, capabilitytypes.ModuleName, minttypes.ModuleName, distrtypes.ModuleName, slashingtypes.ModuleName,
-		evidencetypes.ModuleName, stakingtypes.ModuleName,
+		// If an expedited proposal fails, we do not want to update
+		// the deposit at this point since the proposal is converted to regular.
+		// As a result, the deposits are either deleted or refunded in all casses
+		// EXCEPT when an expedited proposal fails.
+		if !(proposal.IsExpedited && !passes) {
+			if burnDeposits {
+				keeper.DeleteDeposits(ctx, proposal.ProposalId)
+			} else {
+				keeper.RefundDeposits(ctx, proposal.ProposalId)
+			}
+		}
 ```
 
-**File:** x/capability/abci.go (L17-21)
+**File:** x/gov/abci.go (L95-106)
 ```go
-func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+			if proposal.IsExpedited {
+				// When expedited proposal fails, it is converted to a regular proposal.
+				// As a result, the voting period is extended.
+				// Once the regular voting period expires again, the tally is repeated
+				// according to the regular proposal rules.
+				proposal.IsExpedited = false
+				votingParams := keeper.GetVotingParams(ctx)
+				proposal.VotingEndTime = proposal.VotingStartTime.Add(votingParams.VotingPeriod)
 
-	k.InitMemStore(ctx)
-}
+				keeper.InsertActiveProposalQueue(ctx, proposal.ProposalId, proposal.VotingEndTime)
+				tagValue = types.AttributeValueExpeditedConverted
+				logMsg = "expedited proposal converted to regular"
+```
+
+**File:** x/gov/abci_test.go (L361-369)
+```go
+			name:                       "expedited fails, converted to regular - regular eventually passes",
+			isExpeditedPasses:          false,
+			isRegularEventuallyPassing: true,
+		},
+		{
+			name:                       "expedited fails, converted to regular - regular eventually fails",
+			isExpeditedPasses:          false,
+			isRegularEventuallyPassing: false,
+		},
+```
+
+**File:** x/gov/abci_test.go (L519-523)
+```go
+			if tc.isRegularEventuallyPassing {
+				// Validator votes YES, letting the converted regular proposal pass.
+				err = app.GovKeeper.AddVote(ctx, proposal.ProposalId, addrs[0], types.NewNonSplitVoteOption(types.OptionYes))
+				require.NoError(t, err)
+			}
 ```

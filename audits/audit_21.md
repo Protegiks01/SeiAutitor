@@ -1,364 +1,236 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Data Race in CheckTx State Access: checkTxStateLock Does Not Protect Concurrent Reads in getState()
+ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
 
 ## Summary
-The `checkTxStateLock` at lines 562-563 in `baseapp/baseapp.go` only protects writes to `app.checkState` in `setCheckState()`, but does NOT protect reads in `getState()`. This creates a data race where CheckTx operations read `app.checkState` without synchronization while Commit operations modify it with the lock, violating Go's memory model and potentially causing node crashes or incorrect transaction validation. [1](#0-0) 
+The `ClaimCapability` function allows a module to claim the same capability multiple times under different names, causing forward-map corruption that breaks authentication and creates permanent orphaned state. This occurs in `x/capability/keeper/keeper.go` at the `ClaimCapability` function. [1](#0-0) 
 
 ## Impact
 **Medium**
 
 ## Finding Description
 
-**Location:**
-- `baseapp/baseapp.go:562-563` - Lock acquisition in `setCheckState()`
-- `baseapp/baseapp.go:805-811` - Unlocked read in `getState()`
-- `baseapp/baseapp.go:814-832` - `getContextForTx()` calling unlocked `getState()`
-- `baseapp/abci.go:225` - CheckTx calling `getContextForTx()` [2](#0-1) [3](#0-2) [4](#0-3) 
+**Location:** `x/capability/keeper/keeper.go`, function `ClaimCapability` (lines 287-314)
 
-**Intended Logic:**
-The `checkTxStateLock` is intended to synchronize access to `app.checkState` between concurrent CheckTx operations and state modifications during Commit. The pattern is demonstrated correctly in `GetCheckCtx()` which acquires `checkTxStateLock.RLock()` before accessing `app.checkState`: [5](#0-4) 
+**Intended Logic:** The ClaimCapability function should prevent a module from claiming the same capability object more than once, regardless of the name used. Each module should maintain a single, consistent forward mapping to authenticate capabilities.
 
-**Actual Logic:**
-The `getState()` function returns `app.checkState` pointer directly without acquiring any lock: [2](#0-1) 
+**Actual Logic:** ClaimCapability only checks if the exact (module, name) pair already exists as an owner, but does NOT check if the same module is already claiming the same capability under a different name. The vulnerability occurs because:
 
-Meanwhile, `setCheckState()` modifies `app.checkState` while holding the lock: [6](#0-5) 
+1. The owner validation in `addOwner` checks for duplicate (module, name) pairs via `CapabilityOwners.Set`: [2](#0-1) 
 
-This creates an unsynchronized read-write pattern where:
-- **Writer (Commit)**: Acquires `checkTxStateLock` → modifies `app.checkState` → releases lock
-- **Reader (CheckTx)**: Reads `app.checkState` WITHOUT lock → uses stale/inconsistent data
+The owner key is "module/name", so Owner("foo", "channel-1") and Owner("foo", "channel-2") are considered different and both succeed.
 
-**Exploit Scenario:**
-1. Node receives transaction and Tendermint calls CheckTx from Thread A
-2. Thread A enters `CheckTx()` → calls `getContextForTx()` → calls `getState(runTxModeCheck)`
-3. Thread A reads `app.checkState` pointer at line 810 WITHOUT holding `checkTxStateLock`
-4. Simultaneously, Thread B executes `Commit()` → calls `setCheckState(header)`
-5. Thread B acquires `checkTxStateLock` and modifies `app.checkState` (lines 572-573)
-6. Thread A continues with stale state or experiences undefined behavior due to unsynchronized access
+2. The forward mapping uses only (module, capability) as the key, so it gets overwritten on each claim: [3](#0-2) 
 
-Even though the comment at `baseapp/abci.go:391-392` claims "Tendermint holds a lock on the mempool for Commit", this doesn't prevent CheckTx calls that are ALREADY executing from racing with the state update. [7](#0-6) 
+3. Each reverse mapping is created independently without cleanup: [4](#0-3) 
 
-**Security Failure:**
-This violates Go's memory model which requires synchronization for concurrent access to shared memory. The race condition can cause:
-- **Node crashes** from nil pointer dereferences or corrupted state during high concurrent load
-- **Incorrect transaction validation** using inconsistent state snapshots
-- **Undefined behavior** as the Go compiler makes no guarantees about unsynchronized memory access
-- **Production deployment issues** as the code would fail when run with Go's `-race` detector
+**Exploitation Path:**
+1. Module "foo" claims capability: `ClaimCapability(ctx, cap, "channel-1")`
+   - Forward map: `foo/fwd/0xCAP` → "channel-1"
+   - Reverse map: `foo/rev/channel-1` → index
+   - Owners: [("foo", "channel-1")]
+
+2. Module "foo" claims same capability again: `ClaimCapability(ctx, cap, "channel-2")`
+   - Owner check passes (different name)
+   - Forward map OVERWRITES: `foo/fwd/0xCAP` → "channel-2"
+   - New reverse map created: `foo/rev/channel-2` → index
+   - Owners: [("foo", "channel-1"), ("foo", "channel-2")]
+
+3. Authentication now fails: `AuthenticateCapability(ctx, cap, "channel-1")` [5](#0-4) 
+
+Returns false because `GetCapabilityName` returns "channel-2" instead of "channel-1".
+
+4. Release creates orphaned state: `ReleaseCapability(ctx, cap)` [6](#0-5) 
+
+Only cleans up "channel-2" mappings and owner, leaving "channel-1" reverse mapping and owner permanently orphaned.
+
+**Security Guarantee Broken:** The capability authentication invariant is violated - modules cannot authenticate capabilities they legitimately own, and the cleanup mechanism leaves permanent state corruption.
 
 ## Impact Explanation
 
-The vulnerability affects:
-- **Network Availability**: Nodes can crash when the race condition manifests during concurrent CheckTx and Commit operations, leading to node restarts and reduced network capacity
-- **Transaction Processing**: Transactions may be incorrectly validated against stale or inconsistent state, potentially accepting invalid transactions or rejecting valid ones
-- **Mempool Integrity**: The mempool relies on CheckTx for transaction validation; race conditions compromise this critical security boundary
+This vulnerability affects the capability module's core security mechanism used throughout the Cosmos SDK, particularly in IBC:
 
-Severity assessment:
-- Can cause **shutdown of network processing nodes** during high transaction load when CheckTx operations race with block commits
-- Affects transaction validation correctness, potentially causing **unintended smart contract behavior**
-- Violates fundamental concurrency safety requirements, making the codebase fail with Go's race detector
+1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it. `AuthenticateCapability` will fail, potentially preventing legitimate IBC channel operations or other capability-protected actions.
 
-This qualifies as **Medium** severity as it can cause "Shutdown of greater than or equal to 30% of network processing nodes" and "A bug in the network code that results in unintended smart contract behavior."
+2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last claimed name is properly cleaned up. The reverse mappings and owner entries for earlier names remain permanently orphaned, consuming storage and creating inconsistent state that cannot be recovered without a chain upgrade.
+
+3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate in memory and storage, consuming resources that can never be reclaimed.
+
+This fits the **Medium** severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - the capability module is core infrastructure that can cause module misbehavior, though funds are not directly at risk.
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- Can be triggered by **any user** submitting transactions during normal operation
-- Occurs when CheckTx is called concurrently with Commit (common in active networks)
-- The race window exists every time a block is committed while transactions are being validated
+**Likelihood: Medium**
 
-**Frequency:**
-- **High likelihood** in production: Blocks are committed regularly (every few seconds), and CheckTx is called continuously as transactions arrive
-- The vulnerability is **deterministically detectable** with Go's race detector (`go test -race`)
-- Under high transaction load, multiple concurrent CheckTx calls increase race probability
+This vulnerability can be triggered whenever:
+- A module has buggy logic that doesn't properly track which capabilities it has already claimed
+- Retry or error recovery logic attempts to re-claim a capability that was already claimed
+- State confusion occurs in complex IBC handshake scenarios (e.g., crossing hellos with retries)
+- A module implementation doesn't check if it already owns a capability before claiming it
 
-**Who Can Trigger:**
-- **Unprivileged users**: Any node operator or user can trigger by sending transactions
-- **No special conditions required**: Normal network operation with concurrent transaction submission and block production is sufficient
+The vulnerability requires specific module behavior (claiming the same capability twice), but:
+- No special privileges are required - any module can trigger this
+- It can happen during normal operation if module code has bugs or edge-case handling issues
+- IBC channel handshakes involve complex state transitions where this could occur
+- Once triggered, the corruption is permanent and cannot self-heal
 
 ## Recommendation
 
-**Fix:** Add proper lock acquisition in `getState()` to match the pattern used in `GetCheckCtx()`:
+Add a check in `ClaimCapability` to verify that the calling module hasn't already claimed the capability under any name before allowing a new claim:
 
 ```go
-func (app *BaseApp) getState(mode runTxMode) *state {
-	if mode == runTxModeDeliver {
-		return app.deliverState
-	}
-	
-	app.checkTxStateLock.RLock()
-	defer app.checkTxStateLock.RUnlock()
-	return app.checkState
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+    // ... existing validation ...
+    
+    // Check if this module already owns this capability under any name
+    existingName := sk.GetCapabilityName(ctx, cap)
+    if existingName != "" {
+        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
+            "module %s already owns capability under name %s", sk.module, existingName)
+    }
+    
+    // ... rest of function ...
 }
 ```
 
-Alternatively, modify `getContextForTx()` to acquire the lock before calling `getState()`:
-
-```go
-func (app *BaseApp) getContextForTx(mode runTxMode, txBytes []byte) sdk.Context {
-	app.votesInfoLock.RLock()
-	defer app.votesInfoLock.RUnlock()
-	
-	var ctx sdk.Context
-	if mode == runTxModeDeliver {
-		ctx = app.deliverState.Context()
-	} else {
-		app.checkTxStateLock.RLock()
-		ctx = app.checkState.Context()
-		app.checkTxStateLock.RUnlock()
-	}
-	
-	ctx = ctx.WithTxBytes(txBytes).
-		WithVoteInfos(app.voteInfos).
-		WithConsensusParams(app.GetConsensusParams(ctx))
-	// ... rest of the function
-}
-```
-
-Also fix direct field accesses at:
-- `baseapp/test_helpers.go:19,28` - Replace `app.checkState.ctx` with `app.GetCheckCtx()`
-- `baseapp/abci.go:64` - Acquire lock before accessing `app.checkState.ctx`
+This prevents forward-map corruption by ensuring each module can only claim a given capability object once, regardless of the name used.
 
 ## Proof of Concept
 
-**File:** `baseapp/baseapp_race_test.go` (new test file)
-
-**Test Function:** `TestCheckTxCommitDataRace`
-
-```go
-package baseapp
-
-import (
-	"context"
-	"sync"
-	"testing"
-	"time"
-	
-	"github.com/stretchr/testify/require"
-	abci "github.com/tendermint/tendermint/abci/types"
-	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-	
-	"github.com/cosmos/cosmos-sdk/codec"
-	sdk "github.com/cosmos/cosmos-sdk/types"
-)
-
-// TestCheckTxCommitDataRace demonstrates the data race between CheckTx and Commit
-// Run with: go test -race -run TestCheckTxCommitDataRace
-func TestCheckTxCommitDataRace(t *testing.T) {
-	anteOpt := func(bapp *BaseApp) {
-		bapp.SetAnteHandler(func(ctx sdk.Context, tx sdk.Tx, simulate bool) (sdk.Context, error) {
-			// Simulate some processing time to increase race window
-			time.Sleep(1 * time.Millisecond)
-			return ctx, nil
-		})
-	}
-	
-	routerOpt := func(bapp *BaseApp) {
-		bapp.Router().AddRoute(sdk.NewRoute(routeMsgCounter, func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
-			return &sdk.Result{}, nil
-		}))
-	}
-	
-	app := setupBaseApp(t, anteOpt, routerOpt)
-	app.InitChain(context.Background(), &abci.RequestInitChain{})
-	
-	codec := codec.NewLegacyAmino()
-	registerTestCodec(codec)
-	
-	// Prepare transactions
-	tx := newTxCounter(0, 0)
-	txBytes, err := codec.Marshal(tx)
-	require.NoError(t, err)
-	
-	// Run concurrent CheckTx and Commit operations
-	var wg sync.WaitGroup
-	iterations := 100
-	
-	// Start CheckTx goroutines
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				// This will race with Commit's setCheckState
-				_, _ = app.CheckTx(context.Background(), &abci.RequestCheckTx{Tx: txBytes})
-			}
-		}()
-	}
-	
-	// Start Commit goroutines
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for j := 0; j < iterations; j++ {
-			header := tmproto.Header{Height: int64(j + 1)}
-			app.setDeliverState(header)
-			app.BeginBlock(app.deliverState.ctx, abci.RequestBeginBlock{Header: header})
-			app.EndBlock(app.deliverState.ctx, abci.RequestEndBlock{})
-			app.SetDeliverStateToCommit()
-			
-			// This will race with CheckTx's getState
-			_, _ = app.Commit(context.Background())
-		}
-	}()
-	
-	wg.Wait()
-	
-	// If run with -race flag, this test will detect the data race
-	// Without the fix, the race detector will report:
-	// WARNING: DATA RACE
-	// Read at 0x... by goroutine ...:
-	//   baseapp.(*BaseApp).getState()
-	// Write at 0x... by goroutine ...:
-	//   baseapp.(*BaseApp).setCheckState()
-}
-```
+**Test Location:** `x/capability/keeper/keeper_test.go`
 
 **Setup:** 
-- Initialize BaseApp with basic ante handler and router
-- Create test transaction
+- Create a scoped keeper for a module
+- Create a capability with initial name "original"
 
-**Trigger:**
-- Spawn 10 goroutines calling CheckTx concurrently (simulating mempool validation)
-- Spawn 1 goroutine calling Commit repeatedly (simulating block production)
-- CheckTx calls `getState()` without lock (line 810)
-- Commit calls `setCheckState()` with lock (line 562)
+**Action:**
+1. Claim the same capability object with a different name "duplicate"
+2. Verify authentication behavior
+3. Release the capability
 
-**Observation:**
-When run with `go test -race -run TestCheckTxCommitDataRace`, Go's race detector will report:
-```
-WARNING: DATA RACE
-Read at 0x... by goroutine X:
-  github.com/cosmos/cosmos-sdk/baseapp.(*BaseApp).getState()
-      baseapp/baseapp.go:810
-Write at 0x... by goroutine Y:
-  github.com/cosmos/cosmos-sdk/baseapp.(*BaseApp).setCheckState()
-      baseapp/baseapp.go:572
-```
+**Result:**
+1. The second ClaimCapability succeeds (should fail)
+2. `AuthenticateCapability(cap, "original")` returns false (authentication broken)
+3. After `ReleaseCapability`, the "original" reverse mapping still exists (orphaned state)
+4. The owner entry for "original" remains in the owner set (state corruption)
 
-This confirms the unsynchronized access to `app.checkState` between CheckTx (reader) and Commit (writer), proving the vulnerability.
+The vulnerability is confirmed by tracing through the code:
+- Forward map at line 303 uses only (module, cap) as key, causing overwrite
+- Reverse map at line 309 creates new entries without cleanup
+- Authentication at line 279 relies on the overwritten forward map
+- Release at lines 323-340 only cleans up the last claimed name
+
+**Notes**
+
+The existing test suite does not cover this scenario. The `TestClaimCapability` function only tests claiming with the same name by the same module (which correctly fails) and claiming by different modules (which correctly succeeds), but does not test the same module claiming with different names. [7](#0-6)
 
 ### Citations
 
-**File:** baseapp/baseapp.go (L559-574)
+**File:** x/capability/keeper/keeper.go (L275-280)
 ```go
-func (app *BaseApp) setCheckState(header tmproto.Header) {
-	ms := app.cms.CacheMultiStore()
-	ctx := sdk.NewContext(ms, header, true, app.logger).WithMinGasPrices(app.minGasPrices)
-	app.checkTxStateLock.Lock()
-	defer app.checkTxStateLock.Unlock()
-	if app.checkState == nil {
-		app.checkState = &state{
-			ms:  ms,
-			ctx: ctx,
-			mtx: &sync.RWMutex{},
-		}
-		return
+func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
+	if strings.TrimSpace(name) == "" || cap == nil {
+		return false
 	}
-	app.checkState.SetMultiStore(ms)
-	app.checkState.SetContext(ctx)
+	return sk.GetCapabilityName(ctx, cap) == name
 }
 ```
 
-**File:** baseapp/baseapp.go (L805-811)
+**File:** x/capability/keeper/keeper.go (L287-314)
 ```go
-func (app *BaseApp) getState(mode runTxMode) *state {
-	if mode == runTxModeDeliver {
-		return app.deliverState
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+	}
+	if strings.TrimSpace(name) == "" {
+		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
+	}
+	// update capability owner set
+	if err := sk.addOwner(ctx, cap, name); err != nil {
+		return err
 	}
 
-	return app.checkState
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Set the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
+
+	// Set the reverse mapping between the module and capability name and the
+	// index in the in-memory store. Since marshalling and unmarshalling into a store
+	// will change memory address of capability, we simply store index as value here
+	// and retrieve the in-memory pointer to the capability from our map
+	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
+
+	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
+
+	return nil
 }
 ```
 
-**File:** baseapp/baseapp.go (L814-832)
+**File:** x/capability/keeper/keeper.go (L323-340)
 ```go
-func (app *BaseApp) getContextForTx(mode runTxMode, txBytes []byte) sdk.Context {
-	app.votesInfoLock.RLock()
-	defer app.votesInfoLock.RUnlock()
-	ctx := app.getState(mode).Context().
-		WithTxBytes(txBytes).
-		WithVoteInfos(app.voteInfos)
-
-	ctx = ctx.WithConsensusParams(app.GetConsensusParams(ctx))
-
-	if mode == runTxModeReCheck {
-		ctx = ctx.WithIsReCheckTx(true)
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
 	}
 
-	if mode == runTxModeSimulate {
-		ctx, _ = ctx.CacheContext()
-	}
+	memStore := ctx.KVStore(sk.memKey)
 
-	return ctx
-}
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
 ```
 
-**File:** baseapp/baseapp.go (L1249-1253)
+**File:** x/capability/types/types.go (L46-58)
 ```go
-func (app *BaseApp) GetCheckCtx() sdk.Context {
-	app.checkTxStateLock.RLock()
-	defer app.checkTxStateLock.RUnlock()
-	return app.checkState.ctx
-}
+func (co *CapabilityOwners) Set(owner Owner) error {
+	i, ok := co.Get(owner)
+	if ok {
+		// owner already exists at co.Owners[i]
+		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
+	}
+
+	// owner does not exist in the set of owners, so we insert at position i
+	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
+	copy(co.Owners[i+1:], co.Owners[i:])
+	co.Owners[i] = owner
+
+	return nil
 ```
 
-**File:** baseapp/abci.go (L209-255)
+**File:** x/capability/keeper/keeper_test.go (L156-178)
 ```go
-func (app *BaseApp) CheckTx(ctx context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTxV2, error) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "check_tx")
+func (suite *KeeperTestSuite) TestClaimCapability() {
+	sk1 := suite.keeper.ScopeToModule(banktypes.ModuleName)
+	sk2 := suite.keeper.ScopeToModule(stakingtypes.ModuleName)
+	sk3 := suite.keeper.ScopeToModule("foo")
 
-	var mode runTxMode
+	cap, err := sk1.NewCapability(suite.ctx, "transfer")
+	suite.Require().NoError(err)
+	suite.Require().NotNil(cap)
 
-	switch {
-	case req.Type == abci.CheckTxType_New:
-		mode = runTxModeCheck
+	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
+	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
 
-	case req.Type == abci.CheckTxType_Recheck:
-		mode = runTxModeReCheck
+	got, ok := sk1.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
 
-	default:
-		panic(fmt.Sprintf("unknown RequestCheckTx type: %s", req.Type))
-	}
+	got, ok = sk2.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
 
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, gInfo.GasWanted, gInfo.GasUsed, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-
-	res := &abci.ResponseCheckTxV2{
-		ResponseCheckTx: &abci.ResponseCheckTx{
-			GasWanted:    int64(gInfo.GasWanted), // TODO: Should type accept unsigned ints?
-			Data:         result.Data,
-			Priority:     priority,
-			GasEstimated: int64(gInfo.GasEstimate),
-		},
-		ExpireTxHandler:  expireTxHandler,
-		EVMNonce:         txCtx.EVMNonce(),
-		EVMSenderAddress: txCtx.EVMSenderAddress(),
-		IsEVM:            txCtx.IsEVM(),
-	}
-	if pendingTxChecker != nil {
-		res.IsPendingTransaction = true
-		res.Checker = pendingTxChecker
-	}
-
-	return res, nil
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, cap, "  "))
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, nil, "transfer"))
 }
-```
-
-**File:** baseapp/abci.go (L389-393)
-```go
-	// Reset the Check state to the latest committed.
-	//
-	// NOTE: This is safe because Tendermint holds a lock on the mempool for
-	// Commit. Use the header from this latest block.
-	app.setCheckState(header)
 ```

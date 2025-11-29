@@ -1,261 +1,210 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Genesis Validation Allows Duplicate Capability Indices Leading to Silent Owner Overwriting
+Out-of-Bounds Panic in Multisig Verification Due to Missing Signature Count Validation Against True Bits
 
 ## Summary
-The `Validate()` function in the capability module's genesis validation fails to check for duplicate indices in the `Owners` array. This allows a genesis state with duplicate indices to pass validation and be imported during `InitGenesis`, causing the last entry to silently overwrite previous owners for the same index, resulting in permanent loss of capability ownership for affected modules. [1](#0-0) 
+The `VerifyMultisignature` function in `crypto/keys/multisig/multisig.go` fails to validate that the number of provided signatures matches the number of true bits in the bit array. This allows an attacker to craft a malicious multisig transaction that triggers an out-of-bounds array access, causing a node panic and denial of service. [1](#0-0) 
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Validation logic: `x/capability/types/genesis.go`, function `Validate()` (lines 21-49)
-- Genesis initialization: `x/capability/genesis.go`, function `InitGenesis()` (lines 11-22)
+**Location:**
+- Primary: `crypto/keys/multisig/multisig.go`, function `VerifyMultisignature`, lines 50-96
+- Secondary: `x/auth/ante/sigverify.go`, function `ConsumeMultisignatureVerificationGas`, lines 446-471 [2](#0-1) 
 
-**Intended Logic:** 
-The genesis validation should ensure that all capability indices in the imported genesis state are unique and valid. Each capability index should map to exactly one set of owners. The validation is supposed to catch any malformed genesis data before it gets imported into the chain state.
+**Intended Logic:**
+The signature count validation should ensure that the number of signatures provided exactly matches the number of signers indicated by true bits in the bit array, preventing any mismatch that could lead to out-of-bounds access during verification.
 
-**Actual Logic:** 
-The `Validate()` function only checks that each index falls within the range [1, gs.Index) but does not verify uniqueness of indices across the `Owners` array. [2](#0-1) 
+**Actual Logic:**
+The validation only checks that signatures are between threshold and total pubkeys (`len(sigs) >= int(m.Threshold) && len(sigs) <= size`), and that true bits meet threshold (`bitarray.NumTrueBitsBefore(size) >= int(m.Threshold)`). However, it does NOT validate that `len(sigs)` equals `NumTrueBitsBefore(size)`. During the verification loop (lines 69-94), when iterating through bit positions, the code accesses `sig.Signatures[sigIndex]` without bounds checking, assuming every true bit has a corresponding signature.
 
-During `InitGenesis`, the code iterates through all `genState.Owners` and calls `SetOwners` for each entry: [3](#0-2) 
+**Exploitation Path:**
+1. Attacker crafts a transaction with a multisig signature containing independently-specified fields in the protobuf `ModeInfo_Multi` structure
+2. The attacker sets the `Bitarray` field to have N true bits (e.g., 4 bits at positions 0,1,2,3)
+3. The attacker provides only M signatures where M < N (e.g., only 3 signatures) through the `ModeInfos` field
+4. During transaction decoding in `ModeInfoAndSigToSignatureData`, a `MultiSignatureData` is created with the mismatched bit array and signatures [3](#0-2) 
 
-The `SetOwners` function unconditionally writes to the store: [4](#0-3) 
+5. When the transaction enters the ante handler for processing, either `ConsumeMultisignatureVerificationGas` or `VerifyMultisignature` is called
+6. The loop iterates through bit positions; when it encounters the 4th true bit but only 3 signatures exist, accessing `sig.Signatures[3]` triggers an out-of-bounds panic
+7. The Go panic crashes the validator node
 
-If duplicate indices exist, later entries overwrite earlier ones without any warning or error.
-
-**Exploit Scenario:**
-1. During a chain upgrade or genesis migration, an operator exports the genesis state
-2. A tool bug, manual editing error, or genesis state merge introduces duplicate indices (e.g., two `GenesisOwners` entries both have `Index: 5`)
-3. The genesis file is validated using `ValidateGenesis`, which calls `Validate()`
-4. The validation passes because each index individually is within range [1, gs.Index)
-5. `InitGenesis` is called during chain initialization
-6. For the duplicate index 5, `SetOwners` is called twice:
-   - First call: stores owners from first entry
-   - Second call: overwrites with owners from second entry
-7. The first set of owners is permanently lost from the chain state
-8. Modules expecting to own that capability can no longer access it
-
-**Security Failure:**
-This breaks the **state integrity invariant** - the capability ownership state becomes corrupted and inconsistent with what was intended to be imported. Modules that should have capability ownership lose access, potentially breaking critical functionality like IBC port capabilities or inter-module communication.
+**Security Guarantee Broken:**
+This violates memory safety (accessing array out of bounds) and availability guarantees (node crashes should not be triggerable by untrusted transactions).
 
 ## Impact Explanation
 
-**Affected Assets/Processes:**
-- Capability ownership mappings in the capability module
-- IBC port capabilities (if IBC module loses port ownership)
-- Inter-module capability-based permissions and communication
+**Consequences:**
+- Any validator node that processes the malicious transaction will panic and crash
+- The crash occurs during signature verification in the ante handler, part of the critical transaction validation path
+- An attacker can repeatedly broadcast such transactions to continuously crash nodes
+- If enough validators crash simultaneously, the network cannot reach consensus and may halt
+- No funds are directly stolen, but network functionality is completely compromised
 
-**Severity of Damage:**
-- Modules can permanently lose capability ownership without any indication
-- IBC connections could become non-functional if IBC port capabilities are affected
-- Transactions requiring the lost capabilities would fail
-- The chain may not be able to process certain types of transactions
-- Recovery would require manual intervention, potentially a coordinated upgrade or hard fork to fix the capability mappings
-
-**System Impact:**
-This qualifies as **"A bug in the layer 1 network code that results in unintended smart contract behavior with no concrete funds at direct risk"** (Medium severity). In severe cases where critical capabilities like IBC ports are lost, it could escalate to **"Network not being able to confirm new transactions"** if those capabilities are essential for transaction processing.
+This qualifies as "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions" (Medium severity) according to the provided impact criteria. If orchestrated effectively to crash a supermajority of validators, it could escalate to "Network not being able to confirm new transactions (total network shutdown)" (also Medium).
 
 ## Likelihood Explanation
 
 **Who Can Trigger:**
-This can be triggered accidentally by chain operators during:
-- Chain upgrades when genesis state is exported and re-imported
-- Manual genesis file editing during chain migration
-- Tool bugs in genesis generation or manipulation utilities
-- Merging genesis states from multiple sources
+Any network participant who can submit transactions. No special privileges, stake, or resources required beyond the ability to craft and broadcast a transaction.
 
-**Conditions Required:**
-- A genesis file with duplicate capability indices must be created (accidentally or through tooling bugs)
-- The genesis validation is performed (which incorrectly passes)
-- Chain initialization proceeds with the corrupted genesis state
+**Required Conditions:**
+- Attacker crafts a transaction with mismatched bit array (more true bits) and signature count (fewer signatures)
+- No special timing, network state, or coordination required
+- The vulnerability triggers during normal transaction validation flow
 
 **Frequency:**
-While not frequent in normal operation, this is a real risk during:
-- Major chain upgrades (happens periodically)
-- Network forks or migrations
-- Genesis state manipulations for testing or development that accidentally make it to production
+- Exploitable at any time during normal network operation
+- Each malicious transaction crashes any node attempting to process it
+- Attack is repeatable indefinitely by broadcasting multiple malicious transactions
+- With automation, attacker can crash nodes faster than restart time
 
-The likelihood is **moderate** because it requires genesis manipulation, but the consequences are severe and the validation bug makes it easy for such errors to slip through undetected.
+The likelihood is high because:
+1. Trivial to trigger (craft one malicious transaction)
+2. Impact is immediate and deterministic (guaranteed crash)
+3. No rate limits or economic costs prevent repeated exploitation
+4. Attack surface available to all network participants
 
 ## Recommendation
 
-Add a duplicate index check in the `Validate()` function in `x/capability/types/genesis.go`:
+Add validation to ensure the number of signatures exactly equals the number of true bits in the bit array. In `crypto/keys/multisig/multisig.go` after line 64, insert:
 
 ```go
-func (gs GenesisState) Validate() error {
-	// NOTE: index must be greater than 0
-	if gs.Index == 0 {
-		return fmt.Errorf("capability index must be non-zero")
-	}
-
-	// Track seen indices to detect duplicates
-	seenIndices := make(map[uint64]bool)
-
-	for _, genOwner := range gs.Owners {
-		if len(genOwner.IndexOwners.Owners) == 0 {
-			return fmt.Errorf("empty owners in genesis")
-		}
-
-		// Check for duplicate indices
-		if seenIndices[genOwner.Index] {
-			return fmt.Errorf("duplicate capability index %d in genesis", genOwner.Index)
-		}
-		seenIndices[genOwner.Index] = true
-
-		// all exported existing indices must be between [1, gs.Index)
-		if genOwner.Index == 0 || genOwner.Index >= gs.Index {
-			return fmt.Errorf("owners exist for index %d outside of valid range: %d-%d", genOwner.Index, 1, gs.Index-1)
-		}
-
-		for _, owner := range genOwner.IndexOwners.Owners {
-			if strings.TrimSpace(owner.Module) == "" {
-				return fmt.Errorf("owner's module cannot be blank: %s", owner)
-			}
-
-			if strings.TrimSpace(owner.Name) == "" {
-				return fmt.Errorf("owner's name cannot be blank: %s", owner)
-			}
-		}
-	}
-
-	return nil
+numTrueBits := bitarray.NumTrueBitsBefore(size)
+if len(sigs) != numTrueBits {
+    return fmt.Errorf("signature count %d does not match number of signers %d indicated by bit array", len(sigs), numTrueBits)
 }
 ```
+
+Apply the same validation in `x/auth/ante/sigverify.go` in the `ConsumeMultisignatureVerificationGas` function before the loop at line 454.
+
+This ensures the invariant that every true bit in the array has a corresponding signature, preventing out-of-bounds access.
 
 ## Proof of Concept
 
-**File:** `x/capability/types/genesis_test.go`
+**File:** `crypto/keys/multisig/multisig_test.go`
 
-**Test Function:** Add the following test case to the `TestValidateGenesis` function's test cases array:
+**Setup:**
+- Create 5 public/private key pairs and their corresponding signatures for a test message
+- Create a multisig public key with threshold 3 and the 5 public keys
+- Create a bit array with 5 positions and set 4 bits to true (positions 0, 1, 2, 3)
 
-```go
-{
-	name: "duplicate indices",
-	malleate: func(genState *GenesisState) {
-		genState.Index = 10
-		genOwner1 := GenesisOwners{
-			Index:       5,
-			IndexOwners: CapabilityOwners{[]Owner{{Module: "ibc", Name: "port/transfer"}}},
-		}
-		genOwner2 := GenesisOwners{
-			Index:       5,
-			IndexOwners: CapabilityOwners{[]Owner{{Module: "bank", Name: "port/bank"}}},
-		}
-		genState.Owners = append(genState.Owners, genOwner1, genOwner2)
-	},
-	expPass: false,
-},
-```
+**Action:**
+- Construct a `MultiSignatureData` with the 4-bit true bit array but only 3 signatures
+- Call `pk.VerifyMultisignature(signBytesFn, maliciousSig)`
 
-**Setup:** The test uses the existing `TestValidateGenesis` framework which creates a default genesis state and applies malleation functions.
+**Result:**
+- The function panics with an out-of-bounds error when attempting to access `sig.Signatures[3]`
+- The panic occurs at line 71 in `VerifyMultisignature` when `sigIndex=3` but only indices 0-2 exist
+- This confirms the vulnerability: a malicious transaction with this structure will crash any node attempting to verify it
 
-**Trigger:** The test creates a genesis state with two `GenesisOwners` entries that both have `Index: 5`, then calls `genState.Validate()`.
-
-**Observation:** 
-- **Current behavior (vulnerable):** The test will **PASS** (expPass: false will fail) because `Validate()` currently returns no error for duplicate indices
-- **Expected behavior (after fix):** The test should correctly detect the duplicate and return an error
-
-To demonstrate the state corruption in `InitGenesis`, add this additional test to `x/capability/genesis_test.go`:
-
-```go
-func (suite *CapabilityTestSuite) TestInitGenesisDuplicateIndices() {
-	// Create genesis state with duplicate indices
-	genState := types.GenesisState{
-		Index: 10,
-		Owners: []types.GenesisOwners{
-			{
-				Index: 5,
-				IndexOwners: types.CapabilityOwners{
-					Owners: []types.Owner{{Module: "ibc", Name: "port/transfer"}},
-				},
-			},
-			{
-				Index: 5,
-				IndexOwners: types.CapabilityOwners{
-					Owners: []types.Owner{{Module: "bank", Name: "port/bank"}},
-				},
-			},
-		},
-	}
-
-	// Validation incorrectly passes (demonstrates the bug)
-	err := genState.Validate()
-	suite.Require().NoError(err, "validation should fail but doesn't - this demonstrates the bug")
-
-	// Initialize genesis with duplicate indices
-	capability.InitGenesis(suite.ctx, *suite.keeper, genState)
-
-	// Check which owners were actually stored for index 5
-	owners, ok := suite.keeper.GetOwners(suite.ctx, 5)
-	suite.Require().True(ok)
-
-	// This demonstrates the bug: only the LAST entry's owners are stored
-	// The first entry (ibc module) was silently overwritten
-	suite.Require().Equal(1, len(owners.Owners), "expected 1 owner")
-	suite.Require().Equal("bank", owners.Owners[0].Module, "only the last duplicate entry's owner is stored")
-	
-	// The IBC module's ownership was lost - this is the security issue
-	// In a real scenario, this could break IBC functionality
-}
-```
-
-This test demonstrates that duplicate indices bypass validation and cause silent state corruption where the last duplicate entry overwrites all previous ones for the same index.
+The test demonstrates that validations at lines 56, 60, and 64 all pass, but the missing check for signature count matching true bits allows the out-of-bounds access to occur.
 
 ### Citations
 
-**File:** x/capability/types/genesis.go (L21-49)
+**File:** crypto/keys/multisig/multisig.go (L50-96)
 ```go
-func (gs GenesisState) Validate() error {
-	// NOTE: index must be greater than 0
-	if gs.Index == 0 {
-		return fmt.Errorf("capability index must be non-zero")
+func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
+	bitarray := sig.BitArray
+	sigs := sig.Signatures
+	size := bitarray.Count()
+	pubKeys := m.GetPubKeys()
+	// ensure bit array is the correct size
+	if len(pubKeys) != size {
+		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
 	}
-
-	for _, genOwner := range gs.Owners {
-		if len(genOwner.IndexOwners.Owners) == 0 {
-			return fmt.Errorf("empty owners in genesis")
-		}
-
-		// all exported existing indices must be between [1, gs.Index)
-		if genOwner.Index == 0 || genOwner.Index >= gs.Index {
-			return fmt.Errorf("owners exist for index %d outside of valid range: %d-%d", genOwner.Index, 1, gs.Index-1)
-		}
-
-		for _, owner := range genOwner.IndexOwners.Owners {
-			if strings.TrimSpace(owner.Module) == "" {
-				return fmt.Errorf("owner's module cannot be blank: %s", owner)
+	// ensure size of signature list
+	if len(sigs) < int(m.Threshold) || len(sigs) > size {
+		return fmt.Errorf("signature size is incorrect %d", len(sigs))
+	}
+	// ensure at least k signatures are set
+	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
+		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
+	}
+	// index in the list of signatures which we are concerned with.
+	sigIndex := 0
+	for i := 0; i < size; i++ {
+		if bitarray.GetIndex(i) {
+			si := sig.Signatures[sigIndex]
+			switch si := si.(type) {
+			case *signing.SingleSignatureData:
+				msg, err := getSignBytes(si.SignMode)
+				if err != nil {
+					return err
+				}
+				if !pubKeys[i].VerifySignature(msg, si.Signature) {
+					return fmt.Errorf("unable to verify signature at index %d", i)
+				}
+			case *signing.MultiSignatureData:
+				nestedMultisigPk, ok := pubKeys[i].(multisigtypes.PubKey)
+				if !ok {
+					return fmt.Errorf("unable to parse pubkey of index %d", i)
+				}
+				if err := nestedMultisigPk.VerifyMultisignature(getSignBytes, si); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("improper signature data type for index %d", sigIndex)
 			}
-
-			if strings.TrimSpace(owner.Name) == "" {
-				return fmt.Errorf("owner's name cannot be blank: %s", owner)
-			}
+			sigIndex++
 		}
+	}
+	return nil
+}
+```
+
+**File:** x/auth/ante/sigverify.go (L446-471)
+```go
+func ConsumeMultisignatureVerificationGas(
+	meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
+	params types.Params, accSeq uint64,
+) error {
+
+	size := sig.BitArray.Count()
+	sigIndex := 0
+
+	for i := 0; i < size; i++ {
+		if !sig.BitArray.GetIndex(i) {
+			continue
+		}
+		sigV2 := signing.SignatureV2{
+			PubKey:   pubkey.GetPubKeys()[i],
+			Data:     sig.Signatures[sigIndex],
+			Sequence: accSeq,
+		}
+		err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
+		if err != nil {
+			return err
+		}
+		sigIndex++
 	}
 
 	return nil
 }
 ```
 
-**File:** x/capability/genesis.go (L16-19)
+**File:** x/auth/tx/sigs.go (L66-85)
 ```go
-	// set owners for each index
-	for _, genOwner := range genState.Owners {
-		k.SetOwners(ctx, genOwner.Index, genOwner.IndexOwners)
-	}
-```
+	case *tx.ModeInfo_Multi_:
+		multi := modeInfo.Multi
 
-**File:** x/capability/keeper/keeper.go (L167-174)
-```go
-// SetOwners set the capability owners to the store
-func (k Keeper) SetOwners(ctx sdk.Context, index uint64, owners types.CapabilityOwners) {
-	prefixStore := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(index)
+		sigs, err := decodeMultisignatures(sig)
+		if err != nil {
+			return nil, err
+		}
 
-	// set owners in persistent store
-	prefixStore.Set(indexKey, k.cdc.MustMarshal(&owners))
-}
+		sigv2s := make([]signing.SignatureData, len(sigs))
+		for i, mi := range multi.ModeInfos {
+			sigv2s[i], err = ModeInfoAndSigToSignatureData(mi, sigs[i])
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return &signing.MultiSignatureData{
+			BitArray:   multi.Bitarray,
+			Signatures: sigv2s,
+		}, nil
 ```

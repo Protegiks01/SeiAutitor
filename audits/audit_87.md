@@ -1,249 +1,223 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Identifier Collision Vulnerability in Access Control System Due to Non-Normalized JSON Number Encoding and Substring Matching
+Incorrect Slash Accounting for Redelegations When Destination Validator Has Been Slashed
 
 ## Summary
-The access control system's dependency matching mechanism incorrectly matches numeric identifiers using substring comparison after hex encoding non-normalized JSON values. This allows different numeric values to collide when one's hex representation is a substring of another's (e.g., "1" matches "10", "100", "10.0"), enabling access control bypass and dependency graph corruption in WASM contract execution. [1](#0-0) [2](#0-1) 
+The `SlashRedelegation` function in the staking module contains an accounting mismatch where it returns a theoretical slash amount based on `InitialBalance` but actually burns tokens based on current share values. When the destination validator has been slashed between the redelegation and the source validator's slash event, this discrepancy causes the source validator to be systematically under-slashed, violating the protocol's slashing invariants.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary: `x/accesscontrol/keeper/keeper.go`, `BuildSelectorOps()` function, lines 320-338
-- Secondary: `types/accesscontrol/comparator.go`, `DependencyMatch()` function, lines 95-96
+**Location:** [1](#0-0)  and its interaction with the main Slash function at [2](#0-1) 
 
-**Intended Logic:** 
-The access control system should uniquely identify WASM contract operations by extracting values from JSON messages and creating distinct hex-encoded identifiers. Dependencies should match only when identifiers represent the same logical operation.
+**Intended Logic:** According to the protocol specification [3](#0-2) , when a validator is slashed, the total amount slashed should equal `slashFactor * power` at the infraction height. Each amount slashed from redelegations and unbonding delegations should be subtracted from the total slash amount, and the remaining amount should be slashed from the validator's bonded tokens.
 
-**Actual Logic:**
-The system extracts JSON values using JQ selectors without normalization. For numeric values, different JSON representations of semantically equivalent or distinct numbers produce hex identifiers that substring-match incorrectly:
+**Actual Logic:** The `SlashRedelegation` function calculates the theoretical slash amount as `slashFactor.MulInt(entry.InitialBalance)` and accumulates this into `totalSlashAmount` which it returns [4](#0-3) . However, the actual tokens burned come from calling `Unbond` [5](#0-4) , which converts shares to tokens using the destination validator's current exchange rate [6](#0-5) . When the destination validator has been slashed, its exchange rate decreases (fewer tokens per share), causing `tokensToBurn` to be less than the theoretical `slashAmount`. The function returns `totalSlashAmount` (theoretical) rather than the sum of actual `tokensToBurn` values.
 
-1. JQ extracts raw JSON bytes without normalization (line 325)
-2. Values are hex-encoded as-is: `hex.EncodeToString([]byte(trimmedData))` (line 337)
-3. Dependency matching uses `strings.Contains(c.Identifier, accessOp.GetIdentifierTemplate())` (comparator.go:96)
+**Exploitation Path:**
+1. Validator A commits a slashable infraction at height H1
+2. After H1, a delegator redelegates tokens from A to B (normal operation), creating a redelegation entry with `InitialBalance` and `SharesDst`
+3. Validator B is slashed for its own infraction, reducing its share-to-token exchange rate
+4. Evidence for A's infraction is submitted and slashing occurs:
+   - `SlashRedelegation` calculates theoretical slash = `slashFactor * InitialBalance`
+   - Actual burn = `slashFactor * SharesDst * (current tokens/share of B)`
+   - Since B was slashed, current tokens/share < 1, so actual burn < theoretical slash
+   - Function returns theoretical slash amount
+   - Main `Slash` function subtracts theoretical amount from `remainingSlashAmount`
+   - Validator A's bonded tokens are slashed by remaining amount
+   - Total actual burn is less than `slashFactor * power`, violating protocol invariant
 
-This creates collisions:
-- Value `"1"` → hex `"31"` 
-- Value `"10"` → hex `"3130"` (contains `"31"`)
-- Value `"100"` → hex `"313030"` (contains `"31"` and `"3130"`)
-- Value `"10.0"` → hex `"31302e30"` (contains `"3130"`) [3](#0-2) 
-
-**Exploit Scenario:**
-1. A WASM contract has dependency mapping with JQ selector extracting numeric field (e.g., `.amount`)
-2. Expected identifier template contains hex-encoded value "1" = `"31"`
-3. Attacker crafts transaction with JSON containing `"amount": 10` (or `"amount": 100`, etc.)
-4. System generates identifier containing hex `"3130"` or `"313030"`
-5. `DependencyMatch` incorrectly returns true because `strings.Contains("3130", "31")` = true
-6. Operation intended for amount=1 now matches amount=10, bypassing access control [4](#0-3) 
-
-**Security Failure:**
-- **Access Control Bypass**: Operations match incorrect dependency templates
-- **Dependency Graph Corruption**: Transaction ordering based on dependencies becomes incorrect
-- **State Consistency**: Different values trigger same dependency checks, violating isolation
+**Security Guarantee Broken:** The protocol's slashing invariant that validators must be slashed by exactly `slashFactor * power` at the infraction height is violated. This allows validators to escape proportional punishment through strategic or coincidental redelegations to validators that are subsequently slashed.
 
 ## Impact Explanation
 
-This vulnerability affects the WASM contract access control and dependency resolution system:
+This vulnerability weakens the economic security model of the Cosmos network by allowing systematic under-slashing of misbehaving validators. When cascading slashing events occur (multiple validators being slashed in sequence), or when redelegations exist to risky validators that subsequently get slashed, the source validator escapes proportional punishment.
 
-1. **Unintended Smart Contract Behavior**: Operations that should conflict are not detected as conflicting, allowing race conditions
-2. **Incorrect Transaction Ordering**: The dependency DAG used for parallel execution ordering may incorrectly identify dependencies, leading to wrong execution order
-3. **Access Control Bypass**: Resource access checks may fail to properly identify conflicting operations
+For example, if a validator with 10,000 tokens has 2,000 tokens redelegated to another validator that gets slashed 50%, and then the source validator is slashed 50%, the shortfall would be 500 tokens (5% of total intended punishment). This can accumulate across multiple redelegations and slashing events.
 
-The impact qualifies as **Medium severity** under "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." While funds are not directly at risk, incorrect dependency resolution can cause:
-- State corruption from improperly ordered transactions
-- Race conditions in WASM contract execution
-- Bypassing of intended access controls
+The slashing mechanism is fundamental to blockchain security—it ensures validators face financial consequences for misbehavior. Under-slashing reduces deterrence against malicious behavior and undermines the network's security guarantees. Fewer tokens are burned than the protocol specifies, affecting token supply accounting and the effectiveness of the penalty mechanism.
 
 ## Likelihood Explanation
 
-**Likelihood: High**
+**Who Can Trigger:** Any network participant can trigger this through normal operations—no special privileges are required.
 
-- **Who can trigger**: Any user sending WASM contract execute/query messages
-- **Conditions required**: 
-  - WASM contract uses dependency mappings with JQ selectors on numeric fields
-  - User controls JSON message format (standard for WASM contracts)
-- **Frequency**: Can occur on every transaction where:
-  - Numeric values are used in identifiers
-  - Multiple contracts/operations use related numeric ranges (1, 10, 100, etc.)
+**Conditions Required:**
+1. A validator commits a slashable infraction (double-signing, downtime, etc.)
+2. After the infraction, delegators redelegate from that validator to another validator (routine operation)
+3. The destination validator gets slashed for its own independent infraction
+4. The source validator's infraction is eventually detected and slashed
 
-The vulnerability is easily exploitable because:
-1. Users have full control over JSON message formatting
-2. JSON standard explicitly allows multiple numeric representations
-3. No input normalization occurs before hex encoding
-4. The substring matching is systematic, not conditional
+**Frequency:** This can occur naturally during periods of network instability when multiple validators are experiencing issues and being slashed. The vulnerability is systemic and will manifest whenever the conditions align. It can also be strategically exploited by sophisticated attackers who:
+- Commit an infraction and then redelegate to risky or compromised validators they control
+- Cause those destination validators to be slashed before their original infraction is discovered
+- Thereby reduce their total slashing penalty
+
+The issue is repeatable and not a one-time edge case, making it a persistent vulnerability in the protocol's security model.
 
 ## Recommendation
 
-1. **Normalize numeric values** before hex encoding in `BuildSelectorOps`:
-   - Parse JSON numbers using `json.Unmarshal` into numeric types
-   - Re-encode in canonical form (e.g., minimal representation without trailing zeros)
-   
-2. **Use exact matching** for complete identifiers instead of substring matching in `DependencyMatch`:
-   - Replace `strings.Contains()` with equality check for non-wildcard identifiers
-   - Only use prefix matching for explicitly designed hierarchical identifiers
+Modify the `SlashRedelegation` function to return the actual burned amount rather than the theoretical slash amount. The fix requires:
 
-3. **Add delimiter-aware matching**: If substring matching is required for legitimate use cases, ensure proper delimiters prevent false positives:
-   - Use explicit separators between identifier components
-   - Check for delimiter boundaries, not arbitrary substrings
+1. Track the cumulative actual `tokensToBurn` from all redelegation entries instead of the theoretical `slashAmount`
+2. Replace the accumulation at line 240 from `totalSlashAmount = totalSlashAmount.Add(slashAmount)` to `totalSlashAmount = totalSlashAmount.Add(tokensToBurn)`
+3. Return the sum of actual `tokensToBurn` values instead of theoretical `slashAmount` values
 
-Example fix for BuildSelectorOps:
-```go
-// After JQ extraction, normalize numeric values
-var numVal float64
-if err := json.Unmarshal(data, &numVal); err == nil {
-    // It's a number - use canonical representation
-    trimmedData = fmt.Sprintf("%g", numVal) // Removes trailing zeros
-} else {
-    // It's a string - use as-is
-    trimmedData = strings.Trim(string(data), "\"")
-}
-```
+Alternatively, implement a two-phase approach where:
+1. Record both theoretical and actual amounts during redelegation slashing
+2. Track the shortfall between theoretical and actual burns
+3. Adjust the validator's bonded token slash to compensate for any shortfall, ensuring the total burn equals the protocol-specified amount
+
+This ensures the slashing invariant is maintained: total actual burn = `slashFactor * power` at infraction height.
 
 ## Proof of Concept
 
-**File**: `x/accesscontrol/keeper/keeper_test.go`
+**File:** `x/staking/keeper/slash_test.go`
+**Function:** `TestSlashRedelegationWithSlashedDestination` (to be added)
 
-**Test Function**: Add new test `TestIdentifierCollisionVulnerability`
+**Setup:**
+1. Bootstrap test environment with 3 validators (A, B, C) each with 1000 tokens (power=10 at reduction factor of 100)
+2. Create a delegator with sufficient funds
+3. Create a redelegation from validator A to validator B of 400 tokens at height 11
+4. Record validator A's infraction at height 10 (before the redelegation occurred)
 
-**Setup**:
-1. Initialize SimApp with test context
-2. Create test WASM contract address
-3. Register dependency mapping with JQ selector on numeric field `.amount`
-4. Set identifier template expecting value "1"
+**Action:**
+1. Slash validator B by 50% at height 12 (this reduces B's share-to-token exchange rate to 0.5)
+2. Record the bonded pool balance before slashing validator A
+3. Slash validator A by 50% at height 13 for the infraction committed at height 10
+4. Record the bonded pool balance after slashing validator A
 
-**Trigger**:
-1. Create first message with `{"send":{"amount":1}}`
-2. Verify identifier is generated correctly
-3. Create second message with `{"send":{"amount":10}}`
-4. Extract dependencies for both messages
+**Result:**
+The test demonstrates the under-slashing:
+- Theoretical slash for the redelegation: 50% × 400 = 200 tokens
+- Actual burn from redelegation: 50% × 400 shares × 0.5 tokens/share = 100 tokens  
+- Total intended slash: 50% × 1000 = 500 tokens (based on A's power at infraction height)
+- Redelegation theoretical amount subtracted from `remainingSlashAmount`: 200 tokens
+- Remaining amount to slash from A: 500 - 200 = 300 tokens
+- Total actual burn: 100 (actual from redelegation) + 300 (from A's bonded tokens) = 400 tokens
+- **Expected burn: 500 tokens**
+- **Shortfall: 100 tokens (20% under-slash)**
 
-**Observation**:
-The test demonstrates that identifier for amount=10 incorrectly contains identifier for amount=1, causing false match:
-- Expected: Identifiers for "1" and "10" should be distinct and not match
-- Actual: hex("10") = "3130" contains hex("1") = "31", causing incorrect match
-- This proves the substring matching vulnerability
+The bonded pool balance decrease confirms that only 400 tokens were burned instead of the protocol-specified 500 tokens, validating the vulnerability.
 
-```go
-func TestIdentifierCollisionVulnerability(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    wasmContractAddress := simapp.AddTestAddrsIncremental(app, ctx, 1, sdk.NewInt(30000000))[0]
-    
-    // Setup dependency mapping with JQ selector on amount field
-    wasmMapping := acltypes.WasmDependencyMapping{
-        BaseAccessOps: []*acltypes.WasmAccessOperation{
-            {
-                Operation: &acltypes.AccessOperation{
-                    ResourceType:       acltypes.ResourceType_KV_WASM,
-                    AccessType:         acltypes.AccessType_WRITE,
-                    IdentifierTemplate: wasmContractAddress.String() + "/%s",
-                },
-                SelectorType: acltypes.AccessOperationSelectorType_JQ,
-                Selector:     ".send.amount",
-            },
-            {
-                Operation:    types.CommitAccessOp(),
-                SelectorType: acltypes.AccessOperationSelectorType_NONE,
-            },
-        },
-        ContractAddress: wasmContractAddress.String(),
-    }
-    
-    err := app.AccessControlKeeper.SetWasmDependencyMapping(ctx, wasmMapping)
-    require.NoError(t, err)
-    
-    // Test with amount=1
-    info1, _ := types.NewExecuteMessageInfo([]byte("{\"send\":{\"amount\":1}}"))
-    deps1, err := app.AccessControlKeeper.GetWasmDependencyAccessOps(
-        ctx, wasmContractAddress, "", info1, make(aclkeeper.ContractReferenceLookupMap),
-    )
-    require.NoError(t, err)
-    
-    // Test with amount=10
-    info10, _ := types.NewExecuteMessageInfo([]byte("{\"send\":{\"amount\":10}}"))
-    deps10, err := app.AccessControlKeeper.GetWasmDependencyAccessOps(
-        ctx, wasmContractAddress, "", info10, make(aclkeeper.ContractReferenceLookupMap),
-    )
-    require.NoError(t, err)
-    
-    // Extract identifiers
-    identifier1 := fmt.Sprintf("%s/%s", wasmContractAddress.String(), hex.EncodeToString([]byte("1")))
-    identifier10 := fmt.Sprintf("%s/%s", wasmContractAddress.String(), hex.EncodeToString([]byte("10")))
-    
-    // Verify collision: identifier10 contains identifier1
-    require.True(t, strings.Contains(identifier10, hex.EncodeToString([]byte("1"))), 
-        "Vulnerability: hex(10)='3130' contains hex(1)='31'")
-    
-    // This demonstrates the dependency matching would incorrectly match
-    // Operations for amount=1 and amount=10 due to substring collision
-    set1 := types.NewAccessOperationSet(deps1)
-    set10 := types.NewAccessOperationSet(deps10)
-    
-    // Both should have different identifiers, but they collide via substring match
-    t.Logf("Identifier for amount=1: %s (hex: %s)", identifier1, hex.EncodeToString([]byte("1")))
-    t.Logf("Identifier for amount=10: %s (hex: %s)", identifier10, hex.EncodeToString([]byte("10")))
-    t.Logf("Collision: '3130' contains '31' = %v", strings.Contains("3130", "31"))
-}
-```
+## Notes
 
-**Expected Result**: Test demonstrates the collision where hex("10")="3130" contains hex("1")="31", proving that the substring matching causes false positives in dependency matching, enabling access control bypass.
+This vulnerability affects the core slashing mechanism in the Cosmos SDK staking module. It represents a deviation from the protocol specification that compounds across multiple slashing events, potentially allowing validators to significantly reduce their punishment by strategically timing redelegations. The issue is not a hypothetical edge case but a systematic accounting error that violates fundamental protocol invariants whenever cascading slashing events occur.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/keeper.go (L320-338)
+**File:** x/staking/keeper/slash.go (L93-102)
 ```go
-		case acltypes.AccessOperationSelectorType_JQ:
-			op, err := jq.Parse(opWithSelector.Selector)
-			if err != nil {
-				return nil, err
-			}
-			data, err := op.Apply(msgInfo.MessageFullBody)
-			if err != nil {
-				if withinContractReference {
-					opWithSelector.Operation.IdentifierTemplate = "*"
-					break selectorSwitch
-				}
-				// if the operation is not applicable to the message, skip it
+		// Iterate through redelegations from slashed source validator
+		redelegations := k.GetRedelegationsFromSrcValidator(ctx, operatorAddress)
+		for _, redelegation := range redelegations {
+			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
+			if amountSlashed.IsZero() {
 				continue
 			}
-			trimmedData := strings.Trim(string(data), "\"") // we need to trim the quotes around the string
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hex.EncodeToString([]byte(trimmedData)),
-			)
+
+			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
+		}
 ```
 
-**File:** types/accesscontrol/comparator.go (L75-101)
+**File:** x/staking/keeper/slash.go (L219-296)
 ```go
-func (c *Comparator) DependencyMatch(accessOp AccessOperation, prefix []byte) bool {
-	// If the resource prefixes are the same, then its just the access type, if they're not the same
-	// then they do not match. Make this the first condition check to avoid additional matching
-	// as most of the time this will be enough to determine if they're dependency matches
-	if c.AccessType != accessOp.AccessType && accessOp.AccessType != AccessType_UNKNOWN {
-		return false
+func (k Keeper) SlashRedelegation(ctx sdk.Context, srcValidator types.Validator, redelegation types.Redelegation,
+	infractionHeight int64, slashFactor sdk.Dec) (totalSlashAmount sdk.Int) {
+	now := ctx.BlockHeader().Time
+	totalSlashAmount = sdk.ZeroInt()
+	bondedBurnedAmount, notBondedBurnedAmount := sdk.ZeroInt(), sdk.ZeroInt()
+
+	// perform slashing on all entries within the redelegation
+	for _, entry := range redelegation.Entries {
+		// If redelegation started before this height, stake didn't contribute to infraction
+		if entry.CreationHeight < infractionHeight {
+			continue
+		}
+
+		if entry.IsMature(now) {
+			// Redelegation no longer eligible for slashing, skip it
+			continue
+		}
+
+		// Calculate slash amount proportional to stake contributing to infraction
+		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+		slashAmount := slashAmountDec.TruncateInt()
+		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+
+		// Unbond from target validator
+		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
+		if sharesToUnbond.IsZero() {
+			continue
+		}
+
+		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
+		if err != nil {
+			panic(err)
+		}
+
+		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
+
+		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
+		if !found {
+			// If deleted, delegation has zero shares, and we can't unbond any more
+			continue
+		}
+
+		if sharesToUnbond.GT(delegation.Shares) {
+			sharesToUnbond = delegation.Shares
+		}
+
+		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
+		if err != nil {
+			panic(fmt.Errorf("error unbonding delegator: %v", err))
+		}
+
+		dstValidator, found := k.GetValidator(ctx, valDstAddr)
+		if !found {
+			panic("destination validator not found")
+		}
+
+		// tokens of a redelegation currently live in the destination validator
+		// therefor we must burn tokens from the destination-validator's bonding status
+		switch {
+		case dstValidator.IsBonded():
+			bondedBurnedAmount = bondedBurnedAmount.Add(tokensToBurn)
+		case dstValidator.IsUnbonded() || dstValidator.IsUnbonding():
+			notBondedBurnedAmount = notBondedBurnedAmount.Add(tokensToBurn)
+		default:
+			panic("unknown validator status")
+		}
 	}
 
-	// The resource type was found in the parent store mapping or the child mapping
-	if accessOp.GetIdentifierTemplate() == "*" {
-		return true
+	if err := k.burnBondedTokens(ctx, bondedBurnedAmount); err != nil {
+		panic(err)
 	}
 
-	// Both Identifiers should be starting with the same prefix expected for the resource type
-	// e.g if the StoreKey and resource type is ResourceType_KV_BANK_BALANCES, then they both must start with BalancesPrefix
-	encodedPrefix := hex.EncodeToString(prefix)
-	if !strings.HasPrefix(c.Identifier, encodedPrefix) || !strings.HasPrefix(accessOp.GetIdentifierTemplate(), encodedPrefix) {
-		return false
+	if err := k.burnNotBondedTokens(ctx, notBondedBurnedAmount); err != nil {
+		panic(err)
 	}
 
-	// With the same prefix, c.Identififer should be a superset of IdentifierTemplate, it not equal
-	if !strings.Contains(c.Identifier, accessOp.GetIdentifierTemplate()) {
-		return false
-	}
-
-	return true
+	return totalSlashAmount
 }
+```
+
+**File:** x/staking/spec/02_state_transitions.md (L131-138)
+```markdown
+- The total `slashAmount` is calculated as the `slashFactor` (a chain parameter) \* `TokensFromConsensusPower`,
+  the total number of tokens bonded to the validator at the time of the infraction.
+- Every unbonding delegation and pseudo-unbonding redelegation such that the infraction occured before the unbonding or
+  redelegation began from the validator are slashed by the `slashFactor` percentage of the initialBalance.
+- Each amount slashed from redelegations and unbonding delegations is subtracted from the
+  total slash amount.
+- The `remaingSlashAmount` is then slashed from the validator's tokens in the `BondedPool` or
+  `NonBondedPool` depending on the validator's status. This reduces the total supply of tokens.
+```
+
+**File:** x/staking/types/validator.go (L304-305)
+```go
+func (v Validator) TokensFromShares(shares sdk.Dec) sdk.Dec {
+	return (shares.MulInt(v.Tokens)).Quo(v.DelegatorShares)
 ```

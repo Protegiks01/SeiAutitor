@@ -1,244 +1,242 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Missing Store Name Validation in StoreV2 Query Handler Leads to Node Crash via Nil Pointer Dereference
+Concurrent Capability Creation Race Condition Causes Non-Deterministic Consensus Failure
 
 ## Summary
-The `handleQueryStore` function in `baseapp/abci.go` and the `Query` method in `storev2/rootmulti/store.go` do not validate that requested store names correspond to mounted/registered stores before attempting to access them. This allows any external attacker to crash query processing nodes by sending ABCI queries for non-existent store names, triggering nil pointer dereferences. [1](#0-0) 
+The capability module's `NewCapability` function writes to a shared `capMap` without synchronization during concurrent transaction execution via the OCC scheduler. This creates a data race where different validators may end up with different capability objects mapped to the same index, causing non-deterministic authentication results and consensus failure. [1](#0-0) 
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
-**Location:** 
-- Primary: `storev2/rootmulti/store.go`, lines 548-591 (Query method)
-- Secondary: `baseapp/abci.go`, lines 916-949 (handleQueryStore function) [2](#0-1) 
+**Location**: `x/capability/keeper/keeper.go` line 260 in the `NewCapability` function
 
-**Intended Logic:**
-The store query mechanism should only allow queries to validly mounted stores that are registered in the application. The original `store/rootmulti` implementation includes validation by calling `GetStoreByName()` and returning an error if the store is nil. [3](#0-2) 
+**Intended Logic**: The capability module should provide deterministic capability creation and authentication across all validators. Each capability index should map to exactly one capability object, ensuring consistent authentication results across all nodes and deterministic consensus.
 
-**Actual Logic:**
-The storev2 implementation skips this validation entirely. At line 572, it directly calls `scStore.GetTreeByName(storeName)` without checking if the returned tree is nil, then passes it to `commitment.NewStore()`. When a non-existent store name is provided, `GetTreeByName()` returns nil (as evidenced by the explicit nil check in `loadCommitStoreFromParams` at lines 462-464). [4](#0-3) [5](#0-4) 
+**Actual Logic**: 
+The sei-cosmos blockchain uses an OCC (Optimistic Concurrency Control) scheduler that executes transactions concurrently in multiple goroutines (default 20 workers). [2](#0-1) [3](#0-2) 
 
-The subsequent call to `store.Query(req)` at line 579 invokes methods on the `commitment.Store` with a nil tree field. These methods (e.g., `st.tree.Version()` at line 138, `st.tree.Get()` at line 98) cause nil pointer dereference panics. [6](#0-5) [7](#0-6) 
+All `ScopedKeeper` instances share the same `capMap` reference from the parent `Keeper`: [4](#0-3) 
 
-**Exploit Scenario:**
-1. Attacker sends ABCI query: `/store/nonexistent_store_xyz/key` where "nonexistent_store_xyz" is any store name not mounted in the application
-2. `handleQueryStore` reconstructs path as `/nonexistent_store_xyz/key` and calls `queryable.Query(req)`
-3. `storev2/rootmulti/store.Query()` parses "nonexistent_store_xyz" from the path with no validation
-4. For proof-requiring queries: calls `scStore.GetTreeByName("nonexistent_store_xyz")` → returns nil
-5. Creates `commitment.NewStore(nil, rs.logger)` with nil tree
-6. Calls `store.Query(req)` which attempts `st.tree.Version()` on nil tree
-7. Panic occurs, crashing the query handler thread/goroutine
-8. Repeated queries can crash multiple nodes processing RPC requests
+The critical flaw is that `capMap` is a plain Go map accessed without any synchronization (no mutexes, no sync.Map), while the OCC scheduler only tracks reads/writes to the KVStore via multiversion stores. The `capMap` exists outside the KVStore and its modifications cannot be tracked or rolled back by OCC.
 
-**Security Failure:**
-Denial-of-service through unhandled nil pointer dereference. The missing input validation allows external attackers to trigger panics in query processing nodes, violating the availability security property.
+When multiple transactions concurrently execute `NewCapability`:
+1. Both read the same index from the persistent store (optimistic read allowed by OCC)
+2. Both create different capability objects with the same index
+3. Both write to `capMap[index]` concurrently **without synchronization** - this is a data race
+4. OCC detects the KVStore conflict (both wrote to `KeyIndex`) and aborts one transaction
+5. The aborted transaction's KVStore writes (memStore entries) are properly rolled back
+6. **However**, the `capMap[index]` write from the aborted transaction may persist due to the race condition
+
+**Exploitation Path**:
+1. User submits IBC transactions that create capabilities (e.g., port bindings, channel creations)
+2. Two transactions in the same block both call `NewCapability` 
+3. OCC scheduler executes them concurrently in separate goroutines
+4. Both read `index=1`, create different capability objects (`capA` and `capB`), and race on `capMap[1]` write
+5. OCC validation succeeds for one transaction (A), aborts the other (B)
+6. Due to the race, `capMap[1]` may contain either `capA` (correct) or `capB` (wrong - from aborted tx)
+7. Different validators have different goroutine scheduling, resulting in different race outcomes
+8. Later transactions call `GetCapability` which reads from `capMap[1]` [5](#0-4) 
+9. Validators with `capMap[1] = capA` return the correct capability; those with `capMap[1] = capB` return the wrong one
+10. When `AuthenticateCapability` is called, it uses `FwdCapabilityKey` which encodes the capability's memory address [6](#0-5) 
+11. For the wrong capability object, `memStore.Get(FwdCapabilityKey(module, wrongCap))` returns empty (the key was rolled back), causing authentication to fail
+12. Different validators produce different authentication results → different transaction outcomes → different state roots → **consensus failure**
+
+**Security Guarantee Broken**: Deterministic consensus - the same sequence of transactions must produce identical state across all validators.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Query RPC endpoints on all nodes running storev2
-- Node availability and query processing capability
-- Network's ability to serve state queries to users/dApps
+This vulnerability affects the fundamental consensus mechanism:
 
-**Damage Severity:**
-An attacker can repeatedly send malicious queries to crash query handlers on nodes across the network. Since RPC queries are typically handled by dedicated goroutines or threads, this can:
-- Crash RPC handler threads, requiring node restarts
-- Exhaust node resources if panics aren't properly recovered
-- Render nodes unable to serve state queries, affecting dApp functionality
-- Impact nodes representing ≥30% of network infrastructure if targeted systematically
+- **Scope**: All IBC channels, ports, and capability-based authorizations become non-deterministic
+- **Consequence**: Validators disagree on capability authentication results within the same block, computing different state roots for identical transaction sequences
+- **Network Effect**: The blockchain will halt or permanently split when validators cannot reach consensus on block validity
+- **Recovery**: Requires a hard fork to fix the race condition and resync the network
 
-**System Impact:**
-This compromises network reliability and availability. While it doesn't directly affect consensus or funds, it degrades the network's utility by making state data inaccessible, which is critical for users, wallets, and applications interacting with the blockchain.
+The issue is particularly severe because:
+1. It occurs during normal IBC operations (not an attack vector)
+2. The non-determinism is probabilistic and scheduler-dependent (timing-based)
+3. IBC is a critical component for cross-chain communication
+4. There's existing acknowledgment in the code that `capMap` doesn't revert properly [7](#0-6) 
 
 ## Likelihood Explanation
 
-**Trigger Accessibility:**
-Any external actor can trigger this vulnerability - no authentication, privileged access, or special conditions required. ABCI query endpoints are publicly accessible on RPC nodes.
+**Triggering Actors**: Any user or protocol submitting transactions that create capabilities (IBC port bindings, channel openings, etc.)
 
-**Conditions Required:**
-- Target node must be running storev2 storage system (indicated by the code path in `storev2/rootmulti/store.go`)
-- Attacker only needs to know that certain store names don't exist (or can try random names)
-- No rate limiting specifically prevents malicious query patterns
+**Required Conditions**:
+- Concurrent transaction execution enabled (OCC scheduler with >1 worker)
+- At least two transactions in the same block calling `NewCapability`
+- Transactions executing concurrently and reading the same capability index
 
-**Exploit Frequency:**
-Can be exploited continuously during normal operation. An attacker can:
-- Send queries in rapid succession to different nodes
-- Target multiple nodes simultaneously
-- Cause repeated crashes requiring manual intervention
-- Execute attack at any time without special timing requirements
+**Frequency Assessment**:
+- **High likelihood**: IBC operations are frequent in production chains
+- The default configuration uses 20 concurrent workers, maximizing the race window [2](#0-1) 
+- Probability increases linearly with block size and transaction throughput
+- The race is probabilistic but inevitable under sustained IBC traffic
+- Once triggered, all subsequent authentications for that capability index are affected
 
 ## Recommendation
 
-Add store name validation in the `Query` method before attempting to access the store, matching the behavior of the original `store/rootmulti` implementation:
+Replace the plain `map[uint64]*types.Capability` with `sync.Map` for thread-safe concurrent access:
 
 ```go
-// In storev2/rootmulti/store.go Query method, after line 558:
-path := req.Path
-storeName, subPath, err := parsePath(path)
-if err != nil {
-    return sdkerrors.QueryResult(err)
-}
+// In Keeper and ScopedKeeper structs
+capMap sync.Map
 
-// ADD THIS VALIDATION:
-key := rs.storeKeys[storeName]
-if key == nil {
-    return sdkerrors.QueryResult(sdkerrors.Wrapf(
-        sdkerrors.ErrUnknownRequest, 
-        "no such store: %s", 
-        storeName,
-    ))
-}
+// In NewCapability
+sk.capMap.Store(index, cap)
 
-var store types.Queryable
-// ... continue with existing logic
+// In GetCapability  
+capInterface, ok := sk.capMap.Load(index)
+if !ok {
+    panic("capability found in memstore is missing from map")
+}
+cap := capInterface.(*types.Capability)
+
+// In InitializeCapability
+k.capMap.Store(index, cap)
+
+// In ReleaseCapability
+sk.capMap.Delete(cap.GetIndex())
 ```
 
-This ensures that only mounted, registered stores can be queried, preventing the nil tree scenario.
+Alternatively, protect all `capMap` access with a `sync.RWMutex` to ensure atomicity during concurrent execution. This would require:
+- Adding `var capMapMu sync.RWMutex` to the Keeper struct
+- Wrapping all `capMap` reads with `capMapMu.RLock()`/`capMapMu.RUnlock()`
+- Wrapping all `capMap` writes with `capMapMu.Lock()`/`capMapMu.Unlock()`
 
 ## Proof of Concept
 
-**Test File:** `storev2/rootmulti/store_test.go`
+**File**: `x/capability/keeper/keeper_test.go`
 
-**Test Function:** Add `TestQueryNonExistentStoreCausesPanic`
+**Test Function**: `TestConcurrentCapabilityRaceCondition`
 
-**Setup:**
-1. Create a new storev2 Store instance using `NewStore()` with temporary directory
-2. Mount a single valid store (e.g., "validstore") and initialize it
-3. Commit at least one version to have queryable state
+**Setup**:
+1. Initialize a capability keeper with two scoped modules ("ibc" and "transfer")
+2. Initialize the keeper's memory store via `keeper.InitMemStore(ctx)`
+3. Create a context that simulates concurrent OCC execution environment
+4. Set up channels to coordinate goroutine execution timing
 
-**Trigger:**
-1. Construct an ABCI RequestQuery with path `/nonexistent_store/key`
-2. Call `store.Query(req)` with this crafted request
-3. The code will parse "nonexistent_store" as the store name
-4. GetTreeByName returns nil for this non-existent store
-5. commitment.NewStore(nil, ...) is called
-6. The subsequent Query invocation accesses st.tree.Version() on nil
+**Action**:
+1. Launch two goroutines that simultaneously call `NewCapability` with different capability names
+2. Use barriers/channels to ensure both goroutines read the same index before either commits
+3. Both create capabilities with index=1 and race on `capMap[1]` write
+4. Allow one transaction to complete successfully, simulate OCC aborting the other
+5. Attempt to retrieve the capability via `GetCapability` and authenticate it via `AuthenticateCapability`
 
-**Observation:**
-The test will panic with a nil pointer dereference when attempting to access methods on the nil tree. This can be detected using `require.Panics()` or by catching the panic in a defer/recover block. The panic stack trace will show the crash originates from `commitment.Store.Query` attempting to dereference `st.tree`.
+**Result**:
+1. The test should detect (via `go test -race`) a data race on `capMap[index]`
+2. Multiple test runs produce different authentication outcomes depending on race timing
+3. Specifically, when `capMap[1]` contains the wrong capability object:
+   - `GetCapability` returns a capability object
+   - `AuthenticateCapability` returns `false` because `GetCapabilityName` returns empty string
+   - The memStore has the correct forward key, but `capMap[1]` points to a different object
+4. This demonstrates non-deterministic behavior: identical transaction sequences produce different results
 
-**Expected behavior:** Should return an error response indicating "no such store: nonexistent_store" instead of panicking.
+Running with `go test -race` should detect the unsynchronized concurrent access to `capMap[index]`.
 
-**Test demonstrates:** The vulnerability is real and exploitable - any query to a non-mounted store name crashes the query handler, proving the denial-of-service impact.
+## Notes
+
+The code already contains a comment acknowledging that "changes to go map do not automatically get reverted on tx failure" and references issue #7805. However, the current mitigation only handles the case where no capability exists in memStore, not the race condition where concurrent writes leave the wrong capability object in the map. This vulnerability requires immediate attention as it affects consensus determinism under the default concurrent execution configuration.
 
 ### Citations
 
-**File:** baseapp/abci.go (L916-949)
+**File:** x/capability/keeper/keeper.go (L83-89)
 ```go
-func handleQueryStore(app *BaseApp, path []string, req abci.RequestQuery) abci.ResponseQuery {
-	var (
-		queryable sdk.Queryable
-		ok        bool
-	)
-	// Check if online migration is enabled for fallback read
-	if req.Height < app.migrationHeight && app.qms != nil {
-		queryable, ok = app.qms.(sdk.Queryable)
-		if !ok {
-			return sdkerrors.QueryResultWithDebug(sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, "multistore doesn't support queries"), app.trace)
-		}
-	} else {
-		queryable, ok = app.cms.(sdk.Queryable)
-		if !ok {
-			return sdkerrors.QueryResultWithDebug(sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, "multistore doesn't support queries"), app.trace)
-		}
+	return ScopedKeeper{
+		cdc:      k.cdc,
+		storeKey: k.storeKey,
+		memKey:   k.memKey,
+		capMap:   k.capMap,
+		module:   moduleName,
+	}
+```
+
+**File:** x/capability/keeper/keeper.go (L260-260)
+```go
+	sk.capMap[index] = cap
+```
+
+**File:** x/capability/keeper/keeper.go (L361-388)
+```go
+func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
+	if strings.TrimSpace(name) == "" {
+		return nil, false
+	}
+	memStore := ctx.KVStore(sk.memKey)
+
+	key := types.RevCapabilityKey(sk.module, name)
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
+
+	if len(indexBytes) == 0 {
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+
+		return nil, false
 	}
 
-	// "/store" prefix for store queries
-	req.Path = "/" + strings.Join(path[1:], "/")
-
-	if req.Height <= 1 && req.Prove {
-		return sdkerrors.QueryResultWithDebug(
-			sdkerrors.Wrap(
-				sdkerrors.ErrInvalidRequest,
-				"cannot query with proof when height <= 1; please provide a valid height",
-			), app.trace)
+	cap := sk.capMap[index]
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
 	}
 
-	resp := queryable.Query(req)
-	resp.Height = req.Height
-
-	return resp
+	return cap, true
 }
 ```
 
-**File:** storev2/rootmulti/store.go (L461-464)
+**File:** server/config/config.go (L25-26)
 ```go
-		tree := rs.scStore.GetTreeByName(key.Name())
-		if tree == nil {
-			return nil, fmt.Errorf("new store is not added in upgrades: %s", key.Name())
-		}
+	// DefaultConcurrencyWorkers defines the default workers to use for concurrent transactions
+	DefaultConcurrencyWorkers = 20
 ```
 
-**File:** storev2/rootmulti/store.go (L548-591)
+**File:** tasks/scheduler.go (L449-472)
 ```go
-// Implements interface Queryable
-func (rs *Store) Query(req abci.RequestQuery) abci.ResponseQuery {
-	version := req.Height
-	if version <= 0 || version > rs.lastCommitInfo.Version {
-		version = rs.scStore.Version()
+func (s *scheduler) executeAll(ctx sdk.Context, tasks []*deliverTxTask) error {
+	if len(tasks) == 0 {
+		return nil
 	}
-	path := req.Path
-	storeName, subPath, err := parsePath(path)
-	if err != nil {
-		return sdkerrors.QueryResult(err)
-	}
-	var store types.Queryable
-	var commitInfo *types.CommitInfo
+	ctx, span := s.traceSpan(ctx, "SchedulerExecuteAll", nil)
+	span.SetAttributes(attribute.Bool("synchronous", s.synchronous))
+	defer span.End()
 
-	if !req.Prove && rs.ssStore != nil {
-		// Serve abci query from ss store if no proofs needed
-		store = types.Queryable(state.NewStore(rs.ssStore, types.NewKVStoreKey(storeName), version))
-	} else {
-		// Serve abci query from historical sc store if proofs needed
-		scStore, err := rs.scStore.LoadVersion(version, true)
-		if err != nil {
-			return sdkerrors.QueryResult(err)
-		}
-		defer scStore.Close()
-		store = types.Queryable(commitment.NewStore(scStore.GetTreeByName(storeName), rs.logger))
-		commitInfo = convertCommitInfo(scStore.LastCommitInfo())
-		commitInfo = amendCommitInfo(commitInfo, rs.storesParams)
+	// validationWg waits for all validations to complete
+	// validations happen in separate goroutines in order to wait on previous index
+	wg := &sync.WaitGroup{}
+	wg.Add(len(tasks))
+
+	for _, task := range tasks {
+		t := task
+		s.DoExecute(func() {
+			s.prepareAndRunTask(wg, ctx, t)
+		})
 	}
 
-	// trim the path and execute the query
-	req.Path = subPath
-	res := store.Query(req)
+	wg.Wait()
 
-	if !req.Prove || !rootmulti.RequireProof(subPath) {
-		return res
-	} else if commitInfo != nil {
-		// Restore origin path and append proof op.
-		res.ProofOps.Ops = append(res.ProofOps.Ops, commitInfo.ProofOp(storeName))
-	}
-	if res.ProofOps == nil || len(res.ProofOps.Ops) == 0 {
-		return sdkerrors.QueryResult(errors.Wrap(sdkerrors.ErrInvalidRequest, "proof is unexpectedly empty; ensure height has not been pruned"))
-	}
-	return res
+	return nil
 }
 ```
 
-**File:** store/rootmulti/store.go (L679-682)
+**File:** x/capability/types/keys.go (L39-50)
 ```go
-	store := rs.GetStoreByName(firstPath)
-	if store == nil {
-		return sdkerrors.QueryResult(sdkerrors.Wrapf(sdkerrors.ErrUnknownRequest, "no such store: %s", firstPath))
+// FwdCapabilityKey returns a forward lookup key for a given module and capability
+// reference.
+func FwdCapabilityKey(module string, cap *Capability) []byte {
+	// encode the key to a fixed length to avoid breaking consensus state machine
+	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
+	// the length 10 is picked so it's backward compatible on common architectures.
+	key := fmt.Sprintf("%#010p", cap)
+	if len(key) > 10 {
+		key = key[len(key)-10:]
 	}
-```
-
-**File:** storev2/commitment/store.go (L97-98)
-```go
-func (st *Store) Get(key []byte) []byte {
-	return st.tree.Get(key)
-```
-
-**File:** storev2/commitment/store.go (L137-141)
-```go
-func (st *Store) Query(req abci.RequestQuery) (res abci.ResponseQuery) {
-	if req.Height > 0 && req.Height != st.tree.Version() {
-		return sdkerrors.QueryResult(errors.Wrap(sdkerrors.ErrInvalidHeight, "invalid height"))
-	}
-	res.Height = st.tree.Version()
+	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
+}
 ```

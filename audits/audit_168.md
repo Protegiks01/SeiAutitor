@@ -1,374 +1,174 @@
 # Audit Report
 
 ## Title
-State Sync Allows Corrupted Protobuf Data Causing Node Panic and Denial of Service
+Time-of-Check Time-of-Use Vulnerability in Governance Proposal Route Validation Leading to Chain Halt
 
 ## Summary
-During state sync restoration, the system only validates the IAVL snapshot structure but not the application-level protobuf data stored within IAVL node values. A malicious state sync peer can serve snapshots with corrupted protobuf data that passes validation. When keeper methods later attempt to unmarshal this data using `MustUnmarshal`, the node panics and halts. This enables a denial-of-service attack where an attacker can cause multiple syncing nodes to crash.
+The governance module validates proposal handler routes only at submission time but not before execution. When software upgrades remove handlers from the router while proposals with those routes remain in state, the execution in `EndBlocker` triggers an unconditional panic, causing complete blockchain network shutdown.
 
 ## Impact
-**Medium** - Shutdown of greater than or equal to 30% of network processing nodes without brute force actions.
+High
 
 ## Finding Description
 
-**Location:**
-- Validation gap: [1](#0-0) 
-- Panic trigger points: [2](#0-1) , [3](#0-2) , [4](#0-3) 
-- Codec panic implementation: [5](#0-4) 
+**Location:** 
+- Validation check: [1](#0-0) 
+- Vulnerable execution: [2](#0-1) 
+- Panic point: [3](#0-2) 
 
-**Intended Logic:**
-State sync is designed to allow nodes to quickly sync by downloading snapshots from peers. The system should validate that all snapshot data is valid and well-formed before allowing the node to start processing blocks. [6](#0-5) 
+**Intended logic:** The route validation at proposal submission [1](#0-0)  is intended to ensure proposals can only be created for handlers that exist in the system, preventing execution failures later.
 
-**Actual Logic:**
-During snapshot restoration, only the outer IAVL snapshot structure (SnapshotItem protobuf messages) is validated. The application-level protobuf data stored in IAVL node values is not validated. At [7](#0-6) , the code validates `protoReader.ReadMsg(&snapshotItem)` but not the `item.IAVL.Value` field which contains application protobuf data. This corrupted data is written directly to the store at [8](#0-7) .
+**Actual logic:** The validation only checks handler existence at submission time. The router is recreated during software upgrades [4](#0-3) , and if a new version doesn't register a previously existing handler, old proposals stored in state will reference non-existent routes. When `GetRoute()` is called during execution [2](#0-1) , it panics unconditionally [3](#0-2) . Since `EndBlocker` has no panic recovery [5](#0-4) , this causes immediate chain halt.
 
-**Exploit Scenario:**
-1. Attacker sets up a malicious state sync node that serves modified snapshots
-2. Victim node initiates state sync and connects to the malicious peer
-3. Malicious peer sends snapshot chunks with valid IAVL structure but corrupted `MessageDependencyMapping` or other protobuf data in IAVL node values
-4. State sync completes successfully because only IAVL structure is validated
-5. App hash matches because it's computed from raw bytes, not protobuf validity [9](#0-8) 
-6. After sync, when a user queries `ResourceDependencyMappingFromMessageKey` [10](#0-9)  or the node attempts genesis export [11](#0-10) , `MustUnmarshal` is called on the corrupted data
-7. `MustUnmarshal` panics [12](#0-11) , halting the node
+**Exploitation path:**
+1. A governance proposal is submitted with a valid handler route at block N
+2. The proposal enters deposit period and voting period (potentially weeks or months)
+3. A software upgrade passes via governance that upgrades to a new chain version
+4. The chain restarts with new code that doesn't register the previously existing handler in the governance router
+5. The original proposal passes voting and reaches execution phase
+6. In `EndBlocker`, the code calls `keeper.Router().GetRoute(proposal.ProposalRoute())` without checking if the route exists
+7. `GetRoute()` panics with "route does not exist" error
+8. The panic propagates through `EndBlocker` with no recovery mechanism
+9. All validators halt simultaneously, unable to process blocks
+10. Chain remains halted until validators coordinate an emergency hard fork
 
-**Security Failure:**
-The system fails to maintain node availability. Multiple nodes syncing from the malicious peer will all contain corrupted data and crash when attempting to use keeper methods that read this data. This breaks the denial-of-service protection invariant.
+**Security guarantee broken:** This violates the availability guarantee of the blockchain. The system assumes handlers validated at submission time will exist at execution time, but software upgrades can violate this invariant without any defensive checks or panic recovery.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Node availability: Nodes that sync from malicious peers become inoperable
-- Network capacity: If ≥30% of nodes sync from the attacker, network capacity degrades significantly
-- User experience: Queries and transactions fail when nodes crash
+**Affected Process:** Network availability and consensus
 
-**Damage Severity:**
-- Nodes that sync corrupted state will panic on any query or genesis export operation
-- The panic is not recoverable without re-syncing from a different peer or using a trusted snapshot
-- If the attacker positions their malicious node to be discovered by many syncing nodes, they can cause widespread outages
-- This scales with network growth as new nodes are more likely to use state sync
+**Severity of Damage:** Complete network shutdown. All validators panic in `EndBlocker`, preventing block production. No new transactions can be confirmed. The chain remains halted until validators coordinate an emergency hard fork to either re-register the missing handler or manually remove the problematic proposal from state. This affects the entire blockchain network uniformly - users cannot perform transactions, all services built on the chain become unavailable, and economic activity ceases.
 
-**Why This Matters:**
-State sync is a critical feature for network scalability and onboarding. Nodes rely on it to join the network quickly. If this mechanism can be weaponized for DoS attacks, it undermines network resilience and creates a centralization risk where only "trusted" state sync peers can be used.
+**System Impact:** Since this occurs in consensus-critical code (`EndBlocker`), it affects all nodes identically, preventing any subset from continuing operation. This constitutes a total network shutdown requiring coordinated hard fork recovery.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant can run a malicious state sync node. No privileges, stake, or special permissions are required. The attacker only needs to be discoverable by victim nodes during their state sync process.
+**Who Can Trigger:** This is triggered through normal protocol operations, not by a malicious actor:
+- Any user can submit legitimate governance proposals
+- Software upgrades occur through governance voting
+- Developers may deprecate or rename handlers as part of normal protocol evolution
 
-**Conditions Required:**
-- Victim node must perform state sync (common for new nodes joining the network)
-- Victim must connect to the attacker's malicious node as one of their state sync peers
-- After sync completes, any query to affected keeper methods or genesis export will trigger the panic
+**Required Conditions:**
+- A proposal must be submitted and pass through deposit period
+- A software upgrade must occur that doesn't register the same handler route
+- The original proposal must pass voting and reach execution after the upgrade
 
-**Frequency:**
-- High likelihood for new nodes joining the network, as they commonly use state sync
-- Attackers can increase likelihood by running multiple malicious nodes or advertising their node prominently
-- Single successful infection can persist until the node is manually recovered
-- As the network grows and more nodes use state sync, attack surface increases
+**Frequency:** Medium-to-high likelihood during active protocol development. Software upgrades occur regularly in blockchain protocols, and handler changes are a normal part of protocol evolution. Without explicit safeguards, this scenario will occur whenever handler modifications coincide with active proposals, which becomes increasingly likely as the protocol matures and accrues more active proposals.
 
 ## Recommendation
 
-Implement application-level protobuf validation during state sync restoration:
+**Primary Fix:** Add defensive route validation before proposal execution in `EndBlocker`:
 
-1. **Add validation layer in Restore functions:** After importing IAVL nodes, attempt to unmarshal and validate critical application protobuf data before finalizing the restore. Use `Unmarshal` (not `MustUnmarshal`) to catch errors gracefully.
+In `x/gov/abci.go` at line 67-68, modify the execution logic:
+```go
+if passes {
+    if !keeper.Router().HasRoute(proposal.ProposalRoute()) {
+        // Log error and mark proposal as failed instead of panicking
+        proposal.Status = types.StatusFailed
+        tagValue = types.AttributeValueProposalFailed
+        logMsg = fmt.Sprintf("handler for route %s no longer exists", proposal.ProposalRoute())
+    } else {
+        handler := keeper.Router().GetRoute(proposal.ProposalRoute())
+        // ... existing execution logic
+    }
+}
+```
 
-2. **Implement keeper-level validation:** Add a `ValidateStore()` method that iterates through stored protobuf data and attempts unmarshaling in a controlled way. Call this after state sync completes but before allowing the node to process blocks.
-
-3. **Use error-returning unmarshal in keeper read methods:** Replace `MustUnmarshal` with `Unmarshal` in keeper methods that read from the store, and handle errors gracefully by returning appropriate errors rather than panicking. This prevents denial of service while maintaining data integrity.
-
-4. **Add checksums for application data:** Include application-level protobuf checksums in snapshot metadata, similar to existing chunk checksums, to enable validation before data is written to the store.
+**Alternative Mitigations:**
+1. Add migration logic in upgrade handlers to validate active proposals and handle those with deprecated routes before they execute
+2. Consider adding panic recovery in `BaseApp.EndBlock` to prevent chain halt from proposal execution failures (though this is a more invasive change)
+3. Document handler deprecation procedures requiring coordination with active proposals
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/keeper/keeper_test.go`
+**Test File:** `x/gov/abci_test.go`
 
-**Test Function:** `TestCorruptedProtobufFromStateSyncCausesPanic`
+**Test Function:** `TestProposalExecutionWithMissingHandler`
 
 **Setup:**
-```go
-// Initialize app and context
-app := simapp.Setup(false)
-ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-
-// Create valid dependency mapping and marshal it
-validMapping := acltypes.MessageDependencyMapping{
-    MessageKey: "testMessage",
-    AccessOps: []acltypes.AccessOperation{
-        {
-            ResourceType:       acltypes.ResourceType_KV_BANK,
-            AccessType:         acltypes.AccessType_READ,
-            IdentifierTemplate: "test",
-        },
-        *types.CommitAccessOp(),
-    },
-}
-
-// Get the store and storage key
-store := ctx.KVStore(app.AccessControlKeeper.GetStoreKey())
-storageKey := types.GetResourceDependencyKey("testMessage")
-```
+1. Initialize test application with governance keeper using standard test setup (similar to existing tests in the file)
+2. Create and submit a proposal with a valid handler route (e.g., text proposal using `govtypes.RouterKey`)
+3. Deposit sufficient tokens to activate the proposal
+4. Add validator vote to pass the proposal
+5. Advance block time to end of voting period
 
 **Trigger:**
-```go
-// Write corrupted protobuf data directly to the store
-// This simulates what would happen after state sync with corrupted data
-corruptedData := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
-store.Set(storageKey, corruptedData)
+1. Before calling `EndBlocker`, simulate upgrade by creating a new router without the original handler
+2. Use reflection or test helper to replace the keeper's router with the new one (simulating what happens during chain restart after upgrade)
+3. Call `gov.EndBlocker(ctx, app.GovKeeper)` to process the passed proposal
 
-// This simulates a query that would be called after state sync
-// It will panic because MustUnmarshal cannot handle the corrupted data
-```
+**Expected Result:**
+The test will panic with message "route \"...\" does not exist" when `GetRoute()` is called at [2](#0-1) , demonstrating the chain halt condition. Use `require.Panics()` to verify this behavior.
 
-**Observation:**
-```go
-require.Panics(t, func() {
-    // This call to GetResourceDependencyMapping will panic
-    // because it calls MustUnmarshal on the corrupted data
-    app.AccessControlKeeper.GetResourceDependencyMapping(ctx, "testMessage")
-}, "Expected panic when reading corrupted protobuf data from store")
-```
+**Verification:** This panic in `EndBlocker` without recovery [5](#0-4)  confirms that the vulnerability results in consensus failure and chain halt, matching the "Network not being able to confirm new transactions (total network shutdown)" impact category.
 
-The test confirms that corrupted protobuf data in the store (as would result from malicious state sync) causes `MustUnmarshal` to panic when keeper methods attempt to read it. This demonstrates that nodes synced from malicious peers will crash on normal operations, enabling the denial-of-service attack.
+## Notes
+
+This vulnerability represents a TOCTOU (Time-of-Check Time-of-Use) race condition between proposal submission and execution, where the state of the router can change during the intervening time period due to software upgrades. While handler removal during upgrades is within developer authority, the catastrophic impact (complete chain halt requiring hard fork) is far beyond the intended consequences and represents an unrecoverable security failure. The lack of defensive programming (no re-validation or panic recovery) transforms a normal operational change into a critical availability failure.
 
 ### Citations
 
-**File:** store/rootmulti/store.go (L869-948)
+**File:** x/gov/keeper/proposal.go (L19-21)
 ```go
-func (rs *Store) Restore(
-	height uint64, format uint32, protoReader protoio.Reader,
-) (snapshottypes.SnapshotItem, error) {
-	// Import nodes into stores. The first item is expected to be a SnapshotItem containing
-	// a SnapshotStoreItem, telling us which store to import into. The following items will contain
-	// SnapshotNodeItem (i.e. ExportNode) until we reach the next SnapshotStoreItem or EOF.
-	var importer *iavltree.Importer
-	var snapshotItem snapshottypes.SnapshotItem
-loop:
-	for {
-		snapshotItem = snapshottypes.SnapshotItem{}
-		err := protoReader.ReadMsg(&snapshotItem)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(err, "invalid protobuf message")
-		}
+	if !keeper.router.HasRoute(content.ProposalRoute()) {
+		return types.Proposal{}, sdkerrors.Wrap(types.ErrNoProposalHandlerExists, content.ProposalRoute())
+	}
+```
 
-		switch item := snapshotItem.Item.(type) {
-		case *snapshottypes.SnapshotItem_Store:
-			if importer != nil {
-				err = importer.Commit()
-				if err != nil {
-					return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(err, "IAVL commit failed")
-				}
-				importer.Close()
-			}
-			store, ok := rs.GetStoreByName(item.Store.Name).(*iavl.Store)
-			if !ok || store == nil {
-				return snapshottypes.SnapshotItem{}, sdkerrors.Wrapf(sdkerrors.ErrLogic, "cannot import into non-IAVL store %q", item.Store.Name)
-			}
-			importer, err = store.Import(int64(height))
-			if err != nil {
-				return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(err, "import failed")
-			}
-			defer importer.Close()
+**File:** x/gov/abci.go (L68-68)
+```go
+			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
+```
 
-		case *snapshottypes.SnapshotItem_IAVL:
-			if importer == nil {
-				return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
-			}
-			if item.IAVL.Height > math.MaxInt8 {
-				return snapshottypes.SnapshotItem{}, sdkerrors.Wrapf(sdkerrors.ErrLogic, "node height %v cannot exceed %v",
-					item.IAVL.Height, math.MaxInt8)
-			}
-			node := &iavltree.ExportNode{
-				Key:     item.IAVL.Key,
-				Value:   item.IAVL.Value,
-				Height:  int8(item.IAVL.Height),
-				Version: item.IAVL.Version,
-			}
-			// Protobuf does not differentiate between []byte{} as nil, but fortunately IAVL does
-			// not allow nil keys nor nil values for leaf nodes, so we can always set them to empty.
-			if node.Key == nil {
-				node.Key = []byte{}
-			}
-			if node.Height == 0 && node.Value == nil {
-				node.Value = []byte{}
-			}
-			err := importer.Add(node)
-			if err != nil {
-				return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(err, "IAVL node import failed")
-			}
+**File:** x/gov/types/router.go (L66-71)
+```go
+func (rtr *router) GetRoute(path string) Handler {
+	if !rtr.HasRoute(path) {
+		panic(fmt.Sprintf("route \"%s\" does not exist", path))
+	}
 
-		default:
-			break loop
+	return rtr.routes[path]
+```
+
+**File:** simapp/app.go (L305-314)
+```go
+	govRouter := govtypes.NewRouter()
+	govRouter.AddRoute(govtypes.RouterKey, govtypes.ProposalHandler).
+		AddRoute(paramproposal.RouterKey, params.NewParamChangeProposalHandler(app.ParamsKeeper)).
+		AddRoute(distrtypes.RouterKey, distr.NewCommunityPoolSpendProposalHandler(app.DistrKeeper)).
+		AddRoute(upgradetypes.RouterKey, upgrade.NewSoftwareUpgradeProposalHandler(app.UpgradeKeeper))
+	//TODO: we may need to add acl gov proposal types here
+	govKeeper := govkeeper.NewKeeper(
+		appCodec, keys[govtypes.StoreKey], app.GetSubspace(govtypes.ModuleName), app.AccountKeeper, app.BankKeeper,
+		&stakingKeeper, app.ParamsKeeper, govRouter,
+	)
+```
+
+**File:** baseapp/abci.go (L178-201)
+```go
+func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
+	// Clear DeliverTx Events
+	ctx.MultiStore().ResetEvents()
+
+	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
+
+	if app.endBlocker != nil {
+		res = app.endBlocker(ctx, req)
+		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	}
+
+	if cp := app.GetConsensusParams(ctx); cp != nil {
+		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
+	}
+
+	// call the streaming service hooks with the EndBlock messages
+	for _, streamingListener := range app.abciListeners {
+		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
+			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
 		}
 	}
 
-	if importer != nil {
-		err := importer.Commit()
-		if err != nil {
-			return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(err, "IAVL commit failed")
-		}
-		importer.Close()
-	}
-
-	rs.flushMetadata(rs.db, int64(height), rs.buildCommitInfo(int64(height)))
-	return snapshotItem, rs.LoadLatestVersion()
-}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L78-89)
-```go
-func (k Keeper) GetResourceDependencyMapping(ctx sdk.Context, messageKey types.MessageKey) acltypes.MessageDependencyMapping {
-	store := ctx.KVStore(k.storeKey)
-	depMapping := store.Get(types.GetResourceDependencyKey(messageKey))
-	if depMapping == nil {
-		// If the storage key doesn't exist in the mapping then assume synchronous processing
-		return types.SynchronousMessageDependencyMapping(messageKey)
-	}
-
-	dependencyMapping := acltypes.MessageDependencyMapping{}
-	k.cdc.MustUnmarshal(depMapping, &dependencyMapping)
-	return dependencyMapping
-}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L106-117)
-```go
-func (k Keeper) IterateResourceKeys(ctx sdk.Context, handler func(dependencyMapping acltypes.MessageDependencyMapping) (stop bool)) {
-	store := ctx.KVStore(k.storeKey)
-	iter := sdk.KVStorePrefixIterator(store, types.GetResourceDependencyMappingKey())
-	defer iter.Close()
-	for ; iter.Valid(); iter.Next() {
-		dependencyMapping := acltypes.MessageDependencyMapping{}
-		k.cdc.MustUnmarshal(iter.Value(), &dependencyMapping)
-		if handler(dependencyMapping) {
-			break
-		}
-	}
-}
-```
-
-**File:** x/bank/keeper/keeper.go (L291-306)
-```go
-// GetDenomMetaData retrieves the denomination metadata. returns the metadata and true if the denom exists,
-// false otherwise.
-func (k BaseKeeper) GetDenomMetaData(ctx sdk.Context, denom string) (types.Metadata, bool) {
-	store := ctx.KVStore(k.storeKey)
-	store = prefix.NewStore(store, types.DenomMetadataKey(denom))
-
-	bz := store.Get([]byte(denom))
-	if bz == nil {
-		return types.Metadata{}, false
-	}
-
-	var metadata types.Metadata
-	k.cdc.MustUnmarshal(bz, &metadata)
-
-	return metadata, true
-}
-```
-
-**File:** codec/proto_codec.go (L92-99)
-```go
-// MustUnmarshal implements BinaryMarshaler.MustUnmarshal method.
-// NOTE: this function must be used with a concrete type which
-// implements proto.Message. For interface please use the codec.UnmarshalInterface
-func (pc *ProtoCodec) MustUnmarshal(bz []byte, ptr ProtoMarshaler) {
-	if err := pc.Unmarshal(bz, ptr); err != nil {
-		panic(err)
-	}
-}
-```
-
-**File:** snapshots/README.md (L1-50)
-```markdown
-# State Sync Snapshotting
-
-The `snapshots` package implements automatic support for Tendermint state sync
-in Cosmos SDK-based applications. State sync allows a new node joining a network
-to simply fetch a recent snapshot of the application state instead of fetching
-and applying all historical blocks. This can reduce the time needed to join the
-network by several orders of magnitude (e.g. weeks to minutes), but the node
-will not contain historical data from previous heights.
-
-This document describes the Cosmos SDK implementation of the ABCI state sync
-interface, for more information on Tendermint state sync in general see:
-
-* [Tendermint Core State Sync for Developers](https://medium.com/tendermint/tendermint-core-state-sync-for-developers-70a96ba3ee35)
-* [ABCI State Sync Spec](https://docs.tendermint.com/master/spec/abci/apps.html#state-sync)
-* [ABCI State Sync Method/Type Reference](https://docs.tendermint.com/master/spec/abci/abci.html#state-sync)
-
-## Overview
-
-For an overview of how Cosmos SDK state sync is set up and configured by
-developers and end-users, see the
-[Cosmos SDK State Sync Guide](https://blog.cosmos.network/cosmos-sdk-state-sync-guide-99e4cf43be2f).
-
-Briefly, the Cosmos SDK takes state snapshots at regular height intervals given
-by `state-sync.snapshot-interval` and stores them as binary files in the
-filesystem under `<node_home>/data/snapshots/`, with metadata in a LevelDB database
-`<node_home>/data/snapshots/metadata.db`. The number of recent snapshots to keep are given by
-`state-sync.snapshot-keep-recent`.
-
-Snapshots are taken asynchronously, i.e. new blocks will be applied concurrently
-with snapshots being taken. This is possible because IAVL supports querying
-immutable historical heights. However, this requires `state-sync.snapshot-interval`
-to be a multiple of `pruning-keep-every`, to prevent a height from being removed
-while it is being snapshotted.
-
-When a remote node is state syncing, Tendermint calls the ABCI method
-`ListSnapshots` to list available local snapshots and `LoadSnapshotChunk` to
-load a binary snapshot chunk. When the local node is being state synced,
-Tendermint calls `OfferSnapshot` to offer a discovered remote snapshot to the
-local application and `ApplySnapshotChunk` to apply a binary snapshot chunk to
-the local application. See the resources linked above for more details on these
-methods and how Tendermint performs state sync.
-
-The Cosmos SDK does not currently do any incremental verification of snapshots
-during restoration, i.e. only after the entire snapshot has been restored will
-Tendermint compare the app hash against the trusted hash from the chain. Cosmos
-SDK snapshots and chunks do contain hashes as checksums to guard against IO
-corruption and non-determinism, but these are not tied to the chain state and
-can be trivially forged by an adversary. This was considered out of scope for
-the initial implementation, but can be added later without changes to the
-ABCI state sync protocol.
-```
-
-**File:** snapshots/README.md (L232-235)
-```markdown
-
-Once the restore is completed, Tendermint will go on to call the `Info` ABCI
-call to fetch the app hash, and compare this against the trusted chain app
-hash at the snapshot height to verify the restored state. If it matches,
-```
-
-**File:** x/accesscontrol/keeper/grpc_query.go (L20-25)
-```go
-func (k Keeper) ResourceDependencyMappingFromMessageKey(ctx context.Context, req *types.ResourceDependencyMappingFromMessageKeyRequest) (*types.ResourceDependencyMappingFromMessageKeyResponse, error) {
-	sdkCtx := sdk.UnwrapSDKContext(ctx)
-
-	resourceDependency := k.GetResourceDependencyMapping(sdkCtx, types.MessageKey(req.GetMessageKey()))
-	return &types.ResourceDependencyMappingFromMessageKeyResponse{MessageDependencyMapping: resourceDependency}, nil
-}
-```
-
-**File:** x/accesscontrol/keeper/genesis.go (L28-44)
-```go
-func (k Keeper) ExportGenesis(ctx sdk.Context) *types.GenesisState {
-	resourceDependencyMappings := []acltypes.MessageDependencyMapping{}
-	k.IterateResourceKeys(ctx, func(dependencyMapping acltypes.MessageDependencyMapping) (stop bool) {
-		resourceDependencyMappings = append(resourceDependencyMappings, dependencyMapping)
-		return false
-	})
-	wasmDependencyMappings := []acltypes.WasmDependencyMapping{}
-	k.IterateWasmDependencies(ctx, func(dependencyMapping acltypes.WasmDependencyMapping) (stop bool) {
-		wasmDependencyMappings = append(wasmDependencyMappings, dependencyMapping)
-		return false
-	})
-	return &types.GenesisState{
-		Params:                   k.GetParams(ctx),
-		MessageDependencyMapping: resourceDependencyMappings,
-		WasmDependencyMappings:   wasmDependencyMappings,
-	}
+	return res
 }
 ```

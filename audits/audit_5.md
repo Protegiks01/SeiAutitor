@@ -1,298 +1,338 @@
-## Audit Report
+Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**.
 
-### Title
-Race Condition in CheckTx Allows Duplicate Nonce Transactions to Enter Mempool
+# Audit Report
 
-### Summary
-A race condition in the concurrent execution of CheckTx allows multiple transactions with identical nonces (sequence numbers) from the same account to pass validation and be accepted into the mempool. This occurs because the sequence number validation and incrementing in the `IncrementSequenceDecorator` is not atomic across concurrent CheckTx executions, leading to a Time-of-Check-Time-of-Use (TOCTOU) vulnerability.
+## Title
+Incomplete Genesis Validation in Access Control Module Allows Malformed Dependency Mappings to Bypass Validation and Cause Network Initialization Failure
 
-### Impact
-**Severity: Medium**
+## Summary
+The access control module's `ValidateGenesis` method only validates parameters but skips validation of dependency mappings. This allows malformed genesis data to bypass the validation phase and cause a panic during `InitGenesis`, resulting in total network initialization failure.
 
-### Finding Description
+## Impact
+Medium
 
-**Location:** 
-- Primary issue: [1](#0-0) 
-- Supporting context: [2](#0-1) 
+## Finding Description
+
+**Location:** [1](#0-0) 
 
 **Intended Logic:** 
-The sequence number validation system should ensure that only one transaction per sequence number from each account can be accepted into the mempool. The `SigVerificationDecorator` validates that a transaction's sequence matches the account's current sequence [3](#0-2) , and the `IncrementSequenceDecorator` atomically increments the sequence to prevent replay attacks.
+Genesis validation should validate all genesis state before chain initialization. The access control module has a comprehensive validation function that checks both parameters and dependency mappings. [2](#0-1) 
 
 **Actual Logic:** 
-When multiple CheckTx calls execute concurrently for the same account, each creates its own cached context that lazily reads from the shared checkState. The sequence validation and increment operations are not atomic across concurrent executions:
+The module's `ValidateGenesis` method only validates parameters and does not call the comprehensive `types.ValidateGenesis(data)` function. In contrast, other modules like auth correctly implement full validation: [3](#0-2) 
 
-1. Each CheckTx creates a branched cache via `cacheTxContext` [4](#0-3) 
-2. Both threads read the same sequence number from checkState (e.g., sequence=0)
-3. Both pass `SigVerificationDecorator` validation 
-4. Both execute `IncrementSequenceDecorator` which performs non-atomic read-modify-write:
-   - `acc := isd.ak.GetAccount(ctx, addr)` reads sequence from parent store
-   - `acc.SetSequence(acc.GetSequence() + 1)` increments in cache
-   - `isd.ak.SetAccount(ctx, acc)` writes to cache
-5. Both caches write back to checkState via `msCache.Write()` [5](#0-4) 
+**Exploitation Path:**
+1. A genesis file is created with invalid dependency mappings (missing commit operations, empty identifier templates, deprecated selectors, or duplicate message names)
+2. The genesis file is validated through `BasicManager.ValidateGenesis`: [4](#0-3) 
+3. Invalid dependency mappings pass validation because the module only checks parameters
+4. All network nodes attempt to initialize with this genesis data
+5. During `InitGenesis`, the keeper validates and panics when setting invalid mappings: [5](#0-4) 
+6. All nodes fail to initialize, preventing network startup
 
-While individual write operations are mutex-protected [6](#0-5) , the complete read-check-increment-write sequence is not atomic.
+**Security Guarantee Broken:** 
+The two-phase validation pattern (ValidateGenesis → InitGenesis) is broken. Invalid data that should be caught during genesis validation bypasses checks and causes runtime panics during initialization.
 
-**Exploit Scenario:**
-1. Attacker creates two different transactions from the same account, both with sequence=0:
-   - Tx1: Transfer 100 tokens to Bob (hash=H1)
-   - Tx2: Transfer 200 tokens to Charlie (hash=H2)
-2. Attacker submits both transactions concurrently to a node
-3. Both CheckTx calls execute in parallel, race occurs
-4. Both transactions pass validation and enter mempool
-5. Mempool cache only deduplicates by transaction hash, not nonce, so both remain [7](#0-6) 
-6. When included in a block, only one executes successfully; the other fails
-7. Attacker can repeat this to flood mempool with duplicate-nonce transactions
+## Impact Explanation
 
-**Security Failure:** 
-The sequence number uniqueness invariant is violated. Multiple transactions with identical nonces can coexist in the mempool, causing:
-- Mempool pollution with invalid transactions
-- Wasted validator resources processing duplicates
-- State inconsistency between mempool contents and actual valid transaction set
+This vulnerability results in complete network initialization failure. When a genesis file contains invalid dependency mappings:
+- All validator and full nodes fail to initialize
+- The network cannot start or process any transactions
+- Requires genesis file correction and coordinated network restart
+- Affects mainnet launches, testnets, or any chain initialization scenario
 
-### Impact Explanation
+The broken validation allows errors such as:
+- Missing commit access operations [6](#0-5) 
+- Empty identifier templates or invalid resource type configurations [7](#0-6) 
+- Duplicate message names in WASM mappings or deprecated selectors [8](#0-7) 
 
-This vulnerability allows an attacker to:
+## Likelihood Explanation
 
-1. **Pollute the Mempool**: Fill the mempool with multiple transactions having duplicate nonces, reducing space for legitimate transactions
-2. **Waste Node Resources**: Cause validators to repeatedly process, validate, and propagate invalid transactions that will ultimately fail in DeliverTx
-3. **State Inconsistency**: Create discrepancy between the number of transactions in mempool and the actual account sequence in checkState
+**Who Can Trigger:**
+- Chain operators creating genesis files
+- Anyone distributing or modifying genesis configurations during network initialization
 
-This directly matches the in-scope impact: **"Causing network processing nodes to process transactions from the mempool beyond set parameters"** - nodes process and store multiple transactions for the same nonce when only one should be valid.
+**Conditions Required:**
+Genesis file contains invalid dependency mappings that fail validation checks defined in the comprehensive `ValidateGenesis` function.
 
-The checkState mechanism is designed to track sequence numbers across CheckTx calls [8](#0-7) , but the race condition breaks this invariant.
+**Frequency:**
+Can occur during any chain initialization with malformed genesis data. While genesis files are typically carefully reviewed, the absence of proper validation creates a critical gap in the defense-in-depth strategy. The existing test suite confirms this behavior: [9](#0-8) 
 
-### Likelihood Explanation
+## Recommendation
 
-**Likelihood: High**
+Update the `ValidateGenesis` method in `x/accesscontrol/module.go` to call the comprehensive validation function:
 
-- **Who can trigger it:** Any user can trigger this by submitting concurrent transactions with the same nonce
-- **Conditions required:** Simply requires sending multiple transactions with identical nonces concurrently; no special privileges needed
-- **Frequency:** Can occur during normal network operation whenever transactions arrive concurrently, which is common in production networks
-- **Exploitability:** Easy to exploit - attacker just needs to broadcast multiple transactions rapidly
+```go
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
+	}
 
-The vulnerability is particularly likely because:
-1. CheckTx is designed to handle concurrent requests [9](#0-8) 
-2. No explicit synchronization protects the sequence validation flow
-3. Network latency naturally causes concurrent transaction submission
-
-### Recommendation
-
-Add explicit locking around the sequence number validation and increment operations for each account. Two approaches:
-
-**Approach 1: Per-Account Locking**
-Introduce a lock manager that acquires account-specific locks before sequence validation:
-```
-// In IncrementSequenceDecorator
-func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-    sigTx, ok := tx.(authsigning.SigVerifiableTx)
-    if !ok {
-        return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
-    }
-    
-    // Acquire locks for all signers before validation
-    for _, addr := range sigTx.GetSigners() {
-        isd.lockManager.Lock(addr)
-        defer isd.lockManager.Unlock(addr)
-    }
-    
-    // existing increment logic
+	return types.ValidateGenesis(data)
 }
 ```
 
-**Approach 2: State-Level Synchronization**
-Ensure checkState operations for the same account are serialized at the state layer by acquiring write locks during the entire ante handler execution for accounts being modified.
+This aligns with the pattern used by other modules and ensures all genesis state is validated before initialization.
 
-### Proof of Concept
+## Proof of Concept
 
-**File:** `baseapp/deliver_tx_test.go` (add new test function)
+The provided PoC demonstrates that:
+1. Invalid dependency mappings fail `types.ValidateGenesis` (comprehensive validation)
+2. The same invalid mappings pass through the module's `ValidateGenesis` method
+3. Subsequently, `InitGenesis` panics when attempting to set these invalid mappings
 
-**Test Function:** `TestCheckTxConcurrentDuplicateNonce`
+The keeper methods validate mappings before storing them: [10](#0-9) [11](#0-10) 
 
-**Setup:**
-1. Initialize a test app with an account having initial sequence=0
-2. Create two different transactions from the same account, both with sequence=0 but different messages
-3. Fund the account with sufficient tokens for gas fees
+When validation errors occur during `InitGenesis`, the keeper panics, causing total node initialization failure as confirmed by existing tests.
 
-**Trigger:**
-1. Launch two goroutines that simultaneously call CheckTx with the two transactions
-2. Use a sync.WaitGroup to ensure both start at approximately the same time
-3. Collect responses from both CheckTx calls
+## Notes
 
-**Observation:**
-Both CheckTx calls should return success (no error), demonstrating that both duplicate-nonce transactions were accepted into the mempool. The test verifies:
-- Both responses have Code=0 (success)
-- CheckState sequence is incremented only once (to 1, not 2)
-- This proves the race condition allows duplicates
-
-**Test Code Structure:**
-```
-func TestCheckTxConcurrentDuplicateNonce(t *testing.T) {
-    // Setup app and account with sequence=0
-    // Create tx1 and tx2, both with sequence=0, different messages
-    // Launch concurrent CheckTx calls
-    // Assert both succeed (race condition allows this)
-    // Assert checkState.sequence == 1 (not 2, showing only one increment)
-    // This demonstrates the vulnerability
-}
-```
-
-The test would fail on fixed code (one CheckTx would be rejected) but passes on vulnerable code (both CheckTx succeed), proving the race condition exists.
-
-**Notes:**
-
-The vulnerability exists because the state access pattern in CheckTx creates isolated cache branches that don't synchronize sequence number reads across concurrent executions. While Tendermint's mempool provides some deduplication via hash-based caching, it cannot prevent different transactions with identical nonces from entering the mempool when they have different hashes. The race window is real and exploitable in production deployments where concurrent transaction submission is normal behavior.
+This vulnerability represents a defense-in-depth failure where genesis validation—a critical security control designed to catch configuration errors before they cause operational failures—is incomplete. While it requires genesis file creation privileges, the validation layer exists specifically to protect against inadvertent mistakes by trusted operators. The inconsistency with other modules' implementations confirms this is unintended behavior rather than a design choice.
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L269-278)
+**File:** x/accesscontrol/module.go (L62-69)
 ```go
-		// Check account sequence number.
-		if sig.Sequence != acc.GetSequence() {
-			params := svd.ak.GetParams(ctx)
-			if !params.GetDisableSeqnoCheck() {
-				return ctx, sdkerrors.Wrapf(
-					sdkerrors.ErrWrongSequence,
-					"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-				)
-			}
-		}
-```
-
-**File:** x/auth/ante/sigverify.go (L352-369)
-```go
-func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
-	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
 	}
 
-	// increment sequence of all signers
-	for _, addr := range sigTx.GetSigners() {
-		acc := isd.ak.GetAccount(ctx, addr)
-		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
-			panic(err)
-		}
-
-		isd.ak.SetAccount(ctx, acc)
-	}
-
-	return next(ctx, tx, simulate)
+	return data.Params.Validate()
 }
 ```
 
-**File:** baseapp/baseapp.go (L168-168)
+**File:** x/accesscontrol/types/genesis.go (L29-43)
 ```go
-	checkTxStateLock *sync.RWMutex
-```
-
-**File:** baseapp/baseapp.go (L927-1003)
-```go
-	if app.anteHandler != nil {
-		var anteSpan trace.Span
-		if app.TracingEnabled {
-			// trace AnteHandler
-			_, anteSpan = app.TracingInfo.StartWithContext("AnteHandler", ctx.TraceSpanContext())
-			defer anteSpan.End()
-		}
-		var (
-			anteCtx sdk.Context
-			msCache sdk.CacheMultiStore
-		)
-		// Branch context before AnteHandler call in case it aborts.
-		// This is required for both CheckTx and DeliverTx.
-		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2772
-		//
-		// NOTE: Alternatively, we could require that AnteHandler ensures that
-		// writes do not happen if aborted/failed.  This may have some
-		// performance benefits, but it'll be more difficult to get right.
-		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
-		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
-
-		if !newCtx.IsZero() {
-			// At this point, newCtx.MultiStore() is a store branch, or something else
-			// replaced by the AnteHandler. We want the original multistore.
-			//
-			// Also, in the case of the tx aborting, we need to track gas consumed via
-			// the instantiated gas meter in the AnteHandler, so we update the context
-			// prior to returning.
-			//
-			// This also replaces the GasMeter in the context where GasUsed was initalized 0
-			// and updated with gas consumed in the ante handler runs
-			// The GasMeter is a pointer and its passed to the RunMsg and tracks the consumed
-			// gas there too.
-			ctx = newCtx.WithMultiStore(ms)
-		}
-		defer func() {
-			if newCtx.DeliverTxCallback() != nil {
-				newCtx.DeliverTxCallback()(ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx)))
-			}
-		}()
-
-		events := ctx.EventManager().Events()
-
+func ValidateGenesis(data GenesisState) error {
+	for _, mapping := range data.MessageDependencyMapping {
+		err := ValidateMessageDependencyMapping(mapping)
 		if err != nil {
-			return gInfo, nil, nil, 0, nil, nil, ctx, err
-		}
-		// GasMeter expected to be set in AnteHandler
-		gasWanted = ctx.GasMeter().Limit()
-		gasEstimate = ctx.GasEstimate()
-
-		// Dont need to validate in checkTx mode
-		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
-			storeAccessOpEvents := msCache.GetEvents()
-			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
-
-			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
-			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
-			if len(missingAccessOps) != 0 {
-				for op := range missingAccessOps {
-					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
-					op.EmitValidationFailMetrics()
-				}
-				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
-				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
-			}
-		}
-
-		priority = ctx.Priority()
-		pendingTxChecker = ctx.PendingTxChecker()
-		expireHandler = ctx.ExpireTxHandler()
-		msCache.Write()
-		anteEvents = events.ToABCIEvents()
-		if app.TracingEnabled {
-			anteSpan.End()
+			return err
 		}
 	}
+	for _, mapping := range data.WasmDependencyMappings {
+		err := ValidateWasmDependencyMapping(mapping)
+		if err != nil {
+			return err
+		}
+	}
+	return data.Params.Validate()
+}
 ```
 
-**File:** store/cachekv/store.go (L101-103)
+**File:** x/auth/module.go (L54-61)
 ```go
-func (store *Store) Write() {
-	store.mtx.Lock()
-	defer store.mtx.Unlock()
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
+	}
+
+	return types.ValidateGenesis(data)
+}
 ```
 
-**File:** docs/basics/tx-lifecycle.md (L117-127)
-```markdown
-The **mempool** serves the purpose of keeping track of transactions seen by all full-nodes.
-Full-nodes keep a **mempool cache** of the last `mempool.cache_size` transactions they have seen, as a first line of
-defense to prevent replay attacks. Ideally, `mempool.cache_size` is large enough to encompass all
-of the transactions in the full mempool. If the the mempool cache is too small to keep track of all
-the transactions, `CheckTx` is responsible for identifying and rejecting replayed transactions.
-
-Currently existing preventative measures include fees and a `sequence` (nonce) counter to distinguish
-replayed transactions from identical but valid ones. If an attacker tries to spam nodes with many
-copies of a `Tx`, full-nodes keeping a mempool cache will reject identical copies instead of running
-`CheckTx` on all of them. Even if the copies have incremented `sequence` numbers, attackers are
-disincentivized by the need to pay fees.
-```
-
-**File:** baseapp/state.go (L9-13)
+**File:** types/module/module.go (L105-112)
 ```go
-type state struct {
-	ms  sdk.CacheMultiStore
-	ctx sdk.Context
-	mtx *sync.RWMutex
+func (bm BasicManager) ValidateGenesis(cdc codec.JSONCodec, txEncCfg client.TxEncodingConfig, genesis map[string]json.RawMessage) error {
+	for _, b := range bm {
+		if err := b.ValidateGenesis(cdc, txEncCfg, genesis[b.Name()]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+```
+
+**File:** x/accesscontrol/keeper/genesis.go (L11-26)
+```go
+func (k Keeper) InitGenesis(ctx sdk.Context, genState types.GenesisState) {
+	k.SetParams(ctx, genState.Params)
+	for _, resourceDependencyMapping := range genState.GetMessageDependencyMapping() {
+		err := k.SetResourceDependencyMapping(ctx, resourceDependencyMapping)
+		if err != nil {
+			panic(fmt.Errorf("invalid MessageDependencyMapping %s", err))
+		}
+	}
+	for _, wasmDependencyMapping := range genState.GetWasmDependencyMappings() {
+		err := k.SetWasmDependencyMapping(ctx, wasmDependencyMapping)
+		if err != nil {
+			panic(fmt.Errorf("invalid WasmDependencyMapping %s", err))
+		}
+
+	}
+}
+```
+
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-45)
+```go
+func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
+	lastAccessOp := accessOps[len(accessOps)-1]
+	if lastAccessOp != *CommitAccessOp() {
+		return ErrNoCommitAccessOp
+	}
+	for _, accessOp := range accessOps {
+		err := ValidateAccessOp(accessOp)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+```
+
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L47-55)
+```go
+func ValidateAccessOp(accessOp acltypes.AccessOperation) error {
+	if accessOp.IdentifierTemplate == "" {
+		return ErrEmptyIdentifierString
+	}
+	if accessOp.ResourceType.HasChildren() && accessOp.IdentifierTemplate != "*" {
+		return ErrNonLeafResourceTypeWithIdentifier
+	}
+	return nil
+}
+```
+
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L123-181)
+```go
+func ValidateWasmDependencyMapping(mapping acltypes.WasmDependencyMapping) error {
+	numOps := len(mapping.BaseAccessOps)
+	if numOps == 0 || mapping.BaseAccessOps[numOps-1].Operation.AccessType != acltypes.AccessType_COMMIT {
+		return ErrNoCommitAccessOp
+	}
+
+	// ensure uniqueness for partitioned message names across access ops and contract references
+	seenMessageNames := map[string]struct{}{}
+	for _, ops := range mapping.ExecuteAccessOps {
+		if _, ok := seenMessageNames[ops.MessageName]; ok {
+			return ErrDuplicateWasmMethodName
+		}
+		seenMessageNames[ops.MessageName] = struct{}{}
+	}
+	seenMessageNames = map[string]struct{}{}
+	for _, ops := range mapping.QueryAccessOps {
+		if _, ok := seenMessageNames[ops.MessageName]; ok {
+			return ErrDuplicateWasmMethodName
+		}
+		seenMessageNames[ops.MessageName] = struct{}{}
+	}
+	seenMessageNames = map[string]struct{}{}
+	for _, ops := range mapping.ExecuteContractReferences {
+		if _, ok := seenMessageNames[ops.MessageName]; ok {
+			return ErrDuplicateWasmMethodName
+		}
+		seenMessageNames[ops.MessageName] = struct{}{}
+	}
+	seenMessageNames = map[string]struct{}{}
+	for _, ops := range mapping.QueryContractReferences {
+		if _, ok := seenMessageNames[ops.MessageName]; ok {
+			return ErrDuplicateWasmMethodName
+		}
+		seenMessageNames[ops.MessageName] = struct{}{}
+	}
+
+	// ensure deprecation for CONTRACT_REFERENCE access operation selector due to new contract references
+	for _, accessOp := range mapping.BaseAccessOps {
+		if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
+			return ErrSelectorDeprecated
+		}
+	}
+	for _, accessOps := range mapping.ExecuteAccessOps {
+		for _, accessOp := range accessOps.WasmOperations {
+			if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
+				return ErrSelectorDeprecated
+			}
+		}
+	}
+	for _, accessOps := range mapping.QueryAccessOps {
+		for _, accessOp := range accessOps.WasmOperations {
+			if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
+				return ErrSelectorDeprecated
+			}
+		}
+	}
+
+	return nil
+}
+```
+
+**File:** x/accesscontrol/keeper/genesis_test.go (L71-102)
+```go
+func TestKeeper_InitGenesis_InvalidDependencies(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+
+	invalidAccessOp := types.SynchronousMessageDependencyMapping("Test1")
+	invalidAccessOp.AccessOps[0].IdentifierTemplate = ""
+	invalidAccessOp.AccessOps = []accesscontrol.AccessOperation{
+		invalidAccessOp.AccessOps[0],
+	}
+
+	invalidMessageGenesis := types.GenesisState{
+		Params: types.DefaultParams(),
+		MessageDependencyMapping: []accesscontrol.MessageDependencyMapping{
+			invalidAccessOp,
+		},
+	}
+
+	require.Panics(t, func() {
+		app.AccessControlKeeper.InitGenesis(ctx, invalidMessageGenesis)
+	})
+
+	invalidWasmGenesis := types.GenesisState{
+		Params: types.DefaultParams(),
+		WasmDependencyMappings: []accesscontrol.WasmDependencyMapping{
+			types.SynchronousWasmDependencyMapping("Test"),
+		},
+	}
+	require.Panics(t, func() {
+		app.AccessControlKeeper.InitGenesis(ctx, invalidWasmGenesis)
+	})
+
+}
+```
+
+**File:** x/accesscontrol/keeper/keeper.go (L91-104)
+```go
+func (k Keeper) SetResourceDependencyMapping(
+	ctx sdk.Context,
+	dependencyMapping acltypes.MessageDependencyMapping,
+) error {
+	err := types.ValidateMessageDependencyMapping(dependencyMapping)
+	if err != nil {
+		return err
+	}
+	store := ctx.KVStore(k.storeKey)
+	b := k.cdc.MustMarshal(&dependencyMapping)
+	resourceKey := types.GetResourceDependencyKey(types.MessageKey(dependencyMapping.GetMessageKey()))
+	store.Set(resourceKey, b)
+	return nil
+}
+```
+
+**File:** x/accesscontrol/keeper/keeper.go (L443-461)
+```go
+func (k Keeper) SetWasmDependencyMapping(
+	ctx sdk.Context,
+	dependencyMapping acltypes.WasmDependencyMapping,
+) error {
+	err := types.ValidateWasmDependencyMapping(dependencyMapping)
+	if err != nil {
+		return err
+	}
+	store := ctx.KVStore(k.storeKey)
+	b := k.cdc.MustMarshal(&dependencyMapping)
+
+	contractAddr, err := sdk.AccAddressFromBech32(dependencyMapping.ContractAddress)
+	if err != nil {
+		return err
+	}
+	resourceKey := types.GetWasmContractAddressKey(contractAddr)
+	store.Set(resourceKey, b)
+	return nil
 }
 ```

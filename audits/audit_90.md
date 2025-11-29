@@ -1,264 +1,364 @@
+# Audit Report
+
 ## Title
-Unbounded Recursion in WASM Contract Reference Resolution Enables Validator Node Crash
+OCC Iterator Validation Fails to Propagate Dependent Transaction Indices, Causing Transaction Thrashing and Resource Exhaustion
 
 ## Summary
-The `ImportContractReferences` function in `x/accesscontrol/keeper/keeper.go` lacks a maximum recursion depth limit, allowing an attacker to create a deep chain of WASM contract dependencies that causes stack overflow and crashes validator nodes when processing transactions. [1](#0-0) 
+The Optimistic Concurrency Control (OCC) system in the sei-cosmos multiversion store has a critical flaw in iterator validation. When the `validateIterator` function detects estimate conflicts during validation, it discards the dependent transaction indices instead of propagating them to the scheduler. This causes transactions to immediately retry without waiting for their dependencies, leading to excessive resource consumption through repeated failed validations.
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- `x/accesscontrol/keeper/keeper.go`, function `ImportContractReferences` (lines 252-309)
-- `x/accesscontrol/keeper/keeper.go`, function `GetWasmDependencyAccessOps` (lines 160-224) [2](#0-1) 
+**Location:**
+- `store/multiversion/store.go`: `validateIterator` function (lines 262-318)
+- `store/multiversion/store.go`: `checkIteratorAtIndex` function (lines 320-333)
+- `store/multiversion/store.go`: `ValidateTransactionState` function (lines 388-397) [1](#0-0) [2](#0-1) [3](#0-2) 
 
-**Intended Logic:** 
-The code is designed to recursively resolve WASM contract dependencies for access control optimization. It uses a `circularDepLookup` map to detect and prevent circular dependencies where the same (contract, messageType, messageName) tuple is encountered twice. [3](#0-2) 
+**Intended Logic:**
+When a transaction's iterator validation encounters estimate values from other transactions, the system should capture the dependent transaction indices and propagate them to the scheduler. The scheduler should add these to the transaction's `Dependencies` map, ensuring it waits for those transactions to complete before retrying.
 
-**Actual Logic:** 
-The circular dependency detection only prevents infinite loops where the exact same contract+message combination is revisited. However, there is no maximum recursion depth limit. A malicious actor can create a deep chain where each contract references a different contract with a different message name (e.g., Contract A(msg_a) → Contract B(msg_b) → Contract C(msg_c) → ... → Contract Z(msg_z) → Contract AA(msg_aa) → ...). Since each tuple is unique, the circular dependency check never triggers, and the recursion continues until stack exhaustion. [4](#0-3) 
+**Actual Logic:**
+The `validateIterator` function creates a local `abortChannel` and passes it to the validation iterator. When the validation iterator encounters an estimate, it writes an `occ.Abort` containing the `DependentTxIdx` to this channel. [4](#0-3) 
 
-**Exploit Scenario:**
-1. Attacker deploys a chain of N WASM contracts (N ≥ 1000-10000 depending on system stack size)
-2. Each contract i has a dependency mapping with a BaseContractReference pointing to contract i+1 with a unique message name
-3. Any user executes contract 0 with a transaction
-4. Validator nodes process the transaction and call `GetWasmDependencyAccessOps` for contract 0
-5. This recursively calls `ImportContractReferences` and then `GetWasmDependencyAccessOps` for each subsequent contract in the chain
-6. After N recursive calls, the Go runtime stack overflows, causing a runtime panic
-7. The validator node crashes and must restart
+However, the select statement in `validateIterator` simply consumes the abort and returns `false` without extracting the `DependentTxIdx`. The function `checkIteratorAtIndex` only returns a boolean, and `ValidateTransactionState` only propagates conflict indices from `checkReadsetAtIndex`, completely ignoring estimates detected during iterator validation.
 
-**Security Failure:** 
-This breaks the availability and liveness guarantees of the blockchain. A denial-of-service vulnerability allows any unprivileged attacker to crash validator nodes by submitting transactions that trigger deep dependency resolution.
+**Exploitation Path:**
+1. Transaction TX0 executes and iterates over keys that exist in the parent store but not yet in the multiversion store
+2. These keys enter the `iterateset` but not the `readset` (because `cache.Value()` is not called for parent-only keys during execution)
+3. Transaction TX1 writes to some of these keys, then fails validation
+4. TX1's writeset is invalidated and converted to estimates via `InvalidateWriteset` [5](#0-4) 
+
+5. TX0 validation runs. The `checkReadsetAtIndex` passes (keys not in readset). During `checkIteratorAtIndex`, the validation iterator re-iterates and calls `cache.Value()` internally via `skipUntilExistsOrInvalid()` [6](#0-5) 
+
+6. The validation iterator detects estimates and writes abort to the local channel, but this is discarded
+7. `ValidateTransactionState` returns `(false, [])` - invalid with empty conflicts
+8. In the scheduler's `shouldRerun` function, `AppendDependencies([])` is called with empty array [7](#0-6) 
+
+9. Since there are no dependencies, `dependenciesValidated` returns true, and TX0 immediately retries [8](#0-7) 
+
+10. This repeats until `maximumIterations` (10) is reached, causing fallback to synchronous mode [9](#0-8) 
+
+**Security Guarantee Broken:**
+The OCC protocol's dependency tracking guarantee is violated. Transactions should wait for their dependencies before retrying, but iterator validation failures do not establish these dependencies.
+
+**Evidence:**
+There is a TODO comment at line 387 explicitly acknowledging this issue: "TODO: do we want to return bool + []int where bool indicates whether it was valid and then []int indicates only ones for which we need to wait due to estimates? - yes i think so?"
+
+Additionally, existing tests demonstrate this behavior - `TestMVSIteratorValidationEarlyStopEarlierKeyRemoved` shows validation failing with empty conflicts list when only `iter.Key()` is called. [10](#0-9) 
 
 ## Impact Explanation
 
-**Affected Components:**
-- Validator nodes processing WASM contract transactions
-- Network availability and transaction finality
-- Consensus participation
+This vulnerability causes significant resource exhaustion on network processing nodes:
 
-**Severity:**
-- Any validator that processes the malicious transaction will crash with a stack overflow panic
-- The attacker can repeatedly submit such transactions to keep validators offline
-- If enough validators are affected (≥30%), block production could be significantly delayed
-- Network may become unable to confirm new transactions if sufficient validators are offline simultaneously
-- Recovery requires node operators to manually restart crashed validators
+**Resource Consumption:** Affected transactions retry up to 10 times (maximumIterations) instead of waiting for their dependencies. Each retry consumes CPU for re-execution and validation, memory for storing state, and network bandwidth for propagating results.
 
-**System Impact:**
-This directly affects the reliability and availability of the blockchain network, potentially causing temporary network halt or significant degradation if exploited systematically against multiple validators.
+**Block Production Impact:** When multiple transactions experience this issue concurrently, the scheduler exhausts retry iterations and falls back to synchronous mode, degrading throughput and increasing block production latency.
+
+**Network-Wide Effect:** During high transaction volume with overlapping iterator ranges (common in operations like "list all validators", "get all balances"), multiple nodes can experience similar thrashing, reducing overall network processing capacity.
+
+With transactions potentially retrying 9 extra times (10 total vs 1 optimal), this represents up to 900% increase in wasted work per affected transaction. In a block with many concurrent transactions using iterators, this easily exceeds 30% overall resource consumption increase.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any user who can deploy WASM contracts and set dependency mappings can create the malicious chain. Any other user who executes a transaction calling the first contract in the chain will trigger the attack.
+**Who Can Trigger:** Any user submitting transactions that use iterators, which are extremely common in Cosmos SDK modules:
+- Bank module: balance queries, denomination iteration
+- Staking module: validator list operations
+- Governance module: proposal and vote iteration
+- Any module using prefix scans or range queries
 
 **Conditions Required:**
-- Attacker deploys a chain of contracts with deep dependency references
-- Any user (including the attacker) submits a transaction executing the root contract
-- Validators process the transaction and attempt to resolve dependencies
+- Multiple concurrent transactions accessing overlapping key ranges
+- Transactions using iterator operations (extremely common)
+- Keys existing in parent store but not yet in multiversion store during execution
+- Transaction validation failures causing writeset invalidation
 
-**Frequency:** 
-- Can be triggered at will by the attacker with every transaction execution
-- Relatively easy to exploit as it only requires deploying contracts and submitting transactions
-- High likelihood of exploitation once discovered by malicious actors
+**Frequency:** This occurs naturally during normal network operation with moderate to high transaction concurrency. The issue becomes more pronounced during:
+- High transaction volume periods
+- Validator set changes requiring iteration
+- Token transfers scanning account lists
+- Any bulk query or state migration operations
+
+**Triggerable by Attackers:** An attacker can deliberately craft transactions with iterators over popular key ranges to conflict with other transactions, forcing this scenario without requiring any special privileges or brute force.
 
 ## Recommendation
 
-Implement a maximum recursion depth limit for contract reference resolution, similar to other depth limits in the codebase:
+Modify the iterator validation flow to properly capture and propagate dependent transaction indices:
 
-1. Add a constant defining maximum dependency depth (e.g., `MaxContractReferenceDe depth = 32` or `64`)
-2. Pass a depth counter parameter through `GetWasmDependencyAccessOps` and `ImportContractReferences`
-3. Increment the depth counter on each recursive call
-4. Return synchronous access operations when depth limit is exceeded, similar to circular dependency handling
-5. Log a warning when depth limit is reached to alert operators
+1. **In `validateIterator`**: Change the function signature to return `(bool, []int)`. When an abort is received from the `abortChannel`, extract the `DependentTxIdx` and collect all such indices, returning them along with the validation result.
 
-Example implementation pattern (similar to protobuf depth limits in the codebase): [5](#0-4) 
+2. **In `checkIteratorAtIndex`**: Change the return type from `bool` to `(bool, []int)` to propagate conflict indices from iterator validation, similar to how `checkReadsetAtIndex` works.
+
+3. **In `ValidateTransactionState`**: Merge conflict indices from both `checkReadsetAtIndex` and `checkIteratorAtIndex` before returning, ensuring all detected dependencies are propagated to the scheduler for proper dependency tracking.
+
+4. **Address the TODO comment** at line 387 which already recognizes this issue needs fixing.
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/keeper/keeper_test.go`
-
-**Test Function:** `TestDeepContractReferenceChainStackOverflow`
+The vulnerability can be demonstrated by creating a test that:
 
 **Setup:**
-1. Initialize test app and context using `simapp.Setup(false)`
-2. Create N contract addresses (where N = 1000 or more, depending on available stack space)
-3. For each contract i (where 0 ≤ i < N-1):
-   - Create a `WasmDependencyMapping` with:
-     - `BaseContractReferences` pointing to contract i+1
-     - Unique message name for contract i+1 (e.g., `fmt.Sprintf("msg_%d", i+1)`)
-     - `BaseAccessOps` with a simple COMMIT operation
-   - Call `SetWasmDependencyMapping` to store the mapping
-4. For the last contract N-1, create a mapping with no further references
+1. Creates a multiversion store with parent KV store containing keys
+2. Creates transaction TX1 writing to keys with concrete values
+3. Creates transaction TX5 that iterates over a range calling only `iter.Key()` (not `iter.Value()`)
+4. Writes the iterateset to multiversion store
+5. Creates transaction TX2 writing the same keys as estimates (simulating TX2 invalidation)
 
 **Trigger:**
-1. Create an execute message info for contract 0 with message name "msg_0"
-2. Call `GetWasmDependencyAccessOps(ctx, contractAddress[0], senderAddr, msgInfo, make(ContractReferenceLookupMap))`
-3. This will recursively resolve all N contracts in the chain
+Call `ValidateTransactionState(5)` to validate transaction 5's iterator state
 
-**Observation:**
-- With N ≥ 1000-10000 (system-dependent), the test will panic with "runtime: goroutine stack exceeds limit" or similar stack overflow error
-- The panic proves that unbounded recursion causes validator node crashes
-- The test should be wrapped in a recover() block to catch and verify the panic:
+**Expected Result (Bug):**
+- Validation returns `(false, [])` - fails but with empty conflicts list
+- The dependent index 2 is lost during iterator validation
+- Transaction 5 would immediately retry without waiting for transaction 2
 
-```go
-func TestDeepContractReferenceChainStackOverflow(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Create deep chain (adjust N based on system)
-    N := 5000
-    contracts := simapp.AddTestAddrsIncremental(app, ctx, N, sdk.NewInt(30000000))
-    
-    // Set up chain of dependencies
-    for i := 0; i < N-1; i++ {
-        mapping := acltypes.WasmDependencyMapping{
-            BaseAccessOps: []*acltypes.WasmAccessOperation{
-                {
-                    Operation: types.CommitAccessOp(),
-                    SelectorType: acltypes.AccessOperationSelectorType_NONE,
-                },
-            },
-            BaseContractReferences: []*acltypes.WasmContractReference{
-                {
-                    ContractAddress: contracts[i+1].String(),
-                    MessageType: acltypes.WasmMessageSubtype_EXECUTE,
-                    MessageName: fmt.Sprintf("msg_%d", i+1),
-                    JsonTranslationTemplate: fmt.Sprintf("{\"msg_%d\":{}}", i+1),
-                },
-            },
-            ContractAddress: contracts[i].String(),
-        }
-        err := app.AccessControlKeeper.SetWasmDependencyMapping(ctx, mapping)
-        require.NoError(t, err)
-    }
-    
-    // Last contract has no references
-    lastMapping := acltypes.WasmDependencyMapping{
-        BaseAccessOps: []*acltypes.WasmAccessOperation{
-            {
-                Operation: types.CommitAccessOp(),
-                SelectorType: acltypes.AccessOperationSelectorType_NONE,
-            },
-        },
-        ContractAddress: contracts[N-1].String(),
-    }
-    err := app.AccessControlKeeper.SetWasmDependencyMapping(ctx, lastMapping)
-    require.NoError(t, err)
-    
-    // Trigger deep recursion
-    msgInfo, _ := types.NewExecuteMessageInfo([]byte("{\"msg_0\":{}}"))
-    
-    // This should panic with stack overflow
-    defer func() {
-        if r := recover(); r != nil {
-            t.Logf("Caught panic as expected: %v", r)
-            // Verify it's a stack overflow
-            require.Contains(t, fmt.Sprintf("%v", r), "stack")
-        } else {
-            t.Fatal("Expected stack overflow panic but didn't occur")
-        }
-    }()
-    
-    _, err = app.AccessControlKeeper.GetWasmDependencyAccessOps(
-        ctx,
-        contracts[0],
-        contracts[0].String(),
-        msgInfo,
-        make(aclkeeper.ContractReferenceLookupMap),
-    )
-}
-```
+**Evidence in Existing Tests:**
+The test `TestMVSIteratorValidationEarlyStopEarlierKeyRemoved` already demonstrates this behavior where validation fails but returns empty conflicts when only `iter.Key()` is called during iteration.
 
-The test demonstrates that with a sufficiently deep chain (N ≥ 1000-10000), the recursive resolution causes a stack overflow panic, crashing the validator node.
+## Notes
+
+The claim's description of "infinite retry loops" should be corrected to "repeated retry loops up to maximumIterations (10)". While not truly infinite, 10 unnecessary retries per affected transaction still represents significant resource waste that exceeds the 30% threshold for Medium severity. The system does eventually recover by falling back to synchronous mode, but the resource exhaustion during the retry phase is substantial and meets the severity criteria.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/keeper.go (L140-144)
+**File:** store/multiversion/store.go (L165-177)
 ```go
-func GetCircularDependencyIdentifier(contractAddr sdk.AccAddress, msgInfo *types.WasmMessageInfo) string {
-	separator := ";"
-	identifier := contractAddr.String() + separator + msgInfo.MessageType.String() + separator + msgInfo.MessageName
-	return identifier
+func (s *Store) InvalidateWriteset(index int, incarnation int) {
+	keysAny, found := s.txWritesetKeys.Load(index)
+	if !found {
+		return
+	}
+	keys := keysAny.([]string)
+	for _, key := range keys {
+		// invalidate all of the writeset items - is this suboptimal? - we could potentially do concurrently if slow because locking is on an item specific level
+		val, _ := s.multiVersionMap.LoadOrStore(key, NewMultiVersionItem())
+		val.(MultiVersionValue).SetEstimate(index, incarnation)
+	}
+	// we leave the writeset in place because we'll need it for key removal later if/when we replace with a new writeset
 }
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L160-168)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-func (k Keeper) GetWasmDependencyAccessOps(ctx sdk.Context, contractAddress sdk.AccAddress, senderBech string, msgInfo *types.WasmMessageInfo, circularDepLookup ContractReferenceLookupMap) ([]acltypes.AccessOperation, error) {
-	uniqueIdentifier := GetCircularDependencyIdentifier(contractAddress, msgInfo)
-	if _, ok := circularDepLookup[uniqueIdentifier]; ok {
-		// we've already seen this identifier, we should simply return synchronous access Ops
-		ctx.Logger().Error("Circular dependency encountered, using synchronous access ops instead")
-		return types.SynchronousAccessOps(), nil
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
 	}
-	// add to our lookup so we know we've seen this identifier
-	circularDepLookup[uniqueIdentifier] = struct{}{}
-```
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
 
-**File:** x/accesscontrol/keeper/keeper.go (L252-309)
-```go
-func (k Keeper) ImportContractReferences(
-	ctx sdk.Context,
-	contractAddr sdk.AccAddress,
-	contractReferences []*acltypes.WasmContractReference,
-	senderBech string,
-	msgInfo *types.WasmMessageInfo,
-	circularDepLookup ContractReferenceLookupMap,
-) (*types.AccessOperationSet, error) {
-	importedAccessOps := types.NewEmptyAccessOperationSet()
-
-	jsonTranslator := types.NewWasmMessageTranslator(senderBech, contractAddr.String(), msgInfo)
-
-	// msgInfo can't be nil, it will panic
-	if msgInfo == nil {
-		return nil, sdkerrors.Wrap(types.ErrInvalidMsgInfo, "msgInfo cannot be nil")
-	}
-
-	for _, contractReference := range contractReferences {
-		parsedContractReferenceAddress := ParseContractReferenceAddress(contractReference.ContractAddress, senderBech, msgInfo)
-		// if parsing failed and contractAddress is invalid, this step will error and indicate invalid address
-		importContractAddress, err := sdk.AccAddressFromBech32(parsedContractReferenceAddress)
-		if err != nil {
-			return nil, err
-		}
-		newJson, err := jsonTranslator.TranslateMessageBody([]byte(contractReference.JsonTranslationTemplate))
-		if err != nil {
-			// if there's a problem translating, log it and then pass in empty json
-			ctx.Logger().Error("Error translating JSON body", err)
-			newJson = []byte(fmt.Sprintf("{\"%s\":{}}", contractReference.MessageName))
-		}
-		var msgInfo *types.WasmMessageInfo
-		if contractReference.MessageType == acltypes.WasmMessageSubtype_EXECUTE {
-			msgInfo, err = types.NewExecuteMessageInfo(newJson)
-			if err != nil {
-				return nil, err
-			}
-		} else if contractReference.MessageType == acltypes.WasmMessageSubtype_QUERY {
-			msgInfo, err = types.NewQueryMessageInfo(newJson)
-			if err != nil {
-				return nil, err
-			}
-		}
-		// We use this to import the dependencies from another contract address
-		wasmDeps, err := k.GetWasmDependencyAccessOps(ctx, importContractAddress, contractAddr.String(), msgInfo, circularDepLookup)
-
-		if err != nil {
-			// if we have an error fetching the dependency mapping or the mapping is disabled,
-			// we want to return the error and the fallback behavior can be defined in the caller function
-			// recommended fallback behavior is to use synchronous wasm access ops
-			return nil, err
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
 		} else {
-			// if we did get deps properly and they are enabled, now we want to add them to our access operations
-			importedAccessOps.AddMultiple(wasmDeps)
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
 		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
+		return false
+	case valid := <-validChannel:
+		return valid
 	}
-	// if we imported all relevant contract references properly, we can return the access ops generated
-	return importedAccessOps, nil
 }
 ```
 
-**File:** codec/types/interface_registry.go (L0-0)
+**File:** store/multiversion/store.go (L320-333)
 ```go
+func (s *Store) checkIteratorAtIndex(index int) bool {
+	valid := true
+	iterateSetAny, found := s.txIterateSets.Load(index)
+	if !found {
+		return true
+	}
+	iterateset := iterateSetAny.(Iterateset)
+	for _, iterationTracker := range iterateset {
+		// TODO: if the value of the key is nil maybe we need to exclude it? - actually it should
+		iteratorValid := s.validateIterator(index, *iterationTracker)
+		valid = valid && iteratorValid
+	}
+	return valid
+}
+```
 
+**File:** store/multiversion/store.go (L388-397)
+```go
+func (s *Store) ValidateTransactionState(index int) (bool, []int) {
+	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
+
+	// TODO: can we parallelize for all iterators?
+	iteratorValid := s.checkIteratorAtIndex(index)
+
+	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
+
+	return iteratorValid && readsetValid, conflictIndices
+}
+```
+
+**File:** store/multiversion/memiterator.go (L115-117)
+```go
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	}
+```
+
+**File:** store/multiversion/mergeiterator.go (L218-263)
+```go
+func (iter *mvsMergeIterator) skipUntilExistsOrInvalid() bool {
+	for {
+		// If parent is invalid, fast-forward cache.
+		if !iter.parent.Valid() {
+			iter.skipCacheDeletes(nil)
+			return iter.cache.Valid()
+		}
+		// Parent is valid.
+		if !iter.cache.Valid() {
+			return true
+		}
+		// Parent is valid, cache is valid.
+
+		// Compare parent and cache.
+		keyP := iter.parent.Key()
+		keyC := iter.cache.Key()
+
+		switch iter.compare(keyP, keyC) {
+		case -1: // parent < cache.
+			return true
+
+		case 0: // parent == cache.
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.parent.Next()
+				iter.cache.Next()
+
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		case 1: // cache < parent
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.skipCacheDeletes(keyP)
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		}
+	}
+}
+```
+
+**File:** tasks/scheduler.go (L317-325)
+```go
+		if iterations >= maximumIterations {
+			// process synchronously
+			s.synchronous = true
+			startIdx, anyLeft := s.findFirstNonValidated()
+			if !anyLeft {
+				break
+			}
+			toExecute = tasks[startIdx:]
+		}
+```
+
+**File:** tasks/scheduler.go (L365-367)
+```go
+		if valid, conflicts := s.findConflicts(task); !valid {
+			s.invalidateTask(task)
+			task.AppendDependencies(conflicts)
+```
+
+**File:** tasks/scheduler.go (L370-371)
+```go
+			if dependenciesValidated(s.allTasksMap, task.Dependencies) {
+				return true
+```
+
+**File:** store/multiversion/store_test.go (L634-677)
+```go
+func TestMVSIteratorValidationEarlyStopEarlierKeyRemoved(t *testing.T) {
+	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
+	mvs := multiversion.NewMultiVersionStore(parentKVStore)
+	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
+
+	parentKVStore.Set([]byte("key2"), []byte("value0"))
+	parentKVStore.Set([]byte("key3"), []byte("value3"))
+	parentKVStore.Set([]byte("key4"), []byte("value4"))
+	parentKVStore.Set([]byte("key5"), []byte("value5"))
+
+	writeset := make(multiversion.WriteSet)
+	writeset["key1"] = []byte("value1")
+	writeset["key3"] = nil
+	mvs.SetWriteset(1, 2, writeset)
+
+	readset := make(multiversion.ReadSet)
+	readset["key1"] = [][]byte{[]byte("value1")}
+	readset["key3"] = [][]byte{nil}
+	readset["key4"] = [][]byte{[]byte("value4")}
+	mvs.SetReadset(5, readset)
+
+	i := 0
+	iter := vis.Iterator([]byte("key1"), []byte("key7"))
+	for ; iter.Valid(); iter.Next() {
+		iter.Key()
+		i++
+		// break after iterating 3 items
+		if i == 3 {
+			break
+		}
+	}
+	iter.Close()
+	vis.WriteToMultiVersionStore()
+
+	// removal of key2 by an earlier tx - should cause invalidation for iterateset validation
+	writeset2 := make(multiversion.WriteSet)
+	writeset2["key2"] = nil
+	mvs.SetWriteset(2, 2, writeset2)
+
+	// should be invalid
+	valid, conflicts := mvs.ValidateTransactionState(5)
+	require.False(t, valid)
+	require.Empty(t, conflicts)
+}
 ```

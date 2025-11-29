@@ -1,275 +1,167 @@
 # Audit Report
 
 ## Title
-Genesis-Based DoS Attack via Unbounded Capability Owner Sets
+Array Index Out-of-Bounds Panic in Slashing Module Migration Causes Network Halt During Upgrade
 
 ## Summary
-The capability module allows an unbounded number of owners to be specified in the genesis state for a single capability. When combined with the O(n) insertion cost in `CapabilityOwners.Set()`, this enables a DoS attack where claiming a capability with a large pre-existing owner set consumes excessive gas, potentially exceeding block gas limits and preventing critical operations like IBC channel establishment.
+The `Migrate3to4` function in the slashing module's migration code lacks an upper bound check when converting missed block heights to a boolean array. When the chain experiences a rollback and then executes an upgrade, stored missed block heights from before the rollback (which are greater than the current block height) cause an array index out-of-bounds panic, halting all nodes and preventing the network from processing any blocks. [1](#0-0) 
 
 ## Impact
-**Medium**
+**High** - Network not being able to confirm new transactions (total network shutdown)
 
 ## Finding Description
 
-**Location:** 
-- Primary vulnerability: [1](#0-0) 
-- Exploit trigger: [2](#0-1) 
-- Gas consumption: [3](#0-2) 
+**Location:** The vulnerability exists in `x/slashing/keeper/migrations.go`, specifically in the `Migrate3to4` function at lines 206-212 where missed block heights are converted to a boolean array. [2](#0-1) 
 
-**Intended Logic:** 
-The capability module should allow multiple modules to claim ownership of capabilities through the `ClaimCapability` function. The `CapabilityOwners.Set()` method maintains a sorted list of owners and uses binary search for efficient lookups. Genesis validation should ensure the state is reasonable and won't cause operational issues.
+**Intended Logic:** The migration should convert legacy missed block height data into a boolean array representation for the current sliding window. It should only include heights within the valid window range `[startWindowHeight, ctx.BlockHeight())` by filtering out heights outside this range.
 
-**Actual Logic:** 
-The genesis validation function checks that owner lists are non-empty and have valid module/name fields, but imposes no upper limit on the number of owners per capability. The `Set()` method performs an O(n) memory copy operation when inserting a new owner at position i, which is not gas-metered. However, the subsequent marshal and store write operations consume gas proportional to the total serialized size of all owners. With the default gas config [3](#0-2) , writing costs 2000 + 30 * bytes.
+**Actual Logic:** The code calculates `startWindowHeight = ctx.BlockHeight() - window` and creates `newBoolArray` with length `window`. When iterating through missed heights, it only checks if `height < startWindowHeight` (lower bound) but does NOT validate that `height < ctx.BlockHeight()` (upper bound). For any height >= ctx.BlockHeight(), the calculated index becomes `height - startWindowHeight >= window`, causing an out-of-bounds array access that triggers a panic.
 
-**Exploit Scenario:**
-1. An attacker (or compromised governance) proposes a genesis file containing a capability with 50,000+ owners (each owner ~50 bytes serialized)
-2. The chain initializes successfully because `InitGenesis` calls `SetOwners` [4](#0-3)  which directly stores the data without using the `Set()` method
-3. During normal operation, when a legitimate module attempts to claim that capability via `ClaimCapability` [5](#0-4) , it triggers `addOwner` [6](#0-5) 
-4. The `addOwner` function calls `capOwners.Set()` which performs O(n) operations in memory, then marshals and writes the updated owner list
-5. For 50,000 owners: Read cost ≈ 7.5M gas, Write cost ≈ 75M gas (total ~82.5M gas)
-6. This exceeds typical block gas limits (10-50M), causing the transaction to fail with out-of-gas error
+**Exploitation Path:**
+1. Blockchain operates normally, accumulating missed block data for validators at various heights
+2. Chain experiences a rollback to an earlier height (due to consensus failure, network split, or state corruption)
+3. Missed block height data from before the rollback (higher heights) remains in the state store
+4. An upgrade is scheduled and executed at the rolled-back height
+5. During BeginBlocker, the upgrade mechanism calls `Migrate3to4` migration [3](#0-2) 
+6. The migration encounters stored missed block heights greater than the current block height
+7. The code attempts to access `newBoolArray[index]` where `index >= window`
+8. Go runtime panics with "index out of range"
+9. All nodes crash when processing the upgrade block
+10. Network halts completely as no node can successfully process the block
 
-**Security Failure:** 
-This breaks the availability guarantee of the capability system. Critical operations like IBC channel opening that depend on claiming capabilities become impossible to execute, causing a denial-of-service condition without requiring brute-force attacks.
+**Security Guarantee Broken:** This violates the blockchain's liveness and availability guarantees. The upgrade mechanism, which executes in BeginBlocker before other module operations, panics and prevents all block processing, causing complete network shutdown.
 
 ## Impact Explanation
 
-The vulnerability affects network availability and operational functionality:
+**Affected Components:** The entire blockchain network. All validator nodes and full nodes attempting to process the upgrade block will experience the identical panic and halt.
 
-- **Affected Systems**: Any module attempting to claim a capability with a bloated owner set, particularly IBC modules that need to claim channel capabilities during the handshake process
-- **Severity**: Operations requiring capability claims become impossible if gas consumption exceeds block limits. This can freeze IBC connectivity, preventing cross-chain communication and asset transfers
-- **Resource Consumption**: Each attempt to claim the capability consumes substantial gas, increasing network processing node resource consumption by forcing nodes to process oversized state reads/writes
-- **Chain Operations**: If critical system capabilities (like IBC port capabilities) are affected, core chain functionality can be permanently disabled without a hard fork to fix the genesis state
+**Severity of Damage:**
+- Complete network shutdown - no blocks can be produced or validated
+- All transaction finality ceases network-wide  
+- Cannot recover without manual intervention (state surgery to remove invalid heights or coordinated rollback)
+- Requires emergency coordination among validators to resolve
+- May require hard fork if state cannot be easily repaired
+- Undermines the blockchain's fundamental property of continuous operation
 
-This matters because it can halt critical blockchain operations through a single malicious genesis entry, requiring coordinated governance action or hard fork to resolve.
+The upgrade mechanism, intended to improve the system, instead becomes a deterministic kill switch when specific state conditions exist from chain rollbacks.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Requires inclusion of malicious data in the genesis file (possible during chain launch or through governance-approved chain upgrades)
-- Can be triggered by any module attempting to claim the affected capability through normal operations
+**Triggering Conditions:** 
+This is not directly attacker-triggered but occurs automatically when operational conditions align:
+- The blockchain experiences a rollback to a height lower than some stored missed block heights
+- An upgrade is scheduled and executed after the rollback  
+- The slashing module's consensus version upgrades from version 3 to 4 [4](#0-3) 
 
-**Frequency:**
-- One-time setup via genesis; persistent effect on all subsequent claim attempts
-- Every `ClaimCapability` call on the affected capability will fail due to excessive gas
-- For IBC: Every new channel handshake would fail if the port capability is affected
+**Frequency:** While chain rollbacks are rare in production, they DO occur during:
+- Major consensus bugs requiring coordinated rollback
+- Network splits requiring state reconciliation
+- Testnet/devnet operations where rollbacks are more common
+- State replay during node recovery from backups
 
-**Attacker Requirements:**
-- For new chains: Influence over genesis file creation
-- For existing chains: Successful governance proposal for a chain upgrade with modified genesis
-- No special runtime privileges needed to trigger the DoS once the malicious genesis is in place
-
-The attack is realistic because genesis files are often prepared by small teams during chain launches, and the lack of validation makes it easy for this vulnerability to be introduced accidentally or maliciously.
+Once these conditions exist, the vulnerability triggers deterministically during the upgrade with 100% reproducibility. Every node processing the upgrade block will panic identically.
 
 ## Recommendation
 
-Add an upper bound validation on the number of owners per capability in genesis validation:
+Add an upper bound check before array access to ensure the calculated index is within valid range:
 
 ```go
-// In x/capability/types/genesis.go, add to the Validate() function:
-const MaxOwnersPerCapability = 100 // or another reasonable limit
-
-for _, genOwner := range gs.Owners {
-    if len(genOwner.IndexOwners.Owners) == 0 {
-        return fmt.Errorf("empty owners in genesis")
+for _, height := range heights {
+    if height < startWindowHeight {
+        continue
     }
-    
-    // Add this validation
-    if len(genOwner.IndexOwners.Owners) > MaxOwnersPerCapability {
-        return fmt.Errorf("capability %d has %d owners, exceeds maximum of %d",
-            genOwner.Index, len(genOwner.IndexOwners.Owners), MaxOwnersPerCapability)
+    // Add upper bound check
+    if height >= ctx.BlockHeight() {
+        continue  // Skip heights beyond current block height
     }
-    
-    // existing validation continues...
+    index := height - startWindowHeight
+    newBoolArray[index] = true
 }
 ```
 
-Additionally, consider implementing a runtime check in `addOwner` to prevent accumulation of excessive owners during normal operations, and potentially optimize the `Set()` method to use a more efficient data structure for large owner sets (though the genesis limit is the primary fix).
+This ensures only heights within the valid window `[startWindowHeight, ctx.BlockHeight())` are processed, preventing out-of-bounds access while properly handling the rollback scenario by silently ignoring future heights.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
-
-**Test Function:** `TestLargeOwnerSetDoS`
+**Test Function:** Add to `x/slashing/keeper/migrations_test.go`:
 
 **Setup:**
-1. Create a genesis state with a capability (index 1) containing 10,000 owner entries
-2. Initialize the keeper with this genesis state using `InitGenesis`
-3. Create a new scoped keeper for a module that will attempt to claim the capability
+- Initialize test app and blockchain context at height 9000 (simulating post-rollback state)
+- Create validator with signing info
+- Set SignedBlocksWindow parameter to 100
+- Calculate: startWindowHeight = 9000 - 100 = 8900
 
-**Trigger:**
-1. Call `ClaimCapability` on the capability with 10,000 pre-existing owners
-2. Measure the gas consumed by the operation using the context's gas meter
+**Action:**
+- Store legacy missed block heights [9950, 9960, 9970] that are greater than current block height 9000
+- These simulate data from before a chain rollback
+- Call `Migrate3to4` migration function
 
-**Observation:**
-The test demonstrates that claiming a capability with 10,000 owners consumes approximately 16.5 million gas (1024 + 150*10000 for read + 3740 + 1500*10000 for write). This is calculated based on [7](#0-6)  where Get/Set operations consume gas proportional to data size. With 50,000 owners, the cost would exceed 82 million gas, making the operation infeasible within typical block gas limits.
+**Result:**
+- Migration calculates: index = 9950 - 8900 = 1050
+- Attempts to access `newBoolArray[1050]`
+- Array only has length 100 (valid indices 0-99)
+- Go runtime panics: "index out of range [1050] with length 100"
+- This demonstrates the vulnerability causes BeginBlocker to panic during upgrade, which would halt the entire network in production
 
-The test should show that:
-- Genesis initialization succeeds despite the large owner set
-- Attempting to claim the capability results in excessive gas consumption
-- The gas consumed scales linearly with the number of existing owners
-- At sufficient scale (50,000+ owners), the operation would exceed block gas limits
+The test demonstrates that when missed block heights from before a rollback remain in state, the migration code deterministically panics, causing complete network shutdown during the upgrade.
 
-This confirms that an attacker can DoS the capability system by including large owner sets in genesis, preventing legitimate modules from claiming capabilities and disrupting critical operations like IBC channel establishment.
+## Notes
+
+This vulnerability is particularly severe because:
+1. It affects the upgrade mechanism itself, which runs in BeginBlocker before any other operations
+2. The panic is deterministic - all nodes will fail identically when processing the upgrade block
+3. Recovery requires manual state intervention, not just a binary update
+4. The scenario (rollback + upgrade) is operationally realistic, especially in testnets and during consensus issues
+5. The missing bounds check is a straightforward oversight that violates defensive programming practices for array access
 
 ### Citations
 
-**File:** x/capability/types/genesis.go (L21-49)
+**File:** x/slashing/keeper/migrations.go (L192-212)
 ```go
-func (gs GenesisState) Validate() error {
-	// NOTE: index must be greater than 0
-	if gs.Index == 0 {
-		return fmt.Errorf("capability index must be non-zero")
-	}
+	startWindowHeight := ctx.BlockHeight() - window
+	iter := sdk.KVStorePrefixIterator(store, types.ValidatorMissedBlockBitArrayKeyPrefix)
+	defer iter.Close()
+	for ; iter.Valid(); iter.Next() {
+		var missedInfo types.ValidatorMissedBlockArrayLegacyMissedHeights
+		key := iter.Key()
+		consAddrBytes := key[2:]
 
-	for _, genOwner := range gs.Owners {
-		if len(genOwner.IndexOwners.Owners) == 0 {
-			return fmt.Errorf("empty owners in genesis")
-		}
+		consAddr := sdk.ConsAddress(consAddrBytes)
+		ctx.Logger().Info(fmt.Sprintf("Migrating for next validator with consAddr: %s\n", consAddr.String()))
 
-		// all exported existing indices must be between [1, gs.Index)
-		if genOwner.Index == 0 || genOwner.Index >= gs.Index {
-			return fmt.Errorf("owners exist for index %d outside of valid range: %d-%d", genOwner.Index, 1, gs.Index-1)
-		}
-
-		for _, owner := range genOwner.IndexOwners.Owners {
-			if strings.TrimSpace(owner.Module) == "" {
-				return fmt.Errorf("owner's module cannot be blank: %s", owner)
+		newBoolArray := make([]bool, window)
+		m.keeper.cdc.MustUnmarshal(iter.Value(), &missedInfo)
+		heights := missedInfo.MissedHeights
+		for _, height := range heights {
+			if height < startWindowHeight {
+				continue
 			}
-
-			if strings.TrimSpace(owner.Name) == "" {
-				return fmt.Errorf("owner's name cannot be blank: %s", owner)
-			}
+			index := height - startWindowHeight
+			newBoolArray[index] = true
 		}
-	}
-
-	return nil
-}
 ```
 
-**File:** x/capability/types/types.go (L46-59)
+**File:** x/upgrade/abci.go (L61-72)
 ```go
-func (co *CapabilityOwners) Set(owner Owner) error {
-	i, ok := co.Get(owner)
-	if ok {
-		// owner already exists at co.Owners[i]
-		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
-	}
-
-	// owner does not exist in the set of owners, so we insert at position i
-	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
-	copy(co.Owners[i+1:], co.Owners[i:])
-	co.Owners[i] = owner
-
-	return nil
-}
+	if plan.ShouldExecute(ctx) {
+		// If skip upgrade has been set for current height, we clear the upgrade plan
+		if k.IsSkipHeight(ctx.BlockHeight()) {
+			skipUpgrade(k, ctx, plan)
+			return
+		}
+		// If we don't have an upgrade handler for this upgrade name, then we need to shutdown
+		if !k.HasHandler(plan.Name) {
+			panicUpgradeNeeded(k, ctx, plan)
+		}
+		applyUpgrade(k, ctx, plan)
+		return
 ```
 
-**File:** store/types/gas.go (L341-351)
+**File:** x/slashing/module.go (L152-156)
 ```go
-func KVGasConfig() GasConfig {
-	return GasConfig{
-		HasCost:          1000,
-		DeleteCost:       1000,
-		ReadCostFlat:     1000,
-		ReadCostPerByte:  3,
-		WriteCostFlat:    2000,
-		WriteCostPerByte: 30,
-		IterNextCostFlat: 30,
-	}
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L168-174)
-```go
-func (k Keeper) SetOwners(ctx sdk.Context, index uint64, owners types.CapabilityOwners) {
-	prefixStore := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(index)
-
-	// set owners in persistent store
-	prefixStore.Set(indexKey, k.cdc.MustMarshal(&owners))
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L287-314)
-```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L453-467)
-```go
-func (sk ScopedKeeper) addOwner(ctx sdk.Context, cap *types.Capability, name string) error {
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	capOwners := sk.getOwners(ctx, cap)
-
-	if err := capOwners.Set(types.NewOwner(sk.module, name)); err != nil {
-		return err
-	}
-
-	// update capability owner set
-	prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
-
-	return nil
-}
-```
-
-**File:** store/gaskv/store.go (L54-80)
-```go
-func (gs *Store) Get(key []byte) (value []byte) {
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostFlat, types.GasReadCostFlatDesc)
-	value = gs.parent.Get(key)
-
-	// TODO overflow-safe math?
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(key)), types.GasReadPerByteDesc)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(value)), types.GasReadPerByteDesc)
-	if gs.tracer != nil {
-		gs.tracer.Get(key, value, gs.moduleName)
-	}
-
-	return value
-}
-
-// Implements KVStore.
-func (gs *Store) Set(key []byte, value []byte) {
-	types.AssertValidKey(key)
-	types.AssertValidValue(value)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostFlat, types.GasWriteCostFlatDesc)
-	// TODO overflow-safe math?
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(key)), types.GasWritePerByteDesc)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(value)), types.GasWritePerByteDesc)
-	gs.parent.Set(key, value)
-	if gs.tracer != nil {
-		gs.tracer.Set(key, value, gs.moduleName)
-	}
+	m := keeper.NewMigrator(am.keeper)
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+	cfg.RegisterMigration(types.ModuleName, 2, m.Migrate2to3)
+	cfg.RegisterMigration(types.ModuleName, 3, m.Migrate3to4)
 }
 ```

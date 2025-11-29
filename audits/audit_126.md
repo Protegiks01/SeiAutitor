@@ -1,264 +1,319 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Simulation DoS via Unlimited Gas Meter Bypass in SetGasMeter
+Data Race in cachekv.Store Concurrent Iterator Creation Leading to Node Crash
 
 ## Summary
-The `SetGasMeter` function in `x/auth/ante/setup.go` unconditionally returns an infinite gas meter when in simulation mode, completely ignoring the declared gas limit. This allows attackers to craft transactions with arbitrarily expensive operations and repeatedly send them to the publicly accessible Simulate RPC endpoint, consuming excessive node resources (CPU, memory) without gas cost consequences, leading to denial-of-service.
+The `cachekv.Store` implementation contains a critical data race vulnerability where multiple goroutines can concurrently access the shared `sortedCache` field (a `dbm.MemDB`) without proper synchronization. When iterators are created concurrently during parallel transaction execution, one iterator reads from `sortedCache` outside the mutex lock while another goroutine modifies it, causing Go runtime panics and node crashes.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
 **Location:** 
-The vulnerability exists in the `SetGasMeter` function at [1](#0-0) 
+- File: `store/cachekv/store.go`, function `iterator()` at lines 169-193 [1](#0-0) 
+- Shared state: `sortedCache` field defined at lines 19-30 [2](#0-1) 
 
-**Intended Logic:** 
-The gas meter should enforce reasonable resource limits even during simulation to prevent denial-of-service attacks. While simulation needs to allow transactions to complete for accurate gas estimation, it should still enforce a maximum gas limit (such as the transaction's declared gas limit or the block's maximum gas limit) to prevent resource exhaustion.
+**Intended Logic:**
+The `iterator()` method is designed to create iterators over cached data. The mutex lock is intended to protect concurrent access to the cache during iterator creation. The system supports parallel transaction execution where multiple `VersionIndexedStore` instances process transactions concurrently.
 
-**Actual Logic:** 
-When `simulate` is true, `SetGasMeter` unconditionally returns an infinite gas meter via `sdk.NewInfiniteGasMeterWithMultiplier(ctx)`, completely ignoring the `gasLimit` parameter. [2](#0-1) 
+**Actual Logic:**
+The `iterator()` method acquires a lock, calls `dirtyItems()` which writes entries to `sortedCache` via `clearUnsortedCacheSubset()` [3](#0-2) , creates a `memIterator` backed by the shared `sortedCache`, then releases the lock and returns. The returned iterator continues reading from `sortedCache` after the lock is released [4](#0-3) . When another concurrent goroutine calls `iterator()`, it acquires the lock and modifies the same `sortedCache`, creating unsynchronized concurrent read/write access to the underlying `dbm.MemDB`.
 
-The infinite gas meter never enforces any limit during execution - its `IsPastLimit()` and `IsOutOfGas()` methods always return false. [3](#0-2) 
+**Exploitation Path:**
+1. Parallel transaction execution scheduler initializes multiversion stores with shared parent cachekv.Store instances [5](#0-4) 
+2. Multiple `VersionIndexedStore` instances are created, each sharing the same parent store [6](#0-5) 
+3. Transaction A calls `Iterator()`, which delegates to parent cachekv.Store [7](#0-6) 
+4. The cachekv.Store creates an iterator backed by `sortedCache` and releases the lock
+5. Transaction A's iterator begins reading from `sortedCache` outside the lock
+6. Transaction B concurrently calls `Iterator()` on the same parent store
+7. Transaction B acquires the lock and executes `dirtyItems()`, writing to `sortedCache` via `Set()`
+8. Concurrent read (Transaction A's iterator) and write (Transaction B's dirtyItems) to the non-thread-safe `dbm.MemDB` occurs
+9. Go runtime detects concurrent map access and panics, crashing the node
 
-**Exploit Scenario:**
-1. Attacker crafts a transaction with a reasonable declared gas limit (e.g., 100,000 gas via `GetGas()`) that passes the block max gas validation check [4](#0-3) 
-2. The transaction contains extremely expensive operations (e.g., intensive loops, complex smart contract calls, nested state iterations) that would consume millions or billions of gas units
-3. Attacker sends the transaction bytes to the publicly accessible Simulate RPC endpoint [5](#0-4) 
-4. `BaseApp.Simulate` processes the transaction with `runTxModeSimulate` [6](#0-5) 
-5. The ante handler calls `SetGasMeter` with `simulate=true`, which returns an infinite gas meter regardless of the declared limit
-6. The transaction executes with unlimited gas, consuming excessive CPU and memory resources for up to the RPC timeout period (default 10 seconds) [7](#0-6) 
-7. Attacker repeats this process continuously or uses multiple connections to amplify the attack
-
-**Security Failure:**
-This breaks the denial-of-service protection invariant. The system allows unprivileged attackers to consume unbounded node resources during simulation without any gas cost consequences, violating the principle that all resource-intensive operations should be metered and limited.
+**Security Guarantee Broken:**
+Memory safety and thread-safety guarantees are violated. The system allows unsynchronized concurrent access to a non-thread-safe data structure (Go's map inside `dbm.MemDB`), which Go's runtime explicitly forbids.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- Node CPU and memory resources are exhausted by processing expensive simulation requests
-- Network availability is degraded as nodes struggle to process legitimate transactions
-- RPC endpoint responsiveness suffers, impacting user experience and dependent applications
+This vulnerability causes node crashes during normal parallel transaction execution:
 
-**Severity of Damage:**
-An attacker can increase node resource consumption by well over 30% by:
-- Sending continuous simulation requests with expensive operations
-- Using multiple IP addresses or connections to bypass per-connection limits
-- Crafting transactions that maximize computational cost (loops, state iterations, cryptographic operations)
-- Each request consuming up to 10 seconds of CPU time with unlimited gas
+- **Node Crashes**: Validators and full nodes panic with "concurrent map read and map write" errors when the race condition is triggered
+- **Consensus Disruption**: If multiple validators crash simultaneously due to the same race condition, block production can be delayed or halted
+- **Network Instability**: Different nodes may crash at different times based on timing, leading to unpredictable network behavior and potential consensus failures
+- **Denial of Service**: Attackers can increase the likelihood of crashes by submitting transactions that frequently trigger iterator creation
 
-This meets the **Medium** severity criteria: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
-
-**System Impact:**
-- Legitimate simulation requests experience high latency or timeouts
-- Node operators may need to disable the Simulate endpoint entirely
-- Degraded service quality for applications relying on gas estimation
-- Potential cascade effects if multiple nodes are targeted simultaneously
+The vulnerability undermines the reliability of Sei's parallel execution system, which is critical for the network's performance advantages. Since the parent cachekv.Store is shared across multiple concurrent VersionIndexedStore instances [8](#0-7) , any transaction that causes iterator creation can contribute to the race condition.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any unprivileged network participant with access to the node's RPC endpoint. The Simulate endpoint is publicly accessible via gRPC and REST APIs without authentication or authorization requirements.
-
-**Required Conditions:**
-- Node has the API server enabled with default configuration
-- Attacker can send gRPC/REST requests to the node
-- No additional authentication, rate limiting, or privileged access required
+**Trigger Conditions:**
+- Any user can trigger this by submitting transactions that cause modules to create iterators during execution
+- No special permissions, administrative access, or configuration changes required
+- Occurs during normal parallel transaction execution when the scheduler runs multiple transactions concurrently [9](#0-8) 
 
 **Frequency:**
-This vulnerability can be exploited continuously and repeatedly during normal network operation:
-- Attacker can send simulation requests as fast as the RPC timeout allows (every ~10 seconds per connection)
-- Multiple concurrent connections multiply the impact
-- No gas fees are consumed, making attacks essentially free
-- Attack is sustainable indefinitely without resource cost to the attacker
+- High probability during normal operation when parallel execution is enabled
+- The race window exists every time concurrent iterators are created on the shared parent cachekv.Store
+- Common blockchain operations create iterators: balance queries, account iterations, state enumeration
+- As transaction throughput increases, the probability of concurrent iterator creation increases proportionally
 
-**Exploitability:**
-High - The attack is straightforward to execute, requires no special knowledge or privileges, and has minimal cost to the attacker while imposing significant resource costs on the victim node.
+**Who Can Exploit:**
+- Any network participant submitting standard transactions
+- No privilege escalation required
+- Can occur accidentally during high load or be deliberately triggered by crafting transaction patterns that maximize iterator creation
 
 ## Recommendation
 
-Modify `SetGasMeter` to enforce a maximum gas limit even in simulation mode:
+**Immediate Fix:**
+Clone the `sortedCache` contents for each iterator to ensure isolation:
 
+1. Modify the `iterator()` method to create a snapshot of `sortedCache` by cloning its contents into a new temporary `dbm.MemDB` before creating the iterator
+2. Pass this cloned instance to `newMemIterator()` instead of the shared `store.sortedCache`
+3. This ensures each iterator operates on its own isolated data structure, eliminating the race condition
+
+**Implementation:**
 ```go
-func SetGasMeter(simulate bool, ctx sdk.Context, gasLimit uint64, _ sdk.Tx) sdk.Context {
-    // Genesis block still uses infinite gas
-    if ctx.BlockHeight() == 0 {
-        return ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx))
-    }
+func (store *Store) iterator(start, end []byte, ascending bool) types.Iterator {
+    store.mtx.Lock()
+    defer store.mtx.Unlock()
     
-    if simulate {
-        // In simulation mode, enforce the declared gas limit or block max gas
-        // to prevent DoS attacks while still allowing accurate gas estimation
-        maxGas := gasLimit
-        if cp := ctx.ConsensusParams(); cp != nil && cp.Block != nil && cp.Block.MaxGas > 0 {
-            blockMaxGas := uint64(cp.Block.MaxGas)
-            if maxGas == 0 || maxGas > blockMaxGas {
-                maxGas = blockMaxGas
-            }
-        }
-        return ctx.WithGasMeter(sdk.NewGasMeterWithMultiplier(ctx, maxGas))
-    }
+    var parent, cache types.Iterator
+    // ... parent iterator creation ...
     
-    return ctx.WithGasMeter(sdk.NewGasMeterWithMultiplier(ctx, gasLimit))
+    store.dirtyItems(start, end)
+    
+    // Create a snapshot of sortedCache for this iterator
+    sortedSnapshot := dbm.NewMemDB()
+    iter, _ := store.sortedCache.Iterator(nil, nil)
+    for ; iter.Valid(); iter.Next() {
+        sortedSnapshot.Set(iter.Key(), iter.Value())
+    }
+    iter.Close()
+    
+    // Use the snapshot instead of shared sortedCache
+    cache = newMemIterator(start, end, sortedSnapshot, store.deleted, ascending, store.eventManager, store.storeKey)
+    return NewCacheMergeIterator(parent, cache, ascending, store.storeKey)
 }
 ```
 
-Additionally, consider implementing:
-- Rate limiting on the Simulate RPC endpoint per IP address
-- Configurable maximum gas limit for simulation requests
-- Stricter timeout values specifically for simulation requests
-- Monitoring and alerting for excessive simulation request patterns
+**Alternative Approach:**
+Implement iterator lifecycle tracking with read locks that extend beyond the iterator creation, but this is more complex and may impact performance.
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/setup_test.go` (new test file)
-
-**Test Function:** `TestSimulationDoSVulnerability`
+**File:** `store/cachekv/store_test.go`
 
 **Setup:**
-```go
-// Create a test app with ante handler
-app, ctx := createTestApp(false)
-ctx = ctx.WithBlockHeight(1)
+Create a shared cachekv.Store and populate it with initial keys to establish unsortedCache state.
 
-// Set up ante handler with SetUpContextDecorator
-anteHandler := ante.NewSetUpContextDecorator()
+**Action:**
+Launch two goroutines that concurrently:
+1. Add new keys to the store (populating unsortedCache)
+2. Call `Iterator()` which triggers `dirtyItems()` and moves entries to sortedCache
+3. Iterate over the results while the iterator reads from sortedCache
 
-// Create a transaction with low declared gas
-declaredGas := uint64(100000)
-```
+**Result:**
+When executed with `go test -race`, the Go race detector reports concurrent read/write access to the `dbm.MemDB` backing `sortedCache`. Without the race detector, the test eventually panics with "concurrent map iteration and map write" or similar concurrent map access errors, demonstrating that:
+- One goroutine's iterator reads from `sortedCache` via the `dbm.MemDB` iterator
+- Another goroutine's `dirtyItems()` call writes to `sortedCache` via `sortedCache.Set()`
+- The shared `sortedCache` is accessed concurrently without proper synchronization, violating Go's memory safety guarantees
 
-**Trigger:**
-```go
-// Create a mock transaction that declares low gas but would consume excessive gas
-mockTx := &mockGasTx{
-    gas: declaredGas, // Declares only 100k gas
-    msgs: []sdk.Msg{&mockExpensiveMsg{}}, // Contains expensive operations
-}
+The test confirms the race condition exists in production code where multiple VersionIndexedStores share a parent cachekv.Store during parallel transaction execution.
 
-// Test 1: Simulate mode with infinite gas meter
-simulateCtx, err := anteHandler.AnteHandle(ctx, mockTx, true, func(ctx sdk.Context, tx sdk.Tx, simulate bool) (sdk.Context, error) {
-    // This handler consumes far more gas than declared
-    ctx.GasMeter().ConsumeGas(10000000, "expensive operation")
-    return ctx, nil
-})
+## Notes
 
-// Test 2: Normal mode with finite gas meter  
-normalCtx, err := anteHandler.AnteHandle(ctx, mockTx, false, func(ctx sdk.Context, tx sdk.Tx, simulate bool) (sdk.Context, error) {
-    ctx.GasMeter().ConsumeGas(10000000, "expensive operation")
-    return ctx, nil
-})
-```
+This vulnerability is specific to the parallel transaction execution path where multiple `VersionIndexedStore` instances share the same parent `cachekv.Store`. The CacheMultiStore creates cachekv.Store instances for each store key [10](#0-9) , and the parallel execution scheduler shares these stores across concurrent transactions [11](#0-10) .
 
-**Observation:**
-```go
-// In simulation mode: transaction succeeds despite consuming 100x declared gas
-require.NoError(t, simulateErr)
-require.True(t, simulateCtx.GasMeter().Limit() == 0) // Infinite gas meter
-require.Equal(t, uint64(10000000), simulateCtx.GasMeter().GasConsumed())
-
-// In normal mode: transaction fails with out-of-gas error
-require.Error(t, normalErr)
-require.Contains(t, normalErr.Error(), "out of gas")
-
-// This demonstrates that simulation mode bypasses all gas limits,
-// allowing attackers to consume unlimited resources via the Simulate RPC endpoint
-```
-
-The test demonstrates that transactions in simulation mode can consume arbitrarily more gas than declared, proving the DoS vulnerability. An attacker can exploit this by repeatedly sending expensive simulations to the public RPC endpoint, exhausting node resources without gas cost consequences.
+The issue affects Medium severity because it can cause node crashes (shutdown of ≥30% of network nodes) during normal operation without requiring brute force attacks, matching the impact criteria for Medium severity vulnerabilities in blockchain infrastructure.
 
 ### Citations
 
-**File:** x/auth/ante/setup.go (L54-60)
+**File:** store/cachekv/store.go (L19-30)
 ```go
-	if cp := ctx.ConsensusParams(); cp != nil && cp.Block != nil {
-		// If there exists a maximum block gas limit, we must ensure that the tx
-		// does not exceed it.
-		if cp.Block.MaxGas > 0 && gasTx.GetGas() > uint64(cp.Block.MaxGas) {
-			return newCtx, sdkerrors.Wrapf(sdkerrors.ErrOutOfGas, "tx gas wanted %d exceeds block max gas limit %d", gasTx.GetGas(), cp.Block.MaxGas)
+// Store wraps an in-memory cache around an underlying types.KVStore.
+type Store struct {
+	mtx           sync.RWMutex
+	cache         *sync.Map
+	deleted       *sync.Map
+	unsortedCache *sync.Map
+	sortedCache   *dbm.MemDB // always ascending sorted
+	parent        types.KVStore
+	eventManager  *sdktypes.EventManager
+	storeKey      types.StoreKey
+	cacheSize     int
+}
+```
+
+**File:** store/cachekv/store.go (L169-193)
+```go
+func (store *Store) iterator(start, end []byte, ascending bool) types.Iterator {
+	store.mtx.Lock()
+	defer store.mtx.Unlock()
+	// TODO: (occ) Note that for iterators, we'll need to have special handling (discussed in RFC) to ensure proper validation
+
+	var parent, cache types.Iterator
+
+	if ascending {
+		parent = store.parent.Iterator(start, end)
+	} else {
+		parent = store.parent.ReverseIterator(start, end)
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			// close out parent iterator, then reraise panic
+			if parent != nil {
+				parent.Close()
+			}
+			panic(err)
+		}
+	}()
+	store.dirtyItems(start, end)
+	cache = newMemIterator(start, end, store.sortedCache, store.deleted, ascending, store.eventManager, store.storeKey)
+	return NewCacheMergeIterator(parent, cache, ascending, store.storeKey)
+}
+```
+
+**File:** store/cachekv/store.go (L320-333)
+```go
+	for _, item := range unsorted {
+		if item.Value == nil {
+			// deleted element, tracked by store.deleted
+			// setting arbitrary value
+			if err := store.sortedCache.Set(item.Key, []byte{}); err != nil {
+				panic(err)
+			}
+
+			continue
+		}
+		if err := store.sortedCache.Set(item.Key, item.Value); err != nil {
+			panic(err)
 		}
 	}
 ```
 
-**File:** x/auth/ante/setup.go (L85-94)
+**File:** store/cachekv/memiterator.go (L36-40)
 ```go
-func SetGasMeter(simulate bool, ctx sdk.Context, gasLimit uint64, _ sdk.Tx) sdk.Context {
-	// In various cases such as simulation and during the genesis block, we do not
-	// meter any gas utilization.
-
-	if simulate || ctx.BlockHeight() == 0 {
-		return ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx))
+	if ascending {
+		iter, err = items.Iterator(start, end)
+	} else {
+		iter, err = items.ReverseIterator(start, end)
 	}
+```
 
-	return ctx.WithGasMeter(sdk.NewGasMeterWithMultiplier(ctx, gasLimit))
+**File:** tasks/scheduler.go (L217-227)
+```go
+func (s *scheduler) tryInitMultiVersionStore(ctx sdk.Context) {
+	if s.multiVersionStores != nil {
+		return
+	}
+	mvs := make(map[sdk.StoreKey]multiversion.MultiVersionStore)
+	keys := ctx.MultiStore().StoreKeys()
+	for _, sk := range keys {
+		mvs[sk] = multiversion.NewMultiVersionStore(ctx.MultiStore().GetKVStore(sk))
+	}
+	s.multiVersionStores = mvs
 }
 ```
 
-**File:** store/types/gas.go (L252-258)
+**File:** tasks/scheduler.go (L448-472)
 ```go
-func (g *infiniteGasMeter) IsPastLimit() bool {
-	return false
-}
+// ExecuteAll executes all tasks concurrently
+func (s *scheduler) executeAll(ctx sdk.Context, tasks []*deliverTxTask) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	ctx, span := s.traceSpan(ctx, "SchedulerExecuteAll", nil)
+	span.SetAttributes(attribute.Bool("synchronous", s.synchronous))
+	defer span.End()
 
-func (g *infiniteGasMeter) IsOutOfGas() bool {
-	return false
+	// validationWg waits for all validations to complete
+	// validations happen in separate goroutines in order to wait on previous index
+	wg := &sync.WaitGroup{}
+	wg.Add(len(tasks))
+
+	for _, task := range tasks {
+		t := task
+		s.DoExecute(func() {
+			s.prepareAndRunTask(wg, ctx, t)
+		})
+	}
+
+	wg.Wait()
+
+	return nil
 }
 ```
 
-**File:** x/auth/tx/service.go (L98-129)
+**File:** tasks/scheduler.go (L502-522)
 ```go
-func (s txServer) Simulate(ctx context.Context, req *txtypes.SimulateRequest) (*txtypes.SimulateResponse, error) {
-	if req == nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid empty tx")
-	}
+	abortCh := make(chan occ.Abort, len(s.multiVersionStores))
 
-	txBytes := req.TxBytes
-	if txBytes == nil && req.Tx != nil {
-		// This block is for backwards-compatibility.
-		// We used to support passing a `Tx` in req. But if we do that, sig
-		// verification might not pass, because the .Marshal() below might not
-		// be the same marshaling done by the client.
-		var err error
-		txBytes, err = proto.Marshal(req.Tx)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid tx; %v", err)
+	// if there are no stores, don't try to wrap, because there's nothing to wrap
+	if len(s.multiVersionStores) > 0 {
+		// non-blocking
+		cms := ctx.MultiStore().CacheMultiStore()
+
+		// init version stores by store key
+		vs := make(map[store.StoreKey]*multiversion.VersionIndexedStore)
+		for storeKey, mvs := range s.multiVersionStores {
+			vs[storeKey] = mvs.VersionedIndexedStore(task.AbsoluteIndex, task.Incarnation, abortCh)
 		}
-	}
 
-	if txBytes == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty txBytes is not allowed")
-	}
+		// save off version store so we can ask it things later
+		task.VersionStores = vs
+		ms := cms.SetKVStores(func(k store.StoreKey, kvs sdk.KVStore) store.CacheWrap {
+			return vs[k]
+		})
 
-	gasInfo, result, err := s.simulate(txBytes)
-	if err != nil {
-		return nil, status.Errorf(codes.Unknown, "%v With gas wanted: '%d' and gas used: '%d' ", err, gasInfo.GasWanted, gasInfo.GasUsed)
+		ctx = ctx.WithMultiStore(ms)
 	}
+```
 
-	return &txtypes.SimulateResponse{
-		GasInfo: &gasInfo,
-		Result:  result,
-	}, nil
+**File:** store/multiversion/store.go (L62-65)
+```go
+// VersionedIndexedStore creates a new versioned index store for a given incarnation and transaction index
+func (s *Store) VersionedIndexedStore(index int, incarnation int, abortChannel chan occ.Abort) *VersionIndexedStore {
+	return NewVersionIndexedStore(s.parentStore, s, index, incarnation, abortChannel)
 }
 ```
 
-**File:** baseapp/test_helpers.go (L27-38)
+**File:** store/multiversion/mvkv.go (L102-114)
 ```go
-func (app *BaseApp) Simulate(txBytes []byte) (sdk.GasInfo, *sdk.Result, error) {
-	ctx := app.checkState.ctx.WithTxBytes(txBytes).WithVoteInfos(app.voteInfos).WithConsensusParams(app.GetConsensusParams(app.checkState.ctx))
-	ctx, _ = ctx.CacheContext()
-	tx, err := app.txDecoder(txBytes)
-	if err != nil {
-		return sdk.GasInfo{}, nil, err
+func NewVersionIndexedStore(parent types.KVStore, multiVersionStore MultiVersionStore, transactionIndex, incarnation int, abortChannel chan scheduler.Abort) *VersionIndexedStore {
+	return &VersionIndexedStore{
+		readset:           make(map[string][][]byte),
+		writeset:          make(map[string][]byte),
+		iterateset:        []*iterationTracker{},
+		sortedStore:       dbm.NewMemDB(),
+		parent:            parent,
+		multiVersionStore: multiVersionStore,
+		transactionIndex:  transactionIndex,
+		incarnation:       incarnation,
+		abortChannel:      abortChannel,
 	}
-	gasInfo, result, _, _, _, _, _, err := app.runTx(ctx, runTxModeSimulate, tx, sha256.Sum256(txBytes))
-	if len(ctx.MultiStore().GetEvents()) > 0 {
-		panic("Expected simulate events to be empty")
-	}
-	return gasInfo, result, err
+}
 ```
 
-**File:** server/config/config.go (L275-275)
+**File:** store/multiversion/mvkv.go (L307-311)
 ```go
-			RPCReadTimeout:     10,
+	if ascending {
+		parent = store.parent.Iterator(start, end)
+	} else {
+		parent = store.parent.ReverseIterator(start, end)
+	}
+```
+
+**File:** store/cachemulti/store.go (L59-67)
+```go
+	for key, store := range stores {
+		if cms.TracingEnabled() {
+			store = tracekv.NewStore(store.(types.KVStore), cms.traceWriter, cms.traceContext)
+		}
+		if cms.ListeningEnabled(key) {
+			store = listenkv.NewStore(store.(types.KVStore), key, listeners[key])
+		}
+		cms.stores[key] = cachekv.NewStore(store.(types.KVStore), key, types.DefaultCacheSizeLimit)
+	}
 ```

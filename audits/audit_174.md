@@ -1,245 +1,251 @@
+# Audit Report
+
 ## Title
-Data Race in Capability Keeper's Shared capMap During Concurrent Transaction Execution
+Incomplete Genesis Validation in AccessControl Module Allows Chain Initialization Failure
 
 ## Summary
-The capability keeper uses an unsynchronized Go map (`capMap`) that is accessed concurrently by multiple goroutines during parallel transaction execution, causing data races that lead to node panics and crashes. The vulnerability exists in `x/capability/keeper/keeper.go` where `capMap` is defined (lines 33, 60) and accessed by multiple concurrent operations without any synchronization primitives.
+The `ValidateGenesis` function in the accesscontrol module bypasses comprehensive validation of `MessageDependencyMapping` and `WasmDependencyMappings` fields, only validating an empty Params structure. This allows invalid genesis state to pass validation checks, causing chain initialization to panic when the invalid mappings are applied during `InitGenesis`, resulting in total network shutdown.
 
 ## Impact
-**High** - Network not being able to confirm new transactions (total network shutdown)
+Medium
 
 ## Finding Description
 
 **Location:**
-- Primary vulnerability: [1](#0-0) 
-- Map initialization: [2](#0-1) 
-- Shared reference in ScopedKeeper: [3](#0-2) 
+- Vulnerable function: [1](#0-0) 
+- Proper validation function: [2](#0-1) 
+- Panic locations: [3](#0-2)  and [4](#0-3) 
 
-**Intended Logic:**
-The capability keeper maintains an in-memory map (`capMap`) that stores capability pointers indexed by capability index. This map should be accessed safely during transaction execution to create, retrieve, and release capabilities. [4](#0-3) 
+**Intended logic:**
+Genesis state validation should comprehensively verify all fields in the GenesisState structure before chain initialization. The module's `ValidateGenesis` should call `types.ValidateGenesis()` which validates MessageDependencyMapping, WasmDependencyMappings, and Params to prevent invalid data from causing initialization failures.
 
-**Actual Logic:**
-The `capMap` is a regular Go map without any synchronization. Multiple operations access it concurrently:
-- Write operation in `NewCapability`: [5](#0-4) 
-- Read operation in `GetCapability`: [6](#0-5) 
-- Delete operation in `ReleaseCapability`: [7](#0-6) 
-- Write operation in `InitializeCapability`: [8](#0-7) 
+**Actual logic:**
+The module's `ValidateGenesis` only calls `data.Params.Validate()` which returns `nil` as confirmed in [5](#0-4) . It does not invoke `types.ValidateGenesis(data)` which would validate dependency mappings. Invalid MessageDependencyMapping entries (missing COMMIT operations, empty identifiers) and invalid WasmDependencyMappings (duplicate message names, deprecated selectors) pass validation unchecked.
 
-Sei-cosmos implements concurrent transaction execution through an optimistic concurrency control scheduler that processes transactions in parallel using worker goroutines: [9](#0-8) [10](#0-9) 
+**Exploitation path:**
+1. Genesis file created with invalid MessageDependencyMapping or WasmDependencyMappings (accidentally during chain upgrades or genesis export/import operations)
+2. File passes CLI `validate-genesis` command because module's ValidateGenesis only checks params
+3. Nodes attempt chain initialization with this genesis file
+4. During `InitChain` → `InitGenesis`, invalid mappings passed to setter functions [6](#0-5)  and [7](#0-6) 
+5. These functions detect invalid data through validation calls
+6. Validation failures trigger panics in InitGenesis
+7. All nodes crash simultaneously during genesis initialization
+8. Chain cannot start until genesis file manually corrected and redistributed
 
-When multiple transactions execute concurrently and perform capability operations, they race on the shared `capMap`.
-
-**Exploit Scenario:**
-1. A block contains multiple transactions that use IBC or other modules requiring capability operations
-2. The scheduler executes these transactions concurrently via worker goroutines: [11](#0-10) 
-3. Transaction A calls `NewCapability` which writes to `capMap[index]`
-4. Transaction B simultaneously calls `GetCapability` which reads from `capMap[index]`
-5. Go's runtime detects the concurrent map access and panics with "concurrent map read and map write"
-6. The node crashes immediately
-
-**Security Failure:**
-Memory safety violation. Go's map implementation is not thread-safe and explicitly panics when concurrent access is detected. This violates the availability guarantee of the blockchain network.
+**Security guarantee broken:**
+The genesis validation safety mechanism is defeated. The system's availability guarantee is violated as the validation system fails to prevent initialization failures from invalid configuration, despite that being its core purpose.
 
 ## Impact Explanation
 
-**Affected Components:**
-- All nodes processing blocks with concurrent transactions using capabilities
-- Network availability and consensus
-- IBC operations and any module using the capability keeper
+**Affected process:** Chain initialization and network availability
 
-**Severity of Damage:**
-- Node crashes with panic: "concurrent map read and map write" or "concurrent map writes"
-- Complete node unavailability until restart
-- If multiple validators experience this simultaneously, the network cannot reach consensus
-- Transactions cannot be confirmed, blocks cannot be produced
-- Total network shutdown if enough validators crash
+**Consequences:**
+- **Total network shutdown:** All validator nodes fail simultaneously during `InitChain`, preventing blockchain from starting
+- **No transaction processing:** Network cannot confirm any transactions since initialization never completes  
+- **Manual intervention required:** Recovery demands identifying invalid genesis data, correcting it, and redistributing to all nodes
+- **Network-wide impact:** Unlike runtime errors affecting individual nodes, genesis failures impact entire network uniformly
 
-**Why This Matters:**
-Capability-based modules (especially IBC) are critical infrastructure. Any block containing multiple IBC transactions or concurrent capability operations will trigger this race condition, causing widespread node crashes. This directly threatens network liveness and reliability.
+This vulnerability maps to "Network not being able to confirm new transactions (total network shutdown)" - Medium severity impact. Genesis initialization failures prevent the blockchain from becoming operational during initial chain launch, chain restarts after upgrades where exported genesis contains invalid mappings, or network forks using genesis export/import.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant submitting transactions. No special privileges required.
+**Trigger conditions:**
+- Chain operators generating genesis files during setup or upgrades
+- Genesis export/import operations during network forks or migrations
+- Automated genesis generation with bugs producing invalid mappings
 
-**Conditions Required:**
-- A block must contain at least 2 transactions that perform capability operations (e.g., IBC channel operations, port bindings)
-- Concurrent transaction execution must be enabled (default configuration): [12](#0-11) 
-- The scheduler must schedule these transactions to run in parallel (normal operation)
+**Realistic scenarios:**
+Genesis operations are critical but infrequent events where the validation system serves as the primary safety mechanism. The bug defeats this protection during chain upgrades with genesis export/import (a common operational pattern in Cosmos chains), making accidental triggering plausible. While requiring privileged access to genesis creation, the validation system exists specifically to catch errors by these trusted operators - the bug breaks this safety net.
 
-**Frequency:**
-- Very likely during normal operation
-- IBC is a core feature; blocks regularly contain multiple IBC transactions
-- Concurrent execution is the default mode for performance
-- The race detector would catch this immediately if tests were run with `-race` flag
-- Production deployments without race detection will experience random crashes during high transaction throughput
+**Validation errors documented in:** [8](#0-7) 
 
 ## Recommendation
 
-Replace the regular Go map with a thread-safe alternative. The codebase already uses this pattern in other concurrent stores:
+Modify `ValidateGenesis` in `x/accesscontrol/module.go` to call the comprehensive validation:
 
-**Option 1 (Recommended):** Use `sync.Map` like the multiversion store does: [13](#0-12) 
-
-**Option 2:** Add a `sync.RWMutex` to protect all `capMap` accesses, following the pattern in the cache store: [14](#0-13) 
-
-**Implementation:**
-1. Change `capMap map[uint64]*types.Capability` to `capMap *sync.Map` in both `Keeper` and `ScopedKeeper` structs
-2. Update all map operations:
-   - `capMap[index] = cap` → `capMap.Store(index, cap)`
-   - `cap := capMap[index]` → `capInterface, _ := capMap.Load(index); cap := capInterface.(*types.Capability)`
-   - `delete(capMap, index)` → `capMap.Delete(index)`
-3. Initialize with `capMap: &sync.Map{}` instead of `make(map[uint64]*types.Capability)`
-
-## Proof of Concept
-
-**File:** `x/capability/keeper/keeper_race_test.go` (new test file)
-
-**Setup:**
-Create a test that simulates concurrent transaction execution with capability operations.
-
-**Trigger:**
-Spawn multiple goroutines that concurrently perform `NewCapability`, `GetCapability`, and `ReleaseCapability` operations on the same keeper instance, mimicking the scheduler's behavior.
-
-**Observation:**
-When run with `go test -race`, the test will report data races. Without `-race` flag, it may panic with "concurrent map read and map write" or produce corrupted state.
-
-**Test Code Structure:**
 ```go
-func TestCapabilityMapConcurrentAccess(t *testing.T) {
-    // Setup: Create keeper and scoped keepers
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{Height: 1})
-    keeper := keeper.NewKeeper(cdc, storeKey, memKey)
-    
-    sk1 := keeper.ScopeToModule("module1")
-    sk2 := keeper.ScopeToModule("module2")
-    
-    // Trigger: Launch concurrent goroutines performing capability operations
-    // Each goroutine simulates a transaction worker
-    var wg sync.WaitGroup
-    workers := 10
-    
-    for i := 0; i < workers; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            // Simulate capability operations in concurrent transactions
-            cap, _ := sk1.NewCapability(ctx, fmt.Sprintf("cap-%d", id))
-            sk1.GetCapability(ctx, fmt.Sprintf("cap-%d", id))
-            if cap != nil {
-                sk1.ReleaseCapability(ctx, cap)
-            }
-        }(i)
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+    var data types.GenesisState
+    if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+        return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
     }
-    
-    wg.Wait()
-    
-    // Observation: With -race flag, this test will fail with data race detection
-    // Without -race, it may panic with "concurrent map read and map write"
+    return types.ValidateGenesis(data)  // Call comprehensive validation
 }
 ```
 
-**Run Command:**
-```bash
-go test -race -run TestCapabilityMapConcurrentAccess ./x/capability/keeper/
-```
+This aligns with the pattern used in other modules such as: [9](#0-8) 
 
-**Expected Result:**
-The test will report data races on the `capMap` accesses, confirming the vulnerability. The race detector output will show conflicting accesses from multiple goroutines to the same map.
+## Proof of Concept
+
+**Existing test evidence:** [10](#0-9) 
+
+This existing test demonstrates that `InitGenesis` panics when provided invalid dependencies (empty IdentifierTemplate or invalid contract address). The vulnerability is that such invalid data would pass the module's `ValidateGenesis` check, allowing it to reach `InitGenesis` where it causes the panic.
+
+**Setup:** Standard simapp.Setup(false) initializes test application with all modules
+
+**Action:** 
+1. Create invalid MessageDependencyMapping without required COMMIT operation or with empty IdentifierTemplate
+2. Marshal to JSON as would appear in genesis file
+3. Module's ValidateGenesis called (simulating CLI validation) - incorrectly passes
+4. InitGenesis called - panics on validation failure
+
+**Result:** Invalid genesis state bypasses module-level validation but causes panic during chain initialization, confirming validation bypass enables total network shutdown
+
+**Notes:**
+The severity is Medium (not High as claimed) per the provided impact categories where "Network not being able to confirm new transactions (total network shutdown)" is classified as Medium severity. The vulnerability is valid despite requiring privileged access because it represents a failure of the validation safety mechanism designed to protect against operator errors during critical chain operations.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L33-33)
+**File:** x/accesscontrol/module.go (L62-68)
 ```go
-		capMap        map[uint64]*types.Capability
-```
-
-**File:** x/capability/keeper/keeper.go (L60-60)
-```go
-		capMap:        make(map[uint64]*types.Capability),
-```
-
-**File:** x/capability/keeper/keeper.go (L87-87)
-```go
-		capMap:   k.capMap,
-```
-
-**File:** x/capability/keeper/keeper.go (L211-211)
-```go
-		k.capMap[index] = cap
-```
-
-**File:** x/capability/keeper/keeper.go (L260-260)
-```go
-	sk.capMap[index] = cap
-```
-
-**File:** x/capability/keeper/keeper.go (L349-349)
-```go
-		delete(sk.capMap, cap.GetIndex())
-```
-
-**File:** x/capability/keeper/keeper.go (L382-382)
-```go
-	cap := sk.capMap[index]
-```
-
-**File:** docs/architecture/adr-003-dynamic-capability-store.md (L35-41)
-```markdown
-The `CapabilityKeeper` will include a persistent `KVStore`, a `MemoryStore`, and an in-memory map.
-The persistent `KVStore` tracks which capability is owned by which modules.
-The `MemoryStore` stores a forward mapping that map from module name, capability tuples to capability names and
-a reverse mapping that map from module name, capability name to the capability index.
-Since we cannot marshal the capability into a `KVStore` and unmarshal without changing the memory location of the capability,
-the reverse mapping in the KVStore will simply map to an index. This index can then be used as a key in the ephemeral
-go-map to retrieve the capability at the original memory location.
-```
-
-**File:** tasks/scheduler.go (L136-147)
-```go
-	for i := 0; i < workers; i++ {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case work := <-ch:
-					work()
-				}
-			}
-		}()
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
 	}
+
+	return data.Params.Validate()
 ```
 
-**File:** tasks/scheduler.go (L266-267)
+**File:** x/accesscontrol/types/genesis.go (L29-43)
 ```go
-			s.multiVersionStores[storeKey].SetEstimatedWriteset(req.AbsoluteIndex, -1, writeset)
+func ValidateGenesis(data GenesisState) error {
+	for _, mapping := range data.MessageDependencyMapping {
+		err := ValidateMessageDependencyMapping(mapping)
+		if err != nil {
+			return err
+		}
+	}
+	for _, mapping := range data.WasmDependencyMappings {
+		err := ValidateWasmDependencyMapping(mapping)
+		if err != nil {
+			return err
+		}
+	}
+	return data.Params.Validate()
+}
+```
+
+**File:** x/accesscontrol/keeper/genesis.go (L14-16)
+```go
+		err := k.SetResourceDependencyMapping(ctx, resourceDependencyMapping)
+		if err != nil {
+			panic(fmt.Errorf("invalid MessageDependencyMapping %s", err))
+```
+
+**File:** x/accesscontrol/keeper/genesis.go (L20-23)
+```go
+		err := k.SetWasmDependencyMapping(ctx, wasmDependencyMapping)
+		if err != nil {
+			panic(fmt.Errorf("invalid WasmDependencyMapping %s", err))
 		}
 ```
 
-**File:** tasks/scheduler.go (L309-309)
+**File:** x/accesscontrol/types/params.go (L30-32)
 ```go
-	start(workerCtx, s.executeCh, workers)
+func (p Params) Validate() error {
+	return nil
+}
 ```
 
-**File:** baseapp/abci.go (L266-267)
+**File:** x/accesscontrol/keeper/keeper.go (L91-104)
 ```go
-	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
-	txRes, err := scheduler.ProcessAll(ctx, req.TxEntries)
+func (k Keeper) SetResourceDependencyMapping(
+	ctx sdk.Context,
+	dependencyMapping acltypes.MessageDependencyMapping,
+) error {
+	err := types.ValidateMessageDependencyMapping(dependencyMapping)
+	if err != nil {
+		return err
+	}
+	store := ctx.KVStore(k.storeKey)
+	b := k.cdc.MustMarshal(&dependencyMapping)
+	resourceKey := types.GetResourceDependencyKey(types.MessageKey(dependencyMapping.GetMessageKey()))
+	store.Set(resourceKey, b)
+	return nil
+}
 ```
 
-**File:** store/multiversion/store.go (L42-47)
+**File:** x/accesscontrol/keeper/keeper.go (L443-461)
 ```go
-	multiVersionMap *sync.Map
-	// TODO: do we need to support iterators as well similar to how cachekv does it - yes
+func (k Keeper) SetWasmDependencyMapping(
+	ctx sdk.Context,
+	dependencyMapping acltypes.WasmDependencyMapping,
+) error {
+	err := types.ValidateWasmDependencyMapping(dependencyMapping)
+	if err != nil {
+		return err
+	}
+	store := ctx.KVStore(k.storeKey)
+	b := k.cdc.MustMarshal(&dependencyMapping)
 
-	txWritesetKeys *sync.Map // map of tx index -> writeset keys []string
-	txReadSets     *sync.Map // map of tx index -> readset ReadSet
-	txIterateSets  *sync.Map // map of tx index -> iterateset Iterateset
+	contractAddr, err := sdk.AccAddressFromBech32(dependencyMapping.ContractAddress)
+	if err != nil {
+		return err
+	}
+	resourceKey := types.GetWasmContractAddressKey(contractAddr)
+	store.Set(resourceKey, b)
+	return nil
+}
 ```
 
-**File:** store/cache/cache.go (L34-36)
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L11-19)
 ```go
-		// the same CommitKVStoreCache may be accessed concurrently by multiple
-		// goroutines due to transaction parallelization
-		mtx sync.RWMutex
+var (
+	ErrNoCommitAccessOp                  = fmt.Errorf("MessageDependencyMapping doesn't terminate with AccessType_COMMIT")
+	ErrEmptyIdentifierString             = fmt.Errorf("IdentifierTemplate cannot be an empty string")
+	ErrNonLeafResourceTypeWithIdentifier = fmt.Errorf("IdentifierTemplate must be '*' for non leaf resource types")
+	ErrDuplicateWasmMethodName           = fmt.Errorf("a method name is defined multiple times in specific access operation list")
+	ErrQueryRefNonQueryMessageType       = fmt.Errorf("query contract references can only have query message types")
+	ErrSelectorDeprecated                = fmt.Errorf("this selector type is deprecated")
+	ErrInvalidMsgInfo                    = fmt.Errorf("msg info cannot be nil")
+)
+```
+
+**File:** x/auth/module.go (L53-61)
+```go
+// ValidateGenesis performs genesis state validation for the auth module.
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
+	}
+
+	return types.ValidateGenesis(data)
+}
+```
+
+**File:** x/accesscontrol/keeper/genesis_test.go (L71-101)
+```go
+func TestKeeper_InitGenesis_InvalidDependencies(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+
+	invalidAccessOp := types.SynchronousMessageDependencyMapping("Test1")
+	invalidAccessOp.AccessOps[0].IdentifierTemplate = ""
+	invalidAccessOp.AccessOps = []accesscontrol.AccessOperation{
+		invalidAccessOp.AccessOps[0],
+	}
+
+	invalidMessageGenesis := types.GenesisState{
+		Params: types.DefaultParams(),
+		MessageDependencyMapping: []accesscontrol.MessageDependencyMapping{
+			invalidAccessOp,
+		},
+	}
+
+	require.Panics(t, func() {
+		app.AccessControlKeeper.InitGenesis(ctx, invalidMessageGenesis)
+	})
+
+	invalidWasmGenesis := types.GenesisState{
+		Params: types.DefaultParams(),
+		WasmDependencyMappings: []accesscontrol.WasmDependencyMapping{
+			types.SynchronousWasmDependencyMapping("Test"),
+		},
+	}
+	require.Panics(t, func() {
+		app.AccessControlKeeper.InitGenesis(ctx, invalidWasmGenesis)
+	})
+
 ```

@@ -1,333 +1,277 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Chain Halt via Malformed Validator Consensus Public Key in Genesis State
+Genesis Import Panic Due to Unvalidated StakeAuthorization Type Causing Total Network Shutdown
 
 ## Summary
-A validator with a malformed consensus public key in the genesis state will cause all nodes to panic during chain initialization, resulting in a complete network shutdown that requires a hard fork to resolve. The panic occurs when `GetConsAddr()` calls the `Address()` function on a malformed ed25519 public key, and this panic is not caught during the `InitChain` ABCI method.
+The authz module's `ValidateGenesis` function performs no validation on authorization grants, allowing a `StakeAuthorization` with `AUTHORIZATION_TYPE_UNSPECIFIED` to be included in genesis state. This causes all nodes to panic during `InitGenesis` when the authorization's `MsgTypeURL()` method is called, preventing the entire network from starting.
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:**
-- Primary panic location: [1](#0-0) 
-- Call site in genesis initialization: [2](#0-1) 
-- Genesis processing without panic recovery: [3](#0-2) 
-- InitChain without panic recovery: [4](#0-3) 
+**Location:** 
+- Primary vulnerability: `x/authz/genesis.go` lines 15-17 [1](#0-0) 
+- Panic trigger: `x/staking/types/authz.go` lines 41-47 [2](#0-1) 
+- Genesis flow: `x/authz/keeper/keeper.go` lines 245-260 [3](#0-2) 
 
 **Intended Logic:**
-The `Address()` function is intended to derive a consensus address from a validator's public key. Genesis initialization should validate and process validators from the genesis state, setting up the initial validator set for the chain. The protobuf unmarshal process should only accept well-formed keys.
+Genesis validation should verify that all authorization grants are valid before importing them into chain state. The `StakeAuthorization.ValidateBasic()` method explicitly checks that `AuthorizationType` is not `AUTHORIZATION_TYPE_UNSPECIFIED` [4](#0-3) . Other modules like feegrant properly implement this pattern by calling `ValidateBasic()` during genesis validation [5](#0-4) .
 
 **Actual Logic:**
-The protobuf `Unmarshal()` method for ed25519 public keys does not validate the key length, allowing keys of any byte length to be deserialized successfully. [5](#0-4)  When `Address()` is later called on such a malformed key, it panics if the length is not exactly 32 bytes. During genesis initialization, `SetValidatorByConsAddr()` is called for each validator, which invokes `GetConsAddr()`, which in turn calls `Address()` on the consensus public key. [6](#0-5)  This panic occurs within `InitChain`, which has no panic recovery mechanism, causing the entire node to crash.
+The `ValidateGenesis` function returns `nil` without performing any validation checks [1](#0-0) . During `InitGenesis`, the keeper loops through authorization entries and calls `SaveGrant` for each [3](#0-2) . The `SaveGrant` function invokes `authorization.MsgTypeURL()` to construct the storage key [6](#0-5) . For `StakeAuthorization`, `MsgTypeURL()` calls `normalizeAuthzType()` which returns an error for `AUTHORIZATION_TYPE_UNSPECIFIED`, causing a panic [7](#0-6) .
 
-**Exploit Scenario:**
-1. An attacker crafts a malicious genesis file containing a validator with an ed25519 consensus public key that has an incorrect byte length (e.g., 31 or 33 bytes instead of the required 32 bytes)
-2. Network participants download or are provided this genesis file for chain initialization or upgrade
-3. When nodes attempt to start with this genesis file, `InitChain` is called
-4. The staking module's `InitGenesis` processes the validators from genesis state
-5. For the malformed validator, `SetValidatorByConsAddr()` calls `GetConsAddr()`, which calls `Address()` and panics
-6. The panic propagates up through the call stack with no recovery
-7. All nodes crash immediately upon startup
-8. The chain cannot start, resulting in complete network failure
+**Exploitation Path:**
+1. Genesis file contains a `StakeAuthorization` with `authorization_type` set to `AUTHORIZATION_TYPE_UNSPECIFIED` (value 0, the protobuf default) [8](#0-7) 
+2. Genesis passes through `ValidateGenesis` without error
+3. Module's `InitGenesis` is called during chain startup [9](#0-8) 
+4. Keeper's `InitGenesis` loops through entries and calls `SaveGrant` [3](#0-2) 
+5. `SaveGrant` calls `authorization.MsgTypeURL()` [10](#0-9) 
+6. `MsgTypeURL()` panics when encountering invalid authorization type [2](#0-1) 
+7. Panic propagates, causing genesis import to fail
+8. All nodes fail to start, resulting in complete network outage
 
-**Security Failure:**
-This is a denial-of-service vulnerability that breaks network availability. The chain cannot initialize, and all nodes crash on startup. Since the malformed validator is permanently encoded in the genesis state, the only resolution is a coordinated hard fork to manually fix the genesis file.
+**Security Guarantee Broken:**
+Network availability invariant is violated. The system fails to validate critical genesis state, allowing malformed data that causes deterministic panics across all nodes during initialization.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Network availability: Complete chain halt
-- All validator nodes: Crash on startup
-- Block production: Impossible, no blocks can be produced
-- Transaction processing: No transactions can be confirmed
+This vulnerability causes total network shutdown. All nodes attempting to import the genesis state will panic and fail to start. The impact affects:
+- **New chain launch**: Network cannot initialize, preventing blockchain operations
+- **Network restart from genesis**: All nodes fail to restart, causing permanent unavailability until genesis is manually corrected
+- **Transaction confirmation**: No transactions can be confirmed since the network cannot start
+- **Node coverage**: 100% of network nodes are affected deterministically
 
-**Severity of Damage:**
-- **Complete network shutdown:** All nodes attempting to start with the malformed genesis will crash
-- **Requires hard fork:** The only fix is to manually edit the genesis file and coordinate a new chain start, which constitutes a hard fork
-- **Coordination failure risk:** If different participants use different genesis files, it could lead to chain splits
-- **No automatic recovery:** Unlike transaction-level panics that are caught by panic recovery in `runTx`, genesis initialization has no such protection
-
-**System Security Impact:**
-This vulnerability allows an attacker who can influence genesis file creation or distribution (e.g., during chain upgrades involving genesis export/import) to cause a permanent denial of service. The impact matches the "High: Network not being able to confirm new transactions (total network shutdown)" category from the in-scope impacts.
+This matches the listed impact category: "Network not being able to confirm new transactions (total network shutdown)" which is classified as Medium severity.
 
 ## Likelihood Explanation
 
 **Who Can Trigger:**
-Any party involved in genesis file creation or distribution, including:
-- Chain coordinators during initial chain launch
-- Upgrade coordinators during chain upgrades that involve genesis export/import
-- Malicious actors who can inject or modify genesis files before distribution
+Parties with genesis file creation authority can trigger this vulnerability:
+- Chain deployers/launchers creating initial genesis
+- Governance coordinators during network upgrades requiring genesis export/import
+- Network coordinators during hard fork or recovery scenarios
 
 **Conditions Required:**
-- A validator entry in the genesis state must have a consensus public key with incorrect byte length
-- The protobuf unmarshal accepts the malformed key (which it does, as shown in the code)
-- The genesis validation step (`validate-genesis` CLI command) must be skipped or the genesis file not validated before use
+The malformed genesis file must be distributed to and used by network validators during:
+- New blockchain network launches
+- Hard fork upgrades that reset state from genesis
+- Network recovery scenarios requiring genesis restart
 
 **Frequency:**
-- **Low to Medium likelihood of accidental occurrence:** Could happen due to bugs in genesis generation tools or manual editing errors
-- **Medium likelihood of intentional exploit:** Requires ability to influence genesis file, but possible during chain launches or upgrades
-- **One-time occurrence causes permanent damage:** A single malformed validator in genesis causes chain halt until manually fixed
+While genesis imports occur infrequently during normal operation, they are critical events. The vulnerability is deterministic - any node importing the crafted genesis will panic. The issue could occur accidentally (e.g., by omitting the field or a configuration error) since `AUTHORIZATION_TYPE_UNSPECIFIED` is the default protobuf value (0).
 
-The vulnerability is particularly concerning during:
-- New chain launches where genesis files are being created
-- Chain upgrades that involve genesis export and re-import
-- Scenarios where genesis files are transmitted through untrusted channels
+**Note on Privileged Access:**
+Although genesis file creation is a privileged operation, the exception clause applies: even a trusted role inadvertently triggering this would cause an unrecoverable security failure (complete network shutdown) beyond their intended authority (they intended to add an authz grant, not DoS the entire network). The failure mode is disproportionate to the configuration error.
 
 ## Recommendation
 
-Implement defense in depth with multiple layers of protection:
-
-1. **Add length validation in protobuf Unmarshal:** Modify the `UnmarshalAmino` method for ed25519 (and secp256k1) public keys to validate the key length during deserialization, returning an error instead of accepting malformed keys. [7](#0-6) 
-
-2. **Return error instead of panic in Address():** Replace the panic with an error return in the `Address()` function signature to allow graceful error handling throughout the call chain. This is a breaking change but necessary for robustness.
-
-3. **Add explicit validation in SetValidatorByConsAddr:** Check the return value from `GetConsAddr()` and handle errors gracefully. [8](#0-7) 
-
-4. **Add panic recovery in InitChain:** As a last line of defense, add a defer/recover block in the `InitChain` method to catch any panics during genesis initialization and return them as errors rather than crashing the node.
-
-5. **Mandatory genesis validation:** Ensure the `ValidateGenesis` function is always called before `InitGenesis`, and document that node operators must run `validate-genesis` command before starting nodes with a new genesis file.
-
-## Proof of Concept
-
-**Test File:** `x/staking/genesis_test.go`
-
-**Test Function:** `TestGenesisValidatorWithMalformedConsensusPubKey`
+Implement proper validation in the `ValidateGenesis` function following the pattern used in other modules like feegrant:
 
 ```go
-func TestGenesisValidatorWithMalformedConsensusPubKey(t *testing.T) {
-    // Setup: Create a genesis state with a validator that has a malformed ed25519 public key
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Create a malformed ed25519 public key (31 bytes instead of 32)
-    malformedKeyBytes := make([]byte, 31)
-    for i := range malformedKeyBytes {
-        malformedKeyBytes[i] = byte(i)
+func ValidateGenesis(data GenesisState) error {
+    for _, grant := range data.Authorization {
+        // Validate addresses
+        if _, err := sdk.AccAddressFromBech32(grant.Granter); err != nil {
+            return sdkerrors.Wrapf(err, "invalid granter address")
+        }
+        if _, err := sdk.AccAddressFromBech32(grant.Grantee); err != nil {
+            return sdkerrors.Wrapf(err, "invalid grantee address")
+        }
+        
+        // Validate authorization itself using ValidateBasic
+        auth := grant.Authorization.GetCachedValue()
+        if authorization, ok := auth.(Authorization); ok {
+            if err := authorization.ValidateBasic(); err != nil {
+                return sdkerrors.Wrapf(err, "invalid authorization")
+            }
+        }
+        
+        // Additional validations
+        if grant.Expiration.IsZero() {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "expiration time cannot be zero")
+        }
+        
+        if grant.Granter == grant.Grantee {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be the same")
+        }
     }
-    
-    // Create the malformed public key
-    malformedPk := &ed25519.PubKey{Key: malformedKeyBytes}
-    pkAny, err := codectypes.NewAnyWithValue(malformedPk)
-    require.NoError(t, err)
-    
-    // Create a validator with the malformed public key
-    valAddr := sdk.ValAddress([]byte("validator"))
-    validator := types.Validator{
-        OperatorAddress:   valAddr.String(),
-        ConsensusPubkey:   pkAny,
-        Status:           types.Bonded,
-        Tokens:           sdk.NewInt(100),
-        DelegatorShares:  sdk.NewDec(100),
-        Description:      types.NewDescription("test", "", "", "", ""),
-        Commission:       types.NewCommission(sdk.ZeroDec(), sdk.ZeroDec(), sdk.ZeroDec()),
-    }
-    
-    genesisState := types.GenesisState{
-        Params: types.DefaultParams(),
-        Validators: []types.Validator{validator},
-    }
-    
-    // Trigger: Attempt to initialize genesis with the malformed validator
-    // This should panic when SetValidatorByConsAddr calls GetConsAddr -> Address
-    require.Panics(t, func() {
-        InitGenesis(ctx, app.StakingKeeper, app.AccountKeeper, app.BankKeeper, &genesisState)
-    }, "Expected panic when initializing genesis with malformed validator consensus key")
-    
-    // Observation: The test confirms that a panic occurs during genesis initialization
-    // In a real chain start scenario, this panic would crash all nodes
+    return nil
 }
 ```
 
-**Observation:**
-When this test runs, it will panic at the point where `SetValidatorByConsAddr()` calls `validator.GetConsAddr()`, which calls `pk.Address()` on the malformed ed25519 key. The panic message will be "pubkey is incorrect size". This demonstrates that a malformed validator in genesis causes an unrecoverable panic during chain initialization, resulting in a complete network failure requiring a hard fork to resolve.
+This ensures all authorization grants are validated before genesis import, preventing the panic and catching other invalid states.
+
+## Proof of Concept
+
+**Test File:** `x/authz/keeper/genesis_test.go`
+
+**Setup:** Use the existing `GenesisTestSuite` which provides a configured keeper and context [11](#0-10) .
+
+**Action:** Create a `StakeAuthorization` with `AUTHORIZATION_TYPE_UNSPECIFIED` (value 0), pack it into a `GrantAuthorization`, and call `ValidateGenesis` followed by `InitGenesis`.
+
+**Result:** 
+1. `ValidateGenesis` incorrectly returns no error for the invalid authorization
+2. `InitGenesis` panics when attempting to save the grant because `MsgTypeURL()` panics on the invalid authorization type
+
+The test would demonstrate that invalid genesis state bypasses validation and causes a panic during initialization, proving the vulnerability.
+
+## Notes
+
+The `Grant` type has a `ValidateBasic()` method that calls the authorization's `ValidateBasic()` [12](#0-11) , but this is never invoked during genesis validation. The feegrant module demonstrates the correct pattern of calling `ValidateBasic()` during genesis validation [5](#0-4) , confirming this is an implementation gap rather than intentional design.
 
 ### Citations
 
-**File:** crypto/keys/ed25519/ed25519.go (L162-165)
+**File:** x/authz/genesis.go (L15-17)
 ```go
-func (pubKey *PubKey) Address() crypto.Address {
-	if len(pubKey.Key) != PubKeySize {
-		panic("pubkey is incorrect size")
-	}
+func ValidateGenesis(data GenesisState) error {
+	return nil
+}
 ```
 
-**File:** crypto/keys/ed25519/ed25519.go (L210-217)
+**File:** x/staking/types/authz.go (L41-47)
 ```go
-func (pubKey *PubKey) UnmarshalAmino(bz []byte) error {
-	if len(bz) != PubKeySize {
-		return errors.Wrap(errors.ErrInvalidPubKey, "invalid pubkey size")
+func (a StakeAuthorization) MsgTypeURL() string {
+	authzType, err := normalizeAuthzType(a.AuthorizationType)
+	if err != nil {
+		panic(err)
 	}
-	pubKey.Key = bz
+	return authzType
+}
+```
+
+**File:** x/staking/types/authz.go (L49-58)
+```go
+func (a StakeAuthorization) ValidateBasic() error {
+	if a.MaxTokens != nil && a.MaxTokens.IsNegative() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidCoins, "negative coin amount: %v", a.MaxTokens)
+	}
+	if a.AuthorizationType == AuthorizationType_AUTHORIZATION_TYPE_UNSPECIFIED {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "unknown authorization type")
+	}
 
 	return nil
 }
 ```
 
-**File:** x/staking/keeper/validator.go (L64-68)
+**File:** x/staking/types/authz.go (L139-150)
 ```go
-func (k Keeper) SetValidatorByConsAddr(ctx sdk.Context, validator types.Validator) error {
-	consPk, err := validator.GetConsAddr()
+func normalizeAuthzType(authzType AuthorizationType) (string, error) {
+	switch authzType {
+	case AuthorizationType_AUTHORIZATION_TYPE_DELEGATE:
+		return sdk.MsgTypeURL(&MsgDelegate{}), nil
+	case AuthorizationType_AUTHORIZATION_TYPE_UNDELEGATE:
+		return sdk.MsgTypeURL(&MsgUndelegate{}), nil
+	case AuthorizationType_AUTHORIZATION_TYPE_REDELEGATE:
+		return sdk.MsgTypeURL(&MsgBeginRedelegate{}), nil
+	default:
+		return "", sdkerrors.ErrInvalidType.Wrapf("unknown authorization type %T", authzType)
+	}
+}
+```
+
+**File:** x/authz/keeper/keeper.go (L144-160)
+```go
+func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
+	store := ctx.KVStore(k.storeKey)
+
+	grant, err := authz.NewGrant(authorization, expiration)
 	if err != nil {
 		return err
 	}
+
+	bz := k.cdc.MustMarshal(&grant)
+	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
+	store.Set(skey, bz)
+	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
+		MsgTypeUrl: authorization.MsgTypeURL(),
+		Granter:    granter.String(),
+		Grantee:    grantee.String(),
+	})
+}
 ```
 
-**File:** x/staking/genesis.go (L39-44)
+**File:** x/authz/keeper/keeper.go (L245-260)
 ```go
-	for _, validator := range data.Validators {
-		keeper.SetValidator(ctx, validator)
+// InitGenesis new authz genesis
+func (k Keeper) InitGenesis(ctx sdk.Context, data *authz.GenesisState) {
+	for _, entry := range data.Authorization {
+		grantee := sdk.MustAccAddressFromBech32(entry.Grantee)
+		granter := sdk.MustAccAddressFromBech32(entry.Granter)
+		a, ok := entry.Authorization.GetCachedValue().(authz.Authorization)
+		if !ok {
+			panic("expected authorization")
+		}
 
-		// Manually set indices for the first time
-		keeper.SetValidatorByConsAddr(ctx, validator)
-		keeper.SetValidatorByPowerIndex(ctx, validator)
-```
-
-**File:** baseapp/abci.go (L32-76)
-```go
-// InitChain implements the ABCI interface. It runs the initialization logic
-// directly on the CommitMultiStore.
-func (app *BaseApp) InitChain(ctx context.Context, req *abci.RequestInitChain) (res *abci.ResponseInitChain, err error) {
-	// On a new chain, we consider the init chain block height as 0, even though
-	// req.InitialHeight is 1 by default.
-	initHeader := tmproto.Header{ChainID: req.ChainId, Time: req.Time}
-	app.ChainID = req.ChainId
-
-	// If req.InitialHeight is > 1, then we set the initial version in the
-	// stores.
-	if req.InitialHeight > 1 {
-		app.initialHeight = req.InitialHeight
-		initHeader = tmproto.Header{ChainID: req.ChainId, Height: req.InitialHeight, Time: req.Time}
-		err := app.cms.SetInitialVersion(req.InitialHeight)
+		err := k.SaveGrant(ctx, grantee, granter, a, entry.Expiration)
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
 	}
-
-	// initialize the deliver state and check state with a correct header
-	app.setDeliverState(initHeader)
-	app.setCheckState(initHeader)
-	app.setPrepareProposalState(initHeader)
-	app.setProcessProposalState(initHeader)
-
-	// Store the consensus params in the BaseApp's paramstore. Note, this must be
-	// done after the deliver state and context have been set as it's persisted
-	// to state.
-	if req.ConsensusParams != nil {
-		app.StoreConsensusParams(app.deliverState.ctx, req.ConsensusParams)
-		app.StoreConsensusParams(app.prepareProposalState.ctx, req.ConsensusParams)
-		app.StoreConsensusParams(app.processProposalState.ctx, req.ConsensusParams)
-		app.StoreConsensusParams(app.checkState.ctx, req.ConsensusParams)
-	}
-
-	app.SetDeliverStateToCommit()
-
-	if app.initChainer == nil {
-		return
-	}
-
-	resp := app.initChainer(app.deliverState.ctx, *req)
-	app.initChainer(app.prepareProposalState.ctx, *req)
-	app.initChainer(app.processProposalState.ctx, *req)
-	res = &resp
+}
 ```
 
-**File:** crypto/keys/ed25519/keys.pb.go (L249-330)
+**File:** x/feegrant/genesis.go (L17-29)
 ```go
-func (m *PubKey) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowKeys
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= uint64(b&0x7F) << shift
-			if b < 0x80 {
-				break
-			}
+func ValidateGenesis(data GenesisState) error {
+	for _, f := range data.Allowances {
+		grant, err := f.GetGrant()
+		if err != nil {
+			return err
 		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: PubKey: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: PubKey: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowKeys
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				byteLen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthKeys
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex < 0 {
-				return ErrInvalidLengthKeys
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
-			if m.Key == nil {
-				m.Key = []byte{}
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipKeys(dAtA[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if (skippy < 0) || (iNdEx+skippy) < 0 {
-				return ErrInvalidLengthKeys
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
+		err = grant.ValidateBasic()
+		if err != nil {
+			return err
 		}
 	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
+	return nil
+}
 ```
 
-**File:** x/staking/types/validator.go (L497-504)
+**File:** proto/cosmos/staking/v1beta1/authz.proto (L38-40)
+```text
+enum AuthorizationType {
+  // AUTHORIZATION_TYPE_UNSPECIFIED specifies an unknown authorization type
+  AUTHORIZATION_TYPE_UNSPECIFIED = 0;
+```
+
+**File:** x/authz/module/module.go (L149-154)
 ```go
-// GetConsAddr extracts Consensus key address
-func (v Validator) GetConsAddr() (sdk.ConsAddress, error) {
-	pk, ok := v.ConsensusPubkey.GetCachedValue().(cryptotypes.PubKey)
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	var genesisState authz.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+```
+
+**File:** x/authz/keeper/genesis_test.go (L17-30)
+```go
+type GenesisTestSuite struct {
+	suite.Suite
+
+	ctx    sdk.Context
+	keeper keeper.Keeper
+}
+
+func (suite *GenesisTestSuite) SetupTest() {
+	checkTx := false
+	app := simapp.Setup(checkTx)
+
+	suite.ctx = app.BaseApp.NewContext(checkTx, tmproto.Header{Height: 1})
+	suite.keeper = app.AuthzKeeper
+}
+```
+
+**File:** x/authz/authorization_grant.go (L57-64)
+```go
+func (g Grant) ValidateBasic() error {
+	av := g.Authorization.GetCachedValue()
+	a, ok := av.(Authorization)
 	if !ok {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expecting cryptotypes.PubKey, got %T", pk)
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", (Authorization)(nil), av)
 	}
-	return sdk.ConsAddress(pk.Address()), nil
+	return a.ValidateBasic()
 }
 ```

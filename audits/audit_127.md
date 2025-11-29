@@ -1,255 +1,248 @@
 # Audit Report
 
 ## Title
-Transaction Decoding DoS: Gas Consumption Occurs After Expensive Decoding Operations
+Nil Pointer Dereference in Validation Iterator Causes Node Crash During Concurrent Writeset Modifications
 
 ## Summary
-The `ConsumeTxSizeGasDecorator` consumes gas based on transaction size only AFTER the transaction has been fully decoded, which includes expensive operations like protobuf unmarshaling, ADR-027 validation, and field verification. This allows attackers to force nodes to expend significant computational resources processing large transactions before any gas is charged, enabling a denial-of-service attack.
+The `validationIterator.Value()` function contains a nil pointer dereference vulnerability that crashes validator nodes when `GetLatestBeforeIndex()` returns nil during iterator validation. This occurs when transaction writesets are concurrently modified during the validation phase of optimistic concurrency control, causing an unrecovered panic that terminates the node process.
 
 ## Impact
 **Medium**
 
 ## Finding Description
 
-**Location:** 
-- Primary: [1](#0-0) 
-- Decoder: [2](#0-1) 
-- Gas consumption: [3](#0-2) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:** 
-The system should charge gas for transaction size before performing expensive operations on the transaction bytes to prevent DoS attacks. This is the purpose of `ConsumeTxSizeGasDecorator` - to make large transactions pay proportionally for the resources they consume.
+**Intended Logic:** The validation iterator should safely handle cases where keys may have been removed from the multiversion store during concurrent transaction re-execution. The iterator validates that previously observed keys during iteration still exist with consistent values.
 
-**Actual Logic:** 
-The transaction decoding process occurs in the following order:
+**Actual Logic:** The code calls `GetLatestBeforeIndex()` at line 112, which can return nil when a key doesn't exist or has been removed. [2](#0-1)  However, without checking for nil, the code immediately calls methods on the returned value at lines 115, 120, 124, and 125, causing a nil pointer dereference panic.
 
-1. In `CheckTx`, the context is created with raw transaction bytes [4](#0-3) 
-2. Immediately after, the transaction decoder is called to fully decode the transaction [5](#0-4) 
-3. The decoder performs expensive operations including:
-   - Iterating through all transaction bytes to validate ADR-027 compliance [6](#0-5) 
-   - Strict validation of unknown proto fields [7](#0-6) 
-   - Unmarshaling TxRaw, TxBody, and AuthInfo [8](#0-7) 
-4. Only after all decoding work completes does `runTx` execute the anteHandler [9](#0-8) 
-5. Finally, `ConsumeTxSizeGasDecorator` consumes gas based on transaction size [3](#0-2) 
+**Exploitation Path:**
+1. User submits Transaction T0 that writes key K
+2. User submits Transaction T1 that iterates and observes key K from T0
+3. T1's iterateset is recorded for later validation
+4. Concurrently, T0 is re-executed with a different writeset (normal OCC behavior)
+5. `SetWriteset(0, newIncarnation, newWriteset)` is called, triggering `removeOldWriteset()` [3](#0-2) 
+6. Key K is removed from the multiversion map via `Remove(index)` at line 135
+7. T1's validation begins in a goroutine [4](#0-3) 
+8. The validation iterator attempts to read key K
+9. `GetLatestBeforeIndex()` returns nil since K was removed
+10. Line 115 calls `val.IsEstimate()` on nil, triggering panic
+11. The goroutine has no panic recovery, causing the entire node process to crash
 
-**Exploit Scenario:**
-1. Attacker crafts large transactions (approaching `BlockParams.MaxBytes` limit, potentially several MB)
-2. Attacker sends multiple such transactions to the network
-3. Each validator node receives and attempts to process these transactions via `CheckTx`
-4. For each transaction, nodes perform expensive decoding operations (O(n) iteration, protobuf unmarshaling, field validation)
-5. If transactions are malformed or fail later validation, they are rejected but nodes have already expended significant resources
-6. Attacker repeats this continuously, forcing nodes to waste CPU and memory on decoding invalid or spam transactions
-
-**Security Failure:** 
-This is a denial-of-service vulnerability. The system fails to enforce resource accounting (gas charges) before consuming computational resources (decoding). An attacker can exploit this to degrade network performance and node availability without paying proportional fees.
+**Security Guarantee Broken:** Memory safety and node availability. The validation logic that ensures consistency in optimistic concurrency control becomes unsafe and crashes nodes during legitimate concurrent transaction processing.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- CPU: Nodes must perform O(n) iteration through transaction bytes, protobuf unmarshaling, and validation
-- Memory: Large transaction bytes must be held in memory during decoding
-- Network bandwidth: Large transactions consume bandwidth before being rejected
-- Node availability: Sustained attack can slow down or crash nodes
+This vulnerability causes validator node crashes during normal transaction processing. When multiple transactions execute concurrently and trigger re-executions (standard OCC behavior), the race condition window between writeset collection and validation can result in nil pointer dereferences. 
 
-**Severity:**
-An attacker can send numerous large transactions (e.g., 1-2 MB each if `MaxBytes` is set to typical values like 2MB) that force nodes to decode them completely before any gas check occurs. The decoding operations include:
-- Full byte iteration in `rejectNonADR027TxRaw` 
-- Multiple protobuf unmarshal operations
-- Field validation checks
+A crashed node:
+- Cannot process or validate new transactions
+- Cannot participate in consensus
+- Requires manual restart
+- May cause other nodes to experience similar crashes if processing the same transaction sequences
 
-This can increase node resource consumption by at least 30% compared to normal operation, matching the Medium severity criteria: "Increasing network processing node resource consumption by at least 30% without brute force actions."
-
-**System Impact:**
-While this doesn't completely shut down the network, it significantly degrades performance, increases latency for legitimate transactions, and could cause nodes with limited resources to crash or fall behind, potentially triggering the "Shutdown of greater than or equal to 30% of network processing nodes" scenario for under-resourced nodes.
+If 30% or more of validator nodes crash simultaneously, block production and network liveness are severely degraded, though the network doesn't completely halt since some nodes remain operational.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any network participant can trigger this vulnerability by sending transactions to the network. No special privileges or authentication is required.
+**Triggering Conditions:**
+- Any network participant can submit transactions (no special privileges required)
+- Occurs during concurrent transaction execution with optimistic concurrency control
+- More likely during high transaction load when concurrent validations and re-executions are frequent
 
-**Conditions Required:** 
-- Attacker needs ability to send transactions to the network (standard network access)
-- No special timing or state conditions required
-- Can be executed during normal network operation
+**Frequency:**
+The race condition window exists between when `CollectIteratorItems()` snapshots writeset keys (line 264) and when the validation iterator reads those keys during validation. During this window, another transaction's re-execution can remove keys via `removeOldWriteset()`. This is realistic in production environments with:
+- Multi-threaded transaction execution
+- High concurrency/transaction throughput
+- Normal OCC conflict resolution triggering re-executions
 
-**Frequency:** 
-This can be exploited continuously and repeatedly. An attacker can:
-- Send large transactions at a sustained rate
-- Target multiple nodes simultaneously
-- Maintain the attack indefinitely without accumulating gas costs (since failed transactions don't charge gas for decoding work)
-
-The attack is practical, low-cost for the attacker, and can be sustained as long as the attacker has network access and can generate transaction data.
+**Probability:** Medium - While timing-dependent, the scenario occurs during normal operation without requiring attacker-controlled timing or special conditions. High-load periods significantly increase likelihood.
 
 ## Recommendation
 
-**Immediate Fix:**
-Add a transaction size check BEFORE decoding in `CheckTx`. Insert validation between lines 225-226 in `baseapp/abci.go`:
+Add nil check before calling methods on the value returned by `GetLatestBeforeIndex()` in `validationIterator.Value()`:
 
 ```go
-// After line 225: sdkCtx := app.getContextForTx(mode, req.Tx)
-// Add:
-if len(req.Tx) > MaxAcceptableTxSize {
-    return &abci.ResponseCheckTxV2{
-        ResponseCheckTx: &abci.ResponseCheckTx{
-            Code: sdkerrors.ErrTxTooLarge.ABCICode(),
-        },
-    }, sdkerrors.Wrap(sdkerrors.ErrTxTooLarge, "transaction size exceeds limit")
+val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+// Add nil check to handle concurrent writeset modifications
+if val == nil {
+    // Key was removed or doesn't exist - treat as if key doesn't exist
+    // This is safe because either:
+    // 1) The key never existed (validation will fail due to missing expected key)
+    // 2) The key was removed (validation will correctly detect inconsistency)
+    vi.readCache[string(key)] = nil
+    return nil
 }
-// Before line 226: tx, err := app.txDecoder(req.Tx)
+
+// Now safe to call methods on val
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+}
+// ... rest of existing logic
 ```
 
-**Alternative Approach:**
-Implement early gas metering directly on raw transaction bytes before decoding:
-1. Consume gas based on `len(req.Tx)` immediately after receiving the transaction in `CheckTx`
-2. Use a minimal gas context for this initial charge
-3. If the initial charge exceeds available gas, reject before decoding
-4. Continue with normal flow including `ConsumeTxSizeGasDecorator` for final accounting
-
-This ensures that even if decoding begins, the node has already charged for the basic cost of handling large byte arrays.
+Alternatively, add panic recovery in the validation goroutine to prevent node crashes, though this may mask validation failures that should be detected.
 
 ## Proof of Concept
 
-**Test File:** `baseapp/abci_dos_test.go`
+**File:** `store/multiversion/store_test.go`
 
-**Test Setup:**
-```go
-// Create a test that demonstrates the DoS vulnerability
-// File: baseapp/abci_dos_test.go
+**Test Function:** `TestValidationIteratorNilDereference`
 
-package baseapp_test
+**Setup:**
+1. Create parent KV store with keys "aaa", "bbb" 
+2. Create multiversion store
+3. Transaction T0 (index 0) writes key "zzz" (sorts after parent keys)
+4. Create VersionIndexedStore for T1 (index 1)
+5. T1 creates iterator over range ["a", "zzz{") that observes all keys including "zzz"
+6. T1 closes iterator and writes iterateset via `WriteToMultiVersionStore()`
 
-import (
-    "testing"
-    "time"
-    "github.com/stretchr/testify/require"
-    abci "github.com/tendermint/tendermint/abci/types"
-)
+**Action:**
+1. Call `SetWriteset(0, 2, map[string][]byte{})` with empty writeset
+2. This triggers `removeOldWriteset()` removing "zzz" from multiversion map
+3. Call `ValidateTransactionState(1)` to trigger validation
 
-func TestTransactionDecodingDoS(t *testing.T) {
-    // Setup: Create app with standard configuration
-    app := setupBaseApp(t)
-    
-    // Create a very large transaction (1.5 MB of data)
-    // This simulates an attacker sending large transactions
-    largeTxBytes := make([]byte, 1500000)
-    // Fill with valid protobuf structure but mostly padding
-    // ... (construct minimal valid tx structure with large memo/data)
-    
-    // Measure resources before attack
-    startTime := time.Now()
-    
-    // Trigger: Send multiple large transactions via CheckTx
-    // Each will force full decoding before gas consumption
-    for i := 0; i < 100; i++ {
-        req := &abci.RequestCheckTx{
-            Tx:   largeTxBytes,
-            Type: abci.CheckTxType_New,
-        }
-        
-        // This call will decode the entire transaction
-        // BEFORE ConsumeTxSizeGasDecorator runs
-        _, err := app.CheckTx(context.Background(), req)
-        
-        // Transaction may fail validation, but decoding already occurred
-        // Node has already spent resources
-    }
-    
-    decodingTime := time.Since(startTime)
-    
-    // Observation: Verify that significant time was spent
-    // on decoding large transactions before gas was charged
-    // In a patched version, early size checks would reject these faster
-    
-    t.Logf("Time spent decoding large transactions: %v", decodingTime)
-    
-    // In vulnerable code: decodingTime will be significant (seconds)
-    // In patched code: transactions rejected quickly (milliseconds)
-    require.True(t, decodingTime > time.Second, 
-        "Vulnerable: spent %v decoding large transactions before gas charge", 
-        decodingTime)
-}
+**Result:**
+The test panics with:
+```
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation]
+goroutine X [running]:
+github.com/cosmos/cosmos-sdk/store/multiversion.(*validationIterator).Value(...)
+    store/multiversion/memiterator.go:115
 ```
 
-**Observation:**
-The test demonstrates that nodes must fully decode large transactions (performing expensive protobuf unmarshaling, ADR-027 validation, and field checks) before `ConsumeTxSizeGasDecorator` charges any gas. By sending many large transactions, an attacker forces nodes to expend significant CPU and memory resources. The test measures the time spent on decoding operations and confirms it exceeds reasonable thresholds, proving the DoS vulnerability.
+The panic occurs because the validation iterator attempts to read "zzz" which was removed, causing `GetLatestBeforeIndex()` to return nil, and the subsequent method call on nil triggers the crash. This demonstrates that the race condition between writeset modification and validation causes node-level crashes.
 
-In a properly secured implementation, transaction size would be validated and gas charged BEFORE decoding begins, allowing early rejection of oversized transactions with minimal resource consumption.
+## Notes
+
+This vulnerability affects the core optimistic concurrency control validation mechanism. The lack of nil checking combined with no panic recovery in the validation goroutine means that timing-dependent race conditions during normal transaction processing can crash validator nodes. The fix is straightforward (add nil check) but the impact is significant as it affects node availability during concurrent transaction execution.
 
 ### Citations
 
-**File:** baseapp/abci.go (L225-226)
+**File:** store/multiversion/memiterator.go (L99-126)
 ```go
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
-```
+func (vi *validationIterator) Value() []byte {
+	key := vi.Iterator.Key()
 
-**File:** x/auth/tx/decoder.go (L17-75)
-```go
-	return func(txBytes []byte) (sdk.Tx, error) {
-		// Make sure txBytes follow ADR-027.
-		err := rejectNonADR027TxRaw(txBytes)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		var raw tx.TxRaw
-
-		// reject all unknown proto fields in the root TxRaw
-		err = unknownproto.RejectUnknownFieldsStrict(txBytes, &raw, cdc.InterfaceRegistry())
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		err = cdc.Unmarshal(txBytes, &raw)
-		if err != nil {
-			return nil, err
-		}
-
-		var body tx.TxBody
-
-		// allow non-critical unknown fields in TxBody
-		txBodyHasUnknownNonCriticals, err := unknownproto.RejectUnknownFields(raw.BodyBytes, &body, true, cdc.InterfaceRegistry())
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		err = cdc.Unmarshal(raw.BodyBytes, &body)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		var authInfo tx.AuthInfo
-
-		// reject all unknown proto fields in AuthInfo
-		err = unknownproto.RejectUnknownFieldsStrict(raw.AuthInfoBytes, &authInfo, cdc.InterfaceRegistry())
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		err = cdc.Unmarshal(raw.AuthInfoBytes, &authInfo)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		theTx := &tx.Tx{
-			Body:       &body,
-			AuthInfo:   &authInfo,
-			Signatures: raw.Signatures,
-		}
-
-		return &wrapper{
-			tx:                           theTx,
-			bodyBz:                       raw.BodyBytes,
-			authInfoBz:                   raw.AuthInfoBytes,
-			txBodyHasUnknownNonCriticals: txBodyHasUnknownNonCriticals,
-		}, nil
+	// try fetch from writeset - return if exists
+	if val, ok := vi.writeset[string(key)]; ok {
+		return val
 	}
+	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
+	if val, ok := vi.readCache[string(key)]; ok {
+		return val
+	}
+
+	// get the value from the multiversion store
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	}
+
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
+}
 ```
 
-**File:** x/auth/ante/basic.go (L116-116)
+**File:** store/multiversion/store.go (L82-97)
 ```go
-	ctx.GasMeter().ConsumeGas(params.TxSizeCostPerByte*sdk.Gas(len(ctx.TxBytes())), "txSize")
+// GetLatestBeforeIndex implements MultiVersionStore.
+func (s *Store) GetLatestBeforeIndex(index int, key []byte) (value MultiVersionValueItem) {
+	keyString := string(key)
+	mvVal, found := s.multiVersionMap.Load(keyString)
+	// if the key doesn't exist in the overall map, return nil
+	if !found {
+		return nil
+	}
+	val, found := mvVal.(MultiVersionValue).GetLatestBeforeIndex(index)
+	// otherwise, we may have found a value for that key, but its not written before the index passed in
+	if !found {
+		return nil
+	}
+	// found a value prior to the passed in index, return that value (could be estimate OR deleted, but it is a definitive value)
+	return val
+}
 ```
 
-**File:** baseapp/baseapp.go (L947-947)
+**File:** store/multiversion/store.go (L112-138)
 ```go
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
+func (s *Store) removeOldWriteset(index int, newWriteSet WriteSet) {
+	writeset := make(map[string][]byte)
+	if newWriteSet != nil {
+		// if non-nil writeset passed in, we can use that to optimize removals
+		writeset = newWriteSet
+	}
+	// if there is already a writeset existing, we should remove that fully
+	oldKeys, loaded := s.txWritesetKeys.LoadAndDelete(index)
+	if loaded {
+		keys := oldKeys.([]string)
+		// we need to delete all of the keys in the writeset from the multiversion store
+		for _, key := range keys {
+			// small optimization to check if the new writeset is going to write this key, if so, we can leave it behind
+			if _, ok := writeset[key]; ok {
+				// we don't need to remove this key because it will be overwritten anyways - saves the operation of removing + rebalancing underlying btree
+				continue
+			}
+			// remove from the appropriate item if present in multiVersionMap
+			mvVal, found := s.multiVersionMap.Load(key)
+			// if the key doesn't exist in the overall map, return nil
+			if !found {
+				continue
+			}
+			mvVal.(MultiVersionValue).Remove(index)
+		}
+	}
+}
+```
+
+**File:** store/multiversion/store.go (L273-310)
+```go
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
 ```

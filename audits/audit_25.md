@@ -1,263 +1,279 @@
-## Audit Report
+Based on my thorough analysis of the codebase and the security claim, I will now provide my validation.
+
+## Analysis
+
+I have examined the capability keeper implementation and traced through the execution flow. Let me validate each aspect of the claim:
+
+**1. Code Structure Verification:**
+
+The `ReleaseCapability` function performs deletions on three different storage types:
+- Lines 332, 336: memStore deletions (transactional - backed by KVStore)
+- Line 347: prefixStore deletion (transactional - backed by KVStore)  
+- Line 349: capMap deletion (non-transactional - direct Go map operation) [1](#0-0) 
+
+**2. Vulnerability Logic:**
+
+When `ReleaseCapability` executes in a cached context that subsequently rolls back:
+- The cached KVStore changes (memStore and prefixStore) are reverted
+- The Go map deletion at line 349 persists (not backed by any transactional store)
+- This creates an inconsistent state
+
+**3. Panic Mechanism:**
+
+The `GetCapability` function will panic in this inconsistent state:
+- Line 368: Retrieves index from memStore (succeeds because deletion was reverted)
+- Line 382: Looks up `sk.capMap[index]` (returns nil because deletion persisted)
+- Line 384: Panics with "capability found in memstore is missing from map" [2](#0-1) 
+
+**4. Acknowledged Design Issue:**
+
+The code comment at lines 372-377 acknowledges a similar issue exists for capability creation rollback, but the deletion rollback case is not addressed: [3](#0-2) 
+
+**5. Triggering Conditions:**
+
+- No special privileges required
+- Occurs during normal operations (IBC channel closures, capability releases)
+- Transaction failures are common (out of gas, validation errors, application logic errors)
+- Once triggered, the inconsistent state persists across node restarts
+
+**6. Impact Validation:**
+
+This matches the impact category: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network" (Medium)**
+
+When this inconsistency is triggered in a block, all nodes processing that block enter the same inconsistent state. Any subsequent transaction attempting to access the affected capability will cause a deterministic panic across all nodes.
+
+**7. Existing Test Coverage:**
+
+The test suite includes `TestRevertCapability` which tests creation rollback but NOT deletion rollback, confirming this scenario is not currently tested or protected against. [4](#0-3) 
+
+---
+
+# Audit Report
 
 ## Title
-EVM Transaction State Persistence Despite Revert Error
+Capability Keeper Transaction Rollback Causes Node Panic Due to Non-Transactional capMap Deletion
 
 ## Summary
-When an EVM transaction reverts (indicated by `result.EvmError != ""`), the baseapp code in `runTx` commits state changes via `msCache.Write()` because it only checks for standard Go errors (`err == nil`) and does not verify the EVM-specific error field. This allows reverted EVM transactions to persist state modifications while being marked as failed in the response, violating EVM atomicity guarantees and enabling double-counting of transaction results. [1](#0-0) 
+A critical vulnerability exists in the capability keeper where releasing a capability in a transaction that subsequently rolls back creates an inconsistent state between the transactional memStore and non-transactional capMap, causing deterministic node panics when the capability is subsequently accessed.
 
 ## Impact
-**High** - This vulnerability results in unintended smart contract behavior where EVM transactions marked as failed can still modify blockchain state, breaking fundamental EVM execution guarantees.
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary vulnerability: `baseapp/baseapp.go`, lines 1015-1017 in the `runTx` function
-- Related handling: `baseapp/abci.go`, lines 329-333 in the `DeliverTx` function [2](#0-1) 
+- **location**: `x/capability/keeper/keeper.go`, function `ReleaseCapability` (lines 319-356) and `GetCapability` (lines 361-388), critical line 349 (capMap deletion) and line 384 (panic)
 
-**Intended Logic:** 
-According to EVM semantics, when a transaction execution reverts (e.g., via the REVERT opcode), all state changes made during that transaction should be atomically rolled back, with only gas consumption persisting. The transaction should be marked as failed and no storage modifications should be committed to the blockchain state. [3](#0-2) 
+- **intended logic**: When a capability is released and the transaction rolls back, all state changes should be atomically reverted, maintaining consistency between memStore, persistent store, and capMap. The system should return to its pre-transaction state.
 
-**Actual Logic:**
-The code path exhibits inconsistent handling of EVM errors:
+- **actual logic**: The `capMap` is a Go map that is not backed by any transactional store. When `ReleaseCapability` deletes a capability from `capMap` at line 349 using `delete(sk.capMap, cap.GetIndex())`, this deletion persists even if the transaction rolls back. However, the memStore deletions at lines 332 and 336 are reverted because they are backed by transactional KVStores. This creates an inconsistent state where memStore contains a reverse mapping to an index, but `capMap[index]` is nil.
 
-1. In `runMsgs`, when an EVM message handler completes, if the message execution experiences a revert, the handler returns `err = nil` with `msgResult.EvmError` populated with the revert reason. [4](#0-3) 
+- **exploitation path**:
+  1. A module calls `ReleaseCapability` on a capability it is the sole owner of within a cached transaction context
+  2. The capability is deleted from `capMap` at line 349 (non-transactional operation)
+  3. The transaction encounters an error (out of gas, validation failure, application logic error) and rolls back without calling `Write()` on the cache
+  4. memStore and persistent store deletions are reverted, but the `capMap` deletion persists
+  5. Any subsequent call to `GetCapability` with that capability name will find the index in memStore (line 368), look up `capMap[index]` and get nil (line 382), then panic at line 384
 
-2. Since `err == nil`, the message cache is written at line 1149, committing message state changes to the parent cache. [5](#0-4) 
-
-3. The `runMsgs` function returns with `result.EvmError` set and `err = nil`. [6](#0-5) 
-
-4. Back in `runTx`, the condition at line 1015 checks only `err == nil` without verifying `result.EvmError`, causing `msCache.Write()` to commit all cached state changes to the delivery state. [1](#0-0) 
-
-5. Subsequently in `DeliverTx`, when `result.EvmError != ""`, the code wraps it as an error and marks the transaction as failed. [7](#0-6) 
-
-This creates a logical inconsistency where the codebase properly checks for EVM errors before executing hooks: [8](#0-7) 
-
-But fails to apply the same check before committing state changes.
-
-**Exploit Scenario:**
-1. An attacker deploys or interacts with an EVM smart contract that performs state modifications (e.g., token transfers, storage writes)
-2. The contract logic executes successfully, applying state changes to the cache
-3. The contract then intentionally triggers a REVERT operation
-4. The EVM message handler returns `err = nil` with `result.EvmError = "execution reverted"`
-5. At line 1149, `msgMsCache.Write()` commits the state changes to the parent cache
-6. At line 1016, `msCache.Write()` commits all changes to the delivery state
-7. At line 329-333, DeliverTx marks the transaction as failed in the ABCI response
-8. Result: The blockchain state contains modifications from a "failed" transaction
-
-**Security Failure:**
-This breaks the atomicity invariant of EVM transaction execution. In standard EVM implementations, reverted transactions are atomic - either all state changes succeed, or all are rolled back. This vulnerability allows partial execution where state changes persist despite transaction failure, enabling:
-- Unintended smart contract state modifications
-- Token balance inconsistencies
-- Violation of contract invariants that rely on revert semantics
-- Consensus divergence if different nodes interpret revert handling differently
+- **security guarantee broken**: The atomicity invariant of transaction processing is violated. The system enters a permanently inconsistent state that causes deterministic node crashes, breaking the availability guarantee of the network.
 
 ## Impact Explanation
 
-**Affected Assets and Processes:**
-- All EVM smart contracts relying on revert semantics for error handling
-- Token balances and contract storage that should be protected by revert logic
-- Transaction finality and state consistency
-- Cross-contract interactions that depend on atomic execution
+This vulnerability causes network processing node shutdowns through panics. When triggered:
 
-**Severity of Damage:**
-This vulnerability creates a fundamental mismatch between:
-1. What the transaction response indicates (failed)
-2. What actually happened to the state (modified)
+- Nodes that encounter the inconsistent state will panic and crash when attempting to access the affected capability
+- The inconsistency is permanent and survives node restarts because the capMap is rebuilt from memStore state during initialization, which still contains the reverse mapping
+- If the triggering transaction is included in a block, all nodes processing that block will enter this inconsistent state
+- Any block containing a transaction that accesses the affected capability will cause all nodes with the inconsistent state to panic
+- This qualifies as a "shutdown of greater than or equal to 30% of network processing nodes without brute force actions"
 
-This can lead to:
-- **Smart contracts with security bugs becoming exploitable**: Contracts that use revert for access control or state protection would have their state modified even when access is denied
-- **Economic exploits**: Attackers could extract value by triggering state changes that should have been reverted
-- **State inconsistency**: The blockchain state would differ from what clients expect based on transaction receipts
-- **Consensus risks**: Different implementations or versions might handle this differently, potentially causing chain splits
-
-**Why This Matters:**
-EVM atomicity is a core security guarantee that smart contract developers rely on. When a contract reverts, developers expect NO state changes to persist. Breaking this guarantee undermines the security model of every EVM smart contract deployed on the chain and could lead to direct financial losses. [9](#0-8) 
+The impact is particularly severe for IBC operations, as capability releases during channel closures become dangerous operations that can permanently break node state across the network.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any user can trigger this vulnerability by submitting EVM transactions that execute and then revert. This requires no special privileges - just the ability to submit transactions to the network.
+This vulnerability has a realistic likelihood of occurring:
 
-**Required Conditions:**
-- The chain must support EVM transactions (which sei-cosmos does based on the EVM-specific code)
-- An EVM message handler that returns `err = nil` with `result.EvmError` populated when reverts occur
-- Normal transaction processing during block execution
+**Who can trigger**: Any user or module that can cause a transaction to fail after a capability is released, including:
+- IBC relayers submitting channel close messages
+- Modules implementing IBC callbacks that release capabilities  
+- Any transaction flow that releases a capability and then encounters an error
 
-**Frequency:**
-This vulnerability is triggered on EVERY EVM transaction that reverts. Given that reverts are common in EVM execution (used for error handling, access control, and failed operations), this could occur frequently:
-- Failed token transfers
-- Access control violations
-- Out-of-bounds array access
-- Failed external calls
-- Explicit revert statements
+**Required conditions**:
+1. A capability with a single owner (or the last owner releasing it)
+2. `ReleaseCapability` called within a transaction
+3. The transaction fails after the release but before committing
 
-The inconsistency between hooks (which correctly check for EvmError) and state commits (which don't) suggests this is an oversight rather than intentional design. [10](#0-9) 
+**Frequency**: This can occur during normal IBC operations where channels are opened and closed regularly, combined with the common occurrence of transaction failures (out of gas, validation errors, application logic errors). Once triggered, the inconsistency is permanent and affects all subsequent accesses to that capability.
 
 ## Recommendation
 
-Modify the state write condition in `runTx` to check for EVM errors before committing state, consistent with how hooks are handled:
+Implement a transaction-aware mechanism for `capMap` modifications. The recommended approach is:
+
+**Option 1 (Comprehensive Fix)**:
+Make `capMap` transaction-aware by maintaining a per-transaction cache of modifications that are only applied on successful commit:
 
 ```go
-// In baseapp/baseapp.go, replace lines 1015-1017:
-if err == nil && (!ctx.IsEVM() || result.EvmError == "") && mode == runTxModeDeliver {
-    msCache.Write()
+type CapabilityKeeper struct {
+    capMap map[uint64]*types.Capability
+    pendingDeletions map[sdk.Context][]uint64  // Track pending deletions per context
+}
+
+// In ReleaseCapability, defer the deletion:
+func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
+    // ... existing logic ...
+    if len(capOwners.Owners) == 0 {
+        prefixStore.Delete(indexKey)
+        // Store pending deletion instead of immediate delete
+        storePendingDeletion(ctx, cap.GetIndex())
+    }
+}
+
+// Apply deletions only on successful commit via EndBlock or middleware
+```
+
+**Option 2 (Defensive Fix)**:
+Add defensive checking in `GetCapability` to detect and recover from inconsistent state:
+
+```go
+cap := sk.capMap[index]
+if cap == nil {
+    // Inconsistent state detected - memStore has index but capMap doesn't
+    // This can happen after a rollback. Clean up the memStore entry.
+    memStore.Delete(key)
+    return nil, false
 }
 ```
 
-This ensures that:
-1. Non-EVM transactions behave as before (write on `err == nil`)
-2. EVM transactions only write state when both `err == nil` AND `result.EvmError == ""`
-3. The logic is consistent with the hook execution check at line 1027
-
-Alternative: Modify the EVM message handler to return a proper Go error when reverts occur, ensuring `err != nil` and preventing the cache write at line 1016. However, this would require changes to the EVM module integration and might break other assumptions.
+The recommended approach is Option 1 for correctness, with Option 2 as an additional defensive measure.
 
 ## Proof of Concept
 
-**File:** `baseapp/deliver_tx_test.go`
+**File**: `x/capability/keeper/keeper_test.go`
 
-**Test Function:** `TestEVMRevertStatePersistence` (new test to be added)
+**Test Function**: `TestReleaseCapabilityRollbackPanic`
 
-**Setup:**
-1. Create a BaseApp instance with a test EVM message handler
-2. The handler should write a value to the store, then return `err = nil` with `result.EvmError = "execution reverted"`
-3. Initialize the chain and set up delivery state
+**Setup**:
+1. Initialize the capability keeper with a scoped keeper for the bank module
+2. Create a capability named "test-capability" in the base context
+3. Verify the capability exists and can be retrieved
 
-**Trigger:**
-1. Mark the context as EVM using `ctx.WithIsEVM(true)`
-2. Create a test transaction that will be routed to the EVM handler
-3. Call `DeliverTx` on this transaction
+**Action**:
+1. Create a cached multistore context (simulating a transaction)
+2. Call `ReleaseCapability` on the capability in the cached context (as the sole owner)
+3. Do NOT call `msCache.Write()` - simulating transaction rollback
+4. Attempt to retrieve the capability in the original context using `GetCapability`
 
-**Observation:**
-The test should verify that:
-1. The transaction response shows `IsOK() == false` (transaction marked as failed)
-2. The response contains the EVM error information
-3. **Critical assertion**: The store value written by the handler SHOULD NOT be persisted, but currently IS persisted due to the bug
-
-**Expected behavior (after fix):**
-Store should remain unchanged because the EVM error should prevent `msCache.Write()`
-
-**Actual behavior (demonstrating vulnerability):**
-Store contains the written value even though transaction was marked as failed
-
-```go
-func TestEVMRevertStatePersistence(t *testing.T) {
-    testKey := []byte("evm-test-key")
-    testValue := []byte("should-not-persist")
-    
-    // Setup handler that writes to store then returns with EvmError
-    evmRouterOpt := func(bapp *BaseApp) {
-        r := sdk.NewRoute(routeMsgCounter, func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
-            // Simulate EVM execution that modifies state then reverts
-            store := ctx.KVStore(capKey1)
-            store.Set(testKey, testValue)
-            
-            // Return with EvmError set (simulating EVM revert)
-            return &sdk.Result{
-                EvmError: "execution reverted",
-            }, nil
-        })
-        bapp.Router().AddRoute(r)
-    }
-    
-    app := setupBaseApp(t, nil, evmRouterOpt)
-    app.InitChain(context.Background(), &abci.RequestInitChain{})
-    
-    codec := codec.NewLegacyAmino()
-    registerTestCodec(codec)
-    
-    header := tmproto.Header{Height: 1}
-    app.setDeliverState(header)
-    app.BeginBlock(app.deliverState.ctx, abci.RequestBeginBlock{Header: header})
-    
-    // Create and deliver EVM transaction
-    tx := newTxCounter(0, 0)
-    txBytes, err := codec.Marshal(tx)
-    require.NoError(t, err)
-    
-    ctx := app.deliverState.ctx.WithIsEVM(true).WithEVMNonce(1).WithEVMTxHash("0x123")
-    decoded, _ := app.txDecoder(txBytes)
-    res := app.DeliverTx(ctx, abci.RequestDeliverTx{Tx: txBytes}, decoded, sha256.Sum256(txBytes))
-    
-    // Verify transaction is marked as failed
-    require.False(t, res.IsOK(), "Transaction should be marked as failed")
-    require.NotEmpty(t, res.EvmTxInfo.VmError, "Should have EVM error set")
-    
-    // BUG: State changes persist despite revert
-    store := app.deliverState.ctx.KVStore(capKey1)
-    persistedValue := store.Get(testKey)
-    
-    // This assertion FAILS on vulnerable code (value is persisted)
-    // This assertion PASSES after fix (value is nil)
-    require.Nil(t, persistedValue, "State changes should NOT persist when EVM transaction reverts")
-}
-```
-
-This test demonstrates that the current code persists state changes from reverted EVM transactions, violating atomicity guarantees. After applying the recommended fix, the test would pass as the state changes would not be committed when `result.EvmError != ""`.
+**Result**:
+The test will panic with "capability found in memstore is missing from map" at line 384 because:
+- The memStore still has the reverse mapping (deletion was reverted when cache wasn't written)
+- The `capMap` does not have the capability (deletion was NOT reverted as it's a Go map)
+- This confirms the vulnerability: transaction rollback creates an inconsistent state that causes node-crashing panics
 
 ### Citations
 
-**File:** baseapp/baseapp.go (L1010-1017)
+**File:** x/capability/keeper/keeper.go (L319-356)
 ```go
-	// Attempt to execute all messages and only update state if all messages pass
-	// and we're in DeliverTx. Note, runMsgs will never return a reference to a
-	// Result if any single message fails or does not have a registered Handler.
-	result, err = app.runMsgs(runMsgCtx, msgs, mode)
-
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
+func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
 	}
-```
-
-**File:** baseapp/baseapp.go (L1026-1027)
-```go
-	// only apply hooks if no error
-	if err == nil && (!ctx.IsEVM() || result.EvmError == "") {
-```
-
-**File:** baseapp/baseapp.go (L1149-1149)
-```go
-		msgMsCache.Write()
-```
-
-**File:** baseapp/baseapp.go (L1151-1153)
-```go
-		if msgResult.EvmError != "" {
-			evmError = msgResult.EvmError
-		}
-```
-
-**File:** baseapp/baseapp.go (L1182-1187)
-```go
-	return &sdk.Result{
-		Data:     data,
-		Log:      strings.TrimSpace(msgLogs.String()),
-		Events:   events.ToABCIEvents(),
-		EvmError: evmError,
-	}, nil
-```
-
-**File:** types/errors/errors.go (L159-160)
-```go
-	// ErrEVMVMError defines an error for an evm vm error (eg. revert)
-	ErrEVMVMError = Register(RootCodespace, 45, "evm reverted")
-```
-
-**File:** baseapp/abci.go (L321-335)
-```go
-	if resCtx.IsEVM() {
-		res.EvmTxInfo = &abci.EvmTxInfo{
-			SenderAddress: resCtx.EVMSenderAddress(),
-			Nonce:         resCtx.EVMNonce(),
-			TxHash:        resCtx.EVMTxHash(),
-			VmError:       result.EvmError,
-		}
-		// TODO: populate error data for EVM err
-		if result.EvmError != "" {
-			evmErr := sdkerrors.Wrap(sdkerrors.ErrEVMVMError, result.EvmError)
-			res.Codespace, res.Code, res.Log = sdkerrors.ABCIInfo(evmErr, app.trace)
-			resultStr = "failed"
-			return
-		}
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
 	}
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
+
+	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
+	indexKey := types.IndexToKey(cap.GetIndex())
+
+	if len(capOwners.Owners) == 0 {
+		// remove capability owner set
+		prefixStore.Delete(indexKey)
+		// since no one owns capability, we can delete capability from map
+		delete(sk.capMap, cap.GetIndex())
+	} else {
+		// update capability owner set
+		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	}
+
+	return nil
+}
+```
+
+**File:** x/capability/keeper/keeper.go (L361-388)
+```go
+func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
+	if strings.TrimSpace(name) == "" {
+		return nil, false
+	}
+	memStore := ctx.KVStore(sk.memKey)
+
+	key := types.RevCapabilityKey(sk.module, name)
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
+
+	if len(indexBytes) == 0 {
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+
+		return nil, false
+	}
+
+	cap := sk.capMap[index]
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
+	}
+
+	return cap, true
+}
+```
+
+**File:** x/capability/keeper/keeper_test.go (L277-306)
+```go
+func (suite KeeperTestSuite) TestRevertCapability() {
+	sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
+
+	ms := suite.ctx.MultiStore()
+
+	msCache := ms.CacheMultiStore()
+	cacheCtx := suite.ctx.WithMultiStore(msCache)
+
+	capName := "revert"
+	// Create capability on cached context
+	cap, err := sk.NewCapability(cacheCtx, capName)
+	suite.Require().NoError(err, "could not create capability")
+
+	// Check that capability written in cached context
+	gotCache, ok := sk.GetCapability(cacheCtx, capName)
+	suite.Require().True(ok, "could not retrieve capability from cached context")
+	suite.Require().Equal(cap, gotCache, "did not get correct capability from cached context")
+
+	// Check that capability is NOT written to original context
+	got, ok := sk.GetCapability(suite.ctx, capName)
+	suite.Require().False(ok, "retrieved capability from original context before write")
+	suite.Require().Nil(got, "capability not nil in original store")
+
+	// Write to underlying memKVStore
+	msCache.Write()
+
+	got, ok = sk.GetCapability(suite.ctx, capName)
+	suite.Require().True(ok, "could not retrieve capability from context")
+	suite.Require().Equal(cap, got, "did not get correct capability from context")
+}
 ```

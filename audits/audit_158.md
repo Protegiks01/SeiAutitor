@@ -1,249 +1,177 @@
+# Audit Report
+
 ## Title
-Capability Keeper Transaction Rollback Causes Node Panic Due to Non-Transactional capMap Deletion
+Genesis Validation Bypass Allows Invalid Governance Parameters During Chain Initialization
 
 ## Summary
-A critical vulnerability exists in the capability keeper where releasing a capability in a transaction that subsequently rolls back leaves the system in an inconsistent state. The `capMap` (a Go map) deletion is not reverted on transaction rollback, while memStore changes are reverted, causing panics when the capability is accessed later. This occurs at lines 345-349 of `x/capability/keeper/keeper.go` where capabilities are deleted from the non-transactional `capMap`. [1](#0-0) 
+The `ValidateGenesis` function in the governance module fails to check the return value of `validateTallyParams`, allowing invalid tally parameters to be set during chain initialization. This bypasses critical validation that ensures expedited proposals have stricter voting thresholds than regular proposals.
 
 ## Impact
-**High** - This vulnerability causes network processing node shutdowns through panics, falling under the "Medium: Shutdown of greater than or equal to 30% of network processing nodes without brute force actions" impact category.
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Module: `x/capability`
-- File: `x/capability/keeper/keeper.go`
-- Function: `ReleaseCapability` (lines 319-356) and `GetCapability` (lines 361-388)
-- Critical lines: 349 (capMap deletion) and 384 (panic on nil capability) [2](#0-1) [3](#0-2) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:** 
-When a capability is released and has no remaining owners, it should be cleanly removed from all storage (persistent store, memStore, and capMap). If the transaction fails, all changes should be atomically reverted, maintaining consistency between memStore and capMap.
+**Intended logic:**
+The governance module is designed to enforce that expedited proposals (fast-track urgent proposals) must have equal or stricter requirements than regular proposals. The validation function `validateTallyParams` at [2](#0-1)  explicitly checks that `ExpeditedThreshold` must be strictly greater than `Threshold` to ensure this invariant.
 
-**Actual Logic:** 
-The `capMap` is a Go map that is not transactional - changes to it persist even when transactions roll back. When `ReleaseCapability` executes in a cached context:
-1. Lines 332, 336: Forward and reverse memStore mappings are deleted (transactional)
-2. Line 347: Persistent store entry is deleted (transactional)  
-3. Line 349: Capability is deleted from `capMap` (NON-transactional)
+**Actual logic:**
+At line 54 of genesis.go, the code calls `validateTallyParams(data.TallyParams)` but ignores its return value. This means even when the validation function returns an error (because `ExpeditedThreshold <= Threshold`), the genesis validation succeeds and accepts invalid parameters. The error is silently discarded.
 
-When the transaction rolls back, memStore and persistent store changes are reverted, but the `capMap` deletion persists. This creates an inconsistent state where memStore contains a reverse mapping pointing to a capability index, but `capMap[index]` is nil.
+**Exploitation path:**
+1. During chain initialization or genesis migration, a genesis file is created with invalid tally parameters (e.g., `Threshold = 0.67`, `ExpeditedThreshold = 0.50`)
+2. The `validate-genesis` CLI command is run to validate the genesis file
+3. `ValidateGenesis` is called at [3](#0-2) , which calls the buggy validation
+4. Despite `validateTallyParams` returning an error, the validation passes because the return value is not checked
+5. The chain initializes via `InitGenesis` at [4](#0-3) 
+6. Invalid parameters are set via [5](#0-4)  using [6](#0-5) , which uses [7](#0-6)  that does NOT validate (unlike the `Update` method at [8](#0-7)  which does validate)
+7. The tally logic at [9](#0-8)  will use these invalid thresholds, allowing expedited proposals to pass with less consensus than regular proposals
 
-The code comment at lines 372-377 acknowledges this issue exists for capability creation, but the same problem occurs in reverse for capability deletion. [4](#0-3) 
-
-**Exploit Scenario:**
-1. A module (e.g., during an IBC channel close callback) calls `ReleaseCapability` on a capability it is the sole owner of
-2. The capability is deleted from `capMap` at line 349
-3. Later in the same transaction, an error occurs (e.g., another callback fails, validation error, out of gas)
-4. The transaction rolls back - memStore deletions are reverted, but `capMap` deletion persists
-5. The next time any module calls `GetCapability` with that capability name:
-   - Line 368: Finds the index in memStore (because the deletion was reverted)
-   - Line 382: Looks up `sk.capMap[index]` - returns nil (because deletion was NOT reverted)
-   - Line 384: Panics with "capability found in memstore is missing from map"
-
-**Security Failure:** 
-This breaks the atomicity invariant of transaction processing and the memory safety property. The system enters an inconsistent state that causes deterministic panics, resulting in denial-of-service through node crashes.
+**Security guarantee broken:**
+The fundamental governance invariant that expedited proposals require equal or stricter thresholds than regular proposals is violated. This compromises the integrity of the governance mechanism that controls protocol parameters, upgrades, and fund allocations.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Network availability: Nodes crash and become unavailable
-- Transaction processing: Once the inconsistent state exists, any transaction attempting to access the affected capability will panic
-- IBC operations: IBC channels using the affected capability become unusable
+This vulnerability affects governance integrity by allowing expedited proposals to be configured with lower voting thresholds than regular proposals, contrary to their design. This could lead to:
 
-**Severity of Damage:**
-- Nodes that encounter this inconsistent state will panic and crash when attempting to access the capability
-- The inconsistency is permanent (survives restarts) because capMap is rebuilt from memStore state, which still contains the mapping
-- This can affect multiple nodes across the network if the triggering transaction is included in a block
-- Nodes become unable to process blocks containing transactions that access the affected capability
-- Qualifies as a "shutdown of greater than or equal to 30% of network processing nodes" impact
+- **Governance compromise:** Expedited proposals meant for urgent matters with stricter consensus can be approved with LESS community support than regular proposals
+- **Unintended protocol changes:** Proposals can pass more easily through the expedited track without sufficient consensus
+- **Persistent invalid state:** Once embedded during chain initialization, these parameters become part of the chain state and persist until changed via governance (which itself may be compromised)
 
-**System Reliability:**
-This undermines the fundamental reliability guarantees of the capability system, which is critical for IBC security. IBC callbacks that release capabilities (e.g., channel close operations) become dangerous operations that can permanently break node state.
+This constitutes a Medium severity issue under "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" as it affects the governance layer's behavior and could enable unintended protocol changes.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any user or module that can cause a transaction to fail after a capability is released. This includes:
-- IBC relayers submitting channel close messages
-- Modules implementing IBC callbacks that release capabilities
-- Any transaction that releases a capability and encounters an error afterward
+**Who can trigger it:**
+- Chain operators during initial chain launch
+- Validators coordinating genesis parameters during chain initialization
+- Anyone who can influence the genesis file before chain initialization
 
-**Required Conditions:**
-1. A capability with a single owner (or the last owner releasing it)
-2. `ReleaseCapability` is called within a transaction
-3. The transaction fails after `ReleaseCapability` but before committing
+**Conditions required:**
+- Occurs during chain initialization when the genesis file contains invalid tally parameters
+- The broken validation in the `validate-genesis` command fails to catch the error
+- Once the chain starts, parameters can only be changed via governance proposals (which DO enforce proper validation through the `Update` method)
 
 **Frequency:**
-- Can occur during normal IBC operations (channel closure)
-- Transaction failures are common (out of gas, validation errors, application logic errors)
-- Once triggered, the inconsistency is permanent and affects all subsequent accesses
-- The vulnerability is deterministic and reproducible
-
-This is a realistic scenario in production environments where IBC channels are regularly opened and closed, and transaction failures occur naturally.
+Chain initialization and major upgrades requiring genesis export/import are critical but infrequent events. However, the impact is high when it occurs because the invalid parameters become embedded in the chain state. The broken safety mechanism (validation command) means even careful operators following best practices won't detect this issue.
 
 ## Recommendation
 
-Implement one of the following solutions:
+Fix the genesis validation by properly checking the return value of `validateTallyParams`:
 
-**Option 1 (Immediate Fix):** 
-Defer `capMap` deletion until transaction commit by only performing it in `Commit()` or `EndBlock()` hooks. Store pending deletions in a transaction-aware structure.
-
-**Option 2 (Comprehensive Fix):**
-Make `capMap` transaction-aware by:
-1. Maintaining a per-transaction cache of `capMap` modifications
-2. Only applying modifications on successful commit
-3. Reverting modifications on rollback
-
-**Option 3 (Conservative Fix):**
-In `GetCapability`, detect the inconsistent state and attempt recovery:
 ```go
-cap := sk.capMap[index]
-if cap == nil {
-    // Inconsistent state detected - memStore has index but capMap doesn't
-    // This can happen after a rollback. Clean up the memStore entry.
-    memStore.Delete(key)
-    return nil, false
+// In x/gov/types/genesis.go, replace line 54:
+if err := validateTallyParams(data.TallyParams); err != nil {
+    return err
 }
 ```
 
-The recommended approach is Option 2 for correctness, with Option 3 as a defensive measure.
+This ensures that the same validation logic enforced during parameter updates via governance proposals is also enforced during genesis initialization. Additionally, consider adding integration tests that specifically verify the validation catches invalid tally parameter combinations.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
+**File:** `x/gov/types/genesis_test.go`
 
-**Test Function:** `TestReleaseCapabilityRollbackPanic`
+**Test Function:** Add the following test to demonstrate the vulnerability:
 
 ```go
-func (suite *KeeperTestSuite) TestReleaseCapabilityRollbackPanic() {
-	sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
-
-	// Create a capability in the base context
-	cap, err := sk.NewCapability(suite.ctx, "test-capability")
-	suite.Require().NoError(err)
-	suite.Require().NotNil(cap)
-
-	// Verify capability exists
-	got, ok := sk.GetCapability(suite.ctx, "test-capability")
-	suite.Require().True(ok)
-	suite.Require().Equal(cap, got)
-
-	// Create a cached context (transaction context)
-	ms := suite.ctx.MultiStore()
-	msCache := ms.CacheMultiStore()
-	cacheCtx := suite.ctx.WithMultiStore(msCache)
-
-	// Release capability in the cached context (this is the last owner)
-	err = sk.ReleaseCapability(cacheCtx, cap)
-	suite.Require().NoError(err)
-
-	// Verify capability is deleted in cached context
-	got, ok = sk.GetCapability(cacheCtx, "test-capability")
-	suite.Require().False(ok)
-	suite.Require().Nil(got)
-
-	// DO NOT WRITE CACHE - simulate transaction rollback
-	// msCache.Write() is intentionally NOT called
-
-	// Now try to get the capability in the original context
-	// memStore changes were rolled back (reverse mapping still exists)
-	// but capMap deletion persisted (capability is nil)
-	// This should panic with "capability found in memstore is missing from map"
-	suite.Require().Panics(func() {
-		sk.GetCapability(suite.ctx, "test-capability")
-	}, "Expected panic when accessing capability after rollback")
+func TestValidateGenesis_InvalidTallyParams(t *testing.T) {
+    // Setup: Create genesis state with invalid tally params where
+    // expedited threshold is LESS than regular threshold
+    invalidTallyParams := TallyParams{
+        Quorum:             sdk.NewDecWithPrec(334, 3), // 0.334
+        ExpeditedQuorum:    sdk.NewDecWithPrec(667, 3), // 0.667
+        Threshold:          sdk.NewDecWithPrec(667, 3), // 0.667
+        ExpeditedThreshold: sdk.NewDecWithPrec(500, 3), // 0.500 (INVALID!)
+        VetoThreshold:      sdk.NewDecWithPrec(334, 3), // 0.334
+    }
+    
+    genesisState := &GenesisState{
+        StartingProposalId: 1,
+        DepositParams:      DefaultDepositParams(),
+        VotingParams:       DefaultVotingParams(),
+        TallyParams:        invalidTallyParams,
+    }
+    
+    // Action: Call ValidateGenesis with invalid params
+    err := ValidateGenesis(genesisState)
+    
+    // Result: Validation incorrectly passes (should fail)
+    // On vulnerable code: err == nil (bug demonstrated)
+    // After fix: err != nil with message about threshold
+    require.Error(t, err) // This will FAIL on current code, PASS after fix
+    require.Contains(t, err.Error(), "must be greater than the regular threshold")
 }
 ```
 
-**Setup:** 
-1. Initialize the capability keeper with a scoped keeper for the bank module
-2. Create a capability named "test-capability" in the base context
-3. Verify the capability exists and can be retrieved
+**Setup:** Creates a `GenesisState` with `ExpeditedThreshold` (0.500) less than `Threshold` (0.667), violating the validation rule at [2](#0-1) 
 
-**Trigger:**
-1. Create a cached multistore context (simulating a transaction)
-2. Call `ReleaseCapability` on the capability in the cached context
-3. Do NOT call `msCache.Write()` - this simulates a transaction rollback
-4. Attempt to retrieve the capability in the original context
+**Action:** Calls `ValidateGenesis` with the invalid genesis state
 
-**Observation:**
-The test demonstrates that `GetCapability` panics with the message "capability found in memstore is missing from map" because:
-- The memStore still has the reverse mapping (deletion was rolled back)
-- The `capMap` does not have the capability (deletion was NOT rolled back)
-- Line 384 executes `panic("capability found in memstore is missing from map")`
+**Result:** Currently, the test fails because `ValidateGenesis` incorrectly returns nil (no error) instead of returning the validation error. After implementing the fix, this test will pass, properly rejecting invalid genesis parameters.
 
-This confirms the vulnerability: transaction rollback creates an inconsistent state that causes node-crashing panics on subsequent capability access.
+## Notes
+
+This vulnerability exists specifically in the genesis validation path. The parameter update path via governance proposals correctly enforces validation through the `Update` method in the params subspace. The issue is that the safety mechanism designed to catch operator errors during chain initialization (the `validate-genesis` command) is broken due to the unchecked return value, allowing invalid governance parameters to persist in chain state.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L319-356)
+**File:** x/gov/types/genesis.go (L54-54)
 ```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	validateTallyParams(data.TallyParams)
+```
+
+**File:** x/gov/types/params.go (L187-189)
+```go
+	if v.ExpeditedThreshold.LTE(v.Threshold) {
+		return fmt.Errorf("expedited vote threshold %s, must be greater than the regular threshold %s", v.ExpeditedThreshold, v.Threshold)
 	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+```
+
+**File:** x/gov/module.go (L72-72)
+```go
+	return types.ValidateGenesis(&data)
+```
+
+**File:** simapp/app.go (L598-598)
+```go
+	return app.mm.InitGenesis(ctx, app.appCodec, genesisState, genesistypes.GenesisImportConfig{})
+```
+
+**File:** x/gov/genesis.go (L16-16)
+```go
+	k.SetTallyParams(ctx, data.TallyParams)
+```
+
+**File:** x/gov/keeper/params.go (L40-41)
+```go
+func (keeper Keeper) SetTallyParams(ctx sdk.Context, tallyParams types.TallyParams) {
+	keeper.paramSpace.Set(ctx, types.ParamStoreKeyTallyParams, &tallyParams)
+```
+
+**File:** x/params/types/subspace.go (L171-180)
+```go
+func (s Subspace) Set(ctx sdk.Context, key []byte, value interface{}) {
+	s.checkType(key, value)
+
+	bz, err := s.legacyAmino.MarshalJSON(value)
+	if err != nil {
+		panic(err)
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
-	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
-	}
-
-	return nil
+	s.SetRaw(ctx, key, bz)
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L361-388)
+**File:** x/params/types/subspace.go (L213-214)
 ```go
-func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
-	if strings.TrimSpace(name) == "" {
-		return nil, false
-	}
-	memStore := ctx.KVStore(sk.memKey)
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+```
 
-	key := types.RevCapabilityKey(sk.module, name)
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-
-	if len(indexBytes) == 0 {
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-
-		return nil, false
-	}
-
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
-	}
-
-	return cap, true
-}
+**File:** x/gov/keeper/tally.go (L118-119)
+```go
+	voteYesThreshold := tallyParams.GetThreshold(proposal.IsExpedited)
+	if results[types.OptionYes].Quo(totalVotingPower.Sub(results[types.OptionAbstain])).GT(voteYesThreshold) {
 ```

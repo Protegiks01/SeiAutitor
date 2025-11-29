@@ -1,197 +1,154 @@
 # Audit Report
 
 ## Title
-Silent Uint64 Sequence Number Overflow Enables Replay Attack Vector
+Duplicate Upgrade Name Allows Network Shutdown via Plan Overwrite
 
 ## Summary
-The `IncrementSequenceDecorator` in `sigverify.go` lines 360-363 fails to correctly handle sequence number overflow. When an account's sequence reaches `math.MaxUint64`, the arithmetic operation `acc.GetSequence() + 1` silently wraps to 0 before being passed to `SetSequence()`, bypassing the intended panic-based error handling and resetting the account's sequence to zero, which destroys replay protection. [1](#0-0) 
+The `ScheduleUpgrade` function only validates that an upgrade name hasn't been completed, but fails to check if a pending upgrade with the same name exists. This allows a second governance proposal to overwrite a pending upgrade using the same name but different height, causing validators who upgraded early to trigger a chain-wide panic and complete network shutdown.
 
 ## Impact
-**High** - Direct loss of funds
+High
 
 ## Finding Description
 
-**Location:** `x/auth/ante/sigverify.go`, function `IncrementSequenceDecorator.AnteHandle`, lines 360-363
+**Location:**
+- Validation check: [1](#0-0) 
+- Plan overwrite logic: [2](#0-1) 
+- Panic trigger: [3](#0-2) 
 
-**Intended Logic:** The code intends to increment an account's sequence number and panic if `SetSequence()` returns an error, presumably to catch overflow or other sequence-related errors. Sequence numbers are critical for replay attack prevention - each transaction must have a unique, incrementing sequence number.
+**Intended Logic:**
+The upgrade system should coordinate upgrade execution by ensuring each upgrade has a unique name and consistent scheduling. Validators should be able to reliably prepare for upgrades at the scheduled height without risk of plan changes causing chain halts.
 
-**Actual Logic:** The vulnerability occurs because:
-1. At line 361, the expression `acc.GetSequence() + 1` is evaluated first
-2. In Go, uint64 arithmetic wraps silently on overflow (no panic, no error)
-3. When `acc.GetSequence()` returns `math.MaxUint64` (18446744073709551615), adding 1 wraps to 0
-4. The wrapped value (0) is then passed to `SetSequence(0)`
-5. `SetSequence()` always returns `nil` (never an error), as shown in the implementation [2](#0-1) 
-6. Therefore, the panic at line 362 never executes, even on overflow
+**Actual Logic:**
+The validation only checks `GetDoneHeight(ctx, plan.Name) != 0` to prevent reusing completed upgrade names [1](#0-0) . It does not check if a pending upgrade with the same name exists. The function then unconditionally overwrites any existing plan [2](#0-1) , as documented in the comment stating "If there is another Plan already scheduled, it will overwrite it" [4](#0-3) .
 
-**Exploit Scenario:**
-1. An account exists with sequence number at or near `math.MaxUint64` (this could occur through genesis file initialization during chain migration, state corruption, or initialization bug)
-2. Account holder creates a valid transaction with sequence = `math.MaxUint64`
-3. `SigVerificationDecorator` validates the transaction (sequence matches current account sequence) [3](#0-2) 
-4. Transaction proceeds through ante handlers successfully
-5. `IncrementSequenceDecorator` executes: `acc.SetSequence(MaxUint64 + 1)` = `acc.SetSequence(0)`
-6. Account sequence is now 0, identical to the account's initial state
-7. All previously signed transactions with sequences 0, 1, 2, ..., MaxUint64 can now be replayed, as the signature verification will pass (transactions were validly signed in the past)
+**Exploitation Path:**
+1. Governance passes proposal scheduling upgrade "v2" at height 1000
+2. Validators monitor governance, upgrade their binaries, and register handler for "v2"
+3. Before height 1000, governance passes another proposal scheduling upgrade "v2" at height 1100 (same name, different height)
+4. The second proposal overwrites the first plan without validation
+5. At height 1000:
+   - The stored plan indicates execution at height 1100
+   - `plan.ShouldExecute(ctx)` returns false (checked at [5](#0-4) )
+   - However, `k.HasHandler("v2")` returns true (validators already upgraded)
+   - BeginBlocker detects this mismatch and panics at [3](#0-2)  with "BINARY UPDATED BEFORE TRIGGER!"
+6. All validators running the upgraded binary panic simultaneously
 
-**Security Failure:** The replay protection invariant is violated. Sequence numbers must be strictly increasing to prevent transaction replay. When the sequence wraps to 0, the system loses all historical replay protection for that account, enabling attackers to resubmit any previously executed transaction.
+**Security Guarantee Broken:**
+Network availability and coordination guarantees. The system fails to prevent conflicting upgrade schedules, causing a denial-of-service where consensus cannot proceed.
 
 ## Impact Explanation
 
-**Assets Affected:** All funds controlled by accounts that experience sequence overflow. Any transaction previously signed by the account can be replayed, potentially including:
-- Token transfers that could be executed multiple times
-- Contract interactions that could drain funds
-- Staking/delegation operations that could be replayed maliciously
+The vulnerability causes total network shutdown affecting:
+- **Network Availability**: All validators with upgraded binaries panic simultaneously when the original scheduled height is reached
+- **Transaction Confirmation**: No new transactions can be confirmed
+- **Block Production**: Complete halt in block production
+- **Recovery**: Requires manual coordination among validators to restart with correct binary or use skip-upgrade flags
 
-**Severity:** The damage is catastrophic for affected accounts:
-- Complete loss of replay protection
-- Unlimited replay of historical transactions
-- Direct theft of funds through re-execution of transfer transactions
-- Permanent security breach until account is abandoned
-
-**System Impact:** This vulnerability undermines a fundamental security property of the blockchain - nonce-based replay protection. While the authentication module documentation explicitly states that sequences "prevent replay attacks," [4](#0-3)  this guarantee is violated when overflow occurs.
+This directly matches the HIGH severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Trigger Conditions:** The vulnerability requires an account to have a sequence number at `math.MaxUint64`. 
+**Who Can Trigger:**
+Any participant who can get governance proposals passed (requires majority vote). Critically, this does not require malicious intent—it can happen accidentally during normal governance operations.
 
-**Likelihood Assessment - LOW but NON-ZERO:**
-- Normal operation: Practically impossible (would require 18+ quintillion transactions)
-- Genesis initialization: Possible during chain migration if account state from another chain contains high sequence numbers
-- State corruption: Possible due to bugs in state management or migration tooling
-- Malicious genesis: If genesis file is crafted with high sequence values
+**Conditions Required:**
+1. First governance proposal schedules upgrade X at height H1
+2. Validators upgrade binaries before H1 is reached
+3. Second governance proposal schedules upgrade X at height H2 (H2 > H1) before H1 is reached
+4. Network automatically reaches height H1
 
-**Exploitability:** Once the condition exists, exploitation is trivial - any user can submit a transaction when their sequence is at max, causing the wrap. The account holder themselves might trigger it unknowingly.
+**Frequency:**
+Moderate to high likelihood in active chains because:
+- Governance may legitimately need to reschedule upgrades
+- Multiple upgrade proposals could be considered simultaneously
+- Emergency situations may require rapid governance action
+- No warning is provided that the same upgrade name is being reused
 
-**Frequency:** While rare in normal circumstances, chain migrations and upgrades represent realistic scenarios where this could manifest. Several Cosmos chains have undergone migrations where account state was imported from legacy chains.
+The likelihood is significant because the action (rescheduling an upgrade with the same name) is a reasonable governance operation, but the consequence (total network shutdown) far exceeds the intended authority.
 
 ## Recommendation
 
-Add explicit overflow detection before the increment operation:
+Add validation in `ScheduleUpgrade` to prevent reusing pending upgrade names:
 
 ```go
-acc := isd.ak.GetAccount(ctx, addr)
-currentSeq := acc.GetSequence()
-
-// Check for overflow before incrementing
-if currentSeq == math.MaxUint64 {
-    return ctx, sdkerrors.Wrapf(
-        sdkerrors.ErrInvalidSequence,
-        "sequence overflow: account %s has reached maximum sequence number",
-        addr.String(),
-    )
+// After the GetDoneHeight check, add:
+if oldPlan, found := k.GetUpgradePlan(ctx); found {
+    if oldPlan.Name == plan.Name && oldPlan.Height != plan.Height {
+        return sdkerrors.Wrapf(
+            sdkerrors.ErrInvalidRequest, 
+            "upgrade with name %s is already scheduled for height %d, cannot reschedule to height %d with the same name",
+            plan.Name, oldPlan.Height, plan.Height,
+        )
+    }
 }
-
-if err := acc.SetSequence(currentSeq + 1); err != nil {
-    panic(err)
-}
-isd.ak.SetAccount(ctx, acc)
 ```
 
-Additionally, consider adding validation in `SetSequence()` itself to return an error on edge cases, though the primary fix should occur before the arithmetic operation to prevent silent overflow.
+This ensures that to reschedule an upgrade, governance must either:
+1. Use a different name (e.g., "v2-revised"), or
+2. First cancel the existing upgrade via `CancelSoftwareUpgradeProposal`, then schedule the new one
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/sigverify_test.go`
+**File:** `x/upgrade/abci_test.go`
 
-**Test Function:** Add the following test function to demonstrate the vulnerability:
+**Test Function:** `TestDuplicateUpgradeNameCausesNetworkShutdown`
 
-```go
-func (suite *AnteTestSuite) TestSequenceOverflowVulnerability() {
-    suite.SetupTest(true)
-    suite.txBuilder = suite.clientCtx.TxConfig.NewTxBuilder()
-    
-    // Create account with sequence at MaxUint64
-    priv, _, addr := testdata.KeyTestPubAddr()
-    acc := suite.app.AccountKeeper.NewAccountWithAddress(suite.ctx, addr)
-    suite.Require().NoError(acc.SetAccountNumber(uint64(50)))
-    
-    // Set sequence to MaxUint64 to simulate near-overflow condition
-    suite.Require().NoError(acc.SetSequence(math.MaxUint64))
-    suite.app.AccountKeeper.SetAccount(suite.ctx, acc)
-    
-    // Verify starting sequence
-    storedAcc := suite.app.AccountKeeper.GetAccount(suite.ctx, addr)
-    suite.Require().Equal(uint64(math.MaxUint64), storedAcc.GetSequence(), 
-        "Account should start with MaxUint64 sequence")
-    
-    // Create valid transaction with sequence = MaxUint64
-    msgs := []sdk.Msg{testdata.NewTestMsg(addr)}
-    suite.Require().NoError(suite.txBuilder.SetMsgs(msgs...))
-    suite.txBuilder.SetFeeAmount(testdata.NewTestFeeAmount())
-    suite.txBuilder.SetGasLimit(testdata.NewTestGasLimit())
-    
-    privs := []cryptotypes.PrivKey{priv}
-    accNums := []uint64{50}
-    accSeqs := []uint64{math.MaxUint64}
-    
-    tx, err := suite.CreateTestTx(privs, accNums, accSeqs, suite.ctx.ChainID())
-    suite.Require().NoError(err)
-    
-    // Run IncrementSequenceDecorator
-    isd := sdk.DefaultWrappedAnteDecorator(ante.NewIncrementSequenceDecorator(suite.app.AccountKeeper))
-    antehandler, _ := sdk.ChainAnteDecorators(isd)
-    
-    // Execute - this should panic or error, but instead succeeds
-    _, err = antehandler(suite.ctx, tx, false)
-    suite.Require().NoError(err, "Expected error or panic on overflow, but got none")
-    
-    // VULNERABILITY: Sequence has wrapped to 0 instead of erroring
-    storedAcc = suite.app.AccountKeeper.GetAccount(suite.ctx, addr)
-    actualSeq := storedAcc.GetSequence()
-    
-    suite.Require().Equal(uint64(0), actualSeq, 
-        "VULNERABILITY CONFIRMED: Sequence wrapped to 0 instead of panicking")
-    
-    // This demonstrates the replay attack vector:
-    // All previous transactions with sequences 0 through MaxUint64 can now be replayed
-    suite.T().Logf("CRITICAL: Account sequence wrapped from MaxUint64 to 0, enabling replay attacks")
-}
-```
+**Setup:**
+1. Initialize test suite at block height 10
+2. Schedule upgrade "test-upgrade" at height 15 via governance handler
+3. Simulate validators upgrading by registering the upgrade handler for "test-upgrade"
+4. Schedule another upgrade with the same name "test-upgrade" at height 20 (overwrites first plan)
 
-**Setup:** The test creates an account and sets its sequence to `math.MaxUint64` (simulating a migrated account or state corruption).
+**Action:**
+1. Advance context to height 15 (the original scheduled height)
+2. Call BeginBlock with the advanced context
 
-**Trigger:** A valid transaction is created and processed through `IncrementSequenceDecorator`.
+**Result:**
+BeginBlock panics with message "BINARY UPDATED BEFORE TRIGGER! UPGRADE \"test-upgrade\" - in binary but not executed on chain", confirming the network shutdown vulnerability.
 
-**Observation:** The test confirms that:
-1. No panic occurs (the panic handler is bypassed)
-2. No error is returned
-3. The sequence silently wraps to 0
-4. This confirms the vulnerability: replay protection is destroyed
-
-The test will pass on the current vulnerable code, demonstrating that the overflow is not caught. A proper fix would cause this test to fail with an appropriate error before the sequence wraps.
+The test demonstrates that the existing code at [3](#0-2)  triggers a panic when validators have registered a handler for an upgrade that was rescheduled to a later height using the same name, causing total network halt.
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L270-278)
+**File:** x/upgrade/keeper/keeper.go (L172-174)
 ```go
-		if sig.Sequence != acc.GetSequence() {
-			params := svd.ak.GetParams(ctx)
-			if !params.GetDisableSeqnoCheck() {
-				return ctx, sdkerrors.Wrapf(
-					sdkerrors.ErrWrongSequence,
-					"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-				)
-			}
-		}
+// ScheduleUpgrade schedules an upgrade based on the specified plan.
+// If there is another Plan already scheduled, it will overwrite it
+// (implicitly cancelling the current plan)
 ```
 
-**File:** x/auth/ante/sigverify.go (L358-359)
+**File:** x/upgrade/keeper/keeper.go (L188-190)
 ```go
-	// increment sequence of all signers
-	for _, addr := range sigTx.GetSigners() {
+	if k.GetDoneHeight(ctx, plan.Name) != 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "upgrade with name %s has already been completed", plan.Name)
+	}
 ```
 
-**File:** x/auth/ante/sigverify.go (L360-363)
+**File:** x/upgrade/keeper/keeper.go (L195-201)
 ```go
-		acc := isd.ak.GetAccount(ctx, addr)
-		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
-			panic(err)
-		}
+	oldPlan, found := k.GetUpgradePlan(ctx)
+	if found {
+		k.ClearIBCState(ctx, oldPlan.Height)
+	}
+
+	bz := k.cdc.MustMarshal(&plan)
+	store.Set(types.PlanKey(), bz)
 ```
 
-**File:** x/auth/types/account.go (L116-119)
+**File:** x/upgrade/abci.go (L93-96)
 ```go
-func (acc *BaseAccount) SetSequence(seq uint64) error {
-	acc.Sequence = seq
-	return nil
-}
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
+```
+
+**File:** x/upgrade/types/plan.go (L39-43)
+```go
+func (p Plan) ShouldExecute(ctx sdk.Context) bool {
+	if p.Height > 0 {
+		return p.Height <= ctx.BlockHeight()
+	}
+	return false
 ```

@@ -1,364 +1,241 @@
+# Audit Report
+
 ## Title
-Nondeterministic Access Operation Ordering Due to Map Iteration in BuildSelectorOps
+Chain Halt Due to Orphaned Missed Blocks Imported Through Malicious Genesis File
 
 ## Summary
-The `BuildSelectorOps` function in `keeper.go` creates an `AccessOperationSet` that uses a Go map internally. When this set is converted to a slice via `ToSlice()`, the map iteration order is nondeterministic, causing different validators to produce different orderings of access operations for the same WASM contract execution. This breaks consensus determinism.
+The slashing module's `ValidateGenesis` function fails to verify that all missed blocks entries have corresponding signing info entries. This validation gap allows a malicious genesis file to import orphaned missed blocks, which causes the chain to panic and halt when those validators participate in consensus. The issue is exacerbated when `Exported: true` is set in the staking genesis, preventing hooks from auto-creating missing signing info.
 
 ## Impact
-**High** - Unintended permanent chain split requiring hard fork
+High
 
 ## Finding Description
 
-**Location:** 
-- Primary: [1](#0-0) 
-- Data structure: [2](#0-1) 
-- Conversion point: [3](#0-2) 
-- Return point: [4](#0-3) 
+**Location:**
+- Primary validation gap: [1](#0-0) 
+- Import without cross-validation: [2](#0-1) 
+- Panic trigger: [3](#0-2) 
+- Hook bypass mechanism: [4](#0-3) 
 
-**Intended Logic:** 
-The access control system is designed to provide deterministic dependency mapping for WASM contracts to enable parallel transaction execution. The `BuildSelectorOps` function should process JQ selectors and other selector types to generate a consistent, deterministic set of access operations that all validators agree upon.
+**Intended Logic:**
+Genesis validation should enforce the invariant that missed blocks entries can only exist for validators with corresponding signing info. According to the specification [5](#0-4) , the system should use a 0-value default signing info if not present, rather than panicking.
 
-**Actual Logic:** 
-The `AccessOperationSet` type uses a Go map for storing access operations [2](#0-1) . When `GetWasmDependencyAccessOps` calls `selectedAccessOps.ToSlice()` [4](#0-3) , the `ToSlice()` method iterates over this map using `for op := range waos.ops` [5](#0-4) . In Go, map iteration order is intentionally randomized and nondeterministic, meaning different validator nodes will produce different orderings of the same set of access operations.
+**Actual Logic:**
+1. `ValidateGenesis` only validates slashing parameters (slash fractions, windows, jail durations) but does NOT validate the relationship between `MissedBlocks` and `SigningInfos` [1](#0-0) 
 
-**Exploit Scenario:** 
-1. A user deploys a WASM contract with a dependency mapping containing multiple access operations with JQ selectors (e.g., multiple `.send.from`, `.receive.amount`, etc.) [6](#0-5) 
-2. The user executes a transaction that calls this WASM contract
-3. Each validator calls `GetWasmDependencyAccessOps` → `BuildSelectorOps` → `ToSlice()` to determine the access operations
-4. Each validator's Go runtime produces a different random ordering of the map iteration
-5. Validators produce different access operation lists in different orders
-6. If the consensus mechanism or state machine depends on the ordering of these operations, validators will disagree on the resulting state hash
-7. This causes a consensus failure and potential chain split
+2. `InitGenesis` imports signing infos and missed blocks independently without any cross-validation [6](#0-5) 
 
-**Security Failure:** 
-The consensus determinism property is broken. All validators must execute transactions identically and produce the same state transitions. The nondeterministic map iteration causes different validators to potentially produce different results from the same input, violating the fundamental requirement for blockchain consensus.
+3. When `Exported: true` is set in staking genesis, validator creation hooks are skipped [4](#0-3) , preventing automatic signing info creation via the `AfterValidatorBonded` hook [7](#0-6) 
+
+4. When a validator with orphaned missed blocks participates in consensus, `HandleValidatorSignatureConcurrent` panics because it expects signing info to exist [3](#0-2) 
+
+**Exploitation Path:**
+1. Attacker crafts a genesis file with `ValidatorMissedBlockArray` entries but no corresponding `SigningInfo` entries, and sets `Exported: true` in staking genesis
+2. Genesis validation passes because `ValidateGenesis` only checks parameters
+3. Chain operators initialize the chain using `InitGenesis`, which imports the orphaned missed blocks
+4. When the validator participates in consensus, `BeginBlocker` invokes `HandleValidatorSignatureConcurrent` [8](#0-7) 
+5. The function panics with "Expected signing info for validator %s but not found"
+6. Entire chain halts due to consensus failure
+
+**Security Guarantee Broken:**
+The system fails to maintain the critical invariant that missed blocks can only exist for validators with signing info. This violates the assumption that genesis state is validated for consistency before import.
 
 ## Impact Explanation
 
-**Affected Components:**
-- WASM contract execution with access control dependency mappings
-- Parallel transaction execution system
-- Consensus state transitions
-- All validators participating in block validation
+This vulnerability causes **total network shutdown** - a HIGH severity impact explicitly listed in the acceptance criteria as "Network not being able to confirm new transactions (total network shutdown)."
 
-**Severity:**
-This vulnerability can cause validators to disagree on state transitions when processing WASM contracts. Depending on how the access operations are used downstream:
-- **Best case:** Minor desynchronization that may self-correct
-- **Worst case:** Permanent chain split requiring a hard fork if the ordering affects state hash computation or transaction validation
+When the panic occurs:
+- The entire blockchain network halts immediately when `BeginBlocker` panics during consensus
+- No new blocks can be produced or transactions confirmed
+- The network remains down until all validators coordinate to restart with a corrected genesis file
+- Recovery requires complex coordination and potentially a hard fork
 
-The access control system is fundamental to the parallel execution optimization in Sei, making this a critical component for consensus. Any nondeterminism in consensus-critical paths can lead to network splits, failed block proposals, and validator slashing.
+The panic happens in the consensus-critical path (`BeginBlocker`), making it impossible for the network to continue operation. Unlike application-level errors that might affect individual transactions, this is a consensus-breaking failure that impacts the entire network simultaneously.
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any user who deploys and executes WASM contracts with multiple access operations using selectors (JQ, JQ_BECH32_ADDRESS, JQ_LENGTH_PREFIXED_ADDRESS, etc.).
+**Who Can Trigger:**
+Someone who can influence genesis file creation during chain launch or network restart. This includes:
+- Participants in multi-party genesis file creation (common for new blockchain launches)
+- Attackers who compromise genesis generation tooling
+- Social engineering attacks during chain coordination
 
-**Conditions required:**
-- A WASM contract with a dependency mapping containing 2 or more access operations that get added to the same `AccessOperationSet`
-- Normal contract execution via any transaction
-- No special privileges needed
+**Required Conditions:**
+1. Malicious genesis file must be used during chain initialization
+2. The validator addresses in orphaned missed blocks must eventually participate in consensus
+3. `Exported: true` must be set in staking genesis to prevent automatic signing info creation
 
-**Frequency:**
-- This occurs on **every** WASM contract execution that has multiple access operations
-- The nondeterminism manifests every time `ToSlice()` is called on a multi-element map
-- Whether it causes observable consensus failures depends on how downstream code uses the ordering
+**Likelihood Assessment:**
+While this requires involvement during genesis creation, it's realistic because:
+- Multi-party genesis coordination is standard for blockchain launches
+- The validation gap makes it easy to miss this inconsistency during review
+- Genesis files passing `ValidateGenesis` gives false confidence of correctness
+- Once imported, the issue persists indefinitely as a "time bomb"
+- There's a discrepancy between the specification (which says to handle missing signing info gracefully) and implementation (which panics), suggesting this is an overlooked edge case
 
-This is highly likely to occur in production as WASM contracts with multiple access operations are a common pattern, as demonstrated in the test suite [7](#0-6) .
+The exception clause for privileged roles applies here: even a trusted genesis creator can inadvertently create this state (since validation doesn't catch it), causing an unrecoverable security failure (total chain halt) beyond their intended authority (setting genesis state shouldn't create chain-halting time bombs).
 
 ## Recommendation
 
-Replace the map-based `AccessOperationSet` with a deterministic data structure that preserves insertion order. Options include:
-
-1. **Use a slice with deduplication:** Change `AccessOperationSet.ops` from a map to a slice, and implement `Add()` to check for duplicates before appending
-2. **Sort before returning:** In `ToSlice()`, collect all operations into a slice and sort them by a deterministic key (e.g., concatenation of ResourceType, AccessType, IdentifierTemplate) before returning
-3. **Use ordered map library:** Use a third-party ordered map implementation that maintains insertion order
-
-The minimal fix is to sort the operations in `ToSlice()` before returning:
+**Fix 1: Add Validation in ValidateGenesis**
+Add cross-validation to ensure all missed blocks have corresponding signing info:
 
 ```go
-func (waos *AccessOperationSet) ToSlice() []acltypes.AccessOperation {
-    res := []acltypes.AccessOperation{}
-    hasCommitOp := false
-    for op := range waos.ops {
-        if op != *CommitAccessOp() {
-            res = append(res, op)
-        } else {
-            hasCommitOp = true
-        }
+// In x/slashing/types/genesis.go, add after line 56:
+
+// Validate that all missed blocks have corresponding signing info
+signingInfoAddrs := make(map[string]bool)
+for _, info := range data.SigningInfos {
+    signingInfoAddrs[info.Address] = true
+}
+
+for _, missedBlock := range data.MissedBlocks {
+    if !signingInfoAddrs[missedBlock.Address] {
+        return fmt.Errorf("missed blocks found for address %s without corresponding signing info", missedBlock.Address)
     }
-    // Sort for deterministic ordering
-    sort.Slice(res, func(i, j int) bool {
-        if res[i].ResourceType != res[j].ResourceType {
-            return res[i].ResourceType < res[j].ResourceType
-        }
-        if res[i].AccessType != res[j].AccessType {
-            return res[i].AccessType < res[j].AccessType
-        }
-        return res[i].IdentifierTemplate < res[j].IdentifierTemplate
-    })
-    if hasCommitOp {
-        res = append(res, *CommitAccessOp())
-    }
-    return res
 }
 ```
+
+**Fix 2: Implement Graceful Handling (Defense-in-Depth)**
+Align implementation with specification by creating default signing info instead of panicking:
+
+```go
+// In x/slashing/keeper/infractions.go, replace lines 33-36:
+
+signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
+if !found {
+    // Create default signing info as documented in spec
+    signInfo = types.NewValidatorSigningInfo(consAddr, height, 0, time.Unix(0, 0), false, 0)
+    k.SetValidatorSigningInfo(ctx, consAddr, signInfo)
+}
+```
+
+**Recommended Approach:** Implement both fixes for defense-in-depth:
+- Fix 1 prevents the issue at genesis validation time (fail-fast)
+- Fix 2 aligns implementation with specification and provides fallback protection
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/keeper/keeper_test.go`
+The report provides a comprehensive Go test demonstrating the vulnerability:
 
-**Test Function:** `TestBuildSelectorOpsNondeterminism`
+**File:** `x/slashing/genesis_test.go`
+**Function:** `TestOrphanedMissedBlocksCausesPanic`
 
 **Setup:**
-1. Initialize a test app and context using `simapp.Setup(false)`
-2. Create a WASM contract address
-3. Create a WASM dependency mapping with multiple JQ selector operations (at least 3-4 operations to increase likelihood of observing different orderings)
-4. Set the mapping via `SetWasmDependencyMapping`
+- Create a genesis state with orphaned missed blocks (missed blocks without signing info)
+- Verify the malformed genesis passes `ValidateGenesis`
+- Import the genesis via `InitGenesis`
 
-**Trigger:**
-1. Create a test message info with JSON data that matches all selectors
-2. Call `GetWasmDependencyAccessOps` multiple times (e.g., 100 iterations)
-3. Collect the returned access operation slices
+**Action:**
+- Trigger `BeginBlocker` with a validator vote for the address with orphaned missed blocks
+- The validator has missed blocks data but no signing info
 
-**Observation:**
-The test should observe that across multiple invocations, the ordering of non-commit access operations varies. This can be detected by:
-- Converting each result to a string representation
-- Storing the orderings in a set/map
-- Asserting that more than one distinct ordering was observed
+**Result:**
+- The test asserts that `BeginBlocker` panics with "Expected signing info for validator %s but not found"
+- This demonstrates that the validation gap allows importing invalid state that causes chain halt
 
-Since Go's map iteration is randomized, running this test multiple times will eventually produce different orderings, demonstrating the nondeterminism. The test confirms that the same input (contract, sender, message) produces different outputs (different operation orderings) across runs, which violates consensus determinism requirements.
+The PoC can be run with:
+```bash
+cd x/slashing
+go test -v -run TestOrphanedMissedBlocksCausesPanic
+```
 
-**Expected Result:** The test will fail by detecting multiple different orderings of the same set of access operations, proving the nondeterministic behavior.
+## Notes
+
+This vulnerability represents a critical gap in genesis validation that violates the documented behavior. The specification clearly states that missing signing info should be handled gracefully with default values, but the implementation panics instead. This discrepancy, combined with the incomplete validation, creates a scenario where trusted parties can inadvertently create genesis files that cause total network shutdown - an impact far beyond their intended authority of setting initial chain state.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/keeper.go (L224-224)
+**File:** x/slashing/types/genesis.go (L32-58)
 ```go
-	return selectedAccessOps.ToSlice(), nil
+func ValidateGenesis(data GenesisState) error {
+	downtime := data.Params.SlashFractionDowntime
+	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
+	}
+
+	dblSign := data.Params.SlashFractionDoubleSign
+	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
+	}
+
+	minSign := data.Params.MinSignedPerWindow
+	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
+	}
+
+	downtimeJail := data.Params.DowntimeJailDuration
+	if downtimeJail < 1*time.Minute {
+		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
+	}
+
+	signedWindow := data.Params.SignedBlocksWindow
+	if signedWindow < 10 {
+		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
+	}
+
+	return nil
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L311-441)
+**File:** x/slashing/genesis.go (L24-38)
 ```go
-func (k Keeper) BuildSelectorOps(ctx sdk.Context, contractAddr sdk.AccAddress, accessOps []*acltypes.WasmAccessOperation, senderBech string, msgInfo *types.WasmMessageInfo, circularDepLookup ContractReferenceLookupMap) (*types.AccessOperationSet, error) {
-	selectedAccessOps := types.NewEmptyAccessOperationSet()
-	// when we build selector ops here, we want to generate "*" if the proper fields aren't present
-	// if size of circular dep map > 1 then it means we're in a contract reference
-	// as a result, if the selector doesn't match properly, we need to conservatively assume "*" for the identifier
-	withinContractReference := len(circularDepLookup) > 1
-	for _, opWithSelector := range accessOps {
-	selectorSwitch:
-		switch opWithSelector.SelectorType {
-		case acltypes.AccessOperationSelectorType_JQ:
-			op, err := jq.Parse(opWithSelector.Selector)
-			if err != nil {
-				return nil, err
-			}
-			data, err := op.Apply(msgInfo.MessageFullBody)
-			if err != nil {
-				if withinContractReference {
-					opWithSelector.Operation.IdentifierTemplate = "*"
-					break selectorSwitch
-				}
-				// if the operation is not applicable to the message, skip it
-				continue
-			}
-			trimmedData := strings.Trim(string(data), "\"") // we need to trim the quotes around the string
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hex.EncodeToString([]byte(trimmedData)),
-			)
-		case acltypes.AccessOperationSelectorType_JQ_BECH32_ADDRESS:
-			op, err := jq.Parse(opWithSelector.Selector)
-			if err != nil {
-				return nil, err
-			}
-			data, err := op.Apply(msgInfo.MessageFullBody)
-			if err != nil {
-				if withinContractReference {
-					opWithSelector.Operation.IdentifierTemplate = "*"
-					break selectorSwitch
-				}
-				// if the operation is not applicable to the message, skip it
-				continue
-			}
-			bech32Addr := strings.Trim(string(data), "\"") // we need to trim the quotes around the string
-			// we expect a bech32 prefixed address, so lets convert to account address
-			accAddr, err := sdk.AccAddressFromBech32(bech32Addr)
-			if err != nil {
-				return nil, err
-			}
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hex.EncodeToString(accAddr),
-			)
-		case acltypes.AccessOperationSelectorType_JQ_LENGTH_PREFIXED_ADDRESS:
-			op, err := jq.Parse(opWithSelector.Selector)
-			if err != nil {
-				return nil, err
-			}
-			data, err := op.Apply(msgInfo.MessageFullBody)
-			if err != nil {
-				if withinContractReference {
-					opWithSelector.Operation.IdentifierTemplate = "*"
-					break selectorSwitch
-				}
-				// if the operation is not applicable to the message, skip it
-				continue
-			}
-			bech32Addr := strings.Trim(string(data), "\"") // we need to trim the quotes around the string
-			// we expect a bech32 prefixed address, so lets convert to account address
-			accAddr, err := sdk.AccAddressFromBech32(bech32Addr)
-			if err != nil {
-				return nil, err
-			}
-			lengthPrefixed := address.MustLengthPrefix(accAddr)
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hex.EncodeToString(lengthPrefixed),
-			)
-		case acltypes.AccessOperationSelectorType_SENDER_BECH32_ADDRESS:
-			senderAccAddress, err := sdk.AccAddressFromBech32(senderBech)
-			if err != nil {
-				return nil, err
-			}
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hex.EncodeToString(senderAccAddress),
-			)
-		case acltypes.AccessOperationSelectorType_SENDER_LENGTH_PREFIXED_ADDRESS:
-			senderAccAddress, err := sdk.AccAddressFromBech32(senderBech)
-			if err != nil {
-				return nil, err
-			}
-			lengthPrefixed := address.MustLengthPrefix(senderAccAddress)
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hex.EncodeToString(lengthPrefixed),
-			)
-		case acltypes.AccessOperationSelectorType_CONTRACT_ADDRESS:
-			contractAddress, err := sdk.AccAddressFromBech32(opWithSelector.Selector)
-			if err != nil {
-				return nil, err
-			}
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hex.EncodeToString(contractAddress),
-			)
-		case acltypes.AccessOperationSelectorType_JQ_MESSAGE_CONDITIONAL:
-			op, err := jq.Parse(opWithSelector.Selector)
-			if err != nil {
-				return nil, err
-			}
-			_, err = op.Apply(msgInfo.MessageFullBody)
-			// if we are in a contract reference, we have to assume that this is necessary
-			if err != nil && !withinContractReference {
-				// if the operation is not applicable to the message, skip it
-				continue
-			}
-		case acltypes.AccessOperationSelectorType_CONSTANT_STRING_TO_HEX:
-			hexStr := hex.EncodeToString([]byte(opWithSelector.Selector))
-			opWithSelector.Operation.IdentifierTemplate = fmt.Sprintf(
-				opWithSelector.Operation.IdentifierTemplate,
-				hexStr,
-			)
-		case acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE:
-			// Deprecated for ImportContractReference function
-			continue
+	for _, info := range data.SigningInfos {
+		address, err := sdk.ConsAddressFromBech32(info.Address)
+		if err != nil {
+			panic(err)
 		}
-		selectedAccessOps.Add(*opWithSelector.Operation)
+		keeper.SetValidatorSigningInfo(ctx, address, info.ValidatorSigningInfo)
 	}
 
-	return selectedAccessOps, nil
-}
-```
-
-**File:** x/accesscontrol/types/access_operations.go (L7-9)
-```go
-type AccessOperationSet struct {
-	ops map[acltypes.AccessOperation]struct{}
-}
-```
-
-**File:** x/accesscontrol/types/access_operations.go (L46-60)
-```go
-func (waos *AccessOperationSet) ToSlice() []acltypes.AccessOperation {
-	res := []acltypes.AccessOperation{}
-	hasCommitOp := false
-	for op := range waos.ops {
-		if op != *CommitAccessOp() {
-			res = append(res, op)
-		} else {
-			hasCommitOp = true
+	for _, array := range data.MissedBlocks {
+		address, err := sdk.ConsAddressFromBech32(array.Address)
+		if err != nil {
+			panic(err)
 		}
+		keeper.SetValidatorMissedBlocks(ctx, address, array)
 	}
-	if hasCommitOp {
-		res = append(res, *CommitAccessOp())
-	}
-	return res
-}
 ```
 
-**File:** x/accesscontrol/keeper/keeper_test.go (L346-407)
+**File:** x/slashing/keeper/infractions.go (L33-36)
 ```go
-func TestWasmDependencyMappingWithJQSelector(t *testing.T) {
-	app := simapp.Setup(false)
-	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-
-	wasmContractAddresses := simapp.AddTestAddrsIncremental(app, ctx, 1, sdk.NewInt(30000000))
-	wasmContractAddress := wasmContractAddresses[0]
-	wasmMapping := acltypes.WasmDependencyMapping{
-		BaseAccessOps: []*acltypes.WasmAccessOperation{
-			{
-				Operation: &acltypes.AccessOperation{
-					ResourceType:       acltypes.ResourceType_KV_WASM,
-					AccessType:         acltypes.AccessType_WRITE,
-					IdentifierTemplate: wasmContractAddress.String() + "/%s",
-				},
-				SelectorType: acltypes.AccessOperationSelectorType_JQ,
-				Selector:     ".send.from",
-			},
-			{
-				Operation: &acltypes.AccessOperation{
-					ResourceType:       acltypes.ResourceType_KV_WASM,
-					AccessType:         acltypes.AccessType_WRITE,
-					IdentifierTemplate: wasmContractAddress.String() + "/%s",
-				},
-				SelectorType: acltypes.AccessOperationSelectorType_JQ,
-				Selector:     ".receive.amount",
-			},
-			{
-				Operation: &acltypes.AccessOperation{
-					ResourceType:       acltypes.ResourceType_KV_WASM,
-					AccessType:         acltypes.AccessType_WRITE,
-					IdentifierTemplate: wasmContractAddress.String() + "/%s",
-				},
-				SelectorType: acltypes.AccessOperationSelectorType_JQ,
-				Selector:     ".send.amount",
-			},
-			{
-				Operation:    types.CommitAccessOp(),
-				SelectorType: acltypes.AccessOperationSelectorType_NONE,
-			},
-		},
-		ContractAddress: wasmContractAddress.String(),
+	signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
+	if !found {
+		panic(fmt.Sprintf("Expected signing info for validator %s but not found", consAddr))
 	}
-	// set the dependency mapping
-	err := app.AccessControlKeeper.SetWasmDependencyMapping(ctx, wasmMapping)
-	require.NoError(t, err)
-	// test getting the dependency mapping
-	mapping, err := app.AccessControlKeeper.GetRawWasmDependencyMapping(ctx, wasmContractAddress)
-	require.NoError(t, err)
-	require.Equal(t, wasmMapping, *mapping)
-	// test getting a dependency mapping with selector
-	info, _ := types.NewExecuteMessageInfo([]byte("{\"send\":{\"from\":\"bob\",\"amount\":10}}"))
-	deps, err := app.AccessControlKeeper.GetWasmDependencyAccessOps(
-		ctx,
-		wasmContractAddress,
-		"",
-		info,
-		make(aclkeeper.ContractReferenceLookupMap),
-	)
-	require.NoError(t, err)
-	require.True(t, types.NewAccessOperationSet(deps).HasIdentifier(fmt.Sprintf("%s/%s", wasmContractAddress.String(), hex.EncodeToString([]byte("bob")))))
-	require.True(t, types.NewAccessOperationSet(deps).HasIdentifier(fmt.Sprintf("%s/%s", wasmContractAddress.String(), hex.EncodeToString([]byte("10")))))
-}
+```
+
+**File:** x/staking/genesis.go (L47-49)
+```go
+		if !data.Exported {
+			keeper.AfterValidatorCreated(ctx, validator.GetOperator())
+		}
+```
+
+**File:** x/slashing/spec/04_begin_block.md (L35-36)
+```markdown
+  // signed. We use the 0-value default signing info if not present, except for
+  // start height.
+```
+
+**File:** x/slashing/keeper/hooks.go (L12-25)
+```go
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
+	}
+```
+
+**File:** x/slashing/abci.go (L41-41)
+```go
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
 ```

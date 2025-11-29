@@ -1,330 +1,479 @@
 # Audit Report
 
 ## Title
-Data Race in state struct Due to Bypassed RWMutex in Simulate() Function
+Permanent Fund Loss Due to Missing EndBlock Implementation for Deferred Balance Cache Flush
 
 ## Summary
-The `state` struct in `baseapp/state.go` includes an RWMutex (`mtx`) designed to synchronize concurrent access to its fields. However, the `Simulate()` function in `baseapp/test_helpers.go` directly accesses `checkState.ctx` without acquiring this mutex, while `setCheckState()` modifies the same field with proper locking during block commits. This creates a data race that can be triggered by external simulation queries, potentially causing node crashes. [1](#0-0) 
+The bank module implements a deferred cache system for batching fee transfers but lacks the required EndBlock method to flush cached transfers to persistent storage. All transaction fees are immediately deducted from user accounts but only cached (not persisted) for the fee collector module. Since memory stores are cleared on node restart and WriteDeferredBalances is never called in production code, all fees are permanently lost.
 
 ## Impact
-**Low to Medium**
+**High - Direct loss of funds**
 
 ## Finding Description
 
-**Location:** 
-- Vulnerable code: `baseapp/test_helpers.go`, `Simulate()` function, line 28
-- Concurrent modification: `baseapp/baseapp.go`, `setCheckState()` function, lines 559-574
-- State struct definition: `baseapp/state.go`, lines 9-13 [2](#0-1) 
+**Location:**
+- Primary vulnerability: [1](#0-0)  (missing EndBlock implementation)
+- Deferred transfer function: [2](#0-1) 
+- Fee deduction entry point: [3](#0-2) 
+- Memory store initialization: [4](#0-3) 
 
 **Intended Logic:**
-The `state` struct is designed with an RWMutex (`mtx`) to allow concurrent reads via `RLock()` while ensuring exclusive writes via `Lock()`. The mutex-protected methods `Context()`, `MultiStore()`, `SetContext()`, and `SetMultiStore()` should be used to access or modify the state's fields. [3](#0-2) 
+The deferred cache system is designed to optimize gas by batching transfers. The function comment explicitly states: [5](#0-4)  indicating that an EndBlocker should flush these deferred balances. The intended flow is:
+1. User fees immediately deducted from sender account (persisted to IAVL store)
+2. Credit to fee collector cached in memory store
+3. At EndBlock, WriteDeferredBalances flushes all cached transfers to persistent storage
 
 **Actual Logic:**
-The `Simulate()` function bypasses the RWMutex entirely by directly accessing `app.checkState.ctx` at line 28. It reads this field twice (once directly and once within `GetConsensusParams()`) without acquiring any lock. Meanwhile, during block commits, `setCheckState()` calls `SetContext()` which properly acquires `state.mtx.Lock()` before modifying `st.ctx`. [4](#0-3) 
+The bank module does not implement an EndBlock method. The module manager only calls EndBlock on modules implementing the EndBlockAppModule interface: [6](#0-5) . Although the bank module is listed in SetOrderEndBlockers [7](#0-6) , without the EndBlock method implementation, it is skipped.
 
-**Exploit Scenario:**
-1. An attacker sends simulation query requests to a node via the RPC/REST API (e.g., `/app/simulate` query path)
-2. The query handler `handleQueryApp()` invokes `app.Simulate()` which reads `checkState.ctx` without locks
-3. Concurrently, a block is being committed, triggering `setCheckState()`
-4. `setCheckState()` calls `SetContext()` which modifies `checkState.ctx` while holding the mutex
-5. Since `Simulate()` doesn't acquire the mutex, both threads access the same memory location concurrently
-6. This data race can cause `Simulate()` to read partially-written `sdk.Context` struct data, including invalid pointer values [5](#0-4) 
+The deferred cache uses a memory store [4](#0-3)  which according to the store implementation [8](#0-7)  persists "between commits and thus between blocks" but is cleared on node restart. WriteDeferredBalances is only called in test files, never in production code.
 
-**Security Failure:**
-This violates memory safety and thread safety. The `sdk.Context` struct contains multiple pointer fields. When copied during a concurrent write, readers can observe torn reads of pointer values, potentially leading to:
-- Dereferencing invalid memory addresses
-- Node panics/crashes
-- Denial of service
+**Exploitation Path:**
+1. Any user submits a transaction with fees (normal operation, not an attack)
+2. Ante handler calls DeductFees which invokes DeferredSendCoinsFromAccountToModule [9](#0-8) 
+3. User's balance immediately reduced via SubUnlockedCoins (persistent write) [10](#0-9) 
+4. Fee collector credit cached via deferredCache.UpsertBalances (memory store only) [11](#0-10) 
+5. Block ends, bank module has no EndBlock, WriteDeferredBalances never called
+6. Fees accumulate in memory cache across blocks
+7. Node restart clears memory store
+8. Result: User's deducted fees permanently lost, fee collector never receives them
+
+**Security Guarantee Broken:**
+Fundamental accounting invariant violated: total debits must equal total credits. The system creates an asymmetric state where funds are removed from user accounts but never added to the intended recipient, causing permanent fund loss and incorrect total supply tracking.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Node availability and stability
-- Query processing subsystem
-- State management integrity
+**Assets Affected:** All transaction fees paid by network participants
 
-**Severity:**
-An attacker can repeatedly send simulation queries (a legitimate RPC operation) timed to coincide with block commits (which occur regularly every few seconds). Given sufficient attempts, the race condition will eventually trigger, causing the node to crash when it attempts to use the corrupted context.
+**Consequences:**
+- Every transaction's fees are permanently lost (never reach fee collector)
+- User accounts are debited (persisted) but fee collector accounts never credited
+- Lost fees accumulate with every transaction until node restart
+- Total supply incorrectly decreases as fees "vanish" from the system
+- Fee collector module cannot distribute fees to validators/stakers as designed
+- Requires hard fork and manual state correction to recover lost funds
+- Creates potential consensus divergence if different nodes restart at different times
 
-**Impact on Network:**
-- Individual nodes can be crashed repeatedly through this attack vector
-- No special privileges required - any user can send simulation queries
-- If successfully exploited against multiple nodes, could achieve "Shutdown of greater than 10% or equal to but less than 30% of network processing nodes" (Low severity per scope)
-- Depending on attack effectiveness and node distribution, could potentially reach Medium severity threshold (≥30% of nodes)
-
-**Why This Matters:**
-Simulation queries are a standard feature used by clients to estimate gas costs before submitting transactions. This vulnerability turns a benign feature into a DoS vector without requiring brute force - just precise timing of legitimate requests.
+This constitutes direct loss of funds as every transaction permanently loses its fee amount to the void, with no mechanism to recover them.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any external party with access to the node's RPC endpoint can send simulation queries. No authentication or special permissions required.
+**Who Can Trigger:** Any network participant submitting a transaction with fees (i.e., virtually all transactions)
 
-**Conditions Required:**
-- Timing overlap between a simulation query and a block commit
-- Block commits occur regularly (every few seconds in normal operation)
-- The race window is narrow but exists on every commit
+**Conditions Required:** Normal network operation - no special circumstances, attack, or privileged access needed
 
-**Frequency:**
-- Moderate to High likelihood with sustained attack
-- Attacker can send simulation queries continuously
-- Each block commit creates a race window
-- With sufficient volume of queries, race will eventually occur
-- Once discovered, attack is repeatable and automatable
+**Frequency:** Occurs on EVERY transaction that pays fees, which includes all standard transactions going through the ante handler
+
+**Certainty:** 100% - The vulnerability is structural:
+- Bank module objectively lacks EndBlock implementation (verified by examining entire module.go file)
+- WriteDeferredBalances only appears in test files [12](#0-11) 
+- Memory stores are documented as non-persistent across restarts
+- All fee deductions are hardcoded to use the deferred cache mechanism
 
 ## Recommendation
 
-**Immediate Fix:**
-Modify the `Simulate()` function to use the mutex-protected `Context()` method instead of directly accessing the field:
+Implement an EndBlock method in the bank module:
 
+1. Add EndBlock method to `x/bank/module.go`:
 ```go
-func (app *BaseApp) Simulate(txBytes []byte) (sdk.GasInfo, *sdk.Result, error) {
-    // Use Context() method which properly acquires state.mtx.RLock()
-    ctx := app.checkState.Context().WithTxBytes(txBytes).WithVoteInfos(app.voteInfos)
-    ctx = ctx.WithConsensusParams(app.GetConsensusParams(app.checkState.Context()))
-    // ... rest of function
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    events := am.keeper.WriteDeferredBalances(ctx)
+    ctx.EventManager().EmitEvents(events)
+    return []abci.ValidatorUpdate{}
 }
 ```
 
-**Comprehensive Fix:**
-Audit all direct field accesses to state fields throughout the codebase and replace them with mutex-protected method calls:
-- Replace `state.ctx` with `state.Context()`  
-- Replace `state.ms` with `state.MultiStore()`
+2. Ensure the AppModule struct properly implements the EndBlockAppModule interface so the module manager includes it in EndBlock execution
 
-Other instances to fix: [6](#0-5) [7](#0-6) [8](#0-7) [9](#0-8) 
+3. Add integration tests that verify deferred balances are flushed at EndBlock without explicit test calls to WriteDeferredBalances, simulating actual production behavior
+
+4. Consider adding a startup check that panics if deferred cache is non-empty after node restart, to detect this issue early
 
 ## Proof of Concept
 
-**Test File:** `baseapp/state_race_test.go` (new file)
+The vulnerability can be demonstrated with the following test scenario:
 
 **Setup:**
-Create a test that simulates concurrent access to checkState via Simulate() and setCheckState():
+- Initialize bank keeper with deferred cache (as done in simapp)
+- Create user account with initial balance (e.g., 1000 tokens)
+- Create fee collector module account
 
-```go
-package baseapp
+**Action:**
+- Call DeferredSendCoinsFromAccountToModule to simulate fee deduction (e.g., 100 tokens)
+- Verify user balance immediately decreased to 900 (persisted to IAVL store)
+- Verify fee collector balance remains 0 (credit only in memory cache)
+- Verify deferred cache contains the 100 token transfer (memory only)
+- Simulate node restart by creating new keeper instance (memory cache cleared)
+- Verify user balance still 900 (persisted state maintained)
+- Verify fee collector balance still 0 (cached transfer lost)
+- Verify deferred cache now empty (memory cleared)
 
-import (
-    "sync"
-    "testing"
-    "time"
-    
-    "github.com/stretchr/testify/require"
-    tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-)
+**Result:**
+The 100 tokens are permanently lost - deducted from user but never credited to fee collector. This occurs because WriteDeferredBalances [13](#0-12)  is never invoked in production code, only in tests.
 
-// TestSimulateRaceWithSetCheckState demonstrates the data race
-// Run with: go test -race -run TestSimulateRaceWithSetCheckState
-func TestSimulateRaceWithSetCheckState(t *testing.T) {
-    // Setup BaseApp
-    app := setupBaseApp(t)
-    app.InitChain(context.Background(), &abci.RequestInitChain{})
-    
-    // Create a valid transaction for simulation
-    tx := newTxCounter(1, 0)
-    txBytes, err := codec.NewLegacyAmino().Marshal(tx)
-    require.NoError(t, err)
-    
-    // Race condition trigger: concurrent Simulate() and setCheckState()
-    var wg sync.WaitGroup
-    stopChan := make(chan struct{})
-    
-    // Goroutine 1: Continuously call Simulate (reads checkState.ctx without lock)
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        for {
-            select {
-            case <-stopChan:
-                return
-            default:
-                _, _, _ = app.Simulate(txBytes) // Ignore errors, just trigger the race
-            }
-        }
-    }()
-    
-    // Goroutine 2: Continuously call setCheckState (writes checkState.ctx with lock)
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        height := int64(1)
-        for {
-            select {
-            case <-stopChan:
-                return
-            default:
-                header := tmproto.Header{Height: height}
-                app.setCheckState(header)
-                height++
-                time.Sleep(1 * time.Millisecond) // Small delay to simulate block commits
-            }
-        }
-    }()
-    
-    // Run for sufficient time to trigger the race
-    time.Sleep(100 * time.Millisecond)
-    close(stopChan)
-    wg.Wait()
-}
-```
+## Notes
 
-**Trigger:**
-Run the test with Go's race detector:
-```bash
-go test -race ./baseapp -run TestSimulateRaceWithSetCheckState
-```
+This vulnerability exists in the core Cosmos SDK modules (x/bank, x/auth) within the sei-protocol/sei-cosmos fork. While the evidence shows usage in simapp (test/example application), the vulnerability is in the fundamental module code that would be imported by any blockchain using these modules. Any chain using NewBaseKeeperWithDeferredCache with the standard ante handler but without implementing the bank module's EndBlock would experience this permanent fund loss on every transaction.
 
-**Observation:**
-The race detector will report a data race on `checkState.ctx`:
-```
-WARNING: DATA RACE
-Read at 0x... by goroutine X:
-  baseapp.(*BaseApp).Simulate()
-      baseapp/test_helpers.go:28
-
-Write at 0x... by goroutine Y:
-  baseapp.(*state).SetContext()
-      baseapp/state.go:45
-  baseapp.(*BaseApp).setCheckState()
-      baseapp/baseapp.go:573
-```
-
-This confirms unsynchronized concurrent access to the same memory location, validating the vulnerability. In production, this race can cause panics when invalid pointer values are dereferenced.
+The function comments explicitly acknowledge the intended EndBlocker behavior, confirming this is an incomplete implementation rather than intentional design.
 
 ### Citations
 
-**File:** baseapp/state.go (L9-13)
+**File:** x/bank/module.go (L1-210)
 ```go
-type state struct {
-	ms  sdk.CacheMultiStore
-	ctx sdk.Context
-	mtx *sync.RWMutex
-}
-```
+package bank
 
-**File:** baseapp/state.go (L37-48)
-```go
-func (st *state) Context() sdk.Context {
-	st.mtx.RLock()
-	defer st.mtx.RUnlock()
-	return st.ctx
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/spf13/cobra"
+	abci "github.com/tendermint/tendermint/abci/types"
+
+	"github.com/cosmos/cosmos-sdk/client"
+	"github.com/cosmos/cosmos-sdk/codec"
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/telemetry"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/module"
+	simtypes "github.com/cosmos/cosmos-sdk/types/simulation"
+	"github.com/cosmos/cosmos-sdk/x/bank/client/cli"
+	"github.com/cosmos/cosmos-sdk/x/bank/client/rest"
+	"github.com/cosmos/cosmos-sdk/x/bank/keeper"
+	v040 "github.com/cosmos/cosmos-sdk/x/bank/legacy/v040"
+	"github.com/cosmos/cosmos-sdk/x/bank/simulation"
+	"github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+var (
+	_ module.AppModule           = AppModule{}
+	_ module.AppModuleBasic      = AppModuleBasic{}
+	_ module.AppModuleSimulation = AppModule{}
+)
+
+// AppModuleBasic defines the basic application module used by the bank module.
+type AppModuleBasic struct {
+	cdc codec.Codec
 }
 
-func (st *state) SetContext(ctx sdk.Context) *state {
-	st.mtx.Lock()
-	defer st.mtx.Unlock()
-	st.ctx = ctx
-	return st
+func NewAppModuleBasic(cdc codec.Codec) AppModuleBasic {
+	return AppModuleBasic{cdc}
 }
-```
 
-**File:** baseapp/test_helpers.go (L11-25)
-```go
-func (app *BaseApp) Check(txEncoder sdk.TxEncoder, tx sdk.Tx) (sdk.GasInfo, *sdk.Result, error) {
-	// runTx expects tx bytes as argument, so we encode the tx argument into
-	// bytes. Note that runTx will actually decode those bytes again. But since
-	// this helper is only used in tests/simulation, it's fine.
-	bz, err := txEncoder(tx)
-	if err != nil {
-		return sdk.GasInfo{}, nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "%s", err)
-	}
-	ctx := app.checkState.ctx.WithTxBytes(bz).WithVoteInfos(app.voteInfos).WithConsensusParams(app.GetConsensusParams(app.checkState.ctx))
-	gasInfo, result, _, _, _, _, _, err := app.runTx(ctx, runTxModeCheck, tx, sha256.Sum256(bz))
-	if len(ctx.MultiStore().GetEvents()) > 0 {
-		panic("Expected checkTx events to be empty")
-	}
-	return gasInfo, result, err
+// Name returns the bank module's name.
+func (AppModuleBasic) Name() string { return types.ModuleName }
+
+// RegisterLegacyAminoCodec registers the bank module's types on the LegacyAmino codec.
+func (AppModuleBasic) RegisterLegacyAminoCodec(cdc *codec.LegacyAmino) {
+	types.RegisterLegacyAminoCodec(cdc)
 }
-```
 
-**File:** baseapp/test_helpers.go (L27-39)
-```go
-func (app *BaseApp) Simulate(txBytes []byte) (sdk.GasInfo, *sdk.Result, error) {
-	ctx := app.checkState.ctx.WithTxBytes(txBytes).WithVoteInfos(app.voteInfos).WithConsensusParams(app.GetConsensusParams(app.checkState.ctx))
-	ctx, _ = ctx.CacheContext()
-	tx, err := app.txDecoder(txBytes)
-	if err != nil {
-		return sdk.GasInfo{}, nil, err
-	}
-	gasInfo, result, _, _, _, _, _, err := app.runTx(ctx, runTxModeSimulate, tx, sha256.Sum256(txBytes))
-	if len(ctx.MultiStore().GetEvents()) > 0 {
-		panic("Expected simulate events to be empty")
-	}
-	return gasInfo, result, err
+// DefaultGenesis returns default genesis state as raw bytes for the bank
+// module.
+func (AppModuleBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
+	return cdc.MustMarshalJSON(types.DefaultGenesisState())
 }
-```
 
-**File:** baseapp/test_helpers.go (L56-64)
-```go
-// Context with current {check, deliver}State of the app used by tests.
-func (app *BaseApp) NewContext(isCheckTx bool, header tmproto.Header) sdk.Context {
-	if isCheckTx {
-		return sdk.NewContext(app.checkState.ms, header, true, app.logger).
-			WithMinGasPrices(app.minGasPrices)
+// ValidateGenesis performs genesis state validation for the bank module.
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, _ client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
 	}
 
-	return sdk.NewContext(app.deliverState.ms, header, false, app.logger)
+	return data.Validate()
 }
-```
 
-**File:** baseapp/baseapp.go (L559-574)
-```go
-func (app *BaseApp) setCheckState(header tmproto.Header) {
-	ms := app.cms.CacheMultiStore()
-	ctx := sdk.NewContext(ms, header, true, app.logger).WithMinGasPrices(app.minGasPrices)
-	app.checkTxStateLock.Lock()
-	defer app.checkTxStateLock.Unlock()
-	if app.checkState == nil {
-		app.checkState = &state{
-			ms:  ms,
-			ctx: ctx,
-			mtx: &sync.RWMutex{},
+func (am AppModuleBasic) ValidateGenesisStream(cdc codec.JSONCodec, config client.TxEncodingConfig, genesisCh <-chan json.RawMessage) error {
+	for genesis := range genesisCh {
+		err := am.ValidateGenesis(cdc, config, genesis)
+		if err != nil {
+			return err
 		}
-		return
 	}
-	app.checkState.SetMultiStore(ms)
-	app.checkState.SetContext(ctx)
+	return nil
+}
+
+// RegisterRESTRoutes registers the REST routes for the bank module.
+func (AppModuleBasic) RegisterRESTRoutes(clientCtx client.Context, rtr *mux.Router) {
+	rest.RegisterHandlers(clientCtx, rtr)
+}
+
+// RegisterGRPCGatewayRoutes registers the gRPC Gateway routes for the bank module.
+func (AppModuleBasic) RegisterGRPCGatewayRoutes(clientCtx client.Context, mux *runtime.ServeMux) {
+	types.RegisterQueryHandlerClient(context.Background(), mux, types.NewQueryClient(clientCtx))
+}
+
+// GetTxCmd returns the root tx command for the bank module.
+func (AppModuleBasic) GetTxCmd() *cobra.Command {
+	return cli.NewTxCmd()
+}
+
+// GetQueryCmd returns no root query command for the bank module.
+func (AppModuleBasic) GetQueryCmd() *cobra.Command {
+	return cli.GetQueryCmd()
+}
+
+// RegisterInterfaces registers interfaces and implementations of the bank module.
+func (AppModuleBasic) RegisterInterfaces(registry codectypes.InterfaceRegistry) {
+	types.RegisterInterfaces(registry)
+
+	// Register legacy interfaces for migration scripts.
+	v040.RegisterInterfaces(registry)
+}
+
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
+
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
+}
+
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
+	}
+}
+
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
+
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
 }
 ```
 
-**File:** baseapp/baseapp.go (L1249-1253)
+**File:** x/bank/keeper/keeper.go (L404-407)
 ```go
-func (app *BaseApp) GetCheckCtx() sdk.Context {
-	app.checkTxStateLock.RLock()
-	defer app.checkTxStateLock.RUnlock()
-	return app.checkState.ctx
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
+```
+
+**File:** x/bank/keeper/keeper.go (L408-432)
+```go
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
+	}
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 ```
 
-**File:** baseapp/abci.go (L60-65)
+**File:** x/bank/keeper/keeper.go (L435-483)
 ```go
-	if req.ConsensusParams != nil {
-		app.StoreConsensusParams(app.deliverState.ctx, req.ConsensusParams)
-		app.StoreConsensusParams(app.prepareProposalState.ctx, req.ConsensusParams)
-		app.StoreConsensusParams(app.processProposalState.ctx, req.ConsensusParams)
-		app.StoreConsensusParams(app.checkState.ctx, req.ConsensusParams)
+func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+
+	// maps between bech32 stringified module account address and balance
+	moduleAddrBalanceMap := make(map[string]sdk.Coins)
+	// slice of modules to be sorted for consistent write order later
+	moduleList := []string{}
+
+	// iterate over deferred cache and accumulate totals per module
+	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
+		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
+		if !ok {
+			// add to list of modules
+			moduleList = append(moduleList, moduleAddr.String())
+			// set the map value
+			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
+			return false
+		}
+		// add to currCoins
+		newCoins := currCoins.Add(amount)
+		// update map
+		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
+		return false
+	})
+	// sort module list
+	sort.Strings(moduleList)
+
+	// iterate through module list and add the balance to module bank balances in sorted order
+	for _, moduleBech32Addr := range moduleList {
+		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
+		if !ok {
+			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
+			ctx.Logger().Error(err.Error())
+			panic(err)
+		}
+		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
+		if err != nil {
+			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
+			panic(err)
+		}
+	}
+
+	// clear deferred cache
+	k.deferredCache.Clear(ctx)
+	return ctx.EventManager().ABCIEvents()
+}
 ```
 
-**File:** baseapp/abci.go (L851-870)
+**File:** x/auth/ante/fee.go (L202-214)
 ```go
-func handleQueryApp(app *BaseApp, path []string, req abci.RequestQuery) abci.ResponseQuery {
-	if len(path) >= 2 {
-		switch path[1] {
-		case "simulate":
-			txBytes := req.Data
+// DeductFees deducts fees from the given account.
+func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+	}
 
-			gInfo, res, err := app.Simulate(txBytes)
-			if err != nil {
-				return sdkerrors.QueryResultWithDebug(sdkerrors.Wrap(err, "failed to simulate tx"), app.trace)
-			}
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
+	}
 
-			simRes := &sdk.SimulationResponse{
-				GasInfo: gInfo,
-				Result:  res,
-			}
+	return nil
+}
+```
 
-			bz, err := codec.ProtoMarshalJSON(simRes, app.interfaceRegistry)
-			if err != nil {
-				return sdkerrors.QueryResultWithDebug(sdkerrors.Wrap(err, "failed to JSON encode simulation response"), app.trace)
-			}
+**File:** simapp/app.go (L230-230)
+```go
+	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
+```
+
+**File:** simapp/app.go (L372-379)
+```go
+	app.mm.SetOrderEndBlockers(
+		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
+		capabilitytypes.ModuleName, authtypes.ModuleName, banktypes.ModuleName, distrtypes.ModuleName,
+		slashingtypes.ModuleName, minttypes.ModuleName,
+		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
+		feegrant.ModuleName,
+		paramstypes.ModuleName, upgradetypes.ModuleName, vestingtypes.ModuleName, acltypes.ModuleName,
+	)
+```
+
+**File:** types/module/module.go (L646-650)
+```go
+	for _, moduleName := range m.OrderEndBlockers {
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
+			continue
+		}
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** x/bank/keeper/keeper_test.go (L842-843)
+```go
+	// write deferred balances
+	app.BankKeeper.WriteDeferredBalances(ctx)
 ```

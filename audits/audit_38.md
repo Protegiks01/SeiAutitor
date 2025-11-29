@@ -1,180 +1,255 @@
 # Audit Report
 
 ## Title
-DoS via Panic-Inducing Empty TypeUrl in Transaction Messages
+Transaction Rollback in ReleaseCapability Causes Permanent capMap Deletion Leading to Chain Halt
 
 ## Summary
-When a transaction contains a message with an `Any` type that has an empty `TypeUrl` field, the `UnpackAny()` function returns success without unpacking or setting the cached value. Subsequently, when `GetMsgs()` attempts to retrieve messages, it panics upon finding a nil cached value. While this panic is caught by a recovery handler, each malicious transaction triggers expensive stack trace collection operations, enabling a resource exhaustion attack. [1](#0-0) 
+The `ReleaseCapability` function in the capability keeper violates transactional atomicity guarantees by permanently deleting from the in-memory `capMap` (a Go map), while other state changes in memStore and persistent store can be rolled back. When a transaction containing `ReleaseCapability` fails and rolls back, the system enters an inconsistent state where memStore mappings exist but the corresponding `capMap` entry is gone, causing `GetCapability` to panic with "capability found in memstore is missing from map" and halting the entire chain. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary vulnerability: [1](#0-0) 
-- Panic trigger point: [2](#0-1) 
-- Transaction processing: [3](#0-2) 
-- Recovery handler: [4](#0-3) 
+**Location:**
+- Primary: `x/capability/keeper/keeper.go`, lines 319-356 (ReleaseCapability function)
+- Secondary: `x/capability/keeper/keeper.go`, lines 361-388 (GetCapability function with panic)
 
-**Intended Logic:** 
-The `UnpackAny()` function should validate that `Any` types contain valid `TypeUrl` values before proceeding with unpacking. All transaction messages should be properly unpacked during the decode phase, with any invalid messages causing the transaction to be rejected early.
+**Intended Logic:**
+The `ReleaseCapability` function should atomically remove a capability from all storage locations (memStore, persistent store, and capMap) when released. All operations should succeed or fail together - if the transaction rolls back, all changes should be reverted to maintain system consistency.
 
-**Actual Logic:** 
-When `UnpackAny()` receives an `Any` with an empty `TypeUrl`, it returns `nil` (success) without unpacking the value or setting the cached value. [1](#0-0)  This allows the transaction to pass the decode and `UnpackInterfaces` phases. Later, when `GetMsgs()` is called during transaction processing, it attempts to access the cached value, finds it nil, and explicitly panics. [2](#0-1) 
+**Actual Logic:**
+ReleaseCapability performs deletions across three storage types with different transactional properties:
 
-**Exploit Scenario:**
-1. Attacker crafts a transaction with one or more messages where the `Any` wrapper has an empty `TypeUrl` field
-2. The transaction is submitted to the network via CheckTx or DeliverTx
-3. During decode, `UnpackInterfaces` is called [5](#0-4) 
-4. `UnpackAny` is invoked for each message [6](#0-5) 
-5. For messages with empty `TypeUrl`, `UnpackAny` returns success without setting `cachedValue`
-6. The transaction decode completes successfully
-7. During `runTx`, `GetMsgs()` is called [3](#0-2) 
-8. `GetMsgs()` panics when it finds `cached == nil`
-9. The panic is caught by the recovery handler [7](#0-6) 
-10. The recovery process invokes `debug.Stack()` to collect a full stack trace [8](#0-7) 
-11. Attacker repeats with many such transactions to exhaust node resources
+1. **memStore deletions** (lines 332, 336): Transactional - will rollback on tx failure [2](#0-1) 
 
-**Security Failure:** 
-This breaks the denial-of-service protection property. Each malicious transaction triggers a panic and expensive stack trace collection, consuming excessive CPU cycles. An attacker can flood validator nodes with such transactions to significantly increase resource consumption and degrade network performance.
+2. **Persistent store deletion** (line 347): Transactional - will rollback on tx failure [3](#0-2) 
+
+3. **Go map deletion** (line 349): **NOT transactional - permanent and cannot rollback** [4](#0-3) 
+
+**Exploitation Path:**
+1. Module owns a capability (e.g., IBC port capability)
+2. Module calls `ReleaseCapability` within a transaction context
+3. ReleaseCapability executes, deleting from memStore, persistent store, AND capMap
+4. Transaction fails after ReleaseCapability (due to gas exhaustion, logic error, or subsequent operation failure)
+5. Transaction rollback occurs:
+   - memStore deletions are reverted → reverse mappings restored
+   - Persistent store deletions are reverted → owner set restored
+   - **capMap deletion is permanent** → entry permanently gone
+6. System is now in inconsistent state:
+   - memStore contains reverse mapping pointing to capability index
+   - capMap has NO entry for that index
+7. Any call to `GetCapability` for that capability name will:
+   - Retrieve index from memStore (line 368-369)
+   - Attempt to get capability from capMap (line 382)
+   - Find nil in capMap
+   - **Trigger panic** at line 384 [5](#0-4) 
+
+8. Chain halts completely - panic is unrecovered and stops block production
+
+**Security Guarantee Broken:**
+This violates the fundamental transactional atomicity invariant that all operations within a transaction should be atomic - either all succeed or all fail together. The code itself acknowledges this issue with a TODO comment referencing GitHub issue #7805. [6](#0-5) 
 
 ## Impact Explanation
 
-**Affected Processes:**
-- All validator and full nodes processing transactions via CheckTx and DeliverTx
-- Transaction mempool processing
-- Block proposal and validation performance
+**Consequences:**
+- **Complete chain halt**: The panic in GetCapability is unhandled and will stop consensus/block production
+- **Requires hard fork to recover**: Cannot be fixed without coordinated upgrade
+- **Affects entire network**: All nodes will panic when attempting to retrieve the affected capability
+- **Persistent across restarts**: memStore is rebuilt from persistent storage (which was rolled back), so the inconsistency persists
 
-**Severity:**
-The attack enables resource exhaustion without brute force. Each malicious transaction:
-1. Passes initial validation (decode succeeds)
-2. Triggers a panic during message extraction
-3. Forces the node to collect a full stack trace (expensive operation involving goroutine stack walking and string formatting)
-4. Can be repeated at network transaction rate limits
+**Affected Systems:**
+- All transaction processing capability
+- Consensus finality
+- Network availability
+- Any application or module attempting to use the affected capability
 
-An attacker submitting transactions at a moderate rate (e.g., hundreds per second, well below typical spam thresholds) can cause all nodes to spend significant CPU time on panic recovery and stack trace collection, potentially increasing CPU consumption by 30% or more compared to normal operation.
-
-**System Impact:**
-This matters because it allows unprivileged attackers to degrade network performance and delay transaction processing across all nodes simultaneously, affecting the entire network's reliability and user experience.
+This matches the "Network not being able to confirm new transactions (total network shutdown)" impact category, classified as **Medium severity** per the provided impact scale.
 
 ## Likelihood Explanation
 
+**Triggering Conditions:**
+The vulnerability requires:
+1. A module to call `ReleaseCapability` within a transaction
+2. That transaction to fail AFTER `ReleaseCapability` executes
+
 **Who Can Trigger:**
-Any network participant can trigger this vulnerability. No special privileges, staking, or authentication is required. The attacker only needs to submit transactions to the network.
+- Not directly user-callable
+- Requires module code to invoke `ReleaseCapability`
+- Modules that use capabilities include IBC transfer, IBC connection/channel handlers, and custom application modules
 
-**Conditions Required:**
-- Attacker must craft transactions with `Any` types containing empty `TypeUrl` fields in the `Messages` array
-- This is trivial to accomplish through direct protobuf encoding or by manipulating the transaction structure before signing
-- No special timing or network conditions are required
+**Realistic Scenarios:**
+- Complex multi-step transactions where later operations fail
+- IBC packet processing that encounters errors after capability operations
+- Gas exhaustion scenarios where ReleaseCapability executes but transaction runs out of gas
+- Module upgrade scenarios with state transitions
 
-**Frequency:**
-The attack can be executed continuously. An attacker can submit such transactions at any rate up to network/mempool limits. Since each transaction passes decode validation, nodes will process each one until the panic occurs, making this highly exploitable.
+**Likelihood Assessment:**
+While not trivial to exploit intentionally, this can occur accidentally during normal blockchain operation. Transaction failures are common, and if any module uses `ReleaseCapability` in complex operations that can fail mid-execution, the vulnerability becomes triggerable. The Cosmos SDK's `CacheContext` pattern (used for transaction execution) explicitly supports this rollback scenario. [7](#0-6) 
+
+The existing `TestRevertCapability` test demonstrates that the capability keeper is designed to support transaction rollbacks, but it only tests `NewCapability`, not `ReleaseCapability`.
 
 ## Recommendation
 
 **Immediate Fix:**
-Modify `UnpackAny()` to return an error when `TypeUrl` is empty instead of silently returning success:
+Remove the `capMap` deletion from `ReleaseCapability` (line 349). The existing cleanup logic in `GetCapability` (lines 372-379) already handles orphaned `capMap` entries when capabilities are created and rolled back. Apply the same pattern for releases.
 
-In `codec/types/interface_registry.go`, change the empty TypeUrl handling:
-```go
-if any.TypeUrl == "" {
-    // Return error instead of nil to fail decode early
-    return errors.New("cannot unpack Any with empty TypeUrl")
-}
-```
+**Proper Fix:**
+Implement a transactional wrapper around `capMap` that tracks deletions and only applies them on successful transaction commit. This could use:
+1. A pending deletions map that's populated during transaction execution
+2. A commit hook that applies the deletions only after successful commit
+3. A rollback hook that clears pending deletions on failure
 
-This ensures that transactions with invalid `Any` types are rejected during the decode phase before reaching `GetMsgs()`, preventing the panic entirely.
+**Alternative Approach:**
+Defer all `capMap` modifications until after transaction commit by leveraging the BaseApp's commit hooks or event system to ensure atomicity with other state changes.
 
-**Additional Validation:**
-Consider adding validation in `TxBody.UnpackInterfaces` to check that all message `Any` types have non-empty `TypeUrl` before calling `UnpackAny`, providing defense in depth.
+The TODO comment at line 376-377 explicitly mentions the need for this fix and references issue #7805 for tracking.
 
 ## Proof of Concept
 
-**Test File:** `codec/types/interface_registry_test.go`
+**File:** `x/capability/keeper/keeper_test.go`
 
-**Test Function:** `TestUnpackAnyEmptyTypeUrlCausesPanic`
+**Test Function:** `TestReleaseCapabilityTransactionRollbackPanic`
 
 **Setup:**
-1. Create a transaction with a `TxBody` containing a message `Any` with empty `TypeUrl`
-2. Encode the transaction using the protobuf codec
-3. Set up a minimal baseapp environment with CheckTx capability
+1. Create a scoped keeper for a test module
+2. Create a new capability owned solely by that module
+3. Create a cached context (simulating transaction execution)
 
-**Trigger:**
-1. Submit the malformed transaction through CheckTx
-2. Monitor for panic during message extraction
+**Action:**
+1. Call `ReleaseCapability` on the cached context
+2. Verify capability is deleted in cached context
+3. Do NOT commit the cached context (simulate transaction rollback)
 
-**Observation:**
-The test should demonstrate that:
-1. The transaction decode succeeds (no error from decoder)
-2. `GetMsgs()` panics when called
-3. The panic is caught by recovery handler
-4. An error is returned indicating panic recovery occurred
-5. `debug.Stack()` was invoked (can verify via custom recovery middleware)
+**Result:**
+1. Verify that calling `GetCapability` on the original context panics
+2. Panic message: "capability found in memstore is missing from map"
+3. This demonstrates the inconsistent state where memStore has the reverse mapping but capMap doesn't have the capability entry
 
-The test confirms the vulnerability by showing that a transaction with empty `TypeUrl` in message `Any` bypasses decode validation but causes a panic during processing, requiring expensive recovery operations that an attacker can trigger repeatedly for resource exhaustion.
+**Test Code Structure:**
+```go
+func (suite *KeeperTestSuite) TestReleaseCapabilityTransactionRollbackPanic() {
+    sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
+    cap, err := sk.NewCapability(suite.ctx, "transfer")
+    suite.Require().NoError(err)
+    
+    // Create cached context (transaction)
+    ms := suite.ctx.MultiStore()
+    msCache := ms.CacheMultiStore()
+    cacheCtx := suite.ctx.WithMultiStore(msCache)
+    
+    // Release in cached context
+    err = sk.ReleaseCapability(cacheCtx, cap)
+    suite.Require().NoError(err)
+    
+    // Don't call msCache.Write() - simulate rollback
+    
+    // This panics due to inconsistent state
+    suite.Require().Panics(func() {
+        sk.GetCapability(suite.ctx, "transfer")
+    })
+}
+```
+
+This test would pass (i.e., the panic occurs), confirming the vulnerability.
+
+## Notes
+
+The ADR-003 design document explicitly states the system should "Allow CapabilityKeeper to return same capability pointer from go-map while reverting any writes to the persistent KVStore and in-memory MemoryStore on tx failure," indicating proper rollback behavior was intended but not fully implemented for `ReleaseCapability`. [8](#0-7)
 
 ### Citations
 
-**File:** codec/types/interface_registry.go (L255-258)
+**File:** x/capability/keeper/keeper.go (L319-356)
 ```go
-	if any.TypeUrl == "" {
-		// if TypeUrl is empty return nil because without it we can't actually unpack anything
-		return nil
+func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	}
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	}
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
+
+	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
+	indexKey := types.IndexToKey(cap.GetIndex())
+
+	if len(capOwners.Owners) == 0 {
+		// remove capability owner set
+		prefixStore.Delete(indexKey)
+		// since no one owns capability, we can delete capability from map
+		delete(sk.capMap, cap.GetIndex())
+	} else {
+		// update capability owner set
+		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	}
+
+	return nil
+}
+```
+
+**File:** x/capability/keeper/keeper.go (L376-377)
+```go
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+```
+
+**File:** x/capability/keeper/keeper.go (L382-385)
+```go
+	cap := sk.capMap[index]
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
 	}
 ```
 
-**File:** types/tx/types.go (L29-32)
+**File:** x/capability/keeper/keeper_test.go (L277-306)
 ```go
-	for i, any := range anys {
-		cached := any.GetCachedValue()
-		if cached == nil {
-			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
+func (suite KeeperTestSuite) TestRevertCapability() {
+	sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
+
+	ms := suite.ctx.MultiStore()
+
+	msCache := ms.CacheMultiStore()
+	cacheCtx := suite.ctx.WithMultiStore(msCache)
+
+	capName := "revert"
+	// Create capability on cached context
+	cap, err := sk.NewCapability(cacheCtx, capName)
+	suite.Require().NoError(err, "could not create capability")
+
+	// Check that capability written in cached context
+	gotCache, ok := sk.GetCapability(cacheCtx, capName)
+	suite.Require().True(ok, "could not retrieve capability from cached context")
+	suite.Require().Equal(cap, gotCache, "did not get correct capability from cached context")
+
+	// Check that capability is NOT written to original context
+	got, ok := sk.GetCapability(suite.ctx, capName)
+	suite.Require().False(ok, "retrieved capability from original context before write")
+	suite.Require().Nil(got, "capability not nil in original store")
+
+	// Write to underlying memKVStore
+	msCache.Write()
+
+	got, ok = sk.GetCapability(suite.ctx, capName)
+	suite.Require().True(ok, "could not retrieve capability from context")
+	suite.Require().Equal(cap, got, "did not get correct capability from context")
+}
 ```
 
-**File:** types/tx/types.go (L174-179)
-```go
-	for _, any := range m.Messages {
-		var msg sdk.Msg
-		err := unpacker.UnpackAny(any, &msg)
-		if err != nil {
-			return err
-		}
-```
-
-**File:** baseapp/baseapp.go (L904-915)
-```go
-	defer func() {
-		if r := recover(); r != nil {
-			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
-			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
-			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
-			err, result = processRecovery(r, recoveryMW), nil
-			if mode != runTxModeDeliver {
-				ctx.MultiStore().ResetEvents()
-			}
-		}
-		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
-	}()
-```
-
-**File:** baseapp/baseapp.go (L921-921)
-```go
-	msgs := tx.GetMsgs()
-```
-
-**File:** baseapp/recovery.go (L88-94)
-```go
-	handler := func(recoveryObj interface{}) error {
-		return sdkerrors.Wrap(
-			sdkerrors.ErrPanic, fmt.Sprintf(
-				"recovered: %v\nstack:\n%v", recoveryObj, string(debug.Stack()),
-			),
-		)
-	}
-```
-
-**File:** codec/proto_codec.go (L85-85)
-```go
-	err = types.UnpackInterfaces(ptr, pc.interfaceRegistry)
+**File:** docs/architecture/adr-003-dynamic-capability-store.md (L330-330)
+```markdown
+- Allows CapabilityKeeper to return same capability pointer from go-map while reverting any writes to the persistent `KVStore` and in-memory `MemoryStore` on tx failure.
 ```

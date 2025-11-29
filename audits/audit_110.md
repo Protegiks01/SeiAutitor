@@ -1,345 +1,343 @@
-## Audit Report
+Based on my thorough analysis of the codebase, I will validate this security claim.
 
-### Title
-Incomplete Genesis Validation in Access Control Module Allows Malformed Dependency Mappings to Bypass Validation and Cause Network Initialization Failure
+## Validation Analysis
 
-### Summary
-The access control module's `ValidateGenesis` method in `AppModuleBasic` only validates parameters but skips validation of `MessageDependencyMapping` and `WasmDependencyMappings` arrays. This allows malformed genesis data with invalid dependency mappings to bypass the genesis validation phase, only to cause a panic during `InitGenesis`, resulting in total network initialization failure.
+### Code Flow Verification
 
-### Impact
-**High** - Network not being able to confirm new transactions (total network shutdown). All nodes will fail to initialize and the network cannot start.
+I have verified each component of the claimed vulnerability:
 
-### Finding Description
+**1. Validation Weakness Confirmed**
+
+The `validateSignedBlocksWindow` function only checks if the value is positive with no upper bound: [1](#0-0) 
+
+**2. Memory Allocation Path Confirmed**
+
+The `ParseBitGroupsToBoolArray` function allocates a boolean array of size `window` without any bounds checking: [2](#0-1) 
+
+**3. Dual Allocation in Resize Confirmed**
+
+The `ResizeMissedBlockArray` function performs two large allocations when the window expands - first by calling `ParseBitGroupsToBoolArray`, then creating a new array: [3](#0-2) 
+
+**4. Automatic Triggering in BeginBlocker Confirmed**
+
+BeginBlocker processes all validators concurrently and triggers resize if window size changed: [4](#0-3) [5](#0-4) 
+
+**5. Governance Update Path Confirmed**
+
+Parameter changes flow through governance to `Subspace.Update`, which calls the weak validation function: [6](#0-5) [7](#0-6) 
+
+### Platform Acceptance Rules Evaluation
+
+While this requires governance action (a privileged role), the **exception clause applies**:
+
+> "unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority"
+
+**Why the exception applies:**
+1. Governance's intended authority is to adjust parameters within operational bounds, NOT to crash the network
+2. An accidental typo (e.g., "1000000000000" instead of "100000") can trigger total network shutdown
+3. Recovery requires a hard fork since the malicious parameter persists in chain state
+4. The impact (network shutdown) exceeds governance's intended authority scope
+5. Missing parameter bounds is a clear code defect that should be fixed
+
+### Impact Verification
+
+This matches the listed impact category:
+- **"Network not being able to confirm new transactions (total network shutdown)" - Medium**
+
+With `SignedBlocksWindow = 10^12`:
+- Each validator requires ~2 TB of memory allocation (two arrays of 10^12 bools)
+- With 100 validators processed concurrently: ~200 TB total memory requirement
+- All nodes will experience out-of-memory crashes
+- No new blocks can be produced
+- Requires hard fork to recover
+
+---
+
+# Audit Report
+
+## Title
+Unbounded Memory Allocation via SignedBlocksWindow Governance Parameter Enabling Total Network Shutdown
+
+## Summary
+The `SignedBlocksWindow` parameter validation in the slashing module lacks an upper bound check, only verifying the value is positive. This allows governance to set arbitrarily large values that trigger massive memory allocations in BeginBlocker when resizing validator missed block arrays, causing all nodes to crash with out-of-memory errors and resulting in total network shutdown requiring a hard fork to recover.
+
+## Impact
+Medium
+
+## Finding Description
 
 **Location:** 
-The vulnerability exists in the `ValidateGenesis` method of `AppModuleBasic` in the access control module. [1](#0-0) 
+- Validation: `x/slashing/types/params.go`, function `validateSignedBlocksWindow` (lines 72-83)
+- Memory allocation: `x/slashing/keeper/signing_info.go`, function `ParseBitGroupsToBoolArray` (lines 109-116)  
+- Vulnerable execution: `x/slashing/keeper/infractions.go`, function `ResizeMissedBlockArray` (lines 157-181)
+- Automatic trigger: `x/slashing/abci.go`, function `BeginBlocker` (lines 24-66)
 
-**Intended Logic:** 
-The genesis validation flow should validate all genesis state before chain initialization. The access control module has a comprehensive validation function that checks both parameters and dependency mappings. [2](#0-1) 
+**Intended logic:** 
+The validation function should enforce reasonable upper bounds on `SignedBlocksWindow` to prevent resource exhaustion attacks or accidental misconfigurations. The parameter defines a sliding window for tracking validator liveness and should be limited to operationally feasible values (e.g., maximum of several months of blocks).
 
-**Actual Logic:** 
-The module's `ValidateGenesis` method only validates parameters (`data.Params.Validate()`) and completely skips validation of `MessageDependencyMapping` and `WasmDependencyMappings` arrays. It does not call the comprehensive `types.ValidateGenesis(data)` function that validates dependency mappings.
+**Actual logic:** 
+The validation only checks `v > 0` with no upper bound. When an extremely large value is set (e.g., 10^10 or higher), the system attempts to allocate massive boolean arrays:
+1. `ParseBitGroupsToBoolArray` allocates `make([]bool, window)` 
+2. `ResizeMissedBlockArray` allocates a second `make([]bool, window)` for the new array
+3. These allocations happen for each validator concurrently in BeginBlocker
+4. With 100 validators and window=10^12, this requires ~200 TB of memory
 
-In contrast, other modules like the auth module correctly call their comprehensive validation function: [3](#0-2) 
+**Exploitation path:**
+1. Submit governance parameter change proposal setting `SignedBlocksWindow` to a large value (e.g., 10^12)
+2. Proposal passes validation because `validateSignedBlocksWindow` only checks positivity
+3. Parameter is updated via `Subspace.Update` → `Validate` → weak validation passes
+4. Next block's BeginBlocker executes, processing all validators concurrently
+5. Each validator's `HandleValidatorSignatureConcurrent` detects window size change
+6. Calls `ResizeMissedBlockArray` which attempts massive allocations
+7. Nodes crash with out-of-memory errors
+8. Network halts as no nodes can produce blocks
 
-**Exploit Scenario:**
-1. A genesis file is created with invalid dependency mappings (e.g., missing commit operations, empty identifier templates, deprecated selectors, or duplicate message names in WASM mappings)
-2. The genesis file is validated through `BasicManager.ValidateGenesis`, which calls each module's validation [4](#0-3) 
-3. The invalid dependency mappings pass validation because the module only checks parameters
-4. All network nodes attempt to initialize with this genesis data
-5. During `InitGenesis`, the keeper validates and panics when setting invalid mappings [5](#0-4) 
-6. All nodes fail to initialize, preventing network startup
+**Security guarantee broken:**
+The system fails to enforce safe bounds on governance parameters, allowing configurations that exceed physical resource constraints and cause denial-of-service through resource exhaustion. Governance should be able to adjust parameters safely without risking catastrophic network failure.
 
-**Security Failure:** 
-The two-phase validation pattern (ValidateGenesis → InitGenesis) is broken. Invalid data that should be caught during file validation bypasses checks and causes runtime panics during initialization, resulting in a denial-of-service at the network level.
+## Impact Explanation
 
-### Impact Explanation
+**Affected Components:**
+- All validator nodes and full nodes in the network
+- Block production and consensus mechanism  
+- Transaction processing and finality
 
-**Affected Processes:**
-- Network initialization and startup
-- All validator and node operations
-- Network availability and transaction processing
+**Severity of Impact:**
+- **Network shutdown**: All nodes crash attempting to allocate terabytes of memory
+- **Hard fork required**: Normal governance cannot fix the issue since the network is down and the malicious parameter persists in state
+- **Complete halt of transactions**: No new blocks can be produced or confirmed
+- **Accidental trigger risk**: A simple typo in a governance proposal (e.g., adding extra zeros) can trigger this
 
-**Severity of Damage:**
-- Complete network failure to initialize
-- All nodes panic during genesis initialization
-- Network cannot start or process any transactions
-- Requires genesis file correction and complete network restart
+## Likelihood Explanation
 
-**System Reliability:**
-This breaks the fundamental assumption that genesis validation prevents initialization failures. Invalid configuration passes validation silently, only to cause catastrophic failure during actual initialization. This could affect mainnet launches, testnets, or any chain initialization scenario.
+**Who can trigger:**
+- Any participant who can submit and pass a governance proposal
+- Requires majority token holder votes, but governance is the standard mechanism for parameter updates
+- **Accidental misconfiguration** is a realistic scenario (typos, unit confusion, copy-paste errors in proposals)
 
-### Likelihood Explanation
+**Conditions required:**
+1. Submit governance proposal with large `SignedBlocksWindow` value
+2. Proposal passes governance voting
+3. Next block automatically triggers the vulnerability
 
-**Who Can Trigger:**
-- Chain operators creating genesis files
-- Anyone distributing or modifying genesis configurations
-- Accidental misconfiguration during genesis creation
+**Likelihood assessment:**
+- **Moderate**: While requiring governance approval, this is:
+  - The intended mechanism for parameter changes (not an attack vector)
+  - Vulnerable to human error in proposal submission
+  - Has catastrophic impact that exceeds governance's intended authority
+  - Lacks basic defensive validation that should exist
 
-**Conditions Required:**
-- Genesis file contains invalid dependency mappings with any of these issues:
-  - Missing commit access operation (validated by `ValidateAccessOps`)
-  - Empty identifier templates (validated by `ValidateAccessOp`)
-  - Non-leaf resource types with specific identifiers
-  - Deprecated CONTRACT_REFERENCE selectors
-  - Duplicate message names in WASM mappings [6](#0-5) [7](#0-6) 
+The vulnerability can be triggered accidentally through honest mistakes in governance proposals, not just malicious attacks.
 
-**Frequency:**
-- Can occur during any chain initialization with malformed genesis
-- Affects all nodes attempting to start with the invalid genesis
-- Testing confirms the issue is present in the current codebase [8](#0-7) 
+## Recommendation
 
-### Recommendation
-
-Update the `ValidateGenesis` method in `x/accesscontrol/module.go` to call the comprehensive validation function:
+Add upper bound validation to `validateSignedBlocksWindow`:
 
 ```go
-func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
-	}
+func validateSignedBlocksWindow(i interface{}) error {
+    v, ok := i.(int64)
+    if !ok {
+        return fmt.Errorf("invalid parameter type: %T", i)
+    }
 
-	return types.ValidateGenesis(data) // Call comprehensive validation instead of just data.Params.Validate()
+    if v <= 0 {
+        return fmt.Errorf("signed blocks window must be positive: %d", v)
+    }
+
+    // Add maximum bound to prevent resource exhaustion
+    // Maximum value based on operational requirements and resource constraints
+    // For example: 1 year at 0.4s blocks = 365 * 24 * 3600 / 0.4 ≈ 78,840,000
+    const maxSignedBlocksWindow = int64(100_000_000) // ~1.5 years of blocks
+    if v > maxSignedBlocksWindow {
+        return fmt.Errorf("signed blocks window too large (max %d): %d", maxSignedBlocksWindow, v)
+    }
+
+    return nil
 }
 ```
 
-This aligns with the pattern used by other modules and ensures all genesis state is validated before initialization.
+This prevents arbitrarily large values while maintaining backward compatibility (default 108,000 is well below the limit).
 
-### Proof of Concept
+## Proof of Concept
 
-**File:** `x/accesscontrol/module_test.go` (new test file)
-
-**Test Function:** `TestValidateGenesis_InvalidDependencyMappingsBypassValidation`
+**Test File:** `x/slashing/keeper/infractions_test.go`  
+**Function:** `TestExcessiveSignedBlocksWindowMemoryAllocation`
 
 **Setup:**
-1. Create a genesis state with invalid MessageDependencyMapping (missing commit operation)
-2. Marshal it to JSON
-3. Call the module's ValidateGenesis method
+- Create test application with validator
+- Set initial `SignedBlocksWindow` to normal value (e.g., 100)
+- Initialize validator signing info by running BeginBlocker once
 
-**Trigger:**
+**Action:**
+- Update parameter to large value (e.g., 1,000,000 for safe testing, or 10,000,000,000 to demonstrate actual crash)
+- Call BeginBlocker for next block height
+
+**Result:**
+- For moderate values (1M): Significant memory allocation and slow processing demonstrating O(window) behavior
+- For extreme values (10B+): Out-of-memory crash or hang
+- Demonstrates vulnerability is triggered automatically on next block after parameter change
+
+**Code outline:**
 ```go
-package accesscontrol_test
-
-import (
-	"encoding/json"
-	"testing"
-
-	"github.com/cosmos/cosmos-sdk/codec"
-	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
-	"github.com/cosmos/cosmos-sdk/x/accesscontrol"
-	"github.com/cosmos/cosmos-sdk/x/accesscontrol/types"
-	acltypes "github.com/cosmos/cosmos-sdk/types/accesscontrol"
-	"github.com/stretchr/testify/require"
-)
-
-func TestValidateGenesis_InvalidDependencyMappingsBypassValidation(t *testing.T) {
-	// Setup codec
-	interfaceRegistry := codectypes.NewInterfaceRegistry()
-	cdc := codec.NewProtoCodec(interfaceRegistry)
-	
-	// Create invalid MessageDependencyMapping (missing commit operation)
-	invalidMapping := acltypes.MessageDependencyMapping{
-		MessageKey: "TestMessage",
-		AccessOps: []acltypes.AccessOperation{
-			{
-				AccessType:         acltypes.AccessType_UNKNOWN,
-				ResourceType:       acltypes.ResourceType_ANY,
-				IdentifierTemplate: "*",
-			},
-			// Missing commit operation - should fail validation
-		},
-	}
-	
-	// Create genesis state with invalid mapping
-	genState := types.GenesisState{
-		Params:                   types.DefaultParams(),
-		MessageDependencyMapping: []acltypes.MessageDependencyMapping{invalidMapping},
-	}
-	
-	// This should fail types.ValidateGenesis
-	err := types.ValidateGenesis(genState)
-	require.Error(t, err, "types.ValidateGenesis should catch invalid mapping")
-	require.Contains(t, err.Error(), "COMMIT", "should fail due to missing commit operation")
-	
-	// Marshal to JSON
-	genStateJSON, err := cdc.MarshalJSON(&genState)
-	require.NoError(t, err)
-	
-	// Call module's ValidateGenesis - THIS IS THE BUG
-	moduleBasic := accesscontrol.AppModuleBasic{cdc}
-	err = moduleBasic.ValidateGenesis(cdc, nil, genStateJSON)
-	
-	// BUG: This should fail but it doesn't because module.ValidateGenesis only checks params
-	require.NoError(t, err, "BUG: Invalid dependency mapping bypasses module ValidateGenesis")
-}
-
-func TestValidateGenesis_InvalidWasmMappingBypassValidation(t *testing.T) {
-	// Setup codec
-	interfaceRegistry := codectypes.NewInterfaceRegistry()
-	cdc := codec.NewProtoCodec(interfaceRegistry)
-	
-	// Create invalid WasmDependencyMapping (empty BaseAccessOps)
-	invalidWasmMapping := acltypes.WasmDependencyMapping{
-		ContractAddress: "sei1invalidaddress",
-		BaseAccessOps:   []*acltypes.WasmAccessOperation{}, // Empty - should fail validation
-	}
-	
-	// Create genesis state with invalid WASM mapping
-	genState := types.GenesisState{
-		Params:                 types.DefaultParams(),
-		WasmDependencyMappings: []acltypes.WasmDependencyMapping{invalidWasmMapping},
-	}
-	
-	// This should fail types.ValidateGenesis
-	err := types.ValidateGenesis(genState)
-	require.Error(t, err, "types.ValidateGenesis should catch invalid WASM mapping")
-	
-	// Marshal to JSON
-	genStateJSON, err := cdc.MarshalJSON(&genState)
-	require.NoError(t, err)
-	
-	// Call module's ValidateGenesis
-	moduleBasic := accesscontrol.AppModuleBasic{cdc}
-	err = moduleBasic.ValidateGenesis(cdc, nil, genStateJSON)
-	
-	// BUG: This should fail but it doesn't
-	require.NoError(t, err, "BUG: Invalid WASM mapping bypasses module ValidateGenesis")
+func TestExcessiveSignedBlocksWindowMemoryAllocation(t *testing.T) {
+    app := simapp.Setup(false)
+    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+    
+    // Setup validator
+    // Set initial window = 100 and run BeginBlocker
+    
+    // Update to large value
+    params := app.SlashingKeeper.GetParams(ctx)
+    params.SignedBlocksWindow = 1_000_000 // Safe for testing
+    app.SlashingKeeper.SetParams(ctx, params)
+    
+    // Measure time/memory for next block
+    start := time.Now()
+    slashing.BeginBlocker(ctx, req, app.SlashingKeeper)
+    duration := time.Since(start)
+    
+    // Assert excessive duration indicating O(window) behavior
+    // Extrapolate: if 1M takes X ms, then 1B takes 1000*X ms
 }
 ```
 
-**Observation:**
-The test demonstrates that invalid dependency mappings fail `types.ValidateGenesis` (comprehensive validation) but pass through the module's `ValidateGenesis` method. This confirms that malformed genesis data bypasses the intended validation phase. Subsequently, when `InitGenesis` is called with this data, it will panic as shown in existing tests. [9](#0-8)
+## Notes
+
+This vulnerability demonstrates a critical defensive programming failure. While governance is a trusted mechanism, the lack of sanity checks on parameter values exposes the system to:
+
+1. **Accidental misconfiguration**: Human errors in proposal creation (typos, unit confusion)
+2. **Social engineering attacks**: Malicious actors convincing token holders to approve dangerous parameters
+3. **Catastrophic impact beyond intended authority**: Governance should adjust parameters safely, not risk network shutdown
+
+The fix is straightforward and should be implemented to protect against both accidental and malicious scenarios. Parameter validation is a fundamental security practice in blockchain systems.
 
 ### Citations
 
-**File:** x/accesscontrol/module.go (L62-69)
+**File:** x/slashing/types/params.go (L72-83)
 ```go
-func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
+func validateSignedBlocksWindow(i interface{}) error {
+	v, ok := i.(int64)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	return data.Params.Validate()
-}
-```
-
-**File:** x/accesscontrol/types/genesis.go (L29-43)
-```go
-func ValidateGenesis(data GenesisState) error {
-	for _, mapping := range data.MessageDependencyMapping {
-		err := ValidateMessageDependencyMapping(mapping)
-		if err != nil {
-			return err
-		}
-	}
-	for _, mapping := range data.WasmDependencyMappings {
-		err := ValidateWasmDependencyMapping(mapping)
-		if err != nil {
-			return err
-		}
-	}
-	return data.Params.Validate()
-}
-```
-
-**File:** x/auth/module.go (L54-61)
-```go
-func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
-	}
-
-	return types.ValidateGenesis(data)
-}
-```
-
-**File:** types/module/module.go (L105-112)
-```go
-func (bm BasicManager) ValidateGenesis(cdc codec.JSONCodec, txEncCfg client.TxEncodingConfig, genesis map[string]json.RawMessage) error {
-	for _, b := range bm {
-		if err := b.ValidateGenesis(cdc, txEncCfg, genesis[b.Name()]); err != nil {
-			return err
-		}
-	}
-
-	return nil
-```
-
-**File:** x/accesscontrol/keeper/genesis.go (L11-26)
-```go
-func (k Keeper) InitGenesis(ctx sdk.Context, genState types.GenesisState) {
-	k.SetParams(ctx, genState.Params)
-	for _, resourceDependencyMapping := range genState.GetMessageDependencyMapping() {
-		err := k.SetResourceDependencyMapping(ctx, resourceDependencyMapping)
-		if err != nil {
-			panic(fmt.Errorf("invalid MessageDependencyMapping %s", err))
-		}
-	}
-	for _, wasmDependencyMapping := range genState.GetWasmDependencyMappings() {
-		err := k.SetWasmDependencyMapping(ctx, wasmDependencyMapping)
-		if err != nil {
-			panic(fmt.Errorf("invalid WasmDependencyMapping %s", err))
-		}
-
-	}
-}
-```
-
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L11-19)
-```go
-var (
-	ErrNoCommitAccessOp                  = fmt.Errorf("MessageDependencyMapping doesn't terminate with AccessType_COMMIT")
-	ErrEmptyIdentifierString             = fmt.Errorf("IdentifierTemplate cannot be an empty string")
-	ErrNonLeafResourceTypeWithIdentifier = fmt.Errorf("IdentifierTemplate must be '*' for non leaf resource types")
-	ErrDuplicateWasmMethodName           = fmt.Errorf("a method name is defined multiple times in specific access operation list")
-	ErrQueryRefNonQueryMessageType       = fmt.Errorf("query contract references can only have query message types")
-	ErrSelectorDeprecated                = fmt.Errorf("this selector type is deprecated")
-	ErrInvalidMsgInfo                    = fmt.Errorf("msg info cannot be nil")
-)
-```
-
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-54)
-```go
-func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
-	lastAccessOp := accessOps[len(accessOps)-1]
-	if lastAccessOp != *CommitAccessOp() {
-		return ErrNoCommitAccessOp
-	}
-	for _, accessOp := range accessOps {
-		err := ValidateAccessOp(accessOp)
-		if err != nil {
-			return err
-		}
+	if v <= 0 {
+		return fmt.Errorf("signed blocks window must be positive: %d", v)
 	}
 
 	return nil
 }
-
-func ValidateAccessOp(accessOp acltypes.AccessOperation) error {
-	if accessOp.IdentifierTemplate == "" {
-		return ErrEmptyIdentifierString
-	}
-	if accessOp.ResourceType.HasChildren() && accessOp.IdentifierTemplate != "*" {
-		return ErrNonLeafResourceTypeWithIdentifier
-	}
-	return nil
 ```
 
-**File:** x/accesscontrol/keeper/genesis_test.go (L71-102)
+**File:** x/slashing/keeper/signing_info.go (L109-116)
 ```go
-func TestKeeper_InitGenesis_InvalidDependencies(t *testing.T) {
-	app := simapp.Setup(false)
-	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+func (k Keeper) ParseBitGroupsToBoolArray(bitGroups []uint64, window int64) []bool {
+	boolArray := make([]bool, window)
 
-	invalidAccessOp := types.SynchronousMessageDependencyMapping("Test1")
-	invalidAccessOp.AccessOps[0].IdentifierTemplate = ""
-	invalidAccessOp.AccessOps = []accesscontrol.AccessOperation{
-		invalidAccessOp.AccessOps[0],
+	for i := int64(0); i < window; i++ {
+		boolArray[i] = k.GetBooleanFromBitGroups(bitGroups, i)
 	}
-
-	invalidMessageGenesis := types.GenesisState{
-		Params: types.DefaultParams(),
-		MessageDependencyMapping: []accesscontrol.MessageDependencyMapping{
-			invalidAccessOp,
-		},
-	}
-
-	require.Panics(t, func() {
-		app.AccessControlKeeper.InitGenesis(ctx, invalidMessageGenesis)
-	})
-
-	invalidWasmGenesis := types.GenesisState{
-		Params: types.DefaultParams(),
-		WasmDependencyMappings: []accesscontrol.WasmDependencyMapping{
-			types.SynchronousWasmDependencyMapping("Test"),
-		},
-	}
-	require.Panics(t, func() {
-		app.AccessControlKeeper.InitGenesis(ctx, invalidWasmGenesis)
-	})
-
+	return boolArray
 }
+```
+
+**File:** x/slashing/keeper/infractions.go (L52-54)
+```go
+	if found && missedInfo.WindowSize != window {
+		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
+	}
+```
+
+**File:** x/slashing/keeper/infractions.go (L157-181)
+```go
+func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
+	// we need to resize the missed block array AND update the signing info accordingly
+	switch {
+	case missedInfo.WindowSize < window:
+		// missed block array too short, lets expand it
+		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
+		newArray := make([]bool, window)
+		copy(newArray[0:index], boolArray[0:index])
+		if index+1 < missedInfo.WindowSize {
+			// insert `0`s corresponding to the difference between the new window size and old window size
+			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
+		}
+		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
+		missedInfo.WindowSize = window
+	case missedInfo.WindowSize > window:
+		// if window size is reduced, we would like to make a clean state so that no validators are unexpectedly jailed due to more recent missed blocks
+		newMissedBlocks := make([]bool, window)
+		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newMissedBlocks)
+		signInfo.MissedBlocksCounter = int64(0)
+		missedInfo.WindowSize = window
+		signInfo.IndexOffset = 0
+		index = 0
+	}
+	return missedInfo, signInfo, index
+}
+```
+
+**File:** x/slashing/abci.go (L36-50)
+```go
+	for i, _ := range allVotes {
+		wg.Add(1)
+		go func(valIndex int) {
+			defer wg.Done()
+			vInfo := allVotes[valIndex]
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
+				ConsAddr:    consAddr,
+				MissedInfo:  missedInfo,
+				SigningInfo: signInfo,
+				ShouldSlash: shouldSlash,
+				SlashInfo:   slashInfo,
+			}
+		}(i)
+	}
+```
+
+**File:** x/params/types/subspace.go (L196-219)
+```go
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	}
+
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+		return err
+	}
+
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
+	return nil
+}
+```
+
+**File:** x/params/proposal_handler.go (L26-39)
+```go
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
+		if !ok {
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+		}
+
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
+
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		}
 ```

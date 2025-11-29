@@ -1,395 +1,291 @@
 # Audit Report
 
 ## Title
-Missing Panic Recovery in BeginBlock Allows Chain Halt from Module Panics
+Chain-Halting Panic via Fee Grant to Module Account Address
 
 ## Summary
-The `BeginBlock` function in `baseapp/abci.go` lacks panic recovery mechanisms, unlike `PrepareProposal` and `ProcessProposal`. Multiple production modules (upgrade, mint, slashing) intentionally panic in their BeginBlockers under error conditions. When triggered, these panics propagate uncaught and crash all validator nodes, causing a total network shutdown requiring a hard fork to recover.
+The feegrant module's `MsgGrantAllowance` handler allows any user to create a BaseAccount at a module account address, breaking the critical invariant that module addresses must only contain ModuleAccounts. This causes all validators to panic when subsequently accessing the corrupted module account, resulting in complete network shutdown.
 
 ## Impact
 High
 
 ## Finding Description
 
-- **Location:** 
-  - Primary: [1](#0-0) 
-  - Call chain through: [2](#0-1) 
-  - Module manager: [3](#0-2) 
+- **location**: The vulnerability spans multiple files:
+  - Entry point: [1](#0-0) 
+  - Account creation without validation: [2](#0-1) 
+  - Panic trigger: [3](#0-2) 
 
-- **Intended Logic:** BeginBlock should safely execute all module BeginBlockers and handle any errors gracefully to prevent chain halts. The system should be resilient to module-level failures.
+- **intended logic**: Module addresses should exclusively contain ModuleAccount types to maintain system integrity. The banking module correctly enforces this by blocking transfers to module addresses [4](#0-3) , and the vesting module similarly validates recipients [5](#0-4) . Module addresses are populated in the blocked list [6](#0-5)  and passed to the bank keeper during initialization.
 
-- **Actual Logic:** BeginBlock calls `app.beginBlocker(ctx, req)` without any panic recovery [4](#0-3) . The module Manager iterates through modules calling `module.BeginBlock(ctx, req)` without panic recovery [5](#0-4) . In contrast, `PrepareProposal` and `ProcessProposal` have explicit panic recovery [6](#0-5)  and [7](#0-6) .
+- **actual logic**: The `MsgGrantAllowance` handler accepts any valid address as a grantee without checking if it's a blocked/module address. When the grantee account doesn't exist, `GrantAllowance` unconditionally creates a BaseAccount at that address, even if it's a module address. The feegrant keeper only has access to the authKeeper [7](#0-6) , so it cannot perform a `BlockedAddr` check. Additionally, `ValidateBasic()` for `MsgGrantAllowance` [8](#0-7)  only validates that addresses are non-empty and different, but doesn't check for blocked addresses.
 
-- **Exploit Scenario:** Multiple production modules contain intentional panics in their BeginBlockers:
-  - **Upgrade module**: Panics on filesystem errors, wrong binary versions, or missing upgrade handlers [8](#0-7) [9](#0-8) [10](#0-9) 
-  - **Mint module**: Panics on minting or fee collection errors [11](#0-10) 
-  - **Slashing module**: Panics if concurrent processing produces nil writeInfo [12](#0-11) 
+- **exploitation path**:
+  1. Attacker calculates a module address deterministically using public module names [9](#0-8)  (e.g., "fee_collector", "distribution", "mint")
+  2. Attacker submits a `MsgGrantAllowance` transaction with the module address as the grantee
+  3. The handler creates a BaseAccount at the module address without any validation
+  4. In the next block, when the distribution module's `AllocateTokens` function [10](#0-9)  attempts to retrieve the fee collector module account during BeginBlock processing
+  5. `GetModuleAccount` [11](#0-10)  is called, which internally uses `GetModuleAccountAndPermissions`
+  6. The type assertion fails because a BaseAccount exists instead of a ModuleAccount, triggering a panic
+  7. All validators crash simultaneously, halting the entire network
 
-  Any of these conditions triggers a panic during block processing, which propagates through FinalizeBlock [13](#0-12)  and crashes the node.
-
-- **Security Failure:** Denial of Service - The panic propagates uncaught through the entire ABCI call stack, causing all validator nodes to crash when processing the same block. This results in total network shutdown as no nodes can advance past the panic-inducing block.
+- **security guarantee broken**: The critical invariant that "module addresses exclusively contain ModuleAccount types" is violated. This invariant is essential for the blockchain's operation, as module accounts are central to fee collection, token minting, staking rewards, and other core protocol functions.
 
 ## Impact Explanation
 
-- **Affected:** The entire blockchain network. All validator nodes crash and cannot process blocks.
-- **Severity:** Complete network halt. Once any module's BeginBlocker panics, every validator node attempting to process that block will crash. The chain cannot advance until a hard fork is deployed with a fix.
-- **Significance:** This violates the fundamental requirement of blockchain availability. Unlike transient errors that can be recovered from, this causes permanent chain halt until operator intervention via hard fork. Network downtime directly impacts all users, applications, and financial operations on the chain.
+This vulnerability causes **complete network shutdown**. The impact includes:
+
+- **Total validator failure**: All validators will panic when any operation attempts to access the corrupted module account through `GetModuleAccount` or related functions like `SendCoinsFromAccountToModule` [12](#0-11) 
+- **Immediate halt**: Since fee collection happens in BeginBlock for every block, the network halts immediately after the malicious transaction is included
+- **Permanent freeze**: The chain cannot recover without a coordinated hard fork to remove the corrupted account from state
+- **Critical system operations affected**: Fee collection, token minting, staking reward distribution, governance operations, and all other module account interactions become impossible
+
+The vulnerability matches the impact criteria: **"Network not being able to confirm new transactions (total network shutdown)"** which is classified as **High** severity.
 
 ## Likelihood Explanation
 
-- **Who can trigger:** The conditions are triggered by legitimate system states rather than direct attacker actions:
-  - Upgrade module: Automatically triggered at designated upgrade heights if binary is incorrect or filesystem has errors
-  - Mint module: Triggered if underlying bank module encounters errors during routine minting operations
-  - Slashing module: Could be triggered by race conditions in concurrent processing logic
-  
-- **Conditions:** These can occur during normal chain operation when:
-  - Validators upgrade to incorrect binary versions (human error)
-  - Filesystem operations fail (disk full, permission errors)
-  - Bank module state becomes corrupted
-  - Race conditions in slashing module's concurrent processing
-  
-- **Frequency:** While not exploitable by external attackers directly, these conditions can realistically occur during chain upgrades or under system stress. The upgrade module panics are particularly likely during scheduled upgrades, which happen regularly on production chains.
+- **Who can trigger**: Any user with sufficient funds to pay transaction fees (~$0.01 equivalent)
+- **Conditions required**: 
+  - No special permissions or privileges needed
+  - Only requires knowledge of module names, which are public in the codebase [13](#0-12) 
+  - No rate limiting or additional barriers
+- **Frequency**: Can be executed immediately with a single transaction. The attack is deterministic and guaranteed to succeed. Once triggered, the network remains halted until a hard fork is coordinated.
 
 ## Recommendation
 
-Add panic recovery to BeginBlock similar to PrepareProposal and ProcessProposal:
+Add a `BlockedAddr` check in the `MsgGrantAllowance` handler before account creation. The feegrant keeper needs to be modified to include a reference to the bank keeper:
+
+1. Update the Keeper struct to include a bank keeper interface that exposes `BlockedAddr`
+2. Add validation in the `GrantAllowance` function immediately after address parsing:
 
 ```go
-func (app *BaseApp) BeginBlock(ctx sdk.Context, req abci.RequestBeginBlock) (res abci.ResponseBeginBlock) {
-    defer telemetry.MeasureSince(time.Now(), "abci", "begin_block")
-    
-    defer func() {
-        if r := recover(); r != nil {
-            app.logger.Error(
-                "panic recovered in BeginBlock",
-                "height", req.Header.Height,
-                "panic", r,
-            )
-            // Return empty response to allow chain to continue
-            res = abci.ResponseBeginBlock{}
-        }
-    }()
-    
-    // existing logic...
+if bk.BlockedAddr(grantee) {
+    return nil, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to receive fee grants", grantee.String())
 }
 ```
 
-Additionally, consider reviewing module BeginBlockers to handle errors more gracefully without panicking, especially for recoverable errors.
+This mirrors the protection pattern already implemented in the vesting module and bank module, ensuring consistent security across all account-creating operations.
 
 ## Proof of Concept
 
-**File:** `baseapp/abci_panic_test.go` (new test file)
+**File**: `x/feegrant/keeper/msg_server_test.go`
 
-**Test Function:** `TestBeginBlockPanicCausesChainHalt`
+**Test Function**: Add to the existing `KeeperTestSuite`:
 
 ```go
-package baseapp
-
-import (
-    "context"
-    "testing"
+func (suite *KeeperTestSuite) TestGrantAllowanceToModuleAccountPanic() {
+    // Setup: Calculate the fee_collector module address
+    moduleAddr := authtypes.NewModuleAddress(authtypes.FeeCollectorName)
     
-    "github.com/stretchr/testify/require"
-    abci "github.com/tendermint/tendermint/abci/types"
-    tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-    dbm "github.com/tendermint/tm-db"
-    
-    "github.com/cosmos/cosmos-sdk/testutil"
-    sdk "github.com/cosmos/cosmos-sdk/types"
-)
-
-func TestBeginBlockPanicCausesChainHalt(t *testing.T) {
-    logger := defaultLogger()
-    db := dbm.NewMemDB()
-    name := t.Name()
-    app := NewBaseApp(name, logger, db, nil, nil, &testutil.TestAppOpts{})
-    
-    // Set a BeginBlocker that panics
-    app.SetBeginBlocker(func(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
-        panic("simulated module panic in BeginBlock")
+    any, err := codectypes.NewAnyWithValue(&feegrant.BasicAllowance{
+        SpendLimit: suite.atom,
     })
+    suite.Require().NoError(err)
     
-    // Initialize chain
-    app.InitChain(context.Background(), &abci.RequestInitChain{
-        ConsensusParams: &tmproto.ConsensusParams{},
+    // Action: Grant allowance to module address
+    msg := &feegrant.MsgGrantAllowance{
+        Granter:   suite.addrs[0].String(),
+        Grantee:   moduleAddr.String(),
+        Allowance: any,
+    }
+    
+    _, err = suite.msgSrvr.GrantAllowance(suite.ctx, msg)
+    suite.Require().NoError(err) // Succeeds - no BlockedAddr check
+    
+    // Result: BaseAccount created at module address
+    acc := suite.app.AccountKeeper.GetAccount(suite.sdkCtx, moduleAddr)
+    suite.Require().NotNil(acc)
+    _, isModuleAccount := acc.(authtypes.ModuleAccountI)
+    suite.Require().False(isModuleAccount) // It's a BaseAccount, not ModuleAccount
+    
+    // Accessing the module account now causes panic
+    suite.Require().Panics(func() {
+        suite.app.AccountKeeper.GetModuleAccount(suite.sdkCtx, authtypes.FeeCollectorName)
     })
-    
-    header := tmproto.Header{Height: 1}
-    app.setDeliverState(header)
-    
-    // This should panic and crash the node
-    require.Panics(t, func() {
-        app.BeginBlock(app.deliverState.ctx, abci.RequestBeginBlock{Header: header})
-    }, "BeginBlock should panic when module BeginBlocker panics")
-    
-    // In contrast, PrepareProposal has panic recovery
-    app.SetPrepareProposal(func(ctx sdk.Context, req *abci.RequestPrepareProposal) (*abci.ResponsePrepareProposal, error) {
-        panic("simulated panic in PrepareProposal")
-    })
-    
-    // This should NOT panic due to recovery
-    require.NotPanics(t, func() {
-        _, err := app.PrepareProposal(context.Background(), &abci.RequestPrepareProposal{
-            Height: 1,
-        })
-        require.NoError(t, err) // Recovery converts panic to safe response
-    }, "PrepareProposal should recover from panics")
 }
 ```
 
-**Setup:** Create a BaseApp with a custom BeginBlocker that panics to simulate the behavior of production modules (upgrade, mint, slashing) under error conditions.
-
-**Trigger:** Call BeginBlock which invokes the panicking BeginBlocker.
-
-**Observation:** The test confirms that BeginBlock panics and crashes (using `require.Panics`), while PrepareProposal with the same panic is safely recovered (using `require.NotPanics`). This demonstrates the inconsistent panic handling and proves that a module panic in BeginBlock causes a chain halt.
+**Expected behavior**: The test demonstrates that:
+1. The grant operation succeeds without any blocked address validation
+2. A BaseAccount is improperly created at the module account address
+3. Subsequent calls to `GetModuleAccount` panic with "account is not a module account"
+4. This panic would crash all validators in a production environment when triggered during normal block processing
 
 ### Citations
 
-**File:** baseapp/abci.go (L134-157)
+**File:** x/feegrant/keeper/msg_server.go (L27-56)
 ```go
-func (app *BaseApp) BeginBlock(ctx sdk.Context, req abci.RequestBeginBlock) (res abci.ResponseBeginBlock) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "begin_block")
+func (k msgServer) GrantAllowance(goCtx context.Context, msg *feegrant.MsgGrantAllowance) (*feegrant.MsgGrantAllowanceResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
 
-	if !req.Simulate {
-		if err := app.validateHeight(req); err != nil {
-			panic(err)
-		}
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
 	}
 
-	if app.beginBlocker != nil {
-		res = app.beginBlocker(ctx, req)
-		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
 	}
 
-	// call the streaming service hooks with the EndBlock messages
-	if !req.Simulate {
-		for _, streamingListener := range app.abciListeners {
-			if err := streamingListener.ListenBeginBlock(app.deliverState.ctx, req, res); err != nil {
-				app.logger.Error("EndBlock listening hook failed", "height", req.Header.Height, "err", err)
-			}
-		}
+	// Checking for duplicate entry
+	if f, _ := k.Keeper.GetAllowance(ctx, granter, grantee); f != nil {
+		return nil, sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "fee allowance already exists")
 	}
-	return res
+
+	allowance, err := msg.GetFeeAllowanceI()
+	if err != nil {
+		return nil, err
+	}
+
+	err = k.Keeper.GrantAllowance(ctx, granter, grantee, allowance)
+	if err != nil {
+		return nil, err
+	}
+
+	return &feegrant.MsgGrantAllowanceResponse{}, nil
 }
 ```
 
-**File:** baseapp/abci.go (L1037-1052)
+**File:** x/feegrant/keeper/keeper.go (L17-21)
 ```go
-	defer func() {
-		if err := recover(); err != nil {
-			app.logger.Error(
-				"panic recovered in PrepareProposal",
-				"height", req.Height,
-				"time", req.Time,
-				"panic", err,
-			)
-
-			resp = &abci.ResponsePrepareProposal{
-				TxRecords: utils.Map(req.Txs, func(tx []byte) *abci.TxRecord {
-					return &abci.TxRecord{Action: abci.TxRecord_UNMODIFIED, Tx: tx}
-				}),
-			}
-		}
-	}()
-```
-
-**File:** baseapp/abci.go (L1106-1132)
-```go
-	defer func() {
-		if err := recover(); err != nil {
-			app.logger.Error(
-				"panic recovered in ProcessProposal",
-				"height", req.Height,
-				"time", req.Time,
-				"hash", fmt.Sprintf("%X", req.Hash),
-				"panic", err,
-			)
-
-			resp = &abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_REJECT}
-		}
-	}()
-
-	defer func() {
-		if err := recover(); err != nil {
-			app.logger.Error(
-				"panic recovered in ProcessProposal",
-				"height", req.Height,
-				"time", req.Time,
-				"hash", fmt.Sprintf("%X", req.Hash),
-				"panic", err,
-			)
-
-			resp = &abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_REJECT}
-		}
-	}()
-```
-
-**File:** baseapp/abci.go (L1150-1214)
-```go
-func (app *BaseApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "finalize_block")
-
-	if app.cms.TracingEnabled() {
-		app.cms.SetTracingContext(sdk.TraceContext(
-			map[string]interface{}{"blockHeight": req.Height},
-		))
-	}
-
-	// Initialize the DeliverTx state. If this is the first block, it should
-	// already be initialized in InitChain. Otherwise app.deliverState will be
-	// nil, since it is reset on Commit.
-	header := tmproto.Header{
-		ChainID:            app.ChainID,
-		Height:             req.Height,
-		Time:               req.Time,
-		ProposerAddress:    req.ProposerAddress,
-		AppHash:            req.AppHash,
-		NextValidatorsHash: req.NextValidatorsHash,
-		DataHash:           req.DataHash,
-		ConsensusHash:      req.ConsensusHash,
-		EvidenceHash:       req.EvidenceHash,
-		ValidatorsHash:     req.ValidatorsHash,
-		LastCommitHash:     req.LastCommitHash,
-		LastResultsHash:    req.LastResultsHash,
-		LastBlockId: tmproto.BlockID{
-			Hash: req.LastBlockHash,
-			PartSetHeader: tmproto.PartSetHeader{
-				Total: uint32(req.LastBlockPartSetTotal),
-				Hash:  req.LastBlockPartSetHash,
-			},
-		},
-	}
-	if app.deliverState == nil {
-		app.setDeliverState(header)
-	} else {
-		// In the first block, app.deliverState.ctx will already be initialized
-		// by InitChain. Context is now updated with Header information.
-		app.setDeliverStateHeader(header)
-	}
-
-	// NOTE: header hash is not set in NewContext, so we manually set it here
-
-	app.prepareDeliverState(req.Hash)
-
-	// we also set block gas meter to checkState in case the application needs to
-	// verify gas consumption during (Re)CheckTx
-	if app.checkState != nil {
-		app.checkState.SetContext(app.checkState.ctx.WithHeaderHash(req.Hash))
-	}
-
-	if app.finalizeBlocker != nil {
-		res, err := app.finalizeBlocker(app.deliverState.ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
-		// set the signed validators for addition to context in deliverTx
-		app.setVotesInfo(req.DecidedLastCommit.GetVotes())
-
-		return res, nil
-	} else {
-		return nil, errors.New("finalize block handler not set")
-	}
+type Keeper struct {
+	cdc        codec.BinaryCodec
+	storeKey   sdk.StoreKey
+	authKeeper feegrant.AccountKeeper
 }
 ```
 
-**File:** types/module/module.go (L601-617)
+**File:** x/feegrant/keeper/keeper.go (L40-47)
 ```go
-func (m *Manager) BeginBlock(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
-	ctx = ctx.WithEventManager(sdk.NewEventManager())
+func (k Keeper) GrantAllowance(ctx sdk.Context, granter, grantee sdk.AccAddress, feeAllowance feegrant.FeeAllowanceI) error {
 
-	defer telemetry.MeasureSince(time.Now(), "module", "total_begin_block")
-	for _, moduleName := range m.OrderBeginBlockers {
-		module, ok := m.Modules[moduleName].(BeginBlockAppModule)
-		if ok {
-			moduleStartTime := time.Now()
-			module.BeginBlock(ctx, req)
-			telemetry.ModuleMeasureSince(moduleName, moduleStartTime, "module", "begin_block")
+	// create the account if it is not in account state
+	granteeAcc := k.authKeeper.GetAccount(ctx, grantee)
+	if granteeAcc == nil {
+		granteeAcc = k.authKeeper.NewAccountWithAddress(ctx, grantee)
+		k.authKeeper.SetAccount(ctx, granteeAcc)
+	}
+```
+
+**File:** x/auth/keeper/keeper.go (L187-193)
+```go
+	acc := ak.GetAccount(ctx, addr)
+	if acc != nil {
+		macc, ok := acc.(types.ModuleAccountI)
+		if !ok {
+			panic("account is not a module account")
 		}
-	}
+		return macc, perms
+```
 
-	return abci.ResponseBeginBlock{
-		Events: ctx.EventManager().ABCIEvents(),
-	}
+**File:** x/auth/keeper/keeper.go (L206-209)
+```go
+func (ak AccountKeeper) GetModuleAccount(ctx sdk.Context, moduleName string) types.ModuleAccountI {
+	acc, _ := ak.GetModuleAccountAndPermissions(ctx, moduleName)
+	return acc
 }
 ```
 
-**File:** x/upgrade/abci.go (L40-42)
+**File:** x/bank/keeper/msg_server.go (L47-49)
 ```go
-			if lastAppliedPlan != "" && !k.HasHandler(lastAppliedPlan) {
-				panic(fmt.Sprintf("Wrong app version %d, upgrade handler is missing for %s upgrade plan", ctx.ConsensusParams().Version.AppVersion, lastAppliedPlan))
-			}
-```
-
-**File:** x/upgrade/abci.go (L95-96)
-```go
-		ctx.Logger().Error(downgradeMsg)
-		panic(downgradeMsg)
-```
-
-**File:** x/upgrade/abci.go (L104-112)
-```go
-	err := k.DumpUpgradeInfoWithInfoToDisk(ctx.BlockHeight(), plan.Name, plan.Info)
-	if err != nil {
-		panic(fmt.Errorf("unable to write upgrade info to filesystem: %s", err.Error()))
-	}
-
-	upgradeMsg := BuildUpgradeNeededMsg(plan)
-	ctx.Logger().Error(upgradeMsg)
-
-	panic(upgradeMsg)
-```
-
-**File:** x/mint/abci.go (L31-40)
-```go
-	err := k.MintCoins(ctx, mintedCoins)
-	if err != nil {
-		panic(err)
-	}
-
-	// send the minted coins to the fee collector account
-	err = k.AddCollectedFees(ctx, mintedCoins)
-	if err != nil {
-		panic(err)
+	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to receive funds", msg.ToAddress)
 	}
 ```
 
-**File:** x/slashing/abci.go (L54-56)
+**File:** x/auth/vesting/msg_server.go (L48-50)
 ```go
-		if writeInfo == nil {
-			panic("Expected slashing write info to be non-nil")
-		}
+	if bk.BlockedAddr(to) {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to receive funds", msg.ToAddress)
+	}
 ```
 
-**File:** simapp/app.go (L476-504)
+**File:** simapp/app.go (L134-143)
 ```go
-func (app *SimApp) FinalizeBlocker(ctx sdk.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
-	events := []abci.Event{}
-	beginBlockResp := app.BeginBlock(ctx, abci.RequestBeginBlock{
-		Hash: req.Hash,
-		ByzantineValidators: utils.Map(req.ByzantineValidators, func(mis abci.Misbehavior) abci.Evidence {
-			return abci.Evidence{
-				Type:             abci.MisbehaviorType(mis.Type),
-				Validator:        abci.Validator(mis.Validator),
-				Height:           mis.Height,
-				Time:             mis.Time,
-				TotalVotingPower: mis.TotalVotingPower,
-			}
-		}),
-		LastCommitInfo: abci.LastCommitInfo{
-			Round: req.DecidedLastCommit.Round,
-			Votes: utils.Map(req.DecidedLastCommit.Votes, func(vote abci.VoteInfo) abci.VoteInfo {
-				return abci.VoteInfo{
-					Validator:       abci.Validator(vote.Validator),
-					SignedLastBlock: vote.SignedLastBlock,
-				}
-			}),
-		},
-		Header: tmproto.Header{
-			ChainID:         app.ChainID,
-			Height:          req.Height,
-			Time:            req.Time,
-			ProposerAddress: ctx.BlockHeader().ProposerAddress,
-		},
-	})
+	// module account permissions
+	maccPerms = map[string][]string{
+		authtypes.FeeCollectorName:     nil,
+		distrtypes.ModuleName:          nil,
+		minttypes.ModuleName:           {authtypes.Minter},
+		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
+		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
+		govtypes.ModuleName:            {authtypes.Burner},
+	}
+)
+```
+
+**File:** simapp/app.go (L606-614)
+```go
+// ModuleAccountAddrs returns all the app's module account addresses.
+func (app *SimApp) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range maccPerms {
+		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+	}
+
+	return modAccAddrs
+}
+```
+
+**File:** x/feegrant/msgs.go (L39-57)
+```go
+// ValidateBasic implements the sdk.Msg interface.
+func (msg MsgGrantAllowance) ValidateBasic() error {
+	if msg.Granter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing granter address")
+	}
+	if msg.Grantee == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing grantee address")
+	}
+	if msg.Grantee == msg.Granter {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "cannot self-grant fee authorization")
+	}
+
+	allowance, err := msg.GetFeeAllowanceI()
+	if err != nil {
+		return err
+	}
+
+	return allowance.ValidateBasic()
+}
+```
+
+**File:** x/auth/types/account.go (L162-165)
+```go
+// NewModuleAddress creates an AccAddress from the hash of the module's name
+func NewModuleAddress(name string) sdk.AccAddress {
+	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
+}
+```
+
+**File:** x/distribution/keeper/allocation.go (L15-27)
+```go
+func (k Keeper) AllocateTokens(
+	ctx sdk.Context, sumPreviousPrecommitPower, totalPreviousPower int64,
+	previousProposer sdk.ConsAddress, bondedVotes []abci.VoteInfo,
+) {
+
+	logger := k.Logger(ctx)
+
+	// fetch and clear the collected fees for distribution, since this is
+	// called in BeginBlock, collected fees will be from the previous block
+	// (and distributed to the previous proposer)
+	feeCollector := k.authKeeper.GetModuleAccount(ctx, k.feeCollectorName)
+	feesCollectedInt := k.bankKeeper.GetAllBalances(ctx, feeCollector.GetAddress())
+	feesCollected := sdk.NewDecCoinsFromCoins(feesCollectedInt...)
+```
+
+**File:** x/bank/keeper/keeper.go (L393-402)
+```go
+func (k BaseKeeper) SendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amt sdk.Coins,
+) error {
+	recipientAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if recipientAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+
+	return k.SendCoins(ctx, senderAddr, recipientAcc.GetAddress(), amt)
+}
 ```

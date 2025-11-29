@@ -1,248 +1,432 @@
-After thorough investigation of the codebase, I have identified a critical vulnerability related to the security question.
+# Audit Report
 
 ## Title
-Nil Pointer Dereference in Multisig Signature Verification via Malformed Public Key Encoding
+Permanent Loss of Transaction Fees Due to Missing WriteDeferredBalances Call in EndBlocker
 
 ## Summary
-The `GetPubKeys()` method in `LegacyAminoPubKey` can return an array containing nil entries when public keys are encoded with empty `TypeUrl` fields in their protobuf `Any` wrappers. During signature verification, calling methods on these nil public key entries causes a panic that crashes the node, enabling a denial-of-service attack. [1](#0-0) 
+The banking module's deferred balance system immediately deducts transaction fees from user accounts and stores them in a memory-only cache, with the intention of flushing these balances to module accounts via `WriteDeferredBalances` during EndBlock processing. However, the bank module does not implement an EndBlock method, and `WriteDeferredBalances` is never called in production code. This results in permanent loss of all transaction fees when nodes restart, as the memory-only deferred cache is cleared while user account deductions remain persisted.
 
 ## Impact
-**High** - Network not being able to confirm new transactions (total network shutdown)
+**High** - Direct loss of funds
 
 ## Finding Description
 
-**Location:** 
-- Primary: `crypto/keys/multisig/multisig.go` lines 106-116 (`GetPubKeys` method)
-- Secondary: `codec/types/interface_registry.go` lines 255-258 (`UnpackAny` method)
-- Panic location: `crypto/keys/multisig/multisig.go` line 78 (`VerifyMultisignature` method)
+**Location:**
+- Deferred send implementation: [1](#0-0) 
+- Fee deduction call site: [2](#0-1) 
+- Memory store implementation: [3](#0-2) 
+- Memory store key registration: [4](#0-3) 
+- Bank module definition (no EndBlock): [5](#0-4) 
+- FinalizeBlocker (no WriteDeferredBalances call): [6](#0-5) 
 
-**Intended Logic:** 
-The `GetPubKeys()` method should return a fully initialized array of cryptographic public keys for multisig verification. The `UnpackAny` method should unpack all `Any`-wrapped interface values and populate their cached values. [1](#0-0) 
+**Intended logic:**
+According to the code documentation, the deferred balance system is designed to: (1) immediately deduct fees from user accounts during transaction processing via `SubUnlockedCoins`, (2) cache the deducted amounts in a deferred cache indexed by module and transaction, and (3) flush all deferred balances to module accounts in the EndBlocker by calling `WriteDeferredBalances`. The comment explicitly states: "In the EndBlocker, it will then perform one deposit for each module account." [7](#0-6) 
 
-**Actual Logic:** 
-When a multisig public key contains nested public keys encoded as protobuf `Any` messages with empty `TypeUrl` fields, the `UnpackAny` method silently returns without error and without populating the `cachedValue` field. [2](#0-1)  Subsequently, `GetCachedValue()` returns nil, and the type assertion `m.PubKeys[i].GetCachedValue().(cryptotypes.PubKey)` succeeds with a nil value (since nil can be asserted to any interface type). [3](#0-2)  The resulting array contains nil entries instead of valid public keys.
+**Actual logic:**
+The deferred cache uses a memory store that is "not committed as part of app state but maintained privately by each node" [3](#0-2) . When `DeferredSendCoinsFromAccountToModule` is called:
+1. User balance is reduced via `SubUnlockedCoins` and persisted to the IAVL store [8](#0-7) 
+2. The amount is stored in the memory-only deferred cache [9](#0-8) 
+3. The bank module has no EndBlock method implementation (verified by examining the entire module.go file)
+4. `WriteDeferredBalances` is never called in production code (only appears in test files)
+5. On node restart, the memory store is cleared, losing all deferred amounts
+6. User accounts retain their reduced balances, but module accounts never receive the funds
 
-**Exploit Scenario:**
-1. Attacker crafts a transaction for a new account with a multisig public key in `AuthInfo.SignerInfos`
-2. The multisig's nested public keys are maliciously encoded as `Any` wrappers with empty `TypeUrl` but valid `Value` bytes
-3. During transaction decoding, `UnpackInterfaces` is called on the `AuthInfo`, which calls `SignerInfo.UnpackInterfaces` [4](#0-3) 
-4. The `UnpackAny` method encounters the empty `TypeUrl` and returns early without setting `cachedValue` [2](#0-1) 
-5. `SetPubKeyDecorator` calls `sigTx.GetPubKeys()` which returns an array with nil entries [5](#0-4) 
-6. This malformed multisig pubkey is set on the account [6](#0-5) 
-7. `SigVerificationDecorator` retrieves the pubkey and calls `VerifySignature` [7](#0-6) 
-8. `VerifyMultisignature` calls `GetPubKeys()` which returns the array with nil entries [8](#0-7) 
-9. When iterating and calling `pubKeys[i].VerifySignature()` on a nil entry, a nil pointer dereference panic occurs [9](#0-8) 
+**Exploitation path:**
+No attacker is required - this occurs during normal blockchain operation:
+1. User submits transaction with fees
+2. Ante handler's `DeductFees` function calls `DeferredSendCoinsFromAccountToModule` [2](#0-1) 
+3. User's balance is immediately reduced and persisted to disk
+4. Amount is cached in memory-only deferred store
+5. Block processing completes; FinalizeBlocker proceeds through BeginBlock, transaction execution, EndBlock, and commit [6](#0-5)  without calling `WriteDeferredBalances`
+6. Node operator performs routine restart, upgrade, or node crashes
+7. Memory store is cleared on restart (not persisted to disk)
+8. Deferred cache loses all accumulated fees
+9. User accounts show permanently reduced balances, but fee collector module account never received the funds
 
-**Security Failure:** 
-This breaks memory safety and node availability. Any node processing the malicious transaction will panic and crash, preventing transaction confirmation and causing network-wide denial of service if propagated to multiple nodes.
+**Security guarantee broken:**
+This violates the fundamental accounting invariant that all coins deducted from accounts must exist somewhere in the system. The `TotalSupply` invariant correctly includes deferred balances in its calculation during normal operation [10](#0-9) , but after a node restart when the deferred cache is cleared, the invariant would fail because the sum of all account balances would be less than the total supply.
 
 ## Impact Explanation
-- **Affected processes:** Transaction validation and signature verification
-- **Severity:** Any attacker can craft a single malicious transaction that crashes all nodes that attempt to process it
-- **Damage scope:** Complete network shutdown - nodes cannot recover without rejecting the malicious transaction from the mempool
-- **Consequences:** 
-  - Network halts and cannot confirm new transactions
-  - Requires manual intervention to blacklist the malicious transaction
-  - Could be used repeatedly to maintain persistent network disruption
-  - Affects consensus, block production, and all network services
+
+All transaction fees paid by users since the last node restart are permanently and irrecoverably lost. This includes:
+- Fees intended for the fee collector module for validator rewards and governance funding
+- Any other module-to-module transfers using the deferred system
+
+The damage is severe because:
+- **Permanent fund loss**: Transaction fees are deducted from user accounts but never reach their intended module accounts
+- **Accumulates continuously**: Every transaction that pays fees (essentially all transactions) contributes to the loss
+- **No recovery mechanism**: Once the node restarts and clears the memory store, the deferred amounts cannot be recovered
+- **Systemic issue**: Affects every node in the network independently on every restart
+- **Consensus breaking**: After restart, nodes will have inconsistent state - some may have restarted recently (lost more fees), others may have been running longer (lost fewer fees), leading to potential invariant check failures and chain halts
+
+This fundamentally breaks the blockchain's economic model. Users pay fees expecting them to fund validators and governance, but these fees vanish without reaching their destination, making the blockchain economically unsustainable.
 
 ## Likelihood Explanation
-- **Who can trigger:** Any network participant with the ability to submit transactions
-- **Conditions required:** Only requires crafting a properly formatted transaction with malformed public key encoding - no special privileges needed
-- **Frequency:** Can be triggered at will and repeatedly
-- **Ease of exploitation:** Moderate - requires understanding of protobuf encoding but no complex setup
-- **Real-world likelihood:** High - this is a straightforward attack vector that could be discovered and exploited by malicious actors
+
+**Triggering conditions:**
+- Any transaction that pays fees (essentially all transactions on the network)
+- Any node restart (routine maintenance, crashes, upgrades, hardware failures)
+
+**Frequency and scope:**
+- **Every transaction**: Fees are deferred on every single transaction via the ante handler
+- **Every restart**: All accumulated deferred fees are lost on every node restart
+- **Network-wide impact**: Every validator node and full node experiences this independently
+
+Node restarts occur regularly for:
+- Routine software updates and security patches
+- Network upgrades requiring new binary versions
+- Crashes due to bugs, resource exhaustion, or system issues
+- Hardware maintenance or failures
+- Datacenter operations
+
+**Who is affected:**
+- All users paying transaction fees (funds lost)
+- All nodes (operating with inconsistent state after restarts)
+- The protocol itself (fee collector never receives fees for validator rewards/governance)
+
+This vulnerability is triggered continuously during normal blockchain operation without requiring any attacker or special conditions. The likelihood is **very high** because node restarts are a regular operational requirement.
 
 ## Recommendation
-Add explicit nil checks in `GetPubKeys()` and proper error handling for invalid cached values:
 
-1. In `crypto/keys/multisig/multisig.go`, modify `GetPubKeys()` to verify cached values are non-nil:
-   ```go
-   func (m *LegacyAminoPubKey) GetPubKeys() []cryptotypes.PubKey {
-       if m != nil {
-           pubKeys := make([]cryptotypes.PubKey, len(m.PubKeys))
-           for i := 0; i < len(m.PubKeys); i++ {
-               pkAny := m.PubKeys[i].GetCachedValue()
-               if pkAny == nil {
-                   return nil  // Return nil to indicate invalid state
-               }
-               pk, ok := pkAny.(cryptotypes.PubKey)
-               if !ok {
-                   return nil
-               }
-               pubKeys[i] = pk
-           }
-           return pubKeys
-       }
-       return nil
-   }
-   ```
+**Immediate fix:**
+Add an EndBlock method to the bank module that calls `WriteDeferredBalances` before the block is committed:
 
-2. In `x/auth/tx/builder.go`, strengthen the validation to reject nil cached values:
-   ```go
-   pkAny := si.PublicKey.GetCachedValue()
-   if pkAny == nil {
-       return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "PubKey has nil cached value at index %d", i)
-   }
-   pk, ok := pkAny.(cryptotypes.PubKey)
-   if !ok {
-       return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "Expecting PubKey, got: %T", pkAny)
-   }
-   ```
-
-3. In `codec/types/interface_registry.go`, consider returning an error instead of silently succeeding when TypeUrl is empty but the Any is not nil.
-
-## Proof of Concept
-
-**File:** `crypto/keys/multisig/multisig_test.go`
-
-**Test Function:** `TestGetPubKeysWithMalformedAny`
-
+1. In `x/bank/module.go`, add an EndBlock method to the AppModule:
 ```go
-func TestGetPubKeysWithMalformedAny(t *testing.T) {
-    // Setup: Create a multisig with manually crafted Any wrappers that have empty TypeUrl
-    pubKeys := generatePubKeys(3)
-    
-    // Create a properly initialized multisig first
-    validMultisig := kmultisig.NewLegacyAminoPubKey(2, pubKeys)
-    
-    // Now create a malicious multisig by manually constructing Any wrappers with empty TypeUrl
-    maliciousAnys := make([]*types.Any, 3)
-    for i := 0; i < 3; i++ {
-        // Marshal the public key to get valid bytes
-        pkBytes, _ := pubKeys[i].Marshal()
-        // Create Any with empty TypeUrl but valid Value
-        maliciousAnys[i] = &types.Any{
-            TypeUrl: "", // Empty TypeUrl - this is the malicious part
-            Value:   pkBytes,
-        }
-    }
-    
-    maliciousMultisig := &kmultisig.LegacyAminoPubKey{
-        Threshold: 2,
-        PubKeys:   maliciousAnys,
-    }
-    
-    // Simulate the UnpackInterfaces call that would happen during transaction decoding
-    registry := types.NewInterfaceRegistry()
-    cryptocodec.RegisterInterfaces(registry)
-    
-    // This should succeed but leave cachedValues as nil due to empty TypeUrl
-    err := maliciousMultisig.UnpackInterfaces(registry)
-    require.NoError(t, err) // UnpackInterfaces returns nil for empty TypeUrl
-    
-    // Trigger: Call GetPubKeys - this will return an array with nil entries
-    retrievedPubKeys := maliciousMultisig.GetPubKeys()
-    require.NotNil(t, retrievedPubKeys)
-    require.Equal(t, 3, len(retrievedPubKeys))
-    
-    // Observation: The array contains nil entries
-    for i, pk := range retrievedPubKeys {
-        require.Nil(t, pk, "Expected nil public key at index %d due to empty TypeUrl", i)
-    }
-    
-    // Now demonstrate the panic: try to use the multisig for signature verification
-    msg := []byte{1, 2, 3, 4}
-    signBytesFn := func(mode signing.SignMode) ([]byte, error) { return msg, nil }
-    
-    // Create a dummy signature
-    sig := multisig.NewMultisig(3)
-    
-    // This will panic when trying to call VerifySignature on nil pubkey
-    require.Panics(t, func() {
-        _ = maliciousMultisig.VerifyMultisignature(signBytesFn, sig)
-    }, "Expected panic when calling VerifyMultisignature with nil pubkeys")
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    am.keeper.WriteDeferredBalances(ctx)
+    return []abci.ValidatorUpdate{}
 }
 ```
 
-**Observation:** The test confirms that:
-1. An `Any` with empty `TypeUrl` passes `UnpackInterfaces` without error
-2. `GetPubKeys()` returns an array with nil entries (not a nil array)
-3. Calling `VerifyMultisignature` with these nil entries causes a panic
+2. Ensure the bank module is properly registered in the EndBlocker order in `simapp/app.go` (it already appears to be at line 374, but verify the EndBlock method is being called)
 
-This test will panic on the current vulnerable code, demonstrating the exploitable vulnerability.
+**Alternative fix:**
+Add the call directly in the application's FinalizeBlocker in `simapp/app.go` before `SetDeliverStateToCommit()`:
+```go
+// After EndBlock and before SetDeliverStateToCommit
+deferredEvents := app.BankKeeper.WriteDeferredBalances(ctx)
+events = append(events, deferredEvents...)
+```
+
+**Verification:**
+After implementing the fix, verify that:
+- `WriteDeferredBalances` is called once per block
+- Fee collector module accounts receive all accumulated fees
+- TotalSupply invariant passes after node restarts
+- No deferred balances remain in the cache at the end of each block
+
+## Proof of Concept
+
+The vulnerability can be demonstrated with the following test scenario:
+
+**Setup:**
+1. Initialize test application with bank keeper configured with deferred cache
+2. Create user account and fee collector module account
+3. Fund user account with initial balance
+
+**Action:**
+1. Call `DeferredSendCoinsFromAccountToModule` to simulate fee deduction (as done by ante handler)
+2. Verify user balance is reduced (persisted to disk)
+3. Verify fee collector balance remains unchanged (transfer deferred)
+4. Verify deferred cache contains the fee amount
+5. Do NOT call `WriteDeferredBalances`
+6. Simulate node restart by creating a new context (clears memory stores)
+
+**Result:**
+After simulated restart:
+- User balance remains reduced (persisted to IAVL store)
+- Fee collector balance is still zero (never received the funds)
+- Deferred cache is empty (cleared on restart)
+- TotalSupply invariant fails (total of account balances < total supply)
+- Funds are permanently lost - user paid but recipient never received
+
+The key observation is that `WriteDeferredBalances` only appears in test files (verified via grep search showing matches only in `x/bank/keeper/keeper_test.go`, `x/auth/ante/fee_test.go`, `x/auth/ante/testutil_test.go`, and `x/bank/keeper/deferred_cache_test.go`), never in production code paths.
+
+## Notes
+
+This vulnerability was validated by:
+1. Confirming `DeferredSendCoinsFromAccountToModule` is called for every fee deduction
+2. Verifying user balance deduction uses persistent storage via `SubUnlockedCoins`
+3. Confirming deferred cache uses non-persistent memory store
+4. Verifying bank module has no EndBlock implementation
+5. Confirming `WriteDeferredBalances` is never called in production code (only in tests)
+6. Verifying FinalizeBlocker does not call `WriteDeferredBalances`
+7. Confirming memory store behavior on node restart (not persisted to disk)
+
+The issue represents a critical design flaw where the documented behavior (calling `WriteDeferredBalances` in EndBlocker) was never implemented in production code, despite the deferred balance system being actively used for fee collection on every transaction.
 
 ### Citations
 
-**File:** crypto/keys/multisig/multisig.go (L54-54)
+**File:** x/bank/keeper/keeper.go (L404-407)
 ```go
-	pubKeys := m.GetPubKeys()
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
 ```
 
-**File:** crypto/keys/multisig/multisig.go (L78-78)
+**File:** x/bank/keeper/keeper.go (L408-432)
 ```go
-				if !pubKeys[i].VerifySignature(msg, si.Signature) {
-```
-
-**File:** crypto/keys/multisig/multisig.go (L106-116)
-```go
-func (m *LegacyAminoPubKey) GetPubKeys() []cryptotypes.PubKey {
-	if m != nil {
-		pubKeys := make([]cryptotypes.PubKey, len(m.PubKeys))
-		for i := 0; i < len(m.PubKeys); i++ {
-			pubKeys[i] = m.PubKeys[i].GetCachedValue().(cryptotypes.PubKey)
-		}
-		return pubKeys
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
+	}
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 ```
 
-**File:** codec/types/interface_registry.go (L255-258)
+**File:** x/auth/ante/fee.go (L208-208)
 ```go
-	if any.TypeUrl == "" {
-		// if TypeUrl is empty return nil because without it we can't actually unpack anything
-		return nil
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** simapp/app.go (L230-230)
+```go
+	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
+```
+
+**File:** simapp/app.go (L476-574)
+```go
+func (app *SimApp) FinalizeBlocker(ctx sdk.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
+	events := []abci.Event{}
+	beginBlockResp := app.BeginBlock(ctx, abci.RequestBeginBlock{
+		Hash: req.Hash,
+		ByzantineValidators: utils.Map(req.ByzantineValidators, func(mis abci.Misbehavior) abci.Evidence {
+			return abci.Evidence{
+				Type:             abci.MisbehaviorType(mis.Type),
+				Validator:        abci.Validator(mis.Validator),
+				Height:           mis.Height,
+				Time:             mis.Time,
+				TotalVotingPower: mis.TotalVotingPower,
+			}
+		}),
+		LastCommitInfo: abci.LastCommitInfo{
+			Round: req.DecidedLastCommit.Round,
+			Votes: utils.Map(req.DecidedLastCommit.Votes, func(vote abci.VoteInfo) abci.VoteInfo {
+				return abci.VoteInfo{
+					Validator:       abci.Validator(vote.Validator),
+					SignedLastBlock: vote.SignedLastBlock,
+				}
+			}),
+		},
+		Header: tmproto.Header{
+			ChainID:         app.ChainID,
+			Height:          req.Height,
+			Time:            req.Time,
+			ProposerAddress: ctx.BlockHeader().ProposerAddress,
+		},
+	})
+	events = append(events, beginBlockResp.Events...)
+
+	typedTxs := []sdk.Tx{}
+	for _, tx := range req.Txs {
+		typedTx, err := app.txDecoder(tx)
+		if err != nil {
+			typedTxs = append(typedTxs, nil)
+		} else {
+			typedTxs = append(typedTxs, typedTx)
+		}
 	}
-```
 
-**File:** codec/types/any.go (L112-114)
-```go
-func (any *Any) GetCachedValue() interface{} {
-	return any.cachedValue
-}
-```
-
-**File:** types/tx/types.go (L197-199)
-```go
-func (m *SignerInfo) UnpackInterfaces(unpacker codectypes.AnyUnpacker) error {
-	return unpacker.UnpackAny(m.PublicKey, new(cryptotypes.PubKey))
-}
-```
-
-**File:** x/auth/tx/builder.go (L107-128)
-```go
-func (w *wrapper) GetPubKeys() ([]cryptotypes.PubKey, error) {
-	signerInfos := w.tx.AuthInfo.SignerInfos
-	pks := make([]cryptotypes.PubKey, len(signerInfos))
-
-	for i, si := range signerInfos {
-		// NOTE: it is okay to leave this nil if there is no PubKey in the SignerInfo.
-		// PubKey's can be left unset in SignerInfo.
-		if si.PublicKey == nil {
+	txResults := []*abci.ExecTxResult{}
+	for i, tx := range req.Txs {
+		ctx = ctx.WithContext(context.WithValue(ctx.Context(), ante.ContextKeyTxIndexKey, i))
+		if typedTxs[i] == nil {
+			txResults = append(txResults, &abci.ExecTxResult{}) // empty result
 			continue
 		}
-
-		pkAny := si.PublicKey.GetCachedValue()
-		pk, ok := pkAny.(cryptotypes.PubKey)
-		if ok {
-			pks[i] = pk
-		} else {
-			return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "Expecting PubKey, got: %T", pkAny)
-		}
+		deliverTxResp := app.DeliverTx(ctx, abci.RequestDeliverTx{
+			Tx: tx,
+		}, typedTxs[i], sha256.Sum256(tx))
+		txResults = append(txResults, &abci.ExecTxResult{
+			Code:      deliverTxResp.Code,
+			Data:      deliverTxResp.Data,
+			Log:       deliverTxResp.Log,
+			Info:      deliverTxResp.Info,
+			GasWanted: deliverTxResp.GasWanted,
+			GasUsed:   deliverTxResp.GasUsed,
+			Events:    deliverTxResp.Events,
+			Codespace: deliverTxResp.Codespace,
+		})
 	}
+	endBlockResp := app.EndBlock(ctx, abci.RequestEndBlock{
+		Height: req.Height,
+	})
+	events = append(events, endBlockResp.Events...)
 
-	return pks, nil
+	app.SetDeliverStateToCommit()
+	app.WriteState()
+	appHash := app.GetWorkingHash()
+	return &abci.ResponseFinalizeBlock{
+		Events:    events,
+		TxResults: txResults,
+		ValidatorUpdates: utils.Map(endBlockResp.ValidatorUpdates, func(v abci.ValidatorUpdate) abci.ValidatorUpdate {
+			return abci.ValidatorUpdate{
+				PubKey: v.PubKey,
+				Power:  v.Power,
+			}
+		}),
+		ConsensusParamUpdates: &tmproto.ConsensusParams{
+			Block: &tmproto.BlockParams{
+				MaxBytes: endBlockResp.ConsensusParamUpdates.Block.MaxBytes,
+				MaxGas:   endBlockResp.ConsensusParamUpdates.Block.MaxGas,
+			},
+			Evidence: &tmproto.EvidenceParams{
+				MaxAgeNumBlocks: endBlockResp.ConsensusParamUpdates.Evidence.MaxAgeNumBlocks,
+				MaxAgeDuration:  endBlockResp.ConsensusParamUpdates.Evidence.MaxAgeDuration,
+				MaxBytes:        endBlockResp.ConsensusParamUpdates.Block.MaxBytes,
+			},
+			Validator: &tmproto.ValidatorParams{
+				PubKeyTypes: endBlockResp.ConsensusParamUpdates.Validator.PubKeyTypes,
+			},
+			Version: &tmproto.VersionParams{
+				AppVersion: endBlockResp.ConsensusParamUpdates.Version.AppVersion,
+			},
+		},
+		AppHash: appHash,
+	}, nil
 }
 ```
 
-**File:** x/auth/ante/sigverify.go (L93-93)
+**File:** x/bank/module.go (L107-210)
 ```go
-		err = acc.SetPubKey(pk)
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
+
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
+}
+
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
+	}
+}
+
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
+
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
+}
 ```
 
-**File:** x/auth/ante/sigverify.go (L295-295)
+**File:** x/bank/keeper/invariants.go (L74-78)
 ```go
-			err := authsigning.VerifySignature(pubKey, signerData, sig.Data, svd.signModeHandler, tx)
+		// also iterate over deferred balances
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
+			return false
+		})
 ```

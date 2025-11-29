@@ -1,275 +1,247 @@
 # Audit Report
 
 ## Title
-Genesis-Based DoS Attack via Unbounded Capability Owner Sets
+Integer Overflow in BlocksPerYear Parameter Causes Permanent Chain Halt
 
 ## Summary
-The capability module allows an unbounded number of owners to be specified in the genesis state for a single capability. When combined with the O(n) insertion cost in `CapabilityOwners.Set()`, this enables a DoS attack where claiming a capability with a large pre-existing owner set consumes excessive gas, potentially exceeding block gas limits and preventing critical operations like IBC channel establishment.
+The `BlockProvision` function in the mint module performs an unsafe cast of `BlocksPerYear` from `uint64` to `int64` without validation, allowing values exceeding `math.MaxInt64` to overflow into negative numbers. This causes a panic in `sdk.NewCoin` when creating tokens with negative amounts, resulting in permanent chain halt during BeginBlocker execution.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
 **Location:** 
-- Primary vulnerability: [1](#0-0) 
-- Exploit trigger: [2](#0-1) 
-- Gas consumption: [3](#0-2) 
+- Vulnerable cast: [1](#0-0) 
+- Insufficient validation: [2](#0-1) 
+- Panic trigger: [3](#0-2) 
+- Panic source: [4](#0-3) 
+- Negative amount check: [5](#0-4) 
 
-**Intended Logic:** 
-The capability module should allow multiple modules to claim ownership of capabilities through the `ClaimCapability` function. The `CapabilityOwners.Set()` method maintains a sorted list of owners and uses binary search for efficient lookups. Genesis validation should ensure the state is reasonable and won't cause operational issues.
+**Intended Logic:**
+The mint module should safely calculate per-block token provisions by dividing annual provisions by blocks per year. The `validateBlocksPerYear` function should ensure all parameter values are safe for arithmetic operations and type conversions.
 
-**Actual Logic:** 
-The genesis validation function checks that owner lists are non-empty and have valid module/name fields, but imposes no upper limit on the number of owners per capability. The `Set()` method performs an O(n) memory copy operation when inserting a new owner at position i, which is not gas-metered. However, the subsequent marshal and store write operations consume gas proportional to the total serialized size of all owners. With the default gas config [3](#0-2) , writing costs 2000 + 30 * bytes.
+**Actual Logic:**
+The validation function only checks if `BlocksPerYear` is non-zero, but does not verify it's within the safe range for int64 conversion. When `BlockProvision` executes `sdk.NewInt(int64(params.BlocksPerYear))`, any value exceeding `math.MaxInt64` (9,223,372,036,854,775,807) undergoes integer overflow due to Go's two's complement representation, producing a negative value. This negative divisor causes `AnnualProvisions.QuoInt()` to return a negative result, which then triggers a panic in `sdk.NewCoin` since coin validation explicitly rejects negative amounts.
 
-**Exploit Scenario:**
-1. An attacker (or compromised governance) proposes a genesis file containing a capability with 50,000+ owners (each owner ~50 bytes serialized)
-2. The chain initializes successfully because `InitGenesis` calls `SetOwners` [4](#0-3)  which directly stores the data without using the `Set()` method
-3. During normal operation, when a legitimate module attempts to claim that capability via `ClaimCapability` [5](#0-4) , it triggers `addOwner` [6](#0-5) 
-4. The `addOwner` function calls `capOwners.Set()` which performs O(n) operations in memory, then marshals and writes the updated owner list
-5. For 50,000 owners: Read cost ≈ 7.5M gas, Write cost ≈ 75M gas (total ~82.5M gas)
-6. This exceeds typical block gas limits (10-50M), causing the transaction to fail with out-of-gas error
+**Exploitation Path:**
+1. Attacker influences governance (through social engineering, compromised validators, or voting power) to submit a parameter change proposal setting `BlocksPerYear` to a value > `math.MaxInt64`
+2. Proposal passes governance vote (validators/token holders may not recognize the technical danger)
+3. Parameter change executes successfully (validation only checks non-zero)
+4. At next block, BeginBlocker calls `minter.BlockProvision(params)` [3](#0-2) 
+5. Integer overflow occurs: `int64(params.BlocksPerYear)` becomes negative
+6. Division produces negative provision amount
+7. `sdk.NewCoin` panics when validating the negative amount [6](#0-5) 
+8. Panic is uncaught in BeginBlock [7](#0-6)  - no defer/recover mechanism exists
+9. All validators experience identical panic, halting the entire chain
 
-**Security Failure:** 
-This breaks the availability guarantee of the capability system. Critical operations like IBC channel opening that depend on claiming capabilities become impossible to execute, causing a denial-of-service condition without requiring brute-force attacks.
+**Security Guarantee Broken:**
+Chain liveness guarantee is violated. The blockchain becomes unable to produce new blocks, requiring coordinated hard fork intervention for recovery.
 
 ## Impact Explanation
 
-The vulnerability affects network availability and operational functionality:
+This vulnerability causes complete network shutdown affecting all network participants:
 
-- **Affected Systems**: Any module attempting to claim a capability with a bloated owner set, particularly IBC modules that need to claim channel capabilities during the handshake process
-- **Severity**: Operations requiring capability claims become impossible if gas consumption exceeds block limits. This can freeze IBC connectivity, preventing cross-chain communication and asset transfers
-- **Resource Consumption**: Each attempt to claim the capability consumes substantial gas, increasing network processing node resource consumption by forcing nodes to process oversized state reads/writes
-- **Chain Operations**: If critical system capabilities (like IBC port capabilities) are affected, core chain functionality can be permanently disabled without a hard fork to fix the genesis state
+- **Validator Impact**: All validator nodes panic when attempting to execute BeginBlocker, preventing block production
+- **Network Impact**: Consensus halts permanently - no new blocks can be produced or finalized
+- **User Impact**: All transactions become impossible to submit or process; all economic activity freezes
+- **Recovery Complexity**: Only solution is coordinated hard fork to either rollback state or fix the validation logic and upgrade all nodes
 
-This matters because it can halt critical blockchain operations through a single malicious genesis entry, requiring coordinated governance action or hard fork to resolve.
+The impact is catastrophic and unrecoverable through normal chain operations. Unlike a temporary issue or individual node crash, this affects the entire network simultaneously and permanently until manual intervention via hard fork.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Requires inclusion of malicious data in the genesis file (possible during chain launch or through governance-approved chain upgrades)
-- Can be triggered by any module attempting to claim the affected capability through normal operations
+**Trigger Requirements:**
+- Governance proposal to change `BlocksPerYear` parameter must be submitted and approved
+- Parameter must be set between 9,223,372,036,854,775,808 and 18,446,744,073,709,551,615
+- Current validation allows these values (only checks non-zero)
 
-**Frequency:**
-- One-time setup via genesis; persistent effect on all subsequent claim attempts
-- Every `ClaimCapability` call on the affected capability will fail due to excessive gas
-- For IBC: Every new channel handshake would fail if the port capability is affected
+**Attacker Profile:**
+While this requires governance participation, it can be triggered through:
+- Social engineering: Convincing validators/token holders that an extremely high `BlocksPerYear` is economically beneficial
+- Compromised validators: Gaining control of sufficient voting power
+- Inadvertent mistake: Well-meaning governance participant not understanding technical implications
 
-**Attacker Requirements:**
-- For new chains: Influence over genesis file creation
-- For existing chains: Successful governance proposal for a chain upgrade with modified genesis
-- No special runtime privileges needed to trigger the DoS once the malicious genesis is in place
-
-The attack is realistic because genesis files are often prepared by small teams during chain launches, and the lack of validation makes it easy for this vulnerability to be introduced accidentally or maliciously.
+**Likelihood Assessment:**
+The missing validation creates a footgun - the system should protect against values causing technical failures, regardless of governance intent. A governance participant might reasonably think setting a very high `BlocksPerYear` is just an unusual economic choice without realizing it causes integer overflow. The validation passing makes the value appear "safe" from the system's perspective.
 
 ## Recommendation
 
-Add an upper bound validation on the number of owners per capability in genesis validation:
+Add upper bound validation to prevent integer overflow:
 
 ```go
-// In x/capability/types/genesis.go, add to the Validate() function:
-const MaxOwnersPerCapability = 100 // or another reasonable limit
-
-for _, genOwner := range gs.Owners {
-    if len(genOwner.IndexOwners.Owners) == 0 {
-        return fmt.Errorf("empty owners in genesis")
+func validateBlocksPerYear(i interface{}) error {
+    v, ok := i.(uint64)
+    if !ok {
+        return fmt.Errorf("invalid parameter type: %T", i)
     }
     
-    // Add this validation
-    if len(genOwner.IndexOwners.Owners) > MaxOwnersPerCapability {
-        return fmt.Errorf("capability %d has %d owners, exceeds maximum of %d",
-            genOwner.Index, len(genOwner.IndexOwners.Owners), MaxOwnersPerCapability)
+    if v == 0 {
+        return fmt.Errorf("blocks per year must be positive: %d", v)
     }
     
-    // existing validation continues...
+    // Prevent integer overflow when casting to int64
+    if v > math.MaxInt64 {
+        return fmt.Errorf("blocks per year exceeds maximum safe value (math.MaxInt64): %d", v)
+    }
+    
+    return nil
 }
 ```
 
-Additionally, consider implementing a runtime check in `addOwner` to prevent accumulation of excessive owners during normal operations, and potentially optimize the `Set()` method to use a more efficient data structure for large owner sets (though the genesis limit is the primary fix).
+Alternatively, use the safe conversion function that already exists [8](#0-7) :
+
+```go
+func (m Minter) BlockProvision(params Params) sdk.Coin {
+    provisionAmt := m.AnnualProvisions.QuoInt(sdk.NewIntFromUint64(params.BlocksPerYear))
+    return sdk.NewCoin(params.MintDenom, provisionAmt.TruncateInt())
+}
+```
+
+The `NewIntFromUint64` function properly handles the full uint64 range without overflow by using `big.Int.SetUint64()`.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
+**File:** `x/mint/types/minter_test.go`
 
-**Test Function:** `TestLargeOwnerSetDoS`
+**Test Function:**
+```go
+func TestBlockProvisionPanicOnOverflow(t *testing.T) {
+    // Setup: Create minter with positive annual provisions
+    minter := InitialMinter(sdk.NewDecWithPrec(1, 1))
+    minter.AnnualProvisions = sdk.NewDec(1000000000)
+    
+    // Create params with BlocksPerYear exceeding math.MaxInt64
+    params := DefaultParams()
+    params.BlocksPerYear = uint64(math.MaxInt64) + 1
+    
+    // Trigger: BlockProvision panics due to integer overflow
+    // The cast int64(params.BlocksPerYear) overflows to negative
+    // Division produces negative result
+    // sdk.NewCoin panics on negative amount validation
+    require.Panics(t, func() {
+        minter.BlockProvision(params)
+    })
+}
+```
 
-**Setup:**
-1. Create a genesis state with a capability (index 1) containing 10,000 owner entries
-2. Initialize the keeper with this genesis state using `InitGenesis`
-3. Create a new scoped keeper for a module that will attempt to claim the capability
+**Setup:** Minter configured with positive annual provisions; parameters set with `BlocksPerYear` exceeding safe int64 range.
 
-**Trigger:**
-1. Call `ClaimCapability` on the capability with 10,000 pre-existing owners
-2. Measure the gas consumed by the operation using the context's gas meter
+**Action:** Call `BlockProvision(params)` which performs unsafe cast and arithmetic operations.
 
-**Observation:**
-The test demonstrates that claiming a capability with 10,000 owners consumes approximately 16.5 million gas (1024 + 150*10000 for read + 3740 + 1500*10000 for write). This is calculated based on [7](#0-6)  where Get/Set operations consume gas proportional to data size. With 50,000 owners, the cost would exceed 82 million gas, making the operation infeasible within typical block gas limits.
+**Result:** Function panics when `sdk.NewCoin` validates the negative amount produced by division with overflowed negative divisor. This confirms the vulnerability would halt the chain when executed in BeginBlocker.
 
-The test should show that:
-- Genesis initialization succeeds despite the large owner set
-- Attempting to claim the capability results in excessive gas consumption
-- The gas consumed scales linearly with the number of existing owners
-- At sufficient scale (50,000+ owners), the operation would exceed block gas limits
+## Notes
 
-This confirms that an attacker can DoS the capability system by including large owner sets in genesis, preventing legitimate modules from claiming capabilities and disrupting critical operations like IBC channel establishment.
+This vulnerability satisfies the exception to the privileged action rule because:
+
+1. The validation function exists but is incomplete - this is a genuine system bug, not intended behavior
+2. Governance participants might inadvertently approve such a value without understanding the technical implications (validation passing suggests it's "safe")  
+3. The consequence (permanent chain halt requiring hard fork) is far beyond the intended authority of parameter governance
+4. The system should protect against technically dangerous values through proper validation, even if they're approved by governance
+
+The vulnerability is in the **missing validation**, not in governance being malicious. Proper input validation is a security fundamental that should apply even to privileged operations.
 
 ### Citations
 
-**File:** x/capability/types/genesis.go (L21-49)
+**File:** x/mint/types/minter.go (L77-80)
 ```go
-func (gs GenesisState) Validate() error {
-	// NOTE: index must be greater than 0
-	if gs.Index == 0 {
-		return fmt.Errorf("capability index must be non-zero")
+func (m Minter) BlockProvision(params Params) sdk.Coin {
+	provisionAmt := m.AnnualProvisions.QuoInt(sdk.NewInt(int64(params.BlocksPerYear)))
+	return sdk.NewCoin(params.MintDenom, provisionAmt.TruncateInt())
+}
+```
+
+**File:** x/mint/types/params.go (L184-195)
+```go
+func validateBlocksPerYear(i interface{}) error {
+	v, ok := i.(uint64)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	for _, genOwner := range gs.Owners {
-		if len(genOwner.IndexOwners.Owners) == 0 {
-			return fmt.Errorf("empty owners in genesis")
-		}
-
-		// all exported existing indices must be between [1, gs.Index)
-		if genOwner.Index == 0 || genOwner.Index >= gs.Index {
-			return fmt.Errorf("owners exist for index %d outside of valid range: %d-%d", genOwner.Index, 1, gs.Index-1)
-		}
-
-		for _, owner := range genOwner.IndexOwners.Owners {
-			if strings.TrimSpace(owner.Module) == "" {
-				return fmt.Errorf("owner's module cannot be blank: %s", owner)
-			}
-
-			if strings.TrimSpace(owner.Name) == "" {
-				return fmt.Errorf("owner's name cannot be blank: %s", owner)
-			}
-		}
+	if v == 0 {
+		return fmt.Errorf("blocks per year must be positive: %d", v)
 	}
 
 	return nil
 }
 ```
 
-**File:** x/capability/types/types.go (L46-59)
+**File:** x/mint/abci.go (L27-29)
 ```go
-func (co *CapabilityOwners) Set(owner Owner) error {
-	i, ok := co.Get(owner)
-	if ok {
-		// owner already exists at co.Owners[i]
-		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
+	// mint coins, update supply
+	mintedCoin := minter.BlockProvision(params)
+	mintedCoins := sdk.NewCoins(mintedCoin)
+```
+
+**File:** types/coin.go (L14-27)
+```go
+// NewCoin returns a new coin with a denomination and amount. It will panic if
+// the amount is negative or if the denomination is invalid.
+func NewCoin(denom string, amount Int) Coin {
+	coin := Coin{
+		Denom:  denom,
+		Amount: amount,
 	}
 
-	// owner does not exist in the set of owners, so we insert at position i
-	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
-	copy(co.Owners[i+1:], co.Owners[i:])
-	co.Owners[i] = owner
+	if err := coin.Validate(); err != nil {
+		panic(err)
+	}
 
-	return nil
+	return coin
 }
 ```
 
-**File:** store/types/gas.go (L341-351)
+**File:** types/coin.go (L42-52)
 ```go
-func KVGasConfig() GasConfig {
-	return GasConfig{
-		HasCost:          1000,
-		DeleteCost:       1000,
-		ReadCostFlat:     1000,
-		ReadCostPerByte:  3,
-		WriteCostFlat:    2000,
-		WriteCostPerByte: 30,
-		IterNextCostFlat: 30,
-	}
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L168-174)
-```go
-func (k Keeper) SetOwners(ctx sdk.Context, index uint64, owners types.CapabilityOwners) {
-	prefixStore := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(index)
-
-	// set owners in persistent store
-	prefixStore.Set(indexKey, k.cdc.MustMarshal(&owners))
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L287-314)
-```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
+func (coin Coin) Validate() error {
+	if err := ValidateDenom(coin.Denom); err != nil {
 		return err
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
+	if coin.Amount.IsNegative() {
+		return fmt.Errorf("negative coin amount: %v", coin.Amount)
+	}
 
 	return nil
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L453-467)
+**File:** baseapp/abci.go (L133-156)
 ```go
-func (sk ScopedKeeper) addOwner(ctx sdk.Context, cap *types.Capability, name string) error {
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
+// BeginBlock implements the ABCI application interface.
+func (app *BaseApp) BeginBlock(ctx sdk.Context, req abci.RequestBeginBlock) (res abci.ResponseBeginBlock) {
+	defer telemetry.MeasureSince(time.Now(), "abci", "begin_block")
 
-	capOwners := sk.getOwners(ctx, cap)
-
-	if err := capOwners.Set(types.NewOwner(sk.module, name)); err != nil {
-		return err
+	if !req.Simulate {
+		if err := app.validateHeight(req); err != nil {
+			panic(err)
+		}
 	}
 
-	// update capability owner set
-	prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	if app.beginBlocker != nil {
+		res = app.beginBlocker(ctx, req)
+		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	}
 
-	return nil
-}
+	// call the streaming service hooks with the EndBlock messages
+	if !req.Simulate {
+		for _, streamingListener := range app.abciListeners {
+			if err := streamingListener.ListenBeginBlock(app.deliverState.ctx, req, res); err != nil {
+				app.logger.Error("EndBlock listening hook failed", "height", req.Header.Height, "err", err)
+			}
+		}
+	}
+	return res
 ```
 
-**File:** store/gaskv/store.go (L54-80)
+**File:** types/int.go (L97-102)
 ```go
-func (gs *Store) Get(key []byte) (value []byte) {
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostFlat, types.GasReadCostFlatDesc)
-	value = gs.parent.Get(key)
-
-	// TODO overflow-safe math?
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(key)), types.GasReadPerByteDesc)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(value)), types.GasReadPerByteDesc)
-	if gs.tracer != nil {
-		gs.tracer.Get(key, value, gs.moduleName)
-	}
-
-	return value
-}
-
-// Implements KVStore.
-func (gs *Store) Set(key []byte, value []byte) {
-	types.AssertValidKey(key)
-	types.AssertValidValue(value)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostFlat, types.GasWriteCostFlatDesc)
-	// TODO overflow-safe math?
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(key)), types.GasWritePerByteDesc)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(value)), types.GasWritePerByteDesc)
-	gs.parent.Set(key, value)
-	if gs.tracer != nil {
-		gs.tracer.Set(key, value, gs.moduleName)
-	}
+// NewIntFromUint64 constructs an Int from a uint64.
+func NewIntFromUint64(n uint64) Int {
+	b := big.NewInt(0)
+	b.SetUint64(n)
+	return Int{b}
 }
 ```

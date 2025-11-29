@@ -1,330 +1,173 @@
 # Audit Report
 
 ## Title
-Unbounded Dependency Mapping Growth Causing Memory Exhaustion During Genesis Export
+Network-Wide Denial of Service via Future-Height Evidence Submission Causing Panic in Slash Function
 
 ## Summary
-The access control system's dependency mappings (both resource and WASM) can grow unboundedly without size limits, pagination, or cleanup mechanisms. During genesis export operations (critical for chain upgrades), all mappings are loaded into memory at once, which can cause memory exhaustion and prevent successful chain upgrades. [1](#0-0) 
+An attacker can submit evidence with a future block height through `MsgSubmitEvidence`, which bypasses all validation checks and causes all nodes to panic when the staking keeper's `Slash` function detects the future infraction height, resulting in a complete network shutdown.
 
 ## Impact
-**Severity: Medium**
+**Medium** - Network not being able to confirm new transactions (total network shutdown)
 
 ## Finding Description
 
-**Location:** 
-- Primary: `x/accesscontrol/keeper/genesis.go`, function `ExportGenesis` (lines 28-44)
-- Secondary: `x/accesscontrol/keeper/keeper.go`, functions `IterateResourceKeys` (lines 106-117) and `IterateWasmDependencies` (lines 484-496)
-- Validation: `x/accesscontrol/types/message_dependency_mapping.go`, function `ValidateWasmDependencyMapping` (lines 123-181)
+**Location:**
+- Primary validation gap: `x/evidence/types/evidence.go` lines 46-61 (ValidateBasic function)
+- Secondary validation gap: `x/evidence/keeper/infraction.go` lines 42-64 (age check logic)
+- Panic trigger: `x/staking/keeper/slash.go` lines 67-71 (future height check)
+- Call chain: `x/evidence/keeper/infraction.go` line 107 → `x/slashing/keeper/keeper.go` line 78 → `x/staking/keeper/slash.go` line 24
 
-**Intended Logic:** 
-The dependency mapping system should store access control patterns for messages and WASM contracts to enable parallel transaction execution. Genesis export should safely export all state for chain upgrades.
+**Intended Logic:**
+Evidence should only represent past infractions. The system is designed to reject any evidence claiming an infraction occurred at a future block height, as this is logically impossible and indicates malicious or corrupted data.
 
-**Actual Logic:** 
-The system allows unlimited accumulation of dependency mappings without bounds: [2](#0-1) 
+**Actual Logic:**
+The validation flow has two critical gaps. First, the `Equivocation.ValidateBasic()` function only validates that `Height >= 1` but does not check if the height is in the future. [1](#0-0)  Second, in `HandleEquivocationEvidence`, when calculating the age of evidence, the expression `ageBlocks = ctx.BlockHeader().Height - infractionHeight` produces a negative value for future heights. [2](#0-1)  This negative value does not satisfy the "too old" rejection condition `ageBlocks > cp.Evidence.MaxAgeNumBlocks`. [3](#0-2) 
 
-The validation has no size limits on:
-- Number of access operations per mapping
-- Number of contract references
-- Size of individual fields
-- Total number of mappings
+The evidence then proceeds to slashing where `distributionHeight = infractionHeight - sdk.ValidatorUpdateDelay` still results in a future height. [4](#0-3)  This value is passed through the slashing keeper [5](#0-4)  which forwards it to the staking keeper. [6](#0-5)  When the staking keeper's `Slash` function receives this future height as `infractionHeight`, it triggers a panic. [7](#0-6) 
 
-During genesis export, ALL mappings are loaded into memory simultaneously: [3](#0-2) [4](#0-3) 
+**Exploitation Path:**
+1. Attacker crafts a `MsgSubmitEvidence` with an `Equivocation` where `Height = currentBlockHeight + 100`
+2. The message is submitted through the standard transaction submission process [8](#0-7) 
+3. Message validation passes because `ValidateBasic()` only checks `Height >= 1`
+4. Transaction is included in a block and processed
+5. `HandleEquivocationEvidence` is invoked with `infractionHeight = currentBlockHeight + 100`
+6. Age check calculates: `ageBlocks = currentBlockHeight - (currentBlockHeight + 100) = -100`
+7. Since `-100` is NOT `> MaxAgeNumBlocks`, evidence is not rejected
+8. `distributionHeight = infractionHeight - 1 = currentBlockHeight + 99` 
+9. This future height is passed through slashing keeper to staking keeper
+10. Check `infractionHeight > ctx.BlockHeight()` evaluates to `true`, causing panic
 
-**Exploit Scenario:**
-1. Over the chain's lifetime, numerous WASM contracts are deployed and dependency mappings are registered through governance proposals
-2. Each mapping can contain unlimited access operations, contract references, and nested dependencies with no validation limits
-3. No cleanup mechanism exists - old/unused contract mappings remain in storage indefinitely
-4. When a chain upgrade is initiated, nodes must export genesis state
-5. The `ExportGenesis` function iterates over ALL mappings and loads them into memory slices without pagination
-6. With sufficient accumulated mappings or intentionally large mappings, this causes out-of-memory errors
-7. The chain upgrade fails, preventing critical updates and potentially halting the network
-
-**Security Failure:** 
-This breaks the availability guarantee for chain upgrades. The lack of bounds checking combined with unbounded accumulation creates a time-bomb that can prevent essential maintenance operations.
+**Security Guarantee Broken:**
+This violates the availability guarantee of the blockchain. All nodes processing the malicious transaction will panic and halt, preventing the network from producing new blocks or processing any transactions.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Chain upgrade process (genesis export/import)
-- Node memory resources during critical operations
-- Network ability to perform maintenance and security updates
+**Affected Processes:** Network availability and consensus
 
-**Severity:**
-- Chain upgrades are critical for security patches, consensus changes, and protocol improvements
-- Failure during genesis export prevents the upgrade from completing
-- All validator nodes attempting the upgrade would experience the same memory exhaustion
-- This effectively halts the network's ability to upgrade, leaving it stuck on potentially vulnerable old code
-- Falls under "Medium: Increasing network processing node resource consumption by at least 30%" and potentially "High: Network not being able to confirm new transactions" if upgrade failure prevents block production
+**Consequences:**
+- All validator nodes processing the block containing the malicious evidence will panic simultaneously
+- The network cannot progress to produce new blocks
+- All pending transactions remain unprocessed
+- Recovery requires coordinated manual intervention to restart nodes and potentially exclude the malicious transaction from the block
 
-**Why This Matters:**
-Chain upgrades are essential for blockchain health. Without the ability to upgrade, the network cannot patch vulnerabilities, improve performance, or adapt to changing requirements. Memory exhaustion during this critical operation is a severe availability issue.
+This is a critical availability vulnerability that enables a single unprivileged attacker to completely halt the entire blockchain network with a single transaction. The attacker needs no special privileges—only the ability to submit a transaction, which is a fundamental capability in any blockchain.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-- Direct: Governance participants who approve dependency mapping proposals
-- Indirect: Natural accumulation over time as legitimate contracts are deployed and mappings registered
-- Malicious: Attacker who can influence governance or submit large mappings
+**Who Can Trigger:** Any user with the ability to submit transactions to the network
 
-**Conditions Required:**
-- Sufficient dependency mappings accumulated in storage (either through many contracts or intentionally large mappings)
-- Genesis export operation initiated (during chain upgrade)
-- No cleanup of old/unused mappings has occurred
+**Required Conditions:**
+- Attacker must know a valid validator consensus address (publicly available information)
+- No special timing or state conditions required
+- Can be executed at any time during normal network operation
 
-**Frequency:**
-- Low immediate risk for new chains
-- Risk increases linearly with chain age and contract deployment activity
-- Chain upgrades happen periodically (every few months typically)
-- Once threshold is reached, EVERY subsequent upgrade attempt fails until addressed via emergency hard fork
-
-**Realistic Scenario:**
-A mature chain with thousands of deployed contracts, each with dependency mappings registered over years of operation, attempts a routine upgrade. The genesis export runs out of memory, forcing emergency coordination for a hard fork to fix the issue.
+**Frequency:** This attack can be executed immediately and repeatedly. Once discovered, it could be exploited continuously until patched, making it a severe and imminent threat.
 
 ## Recommendation
 
-Implement multiple defensive measures:
+Add explicit validation in `HandleEquivocationEvidence` to reject evidence from the future before any processing occurs:
 
-1. **Add size limits to validation:**
-```
-// In ValidateWasmDependencyMapping
-const MaxAccessOpsPerMapping = 1000
-const MaxContractReferences = 100
-const MaxMappingSizeBytes = 100 * 1024 // 100KB
-
-if len(mapping.BaseAccessOps) > MaxAccessOpsPerMapping {
-    return errors.New("too many access operations")
+```go
+func (k Keeper) HandleEquivocationEvidence(ctx sdk.Context, evidence *types.Equivocation) {
+    logger := k.Logger(ctx)
+    consAddr := evidence.GetConsensusAddress()
+    
+    infractionHeight := evidence.GetHeight()
+    
+    // Reject evidence from the future
+    if infractionHeight > ctx.BlockHeight() {
+        logger.Info(
+            "ignored equivocation; evidence from future height",
+            "validator", consAddr,
+            "infraction_height", infractionHeight,
+            "current_height", ctx.BlockHeight(),
+        )
+        return
+    }
+    
+    // ... rest of the existing function
 }
-// Validate total serialized size
-if proto.Size(&mapping) > MaxMappingSizeBytes {
-    return errors.New("mapping too large")
-}
 ```
 
-2. **Add pagination to iteration:** [5](#0-4) 
-
-Modify `IterateWasmDependencies` and `IterateResourceKeys` to support pagination with configurable page size.
-
-3. **Implement cleanup mechanism:**
-Add a function to delete unused mappings and implement automatic cleanup during EndBlock for contracts that haven't been called in X blocks.
-
-4. **Add genesis export streaming:**
-Instead of loading all mappings into memory, stream them directly to the output file.
+This check should be placed immediately after retrieving the infraction height and before any age calculations or slashing operations.
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/keeper/genesis_test.go`
+**Test Location:** `x/evidence/keeper/infraction_test.go`
 
-**Test Function:** `TestGenesisExportMemoryExhaustion`
+**Setup:**
+- Initialize test context with block height 10
+- Create and register a validator with sufficient power
 
-```go
-func TestGenesisExportMemoryExhaustion(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Setup: Create many contracts with large dependency mappings
-    numMappings := 10000
-    addresses := make([]sdk.AccAddress, numMappings)
-    
-    for i := 0; i < numMappings; i++ {
-        addresses[i] = sdk.AccAddress(fmt.Sprintf("contract%d", i))
-        
-        // Create a large mapping with many access operations
-        largeMapping := accesscontrol.WasmDependencyMapping{
-            ContractAddress: addresses[i].String(),
-            BaseAccessOps:   make([]*accesscontrol.WasmAccessOperation, 500),
-        }
-        
-        // Fill with access operations to increase size
-        for j := 0; j < 500; j++ {
-            largeMapping.BaseAccessOps[j] = &accesscontrol.WasmAccessOperation{
-                Operation: &accesscontrol.AccessOperation{
-                    AccessType:         accesscontrol.AccessType_WRITE,
-                    ResourceType:       accesscontrol.ResourceType_KV_WASM_CONTRACT_STORE,
-                    IdentifierTemplate: fmt.Sprintf("key_%d", j),
-                },
-                SelectorType: accesscontrol.AccessOperationSelectorType_NONE,
-            }
-        }
-        // Add commit op
-        largeMapping.BaseAccessOps = append(largeMapping.BaseAccessOps, &accesscontrol.WasmAccessOperation{
-            Operation:    types.CommitAccessOp(),
-            SelectorType: accesscontrol.AccessOperationSelectorType_NONE,
-        })
-        
-        err := app.AccessControlKeeper.SetWasmDependencyMapping(ctx, largeMapping)
-        require.NoError(t, err)
-    }
-    
-    // Trigger: Attempt genesis export
-    // This will load all mappings into memory
-    var memBefore runtime.MemStats
-    runtime.ReadMemStats(&memBefore)
-    
-    exportedGenesis := app.AccessControlKeeper.ExportGenesis(ctx)
-    
-    var memAfter runtime.MemStats
-    runtime.ReadMemStats(&memAfter)
-    
-    // Observation: Memory usage increases significantly
-    memIncreaseMB := float64(memAfter.Alloc-memBefore.Alloc) / (1024 * 1024)
-    
-    // With 10000 mappings of ~500 ops each, expect >50MB increase
-    require.Greater(t, memIncreaseMB, 50.0, "Expected significant memory increase during genesis export")
-    
-    // Verify all mappings were loaded
-    require.Equal(t, numMappings, len(exportedGenesis.WasmDependencyMappings))
-    
-    // This test demonstrates unbounded memory growth
-    // In production with millions of mappings, this would cause OOM
-    t.Logf("Memory increase during export: %.2f MB for %d mappings", memIncreaseMB, numMappings)
-}
-```
+**Action:**
+- Create `Equivocation` evidence with `Height = 50` (future height)
+- Call `HandleEquivocationEvidence` with this evidence
 
-**Setup:** Initialize application, create many WASM contracts with large dependency mappings using `SetWasmDependencyMapping`.
+**Expected Result:**
+- The system should panic when the staking keeper's `Slash` function detects that `infractionHeight (49 after subtracting ValidatorUpdateDelay of 1) > ctx.BlockHeight() (10)`
+- This panic confirms the vulnerability—in production, this would crash all nodes processing this transaction
 
-**Trigger:** Call `ExportGenesis` which loads all mappings into memory via `IterateWasmDependencies`.
+The test demonstrates that evidence with future heights bypasses all validation checks and triggers a panic that would cause network-wide denial of service.
 
-**Observation:** Memory usage increases proportionally with number and size of mappings, demonstrating unbounded growth. With enough mappings (millions in production), this causes OOM. The test shows no pagination or size limits prevent this accumulation.
+## Notes
 
-**Notes**
-
-This vulnerability is particularly insidious because:
-1. It accumulates gradually over time, making it hard to detect until critical
-2. The impact manifests during the most critical operation (chain upgrades)
-3. All nodes attempting the upgrade experience the same issue simultaneously
-4. No automatic cleanup or bounds checking prevents the accumulation
-
-The combination of no size validation, no cleanup mechanism, and loading everything into memory during genesis export creates a severe availability risk for mature chains.
+The severity is classified as **Medium** according to the impact criterion "Network not being able to confirm new transactions (total network shutdown)". While this represents a complete network halt, the classification follows the provided severity guidelines. The vulnerability is fully exploitable by any unprivileged user and requires immediate patching to prevent potential network-wide denial of service attacks.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/genesis.go (L28-44)
+**File:** x/evidence/types/evidence.go (L50-52)
 ```go
-func (k Keeper) ExportGenesis(ctx sdk.Context) *types.GenesisState {
-	resourceDependencyMappings := []acltypes.MessageDependencyMapping{}
-	k.IterateResourceKeys(ctx, func(dependencyMapping acltypes.MessageDependencyMapping) (stop bool) {
-		resourceDependencyMappings = append(resourceDependencyMappings, dependencyMapping)
-		return false
-	})
-	wasmDependencyMappings := []acltypes.WasmDependencyMapping{}
-	k.IterateWasmDependencies(ctx, func(dependencyMapping acltypes.WasmDependencyMapping) (stop bool) {
-		wasmDependencyMappings = append(wasmDependencyMappings, dependencyMapping)
-		return false
-	})
-	return &types.GenesisState{
-		Params:                   k.GetParams(ctx),
-		MessageDependencyMapping: resourceDependencyMappings,
-		WasmDependencyMappings:   wasmDependencyMappings,
+	if e.Height < 1 {
+		return fmt.Errorf("invalid equivocation height: %d", e.Height)
 	}
-}
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L123-181)
+**File:** x/evidence/keeper/infraction.go (L46-46)
 ```go
-func ValidateWasmDependencyMapping(mapping acltypes.WasmDependencyMapping) error {
-	numOps := len(mapping.BaseAccessOps)
-	if numOps == 0 || mapping.BaseAccessOps[numOps-1].Operation.AccessType != acltypes.AccessType_COMMIT {
-		return ErrNoCommitAccessOp
-	}
-
-	// ensure uniqueness for partitioned message names across access ops and contract references
-	seenMessageNames := map[string]struct{}{}
-	for _, ops := range mapping.ExecuteAccessOps {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-	seenMessageNames = map[string]struct{}{}
-	for _, ops := range mapping.QueryAccessOps {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-	seenMessageNames = map[string]struct{}{}
-	for _, ops := range mapping.ExecuteContractReferences {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-	seenMessageNames = map[string]struct{}{}
-	for _, ops := range mapping.QueryContractReferences {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-
-	// ensure deprecation for CONTRACT_REFERENCE access operation selector due to new contract references
-	for _, accessOp := range mapping.BaseAccessOps {
-		if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
-			return ErrSelectorDeprecated
-		}
-	}
-	for _, accessOps := range mapping.ExecuteAccessOps {
-		for _, accessOp := range accessOps.WasmOperations {
-			if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
-				return ErrSelectorDeprecated
-			}
-		}
-	}
-	for _, accessOps := range mapping.QueryAccessOps {
-		for _, accessOp := range accessOps.WasmOperations {
-			if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
-				return ErrSelectorDeprecated
-			}
-		}
-	}
-
-	return nil
-}
+	ageBlocks := ctx.BlockHeader().Height - infractionHeight
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L106-117)
+**File:** x/evidence/keeper/infraction.go (L53-53)
 ```go
-func (k Keeper) IterateResourceKeys(ctx sdk.Context, handler func(dependencyMapping acltypes.MessageDependencyMapping) (stop bool)) {
-	store := ctx.KVStore(k.storeKey)
-	iter := sdk.KVStorePrefixIterator(store, types.GetResourceDependencyMappingKey())
-	defer iter.Close()
-	for ; iter.Valid(); iter.Next() {
-		dependencyMapping := acltypes.MessageDependencyMapping{}
-		k.cdc.MustUnmarshal(iter.Value(), &dependencyMapping)
-		if handler(dependencyMapping) {
-			break
-		}
-	}
-}
+		if ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks {
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L484-496)
+**File:** x/evidence/keeper/infraction.go (L101-101)
 ```go
-func (k Keeper) IterateWasmDependencies(ctx sdk.Context, handler func(wasmDependencyMapping acltypes.WasmDependencyMapping) (stop bool)) {
-	store := ctx.KVStore(k.storeKey)
-
-	iter := sdk.KVStorePrefixIterator(store, types.GetWasmMappingKey())
-	defer iter.Close()
-	for ; iter.Valid(); iter.Next() {
-		dependencyMapping := acltypes.WasmDependencyMapping{}
-		k.cdc.MustUnmarshal(iter.Value(), &dependencyMapping)
-		if handler(dependencyMapping) {
-			break
-		}
-	}
-}
+	distributionHeight := infractionHeight - sdk.ValidatorUpdateDelay
 ```
 
-**File:** x/accesscontrol/keeper/grpc_query.go (L52-61)
+**File:** x/evidence/keeper/infraction.go (L107-112)
 ```go
-func (k Keeper) ListWasmDependencyMapping(ctx context.Context, req *types.ListWasmDependencyMappingRequest) (*types.ListWasmDependencyMappingResponse, error) {
-	sdkCtx := sdk.UnwrapSDKContext(ctx)
-	wasmDependencyMappings := []acltypes.WasmDependencyMapping{}
-	k.IterateWasmDependencies(sdkCtx, func(dependencyMapping acltypes.WasmDependencyMapping) (stop bool) {
-		wasmDependencyMappings = append(wasmDependencyMappings, dependencyMapping)
-		return false
-	})
+	k.slashingKeeper.Slash(
+		ctx,
+		consAddr,
+		k.slashingKeeper.SlashFractionDoubleSign(ctx),
+		evidence.GetValidatorPower(), distributionHeight,
+	)
+```
 
-	return &types.ListWasmDependencyMappingResponse{WasmDependencyMappingList: wasmDependencyMappings}, nil
-}
+**File:** x/slashing/keeper/keeper.go (L78-78)
+```go
+	k.sk.Slash(ctx, consAddr, distributionHeight, power, fraction)
+```
+
+**File:** x/staking/keeper/slash.go (L67-71)
+```go
+	case infractionHeight > ctx.BlockHeight():
+		// Can't slash infractions in the future
+		panic(fmt.Sprintf(
+			"impossible attempt to slash future infraction at height %d but we are at height %d",
+			infractionHeight, ctx.BlockHeight()))
+```
+
+**File:** x/evidence/keeper/msg_server.go (L23-29)
+```go
+func (ms msgServer) SubmitEvidence(goCtx context.Context, msg *types.MsgSubmitEvidence) (*types.MsgSubmitEvidenceResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	evidence := msg.GetEvidence()
+	if err := ms.Keeper.SubmitEvidence(ctx, evidence); err != nil {
+		return nil, err
+	}
 ```

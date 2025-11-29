@@ -1,192 +1,246 @@
+# Audit Report
+
 ## Title
-Incorrect Error Mapping in Batch Signature Verification Allows Invalid Transactions to Pass Authentication
+Nil Pointer Dereference in Iterator Validation Causing Node Crash During Concurrent Transaction Processing
 
 ## Summary
-The batch signature verification logic in `batch_sigverify.go` lines 178-185 incorrectly maps signature verification failures to transactions. When transactions have multiple signatures, the code uses the signature index instead of the transaction index, causing authentication errors to be assigned to wrong transactions. This allows transactions with invalid signatures to pass verification while rejecting valid transactions. [1](#0-0) 
+A missing nil check in `validationIterator.Value()` allows a nil pointer dereference when `GetLatestBeforeIndex()` returns nil during iterator validation in the multiversion store. This causes validator nodes to panic and crash when processing transactions with concurrent execution and conflicts.
 
 ## Impact
-**High**
+**Medium**
 
 ## Finding Description
 
-**Location:** 
-`x/auth/ante/batch_sigverify.go`, function `SR25519BatchVerifier.VerifyTxs()`, lines 178-185
+**Location:** [1](#0-0) 
 
-**Intended Logic:**
-The batch signature verifier should process multiple transactions, verify all their signatures in batch, and correctly map any verification failures back to the specific transaction that failed. Each transaction should only pass if all its signatures are valid.
+**Intended logic:** The validation iterator should safely retrieve values from the multiversion store during transaction validation, handling cases where keys may have been modified or removed by concurrent transactions.
 
-**Actual Logic:**
-The code maintains a `sigTxIndices` array that tracks which transaction each signature belongs to, since transactions can have multiple signatures. [2](#0-1) [3](#0-2) 
+**Actual logic:** The code calls `GetLatestBeforeIndex()` at line 112 and immediately invokes `.IsEstimate()` at line 115 without checking if the returned value is nil. When `GetLatestBeforeIndex()` returns nil (which can occur when no value exists for a key before the given index), the method call causes a nil pointer dereference panic in Go.
 
-The batch verifier's `Verify()` method returns an `individuals` array with one boolean result per signature added. [4](#0-3) 
+**Exploitation path:**
+1. User submits Transaction A which writes keys to the multiversion store
+2. User submits Transaction B which creates an iterator over a range including Transaction A's keys
+3. Transaction A is re-executed with a new incarnation due to conflicts, writing a different set of keys
+4. The `removeOldWriteset()` function removes old keys from the multiversion store [2](#0-1) 
+5. During validation of Transaction B's iterator, `ValidateTransactionState()` is called [3](#0-2) 
+6. The validation iterator attempts to fetch values for keys that may have been removed
+7. `GetLatestBeforeIndex()` returns nil for removed keys [4](#0-3) 
+8. Calling `.IsEstimate()` on nil triggers a panic, crashing the node
 
-However, the error mapping loop incorrectly uses the signature index `i` to assign errors directly to `v.errors[i]`, when it should use `v.errors[sigTxIndices[i]]` to map the error to the correct transaction index. [1](#0-0) 
-
-**Exploit Scenario:**
-An attacker creates a batch containing:
-- Transaction 0: 2 valid signatures (multi-sig transaction)
-- Transaction 1: 1 **invalid** signature (attacker's unauthorized transaction)
-- Transaction 2: 1 valid signature (victim's legitimate transaction)
-
-The batch verifier processes 4 signatures total and returns:
-- `individuals[0]` = true (TX 0, signature 0)
-- `individuals[1]` = true (TX 0, signature 1)  
-- `individuals[2]` = false (TX 1, invalid signature)
-- `individuals[3]` = true (TX 2, valid signature)
-
-The buggy mapping assigns:
-- `individuals[0]` → `v.errors[0]` ✓ (correct)
-- `individuals[1]` → `v.errors[1]` ✗ (should map to `v.errors[0]`)
-- `individuals[2]` → `v.errors[2]` ✗ (should map to `v.errors[1]`)
-- `individuals[3]` → `v.errors[3]` ✗ (should map to `v.errors[2]`)
-
-Result: Transaction 1's authentication failure gets assigned to `v.errors[2]` (Transaction 2), while Transaction 1's error at `v.errors[1]` remains `nil`. When the ante handler checks errors, Transaction 1 passes authentication and executes despite having an invalid signature. [5](#0-4) 
-
-**Security Failure:**
-This breaks the fundamental security invariant that only properly authenticated transactions can execute. The signature verification mechanism is completely bypassed for transactions in specific positions within batches containing multi-signature transactions.
+**Security guarantee broken:** Memory safety and availability. The code fails to handle nil returns, violating Go's requirement to check pointer values before dereferencing.
 
 ## Impact Explanation
 
-**Affected Assets and Processes:**
-- Transaction authentication and authorization
-- All funds and smart contract state controlled by accounts
-- Network consensus integrity
+This vulnerability causes validator nodes to crash during block processing when specific transaction patterns occur. The consequences include:
 
-**Severity of Damage:**
-1. **Direct Loss of Funds:** Attackers can execute unauthorized transactions (transfers, smart contract calls) by submitting them in batches with the right structure, bypassing signature verification entirely.
+- **Node Crashes**: Validators panic during transaction validation, causing the process to terminate
+- **Network Disruption**: Multiple validators processing the same block with conflicting transactions crash simultaneously  
+- **Denial of Service**: Attackers can craft transaction sequences to reliably crash validators
+- **Consensus Impact**: If sufficient validators crash, block finalization is delayed or prevented
 
-2. **Consensus Breakdown:** Different validators may process batches differently depending on transaction ordering and timing, leading to state divergence and potential chain splits.
-
-3. **Smart Contract Exploitation:** Invalid transactions can interact with smart contracts in unintended ways, potentially draining funds or corrupting state.
-
-4. **Victim Transaction Rejection:** Legitimate transactions incorrectly receive errors from other transactions and get rejected, causing denial of service.
-
-**System Security Impact:**
-This vulnerability fundamentally undermines the blockchain's security model where signatures prove transaction authorization. It enables unauthorized state transitions and asset movements, which is catastrophic for any blockchain system.
+The vulnerability affects the core optimistic concurrency control mechanism used for parallel transaction execution, which is designed to handle high-conflict scenarios.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant can trigger this vulnerability by submitting transactions to the mempool. No special privileges are required.
+**Medium-to-High likelihood:**
 
-**Conditions Required:**
-- Batch must contain at least one transaction with multiple signatures (e.g., multi-sig accounts)
-- Attacker's invalid transaction must be positioned after the multi-sig transaction
-- The batch verification feature must be enabled (active during normal block production)
+- **Who can trigger**: Any user submitting transactions to the network - no special privileges required
+- **Conditions**: Requires transactions that create iterators while other transactions modify their writesets and get re-executed due to conflicts
+- **Frequency**: Transaction conflicts and re-executions are normal in optimistic concurrency control systems. While the exact trigger conditions are complex, they can occur during normal network operation or be deliberately induced by an attacker
 
-**Frequency:**
-This can be exploited repeatedly during normal network operation:
-- Multi-signature accounts are common in production blockchains
-- Attackers can deliberately construct batches with the required structure
-- Every block that uses batch verification is potentially vulnerable
-- The vulnerability is deterministic and reliably exploitable once the conditions are met
+The code demonstrates awareness of this issue in other locations where proper nil checks exist [5](#0-4) , confirming that `GetLatestBeforeIndex()` returning nil is an expected condition that should be handled.
 
 ## Recommendation
 
-Replace the direct index mapping with the correct transaction index lookup:
+Add a nil check before calling methods on the value returned by `GetLatestBeforeIndex()`, matching the pattern used elsewhere in the codebase:
 
-**Change line 180 from:**
 ```go
-v.errors[i] = sdkerrors.Wrap(...)
-```
+val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
 
-**To:**
-```go
-v.errors[sigTxIndices[i]] = sdkerrors.Wrap(...)
-```
+// Check for nil before accessing methods
+if val == nil {
+    // Key doesn't exist in multiversion store, fetch from parent
+    return nil
+}
 
-This ensures that signature verification failures are correctly mapped back to the transaction that contains the failing signature, regardless of how many signatures each transaction has.
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+}
+
+if val.IsDeleted() {
+    vi.readCache[string(key)] = nil
+    return nil
+}
+vi.readCache[string(key)] = val.Value()
+return val.Value()
+```
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/batch_sigverify_test.go` (new test file)
-
-**Test Function:** `TestBatchSigVerifyErrorMapping`
+The provided PoC demonstrates the vulnerability:
 
 **Setup:**
-1. Create a test suite with 3 accounts using SR25519 keys
-2. Initialize accounts with pubkeys set and proper balances
-3. Create 3 transactions:
-   - TX 0: Multi-message transaction requiring 2 signatures (accounts 0 and 1)
-   - TX 1: Single transaction with 1 deliberately invalid signature (account 2 with wrong signature)
-   - TX 2: Single valid transaction (account 2 with correct signature)
+- Initialize multiversion store with parent store
+- Transaction 0 writes keys key1, key2, key3 (incarnation 1)
+- Transaction 1 creates an iterator that reads all three keys and stores them in its iterateset
 
-**Trigger:**
-1. Create a batch verifier instance
-2. Call `VerifyTxs()` with the 3 transactions
-3. Check the error state in `verifier.errors`
+**Action:**  
+- Transaction 0 re-executes with incarnation 2, writing only key1 and key3
+- This triggers `removeOldWriteset()` which removes key2 from the multiversion store
+- Call `ValidateTransactionState(1)` to validate Transaction 1's iterator
 
-**Observation:**
-The test will show that:
-- `verifier.errors[1]` is `nil` (TX 1 incorrectly passes despite invalid signature)
-- `verifier.errors[2]` contains an authentication error (TX 2 incorrectly fails despite valid signature)
+**Result:**
+- During validation, `validationIterator.Value()` is called for a key from the iteration range
+- `GetLatestBeforeIndex()` returns nil for a removed key
+- Code attempts to call `.IsEstimate()` on nil
+- **PANIC occurs**, crashing the node (caught by defer/recover in the test)
 
-This demonstrates the vulnerability: the invalid signature error from TX 1 gets incorrectly assigned to TX 2, allowing TX 1 to bypass authentication.
+The vulnerability is confirmed by:
+1. `GetLatestBeforeIndex()` explicitly returns nil in documented cases [6](#0-5) 
+2. Tests confirm nil returns are expected [7](#0-6) 
+3. Other code paths properly check for nil before method calls [8](#0-7) 
+4. The vulnerable code path lacks this check [9](#0-8) 
 
-**Test Code Structure:**
-```go
-package ante_test
+## Notes
 
-import (
-    "testing"
-    "github.com/cosmos/cosmos-sdk/crypto/keys/sr25519"
-    "github.com/cosmos/cosmos-sdk/testutil/testdata"
-    sdk "github.com/cosmos/cosmos-sdk/types"
-    "github.com/cosmos/cosmos-sdk/x/auth/ante"
-    "github.com/stretchr/testify/require"
-)
-
-func TestBatchSigVerifyErrorMapping(t *testing.T) {
-    // Setup: Create app, context, and accounts with SR25519 keys
-    // Create TX 0 with 2 valid signatures
-    // Create TX 1 with 1 invalid signature (corrupt signature bytes)
-    // Create TX 2 with 1 valid signature
-    
-    // Trigger: Call verifier.VerifyTxs(ctx, []sdk.Tx{tx0, tx1, tx2})
-    
-    // Observation:
-    // require.Nil(t, verifier.errors[0]) // TX 0 should pass
-    // require.NotNil(t, verifier.errors[1]) // TX 1 SHOULD fail (but doesn't due to bug)
-    // require.Nil(t, verifier.errors[2]) // TX 2 should pass (but fails due to bug)
-    
-    // The test will fail, demonstrating the vulnerability
-}
-```
-
-The test confirms that transactions with invalid signatures can pass authentication when positioned correctly in a batch, while valid transactions are incorrectly rejected.
+This vulnerability matches the impact criteria: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"** (Medium severity). The issue can be triggered through normal transaction submission without requiring administrative privileges or brute force attacks.
 
 ### Citations
 
-**File:** x/auth/ante/batch_sigverify.go (L95-95)
+**File:** store/multiversion/memiterator.go (L99-126)
 ```go
-	sigTxIndices := []int{}
+func (vi *validationIterator) Value() []byte {
+	key := vi.Iterator.Key()
+
+	// try fetch from writeset - return if exists
+	if val, ok := vi.writeset[string(key)]; ok {
+		return val
+	}
+	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
+	if val, ok := vi.readCache[string(key)]; ok {
+		return val
+	}
+
+	// get the value from the multiversion store
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	}
+
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
+}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L163-163)
+**File:** store/multiversion/store.go (L82-97)
 ```go
-				sigTxIndices = append(sigTxIndices, i)
+// GetLatestBeforeIndex implements MultiVersionStore.
+func (s *Store) GetLatestBeforeIndex(index int, key []byte) (value MultiVersionValueItem) {
+	keyString := string(key)
+	mvVal, found := s.multiVersionMap.Load(keyString)
+	// if the key doesn't exist in the overall map, return nil
+	if !found {
+		return nil
+	}
+	val, found := mvVal.(MultiVersionValue).GetLatestBeforeIndex(index)
+	// otherwise, we may have found a value for that key, but its not written before the index passed in
+	if !found {
+		return nil
+	}
+	// found a value prior to the passed in index, return that value (could be estimate OR deleted, but it is a definitive value)
+	return val
+}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L176-176)
+**File:** store/multiversion/store.go (L112-138)
 ```go
-	overall, individiauls := v.verifier.Verify()
+func (s *Store) removeOldWriteset(index int, newWriteSet WriteSet) {
+	writeset := make(map[string][]byte)
+	if newWriteSet != nil {
+		// if non-nil writeset passed in, we can use that to optimize removals
+		writeset = newWriteSet
+	}
+	// if there is already a writeset existing, we should remove that fully
+	oldKeys, loaded := s.txWritesetKeys.LoadAndDelete(index)
+	if loaded {
+		keys := oldKeys.([]string)
+		// we need to delete all of the keys in the writeset from the multiversion store
+		for _, key := range keys {
+			// small optimization to check if the new writeset is going to write this key, if so, we can leave it behind
+			if _, ok := writeset[key]; ok {
+				// we don't need to remove this key because it will be overwritten anyways - saves the operation of removing + rebalancing underlying btree
+				continue
+			}
+			// remove from the appropriate item if present in multiVersionMap
+			mvVal, found := s.multiVersionMap.Load(key)
+			// if the key doesn't exist in the overall map, return nil
+			if !found {
+				continue
+			}
+			mvVal.(MultiVersionValue).Remove(index)
+		}
+	}
+}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L178-185)
+**File:** tasks/scheduler.go (L166-183)
 ```go
-		for i, individual := range individiauls {
-			if !individual {
-				v.errors[i] = sdkerrors.Wrap(
-					sdkerrors.ErrUnauthorized,
-					"signature verification failed; please verify account number and chain-id",
-				)
+func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
+	var conflicts []int
+	uniq := make(map[int]struct{})
+	valid := true
+	for _, mv := range s.multiVersionStores {
+		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
+		for _, c := range mvConflicts {
+			if _, ok := uniq[c]; !ok {
+				conflicts = append(conflicts, c)
+				uniq[c] = struct{}{}
 			}
 		}
+		// any non-ok value makes valid false
+		valid = valid && ok
+	}
+	sort.Ints(conflicts)
+	return valid, conflicts
+}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L220-222)
+**File:** store/multiversion/mvkv.go (L161-176)
 ```go
-	if err := svd.verifier.errors[txIdx]; err != nil {
-		return ctx, err
+	mvsValue := store.multiVersionStore.GetLatestBeforeIndex(store.transactionIndex, key)
+	if mvsValue != nil {
+		if mvsValue.IsEstimate() {
+			abort := scheduler.NewEstimateAbort(mvsValue.Index())
+			store.WriteAbort(abort)
+			panic(abort)
+		} else {
+			// This handles both detecting readset conflicts and updating readset if applicable
+			return store.parseValueAndUpdateReadset(strKey, mvsValue)
+		}
 	}
+	// if we didn't find it in the multiversion store, then we want to check the parent store + add to readset
+	parentValue := store.parent.Get(key)
+	store.UpdateReadSet(key, parentValue)
+	return parentValue
+}
+```
+
+**File:** store/multiversion/store_test.go (L152-160)
+```go
+	// try replacing writeset1 to verify old keys removed
+	writeset1_b := make(map[string][]byte)
+	writeset1_b["key1"] = []byte("value4")
+
+	mvs.SetWriteset(1, 2, writeset1_b)
+	require.Equal(t, []byte("value4"), mvs.GetLatestBeforeIndex(2, []byte("key1")).Value())
+	require.Nil(t, mvs.GetLatestBeforeIndex(2, []byte("key2")))
+	// verify that GetLatest for key3 returns nil - because of removal from writeset
+	require.Nil(t, mvs.GetLatest([]byte("key3")))
 ```

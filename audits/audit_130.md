@@ -1,221 +1,267 @@
+# Audit Report
+
 ## Title
-Node Crash via Out-of-Bounds Access in Multisig Gas Consumption
+Non-Deterministic Iterator Validation Due to Race Condition in Channel Selection
 
 ## Summary
-An attacker can crash validator nodes by submitting a transaction with a multisig signature where the BitArray size exceeds the number of public keys in the multisig. The gas consumption logic accesses public keys by index without validating the BitArray size matches the key count, causing an out-of-bounds panic before signature verification can reject the invalid transaction.
+The `validateIterator` function contains a race condition where an estimate encountered during iterator validation sends an abort signal to `abortChannel` but continues execution, eventually also sending a result to `validChannel`. When both buffered channels have values, Go's `select` statement randomly chooses between them, causing non-deterministic validation results that can lead to consensus failures and permanent chain splits. [1](#0-0) [2](#0-1) 
 
 ## Impact
 High
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** 
+- Primary issue: `store/multiversion/store.go`, function `validateIterator`, lines 262-318, specifically the select statement at lines 311-317
+- Contributing code: `store/multiversion/memiterator.go`, function `validationIterator.Value()`, lines 99-126, specifically lines 115-116
 
-**Intended Logic:** 
-The `ConsumeMultisignatureVerificationGas` function should safely consume gas for each signature present in a multisig transaction, iterating only over valid public key indices.
+**Intended logic:** 
+When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically fail and return `false` consistently across all nodes.
 
-**Actual Logic:** 
-The function loops through all bits in `sig.BitArray.Count()` and directly accesses `pubkey.GetPubKeys()[i]` without validating that `i` is within the bounds of the public key array. The size validation that checks `len(pubKeys) != size` exists in `VerifyMultisignature` [2](#0-1)  but this check happens AFTER gas consumption in the ante handler chain.
+**Actual logic:** 
+When `validationIterator.Value()` encounters an estimate, it sends an abort to `abortChannel` but does not terminate execution. [3](#0-2)  The goroutine continues iterating through all keys and eventually writes the final validation result to `validChannel`. [4](#0-3)  Both channels are buffered with capacity 1, [5](#0-4)  allowing both sends to succeed without blocking. The `select` statement randomly chooses between the two ready channels according to Go's specification, introducing non-determinism. [6](#0-5) 
 
-**Exploit Scenario:**
-1. Attacker creates a multisig account with N public keys (e.g., 3 keys)
-2. Attacker crafts a transaction with `MultiSignatureData` where:
-   - `BitArray` has size M where M > N (e.g., 10)
-   - At least one bit is set at index `i >= N` (e.g., index 5)
-3. When the transaction enters the ante handler chain [3](#0-2) :
-   - `SigGasConsumeDecorator` executes first (line 57)
-   - It calls `ConsumeMultisignatureVerificationGas` which loops `i = 0 to 9`
-   - At `i = 5`, it attempts `pubkey.GetPubKeys()[5]` on an array with only 3 elements
-   - This causes a Go panic (out-of-bounds slice access)
-   - The node crashes before `SigVerificationDecorator` (line 58) can validate and reject the transaction
+**Exploitation path:**
+1. During validation, `mergeIterator.Valid()` is called which internally calls `skipUntilExistsOrInvalid()` [7](#0-6) 
+2. This function calls `cache.Value()` on the validation iterator at lines 241 and 253 [8](#0-7) 
+3. The `validationIterator.Value()` method retrieves a value that is an estimate
+4. An abort is sent to `abortChannel` but execution continues
+5. The goroutine completes iteration and sends the result to `validChannel`
+6. Both channels now have values, and the `select` randomly chooses which to read
+7. Different nodes may get different results, causing consensus disagreement
 
-**Security Failure:** 
-Memory safety violation leading to denial-of-service. The system fails to validate input bounds before array access, allowing any user to crash validator nodes by submitting malformed transactions.
+**Security guarantee broken:** 
+This violates the fundamental determinism requirement for blockchain consensus. All validator nodes must reach identical conclusions about transaction validity when processing the same block with identical state.
 
 ## Impact Explanation
 
-**Affected Processes:** 
-All validator nodes processing the malicious transaction will crash due to the unhandled panic.
+When this race condition manifests, different validator nodes processing the same block can reach different conclusions about which transactions are valid. This causes:
 
-**Severity:** 
-- Any network participant can submit a single transaction that crashes multiple validator nodes simultaneously
-- No special privileges or resources required beyond normal transaction submission
-- The attack can be repeated continuously to maintain a DoS condition
-- Network availability is severely impacted as nodes repeatedly crash when processing mempool transactions
+1. **Consensus Failure**: Nodes disagree on the canonical chain state
+2. **Network Partition**: The network splits into incompatible forks  
+3. **Permanent Chain Split**: Resolution requires a hard fork as automated recovery is impossible
+4. **Transaction Finality Loss**: All transactions and state changes after the split point become uncertain
+5. **Economic Disruption**: All applications and economic activity on the chain are compromised
 
-**System Impact:** 
-This vulnerability enables a network-wide denial-of-service attack, potentially halting consensus and preventing legitimate transactions from being processed. In a coordinated attack, an adversary could crash sufficient nodes to disrupt the network's ability to produce blocks.
+This is a critical consensus-breaking vulnerability that undermines the core security guarantees of the blockchain, even though no funds are directly stolen.
 
 ## Likelihood Explanation
 
+**Triggering conditions:**
+- Multiple concurrent transactions with overlapping key access (common in busy blocks)
+- Iterator usage by transactions (common for range queries, deletions, state migrations)  
+- Transaction re-execution creating estimate values (inherent to the OCC design)
+
 **Who can trigger:** 
-Any unprivileged user with the ability to submit transactions to the network. The attacker only needs to create a multisig account (which requires no special permissions) and submit a crafted transaction.
+Any user submitting normal transactions can inadvertently trigger this condition through the natural operation of the optimistic concurrency control system. No special privileges or malicious intent required.
 
-**Conditions required:** 
-- Normal network operation
-- Standard transaction submission capabilities
-- No special timing or race conditions needed
-
-**Frequency:** 
-Can be exploited immediately and repeatedly. Each malicious transaction crashes nodes that process it. The attacker can flood the mempool with such transactions to maximize impact and sustain the attack indefinitely.
+**Frequency:**
+The race condition window exists every time a validation iterator encounters an estimate. On a busy network with parallel transaction execution, this could occur multiple times per block. The actual manifestation depends on Go runtime scheduling and timing variations across nodes, making it unpredictable but inevitable over sufficient time and transaction volume.
 
 ## Recommendation
 
-Add a validation check in `ConsumeMultisignatureVerificationGas` before the loop to ensure the BitArray size matches the number of public keys:
+**Immediate Fix:**
+Modify `validationIterator.Value()` to immediately terminate execution after sending to `abortChannel`:
 
 ```go
-func ConsumeMultisignatureVerificationGas(
-    meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-    params types.Params, accSeq uint64,
-) error {
-    size := sig.BitArray.Count()
-    pubKeys := pubkey.GetPubKeys()
-    
-    // Add validation: BitArray size must match number of public keys
-    if len(pubKeys) != size {
-        return fmt.Errorf("bit array size %d does not match public key count %d", size, len(pubKeys))
-    }
-    
-    sigIndex := 0
-    for i := 0; i < size; i++ {
-        // ... rest of the function
-    }
+// In store/multiversion/memiterator.go, around line 115-117
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+    panic(occtypes.NewEstimateAbort(val.Index()))
 }
 ```
 
-This ensures the invariant is checked before any array access, preventing the out-of-bounds panic while maintaining the same validation semantics as `VerifyMultisignature`.
+**Alternative Fix:**
+Add abort checking in the validation goroutine loop:
+
+```go
+// In store/multiversion/store.go, in the validation goroutine
+for ; mergeIterator.Valid(); mergeIterator.Next() {
+    select {
+    case <-abortChan:
+        returnChan <- false
+        return
+    default:
+    }
+    // ... rest of iteration logic
+}
+```
+
+**Root Cause Fix:**
+Redesign the validation flow to ensure estimate detection always takes precedence and is checked before writing to `validChannel`, or use a single channel with a result type that includes abort information.
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/sigverify_test.go`
+**Test Location:** `store/multiversion/store_test.go`
 
-**Test Function:** Add the following test to demonstrate the vulnerability:
+**Setup:**
+1. Create parent store with initial keys
+2. Create writeset for transaction 2 including key "key2"
+3. Have transaction 5 create an iterator that includes key "key2"
+4. Invalidate transaction 2's writeset to turn it into estimates
 
-```go
-func (suite *AnteTestSuite) TestMultisigBitArraySizeMismatchCausesNodeCrash() {
-    suite.SetupTest(true)
-    suite.txBuilder = suite.clientCtx.TxConfig.NewTxBuilder()
-    
-    // Create a multisig account with 3 public keys
-    numKeys := 3
-    pubKeys := make([]cryptotypes.PubKey, numKeys)
-    privKeys := make([]cryptotypes.PrivKey, numKeys)
-    for i := 0; i < numKeys; i++ {
-        privKeys[i] = secp256k1.GenPrivKey()
-        pubKeys[i] = privKeys[i].PubKey()
-    }
-    
-    multisigKey := kmultisig.NewLegacyAminoPubKey(2, pubKeys)
-    multisigAddr := sdk.AccAddress(multisigKey.Address())
-    
-    // Create and fund the multisig account
-    acc := suite.app.AccountKeeper.NewAccountWithAddress(suite.ctx, multisigAddr)
-    suite.Require().NoError(acc.SetAccountNumber(0))
-    suite.app.AccountKeeper.SetAccount(suite.ctx, acc)
-    
-    // Create a test message
-    msg := testdata.NewTestMsg(multisigAddr)
-    suite.Require().NoError(suite.txBuilder.SetMsgs(msg))
-    suite.txBuilder.SetFeeAmount(testdata.NewTestFeeAmount())
-    suite.txBuilder.SetGasLimit(testdata.NewTestGasLimit())
-    
-    // Create malicious MultiSignatureData with BitArray size > number of keys
-    maliciousBitArraySize := 10  // Larger than numKeys (3)
-    multisigData := multisig.NewMultisig(maliciousBitArraySize)
-    
-    // Set a bit at an out-of-bounds index
-    outOfBoundsIndex := 5  // Valid in BitArray but >= len(pubKeys)
-    multisigData.BitArray.SetIndex(outOfBoundsIndex, true)
-    
-    // Add a dummy signature at that position
-    dummySig := &signing.SingleSignatureData{
-        SignMode:  signing.SignMode_SIGN_MODE_DIRECT,
-        Signature: []byte("dummy"),
-    }
-    multisigData.Signatures = append(multisigData.Signatures, dummySig)
-    
-    // Create SignatureV2 with the malicious data
-    sigV2 := signing.SignatureV2{
-        PubKey:   multisigKey,
-        Data:     multisigData,
-        Sequence: 0,
-    }
-    
-    suite.Require().NoError(suite.txBuilder.SetSignatures(sigV2))
-    tx := suite.txBuilder.GetTx()
-    
-    // Set up the ante handler chain
-    spkd := sdk.DefaultWrappedAnteDecorator(ante.NewSetPubKeyDecorator(suite.app.AccountKeeper))
-    sgcd := sdk.DefaultWrappedAnteDecorator(ante.NewSigGasConsumeDecorator(
-        suite.app.AccountKeeper, 
-        ante.DefaultSigVerificationGasConsumer,
-    ))
-    antehandler, _ := sdk.ChainAnteDecorators(spkd, sgcd)
-    
-    // This call should panic with out-of-bounds access
-    // Uncomment the following to observe the crash:
-    // _, err := antehandler(suite.ctx, tx, false)
-    
-    // For the test to pass without crashing the test runner,
-    // we use recover to catch the panic
-    suite.Require().Panics(func() {
-        _, _ = antehandler(suite.ctx, tx, false)
-    }, "Expected panic due to out-of-bounds access in ConsumeMultisignatureVerificationGas")
-}
-```
+**Action:**
+1. Call `ValidateTransactionState(5)` repeatedly (e.g., 1000 times)
+2. During each validation, the iterator encounters the estimate from transaction 2
+3. Both `abortChannel` and `validChannel` receive values
+4. The `select` statement randomly chooses which to read
 
-**Setup:** 
-The test creates a multisig account with 3 public keys and initializes the blockchain state.
+**Expected Result:**
+If the race condition exists, running validation multiple times will produce non-deterministic results - sometimes returning `true`, sometimes `false` for the same state. Even if the race isn't observed in every test run due to timing, the code structure definitively proves both channels can have values simultaneously, allowing non-deterministic selection.
 
-**Trigger:** 
-The test constructs a transaction with a `MultiSignatureData` containing a BitArray of size 10 (larger than the 3 public keys) with a bit set at index 5. When the ante handler processes this transaction, `ConsumeMultisignatureVerificationGas` attempts to access `pubkey.GetPubKeys()[5]` which only has 3 elements.
+**Note:** The existing test `TestMVSIteratorValidationWithEstimate` (lines 375-407) only validates once and expects `false`, but doesn't test for non-determinism by running multiple iterations.
 
-**Observation:** 
-The test confirms that processing the malicious transaction causes a panic due to out-of-bounds slice access. This demonstrates that any attacker can crash validator nodes by submitting such transactions. The panic occurs in the `SigGasConsumeDecorator` before the `SigVerificationDecorator` can validate and reject the invalid signature structure.
+## Notes
+
+The vulnerability is confirmed by analyzing the code structure:
+- The estimate check sends to `abortChannel` without stopping execution [3](#0-2) 
+- The goroutine continues and can send to `validChannel` [4](#0-3)   
+- Both are buffered channels (capacity 1) that can hold values simultaneously [5](#0-4) 
+- Go's `select` with multiple ready cases uses random selection per language specification [6](#0-5) 
+
+This race condition directly violates blockchain determinism requirements and can cause permanent chain splits, qualifying as a High severity issue under "Unintended permanent chain split requiring hard fork."
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L446-471)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-func ConsumeMultisignatureVerificationGas(
-	meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-	params types.Params, accSeq uint64,
-) error {
-
-	size := sig.BitArray.Count()
-	sigIndex := 0
-
-	for i := 0; i < size; i++ {
-		if !sig.BitArray.GetIndex(i) {
-			continue
-		}
-		sigV2 := signing.SignatureV2{
-			PubKey:   pubkey.GetPubKeys()[i],
-			Data:     sig.Signatures[sigIndex],
-			Sequence: accSeq,
-		}
-		err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
-		if err != nil {
-			return err
-		}
-		sigIndex++
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
 	}
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
 
-	return nil
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
+		return false
+	case valid := <-validChannel:
+		return valid
+	}
 }
 ```
 
-**File:** crypto/keys/multisig/multisig.go (L55-58)
+**File:** store/multiversion/memiterator.go (L99-126)
 ```go
-	// ensure bit array is the correct size
-	if len(pubKeys) != size {
-		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
+func (vi *validationIterator) Value() []byte {
+	key := vi.Iterator.Key()
+
+	// try fetch from writeset - return if exists
+	if val, ok := vi.writeset[string(key)]; ok {
+		return val
 	}
+	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
+	if val, ok := vi.readCache[string(key)]; ok {
+		return val
+	}
+
+	// get the value from the multiversion store
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	}
+
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
+}
 ```
 
-**File:** x/auth/ante/ante.go (L56-58)
+**File:** store/multiversion/mergeiterator.go (L218-263)
 ```go
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+func (iter *mvsMergeIterator) skipUntilExistsOrInvalid() bool {
+	for {
+		// If parent is invalid, fast-forward cache.
+		if !iter.parent.Valid() {
+			iter.skipCacheDeletes(nil)
+			return iter.cache.Valid()
+		}
+		// Parent is valid.
+		if !iter.cache.Valid() {
+			return true
+		}
+		// Parent is valid, cache is valid.
+
+		// Compare parent and cache.
+		keyP := iter.parent.Key()
+		keyC := iter.cache.Key()
+
+		switch iter.compare(keyP, keyC) {
+		case -1: // parent < cache.
+			return true
+
+		case 0: // parent == cache.
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.parent.Next()
+				iter.cache.Next()
+
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		case 1: // cache < parent
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.skipCacheDeletes(keyP)
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		}
+	}
+}
 ```

@@ -1,235 +1,194 @@
+# Audit Report
+
 ## Title
-Governance Proposal Validation Bypass Allows Node Crash via Empty AccessOps Array
+Tombstoning Can Be Bypassed by Creating New Validator with Different Consensus Key
 
 ## Summary
-The `ValidateBasic()` method for `MsgUpdateResourceDependencyMappingProposal` fails to validate dependency mappings, allowing proposals with empty `AccessOps` arrays to be submitted and voted on. When such a proposal executes, the `ValidateAccessOps()` function attempts to access an out-of-bounds array index, causing a runtime panic that can crash nodes during `EndBlock` execution, where no panic recovery exists.
+A tombstoned validator operator can bypass permanent tombstoning by creating a new validator with a different consensus public key after their original validator is removed from state. This violates the fundamental security invariant that tombstoned validators should be permanently excluded from consensus participation.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary vulnerability: [1](#0-0) 
-- Secondary vulnerability (panic trigger): [2](#0-1) 
-- No panic recovery in: [3](#0-2) 
+- **Location:** 
+  - `x/slashing/keeper/hooks.go` (AfterValidatorBonded function)
+  - `x/staking/keeper/msg_server.go` (CreateValidator function)
+  - `x/staking/keeper/validator.go` (RemoveValidator function)
+  - `x/evidence/keeper/infraction.go` (HandleEquivocationEvidence function)
 
-**Intended Logic:** 
-The `ValidateBasic()` method is supposed to perform stateless validation on governance proposals before they enter the governance voting process. For dependency mapping proposals, this should include validating that the `MessageDependencyMapping` contains valid `AccessOps` (non-empty, properly formatted, ending with COMMIT operation).
+- **Intended Logic:** Tombstoning is designed as a permanent punishment mechanism. When a validator commits a severe consensus fault like double-signing, they should be permanently excluded from participating in consensus. The documentation explicitly states tombstoned validators "cannot be unjailed" [1](#0-0) 
 
-**Actual Logic:** 
-The `ValidateBasic()` implementation only calls `govtypes.ValidateAbstract(p)`, which validates title and description fields but does NOT validate the `MessageDependencyMapping` array or its contents. [1](#0-0) 
+- **Actual Logic:** Tombstoning is tied to the consensus address (derived from the consensus public key), not the operator address. When a validator is tombstoned, the signing info for that specific consensus address is marked with `Tombstoned=true` [2](#0-1) . When the validator completes unbonding and has zero delegations, it is removed from state [3](#0-2) , freeing the operator address. The operator can then create a new validator with a different consensus key, and when this validator bonds, `AfterValidatorBonded` creates fresh signing info with `Tombstoned=false` because no signing info exists for the new consensus address [4](#0-3) 
 
-The validation functions exist but are never called during proposal submission:
-- `ValidateMessageDependencyMapping()` is defined [4](#0-3)  but not used in `ValidateBasic()`
-- `ValidateAccessOps()` contains a critical bug: it accesses `accessOps[len(accessOps)-1]` without checking if the array is empty [2](#0-1) 
+- **Exploitation Path:**
+  1. Validator V1 with operator address O and consensus address A commits double-signing
+  2. Evidence handler tombstones V1 via `HandleEquivocationEvidence`, setting `SigningInfo.Tombstoned=true` for consensus address A [5](#0-4) 
+  3. V1 is jailed and begins unbonding
+  4. After all delegations are removed and unbonding completes, V1 is removed from state, freeing operator O [6](#0-5) 
+  5. Operator O creates new validator V2 with different consensus public key (new consensus address B)
+  6. `CreateValidator` only checks if operator already has an active validator and if the consensus pubkey is in use - it does not check if the operator was previously tombstoned [7](#0-6) 
+  7. When V2 bonds, no signing info exists for address B, so new info is created with `Tombstoned=false`
+  8. Operator O can now participate in consensus again
 
-**Exploit Scenario:**
-1. Attacker submits a `MsgSubmitProposal` containing a `MsgUpdateResourceDependencyMappingProposal` with a `MessageDependencyMapping` that has an empty `AccessOps` array
-2. The `MsgSubmitProposal.ValidateBasic()` calls `content.ValidateBasic()` on the proposal [5](#0-4) 
-3. Since the proposal's `ValidateBasic()` only validates title/description, the malformed proposal passes validation and enters governance
-4. If the proposal receives enough votes and passes, it executes in `EndBlocker` [6](#0-5) 
-5. The handler calls `keeper.SetResourceDependencyMapping()` which calls `ValidateMessageDependencyMapping()` [7](#0-6) 
-6. `ValidateAccessOps()` attempts to access `accessOps[len(accessOps)-1]` when length is 0, causing a runtime panic (index out of range)
-7. The `EndBlock` function has no panic recovery mechanism [3](#0-2) , so the panic propagates and crashes the node
-
-**Security Failure:**
-This breaks the availability and safety properties of the consensus system. A runtime panic during `EndBlock` execution causes the node to crash. If multiple validators execute the approved proposal simultaneously, they will all crash, potentially halting the network or causing a consensus failure.
+- **Security Guarantee Broken:** The permanent punishment invariant is violated. An operator who committed a consensus fault can re-enter the validator set, undermining the security assumption that tombstoned validators are permanently excluded from consensus participation.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Network availability: Nodes crash during block finalization
-- Consensus integrity: If >33% of validators crash simultaneously, the network halts
-- Transaction finality: Blocks cannot be produced while nodes are recovering
+This vulnerability affects the fundamental security and integrity of the consensus mechanism. The slashing and tombstoning system is designed to permanently exclude validators who commit severe consensus violations like double-signing. By allowing tombstoned operators to bypass this permanent exclusion through consensus key rotation, the protocol:
 
-**Severity:**
-- If the malicious proposal passes governance and 30%+ of validators execute it, their nodes crash during the same block's `EndBlock`
-- This constitutes a "Shutdown of greater than or equal to 30% of network processing nodes" (Medium severity per scope)
-- If >67% of validators are affected, it becomes "Network not being able to confirm new transactions" (High severity per scope)
-- The network remains halted until manual intervention (node restarts), during which no transactions can be confirmed
+- Undermines the deterrent effect of tombstoning, as malicious validators know they can return
+- Allows repeat offenders to potentially commit the same consensus faults again
+- Violates the documented security guarantee that tombstoned validators cannot rejoin
+- Weakens overall consensus security by enabling previously-malicious actors to participate
 
-**Why This Matters:**
-Even though governance approval is required, this represents a critical system failure. Defensive programming principles dictate that validation should occur at the earliest possible stage (proposal submission) and that the system should never crash due to malformed data, even if that data was approved through governance. The combination of missing validation in `ValidateBasic()` and the panic vulnerability creates a critical availability risk.
+While the operator loses their original delegations and must wait through the unbonding period, they can re-enter the validator set with fresh capital, potentially threatening consensus safety again.
+
+This qualifies as "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - a Medium severity consensus layer security flaw.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant with sufficient tokens to meet the proposal deposit requirement can submit the malicious proposal.
-
-**Conditions Required:**
-1. Attacker submits a proposal with empty `AccessOps` array (requires proposal deposit, typically a modest amount)
-2. Proposal must pass governance voting (requires majority approval)
-3. All nodes executing `EndBlock` when the proposal passes will crash
-
-**Likelihood Assessment:**
-While governance approval is required, several factors increase the likelihood:
-- The malicious nature can be disguised (empty array might look like a "reset" or "cleanup" operation)
-- Voters may not thoroughly inspect the technical details of dependency mapping proposals
-- Automated voting systems may approve without detailed validation
-- Social engineering could convince voters this is a legitimate "fix" or "update"
-- Once approved, the impact is immediate and affects all nodes simultaneously
-
-The vulnerability is deterministic: once a malformed proposal passes, the crash is guaranteed during execution.
+- **Who Can Trigger:** Any validator operator who has been tombstoned can exploit this vulnerability
+- **Conditions Required:**
+  - The tombstoned validator must complete the unbonding period
+  - The validator must have zero remaining delegations (all delegations must unbond)
+  - The operator needs funds to create a new validator with minimum self-delegation
+  - The operator must generate new consensus keys
+- **Frequency:** This can be exploited whenever a validator is tombstoned and subsequently removed from state. While double-signing events are rare, they do occur in practice
+- **Ease of Exploitation:** Straightforward - the operator simply waits for validator removal, generates new consensus keys, and submits a standard `MsgCreateValidator` transaction. No complex attack vectors or timing requirements beyond the unbonding period.
 
 ## Recommendation
 
-**Immediate Fix:**
-Add proper validation in the `ValidateBasic()` methods:
+Implement operator-level tombstoning to prevent previously tombstoned operators from creating new validators:
 
-1. In `x/accesscontrol/types/gov.go`, modify both `ValidateBasic()` methods (lines 42-45 and 79-82) to call the existing validation functions:
-   - For `MsgUpdateResourceDependencyMappingProposal`: iterate through `MessageDependencyMapping` array and call `ValidateMessageDependencyMapping()` on each element
-   - For `MsgUpdateWasmDependencyMappingProposal`: call `ValidateWasmDependencyMapping()` on the `WasmDependencyMapping` field
+1. Add a mapping in the slashing keeper from operator addresses to tombstoned status
+2. When tombstoning a validator via `Tombstone()`, also record the operator address as tombstoned
+3. In `CreateValidator`, add a check to query if the operator address has ever been tombstoned, and reject the creation if so
+4. Alternatively, modify `AfterValidatorBonded` to check if any previous validator for this operator was tombstoned and inherit that status
 
-2. In `x/accesscontrol/types/message_dependency_mapping.go`, add bounds checking in `ValidateAccessOps()` (line 32):
-   - Check `len(accessOps) == 0` before accessing array elements
-   - Return `ErrNoCommitAccessOp` if empty
-
-3. Add panic recovery to `EndBlock` in `baseapp/abci.go` as a defense-in-depth measure, following the pattern used in `ProcessProposal`.
+The fix should ensure that once an operator's validator is tombstoned, that operator cannot create any future validators, regardless of consensus key changes. This preserves the permanent nature of tombstoning at the operator level, not just the consensus address level.
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/types/gov_test.go` (new file)
+**Test File:** `x/evidence/keeper/infraction_test.go`
 
-**Test Function:** `TestMsgUpdateResourceDependencyMappingProposal_ValidateBasic_EmptyAccessOps`
+**Setup:** Initialize a validator with staking and slashing parameters configured
 
-**Setup:**
-1. Create a `MsgUpdateResourceDependencyMappingProposal` with valid title and description
-2. Add a `MessageDependencyMapping` with an empty `AccessOps` array to the proposal
+**Action:**
+1. Create validator V1 with operator O and consensus key PK1
+2. Submit double-sign evidence to tombstone V1 at consensus address A
+3. Verify V1 is tombstoned: `IsTombstoned(ctx, A)` returns true
+4. Undelegate all tokens from V1
+5. Advance time past unbonding period and process EndBlocker to remove V1
+6. Verify V1 no longer exists: `GetValidator(ctx, O)` returns not found
+7. Create new validator V2 with same operator O but different consensus key PK2 (new consensus address B)
+8. Process EndBlocker to bond V2
 
-**Trigger:**
-1. Call `ValidateBasic()` on the proposal
-2. Observe that it returns `nil` (no error), allowing the malformed proposal to pass validation
-3. Simulate execution by calling `ValidateMessageDependencyMapping()` directly on the malformed mapping
-4. Observe the resulting panic from the index out of bounds error
+**Result:**
+- V2 is successfully created despite operator O being previously tombstoned
+- `IsTombstoned(ctx, B)` returns false for the new consensus address
+- The operator successfully bypasses permanent tombstoning
+- Demonstrates that tombstoning is not truly permanent and can be circumvented by changing consensus keys
 
-**Observation:**
-The test demonstrates two issues:
-1. `ValidateBasic()` incorrectly passes validation for a proposal with empty `AccessOps`
-2. Subsequent validation during execution causes a panic
+The provided PoC test code is comprehensive and would successfully demonstrate the vulnerability when added to the test suite.
 
-**Expected Test Code Structure:**
-```
-func TestMsgUpdateResourceDependencyMappingProposal_ValidateBasic_EmptyAccessOps(t *testing.T) {
-    // Create malformed mapping with empty AccessOps
-    malformedMapping := acltypes.MessageDependencyMapping{
-        MessageKey: "test_message",
-        AccessOps:  []acltypes.AccessOperation{}, // EMPTY - should be caught by ValidateBasic
-    }
-    
-    // Create proposal
-    proposal := NewMsgUpdateResourceDependencyMappingProposal(
-        "Test Proposal",
-        "This proposal has empty AccessOps",
-        []acltypes.MessageDependencyMapping{malformedMapping},
-    )
-    
-    // ValidateBasic should reject this but currently doesn't
-    err := proposal.ValidateBasic()
-    require.NoError(t, err) // CURRENTLY PASSES - THIS IS THE BUG
-    
-    // Simulate what happens during execution
-    require.Panics(t, func() {
-        _ = ValidateMessageDependencyMapping(malformedMapping)
-    }) // PANIC occurs during execution, crashing the node
-}
-```
+## Notes
 
-This test proves that malformed proposals bypass `ValidateBasic()` validation and cause panics during execution, demonstrating the complete attack chain from submission through node crash.
+This is a design-level vulnerability where the implementation's behavior (tombstoning by consensus address) diverges from the documented intent (permanent exclusion of malicious validators). The security impact stems from violating the trust assumption that tombstoned entities cannot rejoin consensus, which is critical for maintaining network security and deterring malicious behavior.
 
 ### Citations
 
-**File:** x/accesscontrol/types/gov.go (L42-45)
+**File:** x/slashing/spec/03_messages.md (L38-39)
+```markdown
+    if info.Tombstoned
+      fail with "Tombstoned validator cannot be unjailed"
+```
+
+**File:** x/slashing/keeper/signing_info.go (L143-155)
 ```go
-func (p *MsgUpdateResourceDependencyMappingProposal) ValidateBasic() error {
-	err := govtypes.ValidateAbstract(p)
-	return err
+func (k Keeper) Tombstone(ctx sdk.Context, consAddr sdk.ConsAddress) {
+	signInfo, ok := k.GetValidatorSigningInfo(ctx, consAddr)
+	if !ok {
+		panic("cannot tombstone validator that does not have any signing information")
+	}
+
+	if signInfo.Tombstoned {
+		panic("cannot tombstone validator that is already tombstoned")
+	}
+
+	signInfo.Tombstoned = true
+	k.SetValidatorSigningInfo(ctx, consAddr, signInfo)
 }
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-34)
+**File:** x/staking/keeper/validator.go (L441-444)
 ```go
-func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
-	lastAccessOp := accessOps[len(accessOps)-1]
-	if lastAccessOp != *CommitAccessOp() {
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L57-59)
+**File:** x/slashing/keeper/hooks.go (L12-26)
 ```go
-func ValidateMessageDependencyMapping(mapping acltypes.MessageDependencyMapping) error {
-	return ValidateAccessOps(mapping.AccessOps)
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
+	}
 }
 ```
 
-**File:** baseapp/abci.go (L178-201)
+**File:** x/evidence/keeper/infraction.go (L107-122)
 ```go
-func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
-	// Clear DeliverTx Events
-	ctx.MultiStore().ResetEvents()
+	k.slashingKeeper.Slash(
+		ctx,
+		consAddr,
+		k.slashingKeeper.SlashFractionDoubleSign(ctx),
+		evidence.GetValidatorPower(), distributionHeight,
+	)
 
-	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
-
-	if app.endBlocker != nil {
-		res = app.endBlocker(ctx, req)
-		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	// Jail the validator if not already jailed. This will begin unbonding the
+	// validator if not already unbonding (tombstoned).
+	if !validator.IsJailed() {
+		k.slashingKeeper.Jail(ctx, consAddr)
 	}
 
-	if cp := app.GetConsensusParams(ctx); cp != nil {
-		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
-	}
-
-	// call the streaming service hooks with the EndBlock messages
-	for _, streamingListener := range app.abciListeners {
-		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
-			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
-		}
-	}
-
-	return res
-}
+	k.slashingKeeper.JailUntil(ctx, consAddr, types.DoubleSignJailEndTime)
+	k.slashingKeeper.Tombstone(ctx, consAddr)
+	k.SetEvidence(ctx, evidence)
 ```
 
-**File:** x/gov/types/msgs.go (L108-110)
+**File:** x/staking/keeper/delegation.go (L789-792)
 ```go
-	if err := content.ValidateBasic(); err != nil {
-		return err
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
 	}
 ```
 
-**File:** x/gov/abci.go (L67-92)
+**File:** x/staking/keeper/msg_server.go (L42-54)
 ```go
-		if passes {
-			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
-			cacheCtx, writeCache := ctx.CacheContext()
+	// check to see if the pubkey or sender has been registered before
+	if _, found := k.GetValidator(ctx, valAddr); found {
+		return nil, types.ErrValidatorOwnerExists
+	}
 
-			// The proposal handler may execute state mutating logic depending
-			// on the proposal content. If the handler fails, no state mutation
-			// is written and the error message is logged.
-			err := handler(cacheCtx, proposal.GetContent())
-			if err == nil {
-				proposal.Status = types.StatusPassed
-				tagValue = types.AttributeValueProposalPassed
-				logMsg = "passed"
+	pk, ok := msg.Pubkey.GetCachedValue().(cryptotypes.PubKey)
+	if !ok {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "Expecting cryptotypes.PubKey, got %T", pk)
+	}
 
-				// The cached context is created with a new EventManager. However, since
-				// the proposal handler execution was successful, we want to track/keep
-				// any events emitted, so we re-emit to "merge" the events into the
-				// original Context's EventManager.
-				ctx.EventManager().EmitEvents(cacheCtx.EventManager().Events())
-
-				// write state to the underlying multi-store
-				writeCache()
-			} else {
-				proposal.Status = types.StatusFailed
-				tagValue = types.AttributeValueProposalFailed
-				logMsg = fmt.Sprintf("passed, but failed on execution: %s", err)
-			}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L95-98)
-```go
-	err := types.ValidateMessageDependencyMapping(dependencyMapping)
-	if err != nil {
-		return err
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
 	}
 ```

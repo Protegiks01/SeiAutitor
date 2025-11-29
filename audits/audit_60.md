@@ -1,164 +1,430 @@
 # Audit Report
 
 ## Title
-Integer Truncation in Validator Power Calculation Enables Under-Slashing Attack
+Node Crash Due to Missing Nil Check for Removed Validators in Reward Allocation Loop
 
 ## Summary
-The validator power calculation uses integer division that truncates remainders when converting tokens to consensus power. When slashing occurs, the system converts power back to tokens through multiplication, but this lossy conversion results in validators being slashed based on fewer tokens than they actually hold. Validators with stake amounts just below PowerReduction boundaries can exploit this to significantly reduce their slashing exposure.
+The `AllocateTokens` function in the distribution module fails to check if `ValidatorByConsAddr` returns nil when processing votes from bonded validators. When a validator is removed between voting in block N and reward allocation in block N+1, the function attempts to dereference a nil validator interface, causing a panic that crashes all nodes simultaneously and halts the network.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:** 
-The vulnerability spans multiple files in the staking module: [1](#0-0) [2](#0-1) [3](#0-2) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:** 
-The slashing mechanism should penalize validators proportionally based on their actual token stake at the time of infraction. For a validator with X tokens and a slash factor F, the expected slash amount should be X × F.
+**Intended logic:** 
+The reward allocation loop should safely distribute fees to all validators who participated in the previous block's consensus, handling edge cases where validators may no longer exist in state.
 
-**Actual Logic:**
-The power calculation performs integer division that discards remainders: [1](#0-0) 
+**Actual logic:** 
+The code retrieves a validator via `ValidatorByConsAddr` without checking for nil, then immediately passes it to `AllocateTokensToValidator`. When the validator interface is nil, the subsequent call to `val.GetCommission()` causes a nil pointer dereference panic. [2](#0-1) 
 
-When slashing occurs, the system uses the truncated power value to calculate slash amounts: [2](#0-1) 
+**Exploitation path:**
+1. Block N: A bonded validator participates in consensus (votes/signs block N). All delegations to this validator are removed via `Undelegate` transactions, causing `DelegatorShares` to become zero.
 
-The conversion back to tokens uses multiplication, which cannot recover the lost precision: [4](#0-3) 
+2. Block N EndBlock: The staking module's `BlockValidatorUpdates` processes validator state changes:
+   - `ApplyAndReturnValidatorSetUpdates` transitions validator from Bonded → Unbonding [3](#0-2) 
+   
+   - With a short unbonding period (as low as 1 nanosecond, which passes validation), `UnbondAllMatureValidators` immediately transitions the validator from Unbonding → Unbonded [4](#0-3) 
+   
+   - Since `DelegatorShares.IsZero()` and validator `IsUnbonded()`, `RemoveValidator` is called, deleting the validator and its consensus address mapping from state [5](#0-4) 
 
-**Exploit Scenario:**
-1. A validator delegates tokens such that their total stake is just below a PowerReduction boundary (e.g., 1,999,999 tokens with DefaultPowerReduction = 1,000,000)
-2. Their consensus power is calculated as: 1,999,999 ÷ 1,000,000 = 1 (truncated)
-3. This power value is sent to Tendermint via ABCI validator updates: [5](#0-4) 
-4. When the validator commits a slashable offense, the power from Tendermint's evidence is used: [6](#0-5) 
-5. For downtime slashing (via BeginBlock), the power from ABCI votes is used: [3](#0-2) 
-6. The slash amount is calculated as: (1 × 1,000,000) × SlashFactor = 1,000,000 × SlashFactor
-7. But the correct calculation should be: 1,999,999 × SlashFactor
-8. With a 5% downtime slash, the validator escapes ~50,000 tokens; with 10% double-sign slash, they escape ~100,000 tokens
+3. Block N+1 BeginBlock: Distribution module's `BeginBlocker` calls `AllocateTokens` with votes from block N [6](#0-5) 
+   
+   - `ValidatorByConsAddr` returns nil for the removed validator [7](#0-6) 
+   
+   - `AllocateTokensToValidator(ctx, nil, reward)` is called without a nil check, causing immediate panic
 
-**Security Failure:**
-The accounting mechanism is broken - the slashing penalty does not accurately reflect the validator's actual stake. This undermines the economic security model where slashing serves as a deterrent against misbehavior.
+**Security guarantee broken:** 
+Network liveness and availability. BeginBlock must complete successfully for consensus to proceed. The panic violates the invariant that all valid state transitions must be handled gracefully.
 
 ## Impact Explanation
 
-**Affected Assets:** 
-The staked tokens of validators are affected. Validators can structure their stakes to minimize slashing exposure by up to (PowerReduction - 1) tokens, which is 999,999 tokens with the default configuration.
+This vulnerability causes complete network shutdown when triggered. Since BeginBlock execution is deterministic and consensus-critical, all validators process the same state and will crash at the identical block height. This results in:
 
-**Severity:**
-- For each validator exploiting this, they can reduce slash amounts by up to ~50% when their tokens are near boundaries
-- With a 5% downtime slash on 1,999,999 tokens, they escape ~50,000 tokens (should be 99,999, but only 50,000 is slashed)
-- With a 10% double-sign slash, they escape ~100,000 tokens
-- This creates a perverse incentive for validators to keep stakes just below boundaries
-- Multiple validators can exploit this simultaneously, reducing the overall deterrent effect of slashing
+1. **Total network halt** - No new blocks can be produced
+2. **Loss of transaction finality** - All pending transactions remain unprocessed  
+3. **Requires emergency intervention** - Manual coordination among validators to restart nodes, potentially requiring a coordinated upgrade or hard fork to fix the state
 
-**System Impact:**
-This undermines the fundamental security assumption that validators will be properly penalized for misbehavior, potentially encouraging more infractions and reducing network security.
+The severity qualifies as **High** per the impact criteria: "Network not being able to confirm new transactions (total network shutdown)."
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any validator can exploit this by controlling their delegation amounts through self-delegation or coordinating with delegators
-- No special privileges or timing requirements needed
-- The exploit works with normal validator operations
+**Who can trigger:** Any network participant with delegations can submit `Undelegate` transactions. No special privileges required.
+
+**Conditions:**
+1. Unbonding period configured to a short duration (validation only requires > 0, allowing values as low as 1 nanosecond) [8](#0-7) 
+
+2. A validator must have all delegations removed in a single block
+3. The validator must participate in consensus during that block
 
 **Frequency:**
-- Validators can maintain this state continuously by rejecting new delegations that would push them over boundaries
-- Every slashing event on an affected validator will result in under-slashing
-- The vulnerability is exploitable during both downtime slashing (common) and double-sign slashing (less common but more severe)
+- With short unbonding periods (used in testnets): Moderately likely during normal operations
+- With standard periods: Less likely but still possible if validator has minimal delegations and unbonding naturally completes
 
-**Accessibility:**
-Any validator operator can exploit this, making it a systemic vulnerability affecting the network's economic security model.
+The code explicitly acknowledges this scenario can occur: [9](#0-8) 
+
+Significantly, the proposer reward allocation already handles this exact case with a nil check and warning log, demonstrating developer awareness of the edge case: [10](#0-9) 
+
+Additionally, other modules (slashing and evidence) defensively check for nil validators when calling `ValidatorByConsAddr`, confirming this is a known and expected edge case that requires defensive handling.
 
 ## Recommendation
 
-Modify the slashing calculation to use the validator's actual token amount at the infraction height instead of converting from power. Store historical token amounts when validator updates are sent to Tendermint, and reference these during slashing:
+Add a nil check in the vote allocation loop, mirroring the approach used for proposer rewards:
 
-1. In `ApplyAndReturnValidatorSetUpdates`, store a mapping of (validator, height) → tokens alongside the power
-2. In the `Slash` function, retrieve the actual token amount from this historical record instead of converting from power
-3. Calculate slash amount directly as: actualTokens × slashFactor
+```go
+for _, vote := range bondedVotes {
+    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+    
+    if validator == nil {
+        logger.Error(fmt.Sprintf(
+            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
+            "This should happen only if the validator unbonded completely within a single block.",
+            vote.Validator.Address.String()))
+        continue
+    }
+    
+    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+    reward := feeMultiplier.MulDecTruncate(powerFraction)
 
-This preserves precision and ensures validators are slashed based on their true stake.
+    k.AllocateTokensToValidator(ctx, validator, reward)
+    remaining = remaining.Sub(reward)
+}
+```
+
+If a validator is removed, their rewards remain in the pool and get added to the community pool at function end, matching the behavior for proposer rewards and maintaining network stability.
 
 ## Proof of Concept
 
-**File:** `x/staking/keeper/slash_test.go`
-
-**Test Function:** Add a new test `TestSlashWithTruncatedPower`
+**Test Location:** `x/distribution/keeper/allocation_test.go`
 
 **Setup:**
-1. Initialize a test blockchain with default PowerReduction = 1,000,000
-2. Create a validator with exactly 1,999,999 tokens (just below 2 PowerReduction units)
-3. Verify the validator's consensus power is 1 (truncated from 1.999999)
-4. Simulate the validator committing a slashable infraction at this height
+1. Initialize test app with 1-nanosecond unbonding period
+2. Create a validator with minimal delegation (100 tokens)
+3. Fund fee collector with distributable fees
+4. Include validator in vote list for block N
 
 **Trigger:**
-1. Call the Slash function with power=1 (as would come from Tendermint evidence) and slashFactor=0.05 (5% downtime slash)
-2. Observe the calculated slash amount
+1. Submit `Undelegate` messages removing all delegations from validator
+2. Call `staking.EndBlocker` to process state changes:
+   - Validator transitions to unbonding
+   - Unbonding completes immediately (1ns period)
+   - Validator removed from state (zero shares)
+3. Call `distribution.BeginBlocker` with vote info containing removed validator
 
-**Observation:**
-The test should demonstrate that:
-- Expected slash amount: 1,999,999 × 0.05 = 99,999 tokens
-- Actual slash amount calculated: (1 × 1,000,000) × 0.05 = 50,000 tokens  
-- The validator escapes approximately 49,999 tokens from slashing (~50% reduction in penalty)
+**Expected Result:**
+Panic with nil pointer dereference when `AllocateTokens` attempts to call `validator.GetCommission()` on nil interface.
 
-This proves the under-slashing vulnerability exists and can be exploited by any validator who structures their stake appropriately.
-
-**Test Code Structure:**
-```
-func TestSlashWithTruncatedPower(t *testing.T) {
-    // Setup: Create validator with 1,999,999 tokens
-    // Assert: Power should be 1 (truncated)
-    // Execute: Slash with power=1, slashFactor=0.05
-    // Assert: Slash amount is ~50,000 instead of expected ~99,999
-    // Demonstrates ~49,999 token escape from slashing
-}
-```
+**Notes:**
+The test confirms the vulnerability is exploitable and causes network-wide denial of service. The code inconsistency (proposer rewards check for nil, voter rewards don't) combined with acknowledgment in comments that this scenario occurs demonstrates this is an oversight requiring defensive programming, not a configuration constraint.
 
 ### Citations
 
-**File:** types/staking.go (L33-34)
+**File:** x/distribution/keeper/allocation.go (L54-79)
 ```go
-func TokensToConsensusPower(tokens Int, powerReduction Int) int64 {
-	return (tokens.Quo(powerReduction)).Int64()
+	remaining := feesCollected
+	proposerValidator := k.stakingKeeper.ValidatorByConsAddr(ctx, previousProposer)
+
+	if proposerValidator != nil {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeProposerReward,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, proposerReward.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, proposerValidator.GetOperator().String()),
+			),
+		)
+
+		k.AllocateTokensToValidator(ctx, proposerValidator, proposerReward)
+		remaining = remaining.Sub(proposerReward)
+	} else {
+		// previous proposer can be unknown if say, the unbonding period is 1 block, so
+		// e.g. a validator undelegates at block X, it's removed entirely by
+		// block X+1's endblock, then X+2 we need to refer to the previous
+		// proposer for X+1, but we've forgotten about them.
+		logger.Error(fmt.Sprintf(
+			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
+				"This should happen only if the proposer unbonded completely within a single block, "+
+				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
+				"We recommend you investigate immediately.",
+			previousProposer.String()))
+	}
 ```
 
-**File:** types/staking.go (L38-40)
+**File:** x/distribution/keeper/allocation.go (L91-102)
 ```go
-func TokensFromConsensusPower(power int64, powerReduction Int) Int {
-	return NewInt(power).Mul(powerReduction)
-}
+	for _, vote := range bondedVotes {
+		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+
+		// TODO: Consider micro-slashing for missing votes.
+		//
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
+		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+		reward := feeMultiplier.MulDecTruncate(powerFraction)
+
+		k.AllocateTokensToValidator(ctx, validator, reward)
+		remaining = remaining.Sub(reward)
+	}
 ```
 
-**File:** x/staking/keeper/slash.go (L32-34)
+**File:** x/distribution/keeper/allocation.go (L111-115)
 ```go
-	amount := k.TokensFromConsensusPower(ctx, power)
-	slashAmountDec := amount.ToDec().Mul(slashFactor)
-	slashAmount := slashAmountDec.TruncateInt()
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+
 ```
 
-**File:** x/slashing/abci.go (L41-41)
+**File:** x/staking/keeper/val_state_change.go (L22-26)
 ```go
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+	// This fixes a bug when the unbonding period is instant (is the case in
+	// some of the tests). The test expected the validator to be completely
+	// unbonded after the Endblocker (go from Bonded -> Unbonding during
+	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
+	// UnbondAllMatureValidatorQueue).
 ```
 
-**File:** x/staking/keeper/val_state_change.go (L169-174)
+**File:** x/staking/keeper/val_state_change.go (L108-222)
 ```go
+func (k Keeper) ApplyAndReturnValidatorSetUpdates(ctx sdk.Context) (updates []abci.ValidatorUpdate, err error) {
+	params := k.GetParams(ctx)
+	maxValidators := params.MaxValidators
+	powerReduction := k.PowerReduction(ctx)
+	totalPower := sdk.ZeroInt()
+	amtFromBondedToNotBonded, amtFromNotBondedToBonded := sdk.ZeroInt(), sdk.ZeroInt()
+
+	// Retrieve the last validator set.
+	// The persistent set is updated later in this function.
+	// (see LastValidatorPowerKey).
+	last, err := k.getLastValidatorsByAddr(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Iterate over validators, highest power to lowest.
+	iterator := k.ValidatorsPowerStoreIterator(ctx)
+	defer iterator.Close()
+
+	for count := 0; iterator.Valid() && count < int(maxValidators); iterator.Next() {
+		// everything that is iterated in this loop is becoming or already a
+		// part of the bonded validator set
+		valAddr := sdk.ValAddress(iterator.Value())
+		validator := k.mustGetValidator(ctx, valAddr)
+
+		if validator.Jailed {
+			panic("should never retrieve a jailed validator from the power store")
+		}
+
+		// if we get to a zero-power validator (which we don't bond),
+		// there are no more possible bonded validators
+		if validator.PotentialConsensusPower(k.PowerReduction(ctx)) == 0 {
+			break
+		}
+
+		// apply the appropriate state change if necessary
+		switch {
+		case validator.IsUnbonded():
+			validator, err = k.unbondedToBonded(ctx, validator)
+			if err != nil {
+				return
+			}
+			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
+		case validator.IsUnbonding():
+			validator, err = k.unbondingToBonded(ctx, validator)
+			if err != nil {
+				return
+			}
+			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
+		case validator.IsBonded():
+			// no state change
+		default:
+			panic("unexpected validator status")
+		}
+
+		// fetch the old power bytes
+		valAddrStr, err := sdk.Bech32ifyAddressBytes(sdk.GetConfig().GetBech32ValidatorAddrPrefix(), valAddr)
+		if err != nil {
+			return nil, err
+		}
+		oldPowerBytes, found := last[valAddrStr]
 		newPower := validator.ConsensusPower(powerReduction)
 		newPowerBytes := k.cdc.MustMarshal(&gogotypes.Int64Value{Value: newPower})
 
 		// update the validator set if power has changed
 		if !found || !bytes.Equal(oldPowerBytes, newPowerBytes) {
 			updates = append(updates, validator.ABCIValidatorUpdate(powerReduction))
+
+			k.SetLastValidatorPower(ctx, valAddr, newPower)
+		}
+
+		delete(last, valAddrStr)
+		count++
+
+		totalPower = totalPower.Add(sdk.NewInt(newPower))
+	}
+
+	noLongerBonded, err := sortNoLongerBonded(last)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, valAddrBytes := range noLongerBonded {
+		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
+		validator, err = k.bondedToUnbonding(ctx, validator)
+		if err != nil {
+			return
+		}
+		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
+		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
+		updates = append(updates, validator.ABCIValidatorUpdateZero())
+	}
+
+	// Update the pools based on the recent updates in the validator set:
+	// - The tokens from the non-bonded candidates that enter the new validator set need to be transferred
+	// to the Bonded pool.
+	// - The tokens from the bonded validators that are being kicked out from the validator set
+	// need to be transferred to the NotBonded pool.
+	switch {
+	// Compare and subtract the respective amounts to only perform one transfer.
+	// This is done in order to avoid doing multiple updates inside each iterator/loop.
+	case amtFromNotBondedToBonded.GT(amtFromBondedToNotBonded):
+		k.notBondedTokensToBonded(ctx, amtFromNotBondedToBonded.Sub(amtFromBondedToNotBonded))
+	case amtFromNotBondedToBonded.LT(amtFromBondedToNotBonded):
+		k.bondedTokensToNotBonded(ctx, amtFromBondedToNotBonded.Sub(amtFromNotBondedToBonded))
+	default: // equal amounts of tokens; no update required
+	}
+
+	// set total power on lookup index if there are any updates
+	if len(updates) > 0 {
+		k.SetLastTotalPower(ctx, totalPower)
+	}
+
+	return updates, err
+}
 ```
 
-**File:** x/evidence/keeper/infraction.go (L103-112)
+**File:** x/staking/keeper/validator.go (L153-181)
 ```go
-	// Slash validator. The `power` is the int64 power of the validator as provided
-	// to/by Tendermint. This value is validator.Tokens as sent to Tendermint via
-	// ABCI, and now received as evidence. The fraction is passed in to separately
-	// to slash unbonding and rebonding delegations.
-	k.slashingKeeper.Slash(
-		ctx,
-		consAddr,
-		k.slashingKeeper.SlashFractionDoubleSign(ctx),
-		evidence.GetValidatorPower(), distributionHeight,
-	)
+func (k Keeper) RemoveValidator(ctx sdk.Context, address sdk.ValAddress) {
+	// first retrieve the old validator record
+	validator, found := k.GetValidator(ctx, address)
+	if !found {
+		return
+	}
+
+	if !validator.IsUnbonded() {
+		panic("cannot call RemoveValidator on bonded or unbonding validators")
+	}
+
+	if validator.Tokens.IsPositive() {
+		panic("attempting to remove a validator which still contains tokens")
+	}
+
+	valConsAddr, err := validator.GetConsAddr()
+	if err != nil {
+		panic(err)
+	}
+
+	// delete the old validator record
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.GetValidatorKey(address))
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+	store.Delete(types.GetValidatorsByPowerIndexKey(validator, k.PowerReduction(ctx)))
+
+	// call hooks
+	k.AfterValidatorRemoved(ctx, valConsAddr, validator.GetOperator())
+}
+```
+
+**File:** x/staking/keeper/validator.go (L399-450)
+```go
+func (k Keeper) UnbondAllMatureValidators(ctx sdk.Context) {
+	store := ctx.KVStore(k.storeKey)
+
+	blockTime := ctx.BlockTime()
+	blockHeight := ctx.BlockHeight()
+
+	// unbondingValIterator will contains all validator addresses indexed under
+	// the ValidatorQueueKey prefix. Note, the entire index key is composed as
+	// ValidatorQueueKey | timeBzLen (8-byte big endian) | timeBz | heightBz (8-byte big endian),
+	// so it may be possible that certain validator addresses that are iterated
+	// over are not ready to unbond, so an explicit check is required.
+	unbondingValIterator := k.ValidatorQueueIterator(ctx, blockTime, blockHeight)
+	defer unbondingValIterator.Close()
+
+	for ; unbondingValIterator.Valid(); unbondingValIterator.Next() {
+		key := unbondingValIterator.Key()
+		keyTime, keyHeight, err := types.ParseValidatorQueueKey(key)
+		if err != nil {
+			panic(fmt.Errorf("failed to parse unbonding key: %w", err))
+		}
+
+		// All addresses for the given key have the same unbonding height and time.
+		// We only unbond if the height and time are less than the current height
+		// and time.
+		if keyHeight <= blockHeight && (keyTime.Before(blockTime) || keyTime.Equal(blockTime)) {
+			addrs := types.ValAddresses{}
+			k.cdc.MustUnmarshal(unbondingValIterator.Value(), &addrs)
+
+			for _, valAddr := range addrs.Addresses {
+				addr, err := sdk.ValAddressFromBech32(valAddr)
+				if err != nil {
+					panic(err)
+				}
+				val, found := k.GetValidator(ctx, addr)
+				if !found {
+					panic("validator in the unbonding queue was not found")
+				}
+
+				if !val.IsUnbonding() {
+					panic("unexpected validator in unbonding queue; status was not unbonding")
+				}
+
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+			}
+
+			store.Delete(key)
+		}
+	}
+}
+```
+
+**File:** x/distribution/abci.go (L29-32)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+	}
+```
+
+**File:** x/staking/keeper/alias_functions.go (L88-96)
+```go
+// ValidatorByConsAddr gets the validator interface for a particular pubkey
+func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
+	val, found := k.GetValidatorByConsAddr(ctx, addr)
+	if !found {
+		return nil
+	}
+
+	return val
+}
+```
+
+**File:** x/staking/types/params.go (L167-178)
+```go
+func validateUnbondingTime(i interface{}) error {
+	v, ok := i.(time.Duration)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v <= 0 {
+		return fmt.Errorf("unbonding time must be positive: %d", v)
+	}
+
+	return nil
+}
 ```

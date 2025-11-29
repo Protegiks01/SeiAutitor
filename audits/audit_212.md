@@ -1,278 +1,292 @@
-# Audit Report
+Based on my thorough analysis of the sei-cosmos codebase, I will now provide my assessment of this security claim.
+
+## Technical Validation
+
+I have examined the relevant code paths and can confirm the following:
+
+1. **The Grant method lacks protection**: The `Grant` method in `x/authz/keeper/msg_server.go` only validates that the authorization is present and a handler exists, with NO check preventing authorization for `MsgExec` or `MsgGrant` message types. [1](#0-0) 
+
+2. **GenericAuthorization is permissive**: The `GenericAuthorization.Accept()` method always returns `Accept: true` without any validation. [2](#0-1) 
+
+3. **Recursive execution is possible**: The `DispatchActions` method processes messages and calls handlers, which for `MsgExec` would recursively call `DispatchActions` again. [3](#0-2) 
+
+4. **MsgExec is registered**: The authz module registers `MsgExec` as a valid message type through `RegisterMsgServer`. [4](#0-3) 
+
+## Exploit Flow Verification
+
+The described exploit scenario is technically valid:
+
+1. Alice grants Bob `SendAuthorization` → stored as (grantee: Bob, granter: Alice, type: MsgSend)
+2. Bob grants Charlie `GenericAuthorization` for `MsgExec` → stored as (grantee: Charlie, granter: Bob, type: MsgExec)
+3. Charlie submits nested `MsgExec`:
+   - Outer `MsgExec` (grantee: Charlie) containing Inner `MsgExec`
+   - Inner `MsgExec` (grantee: Bob) containing `MsgSend` (from: Alice)
+4. Execution:
+   - Outer `MsgExec` validates Charlie has authorization from Bob for `MsgExec` ✓
+   - Inner `MsgExec` validates Bob has authorization from Alice for `MsgSend` ✓
+   - `MsgSend` executes, transferring Alice's funds
+
+## Security Assessment
+
+**Impact**: This vulnerability enables **direct loss of funds** - Charlie can steal Alice's funds without Alice ever authorizing Charlie. This matches the valid impact criteria.
+
+**Likelihood**: High - Any grantee can exploit this by granting `MsgExec` authorization to a third party. No special conditions or privileges required.
+
+**Root Cause**: The authz module fails to enforce non-transitive authorization. There is no documentation or code comment indicating this transitive delegation behavior is intentional.
+
+**Audit Report**
 
 ## Title
-Unbounded Query Resource Consumption via Infinite Gas Meter in Authorization Lookups
+Privilege Escalation Through Unrestricted MsgExec Authorization Enabling Unauthorized Transitive Delegation
 
 ## Summary
-Query contexts are initialized with an infinite gas meter, allowing expensive authorization lookup queries (specifically `GranteeGrants`) to iterate through unlimited grant records without any gas limit enforcement. An attacker can exhaust node resources (CPU, memory, I/O) by creating many grants and querying with high pagination limits.
+The authz module's `Grant` method lacks validation to prevent granting authorization for `MsgExec` and `MsgGrant` message types, enabling privilege escalation through delegation chains. This allows grantees to re-delegate authorizations to unauthorized third parties, resulting in direct loss of funds.
 
 ## Impact
-**Medium** - Increasing network processing node resource consumption by at least 30% without brute force actions.
+High
 
 ## Finding Description
-
-**Location:** 
-- Primary issue: [1](#0-0) 
-- Vulnerable query: [2](#0-1) 
-- Query context creation: [3](#0-2) 
-- Pagination implementation: [4](#0-3) 
-
-**Intended Logic:** 
-Query gas limits should prevent expensive operations from consuming excessive node resources. Authorization queries should have bounded resource consumption to protect nodes from DoS attacks.
-
-**Actual Logic:** 
-When creating query contexts, the system initializes with an infinite gas meter [1](#0-0) , which never triggers out-of-gas errors [5](#0-4) . The `GranteeGrants` query creates a prefix store over ALL authorization grants [6](#0-5) , then uses `GenericFilteredPaginate` to iterate through them. The pagination function reads and unmarshals every grant entry [7](#0-6) , then filters by comparing addresses [8](#0-7) . With no maximum limit enforcement (MaxLimit is set to math.MaxUint64 [9](#0-8) ), an attacker can request pagination through millions of records.
-
-**Exploit Scenario:**
-1. Attacker creates numerous authorization grants (e.g., 1 million grants) between various address pairs by submitting normal grant transactions over time
-2. Attacker sends a `GranteeGrants` query with a very high pagination limit (e.g., 1 million) to a public RPC endpoint
-3. The query iterates through ALL grants in the store, reading from disk, unmarshalling protobuf messages, and performing address comparisons for each one
-4. With the infinite gas meter, this continues without limit, consuming CPU, memory, and I/O resources
-5. Multiple concurrent queries amplify the effect, potentially overwhelming the node
-
-**Security Failure:** 
-Denial-of-service through unbounded resource consumption. The infinite gas meter breaks the security property that queries should have limited resource usage, allowing any user to exhaust node resources without paying transaction fees.
+- **location**: `x/authz/keeper/msg_server.go` lines 14-42 (Grant method) and `x/authz/keeper/keeper.go` lines 76-139 (DispatchActions method)
+- **intended logic**: Authorizations should be explicit and non-transitive. When Alice grants Bob authorization, only Bob should be able to execute actions on Alice's behalf, not arbitrary third parties that Bob chooses to delegate to.
+- **actual logic**: The `Grant` method only validates that an authorization is present and a handler exists for the message type. There is no check preventing authorization of `MsgExec` or `MsgGrant` themselves. Combined with `GenericAuthorization` which accepts any message without validation, this allows unlimited re-delegation chains.
+- **exploitation path**: 
+  1. Alice grants Bob a `SendAuthorization` for 100 tokens
+  2. Bob grants Charlie a `GenericAuthorization` for `MsgExec` type
+  3. Charlie creates nested `MsgExec` messages: outer (grantee: Charlie, msgs: [inner]) where inner is (grantee: Bob, msgs: [MsgSend from Alice])
+  4. When processed, the outer `MsgExec` validates Charlie's authorization from Bob, the inner `MsgExec` validates Bob's authorization from Alice, and the `MsgSend` executes
+  5. Alice's funds are transferred without Alice ever authorizing Charlie
+- **security guarantee broken**: The principle that authorizations are personal and non-transferable is violated, enabling transitive delegation without explicit consent from the original granter.
 
 ## Impact Explanation
-
-**Affected Resources:** 
-- Node CPU (unmarshalling, address comparisons)
-- Node memory (loading grant data)
-- Node I/O (reading from disk)
-- RPC endpoint availability
-
-**Damage Severity:** 
-An attacker can significantly increase resource consumption on RPC nodes by sending expensive queries. Since queries are free and accessible to anyone, this can be done repeatedly without cost to the attacker. If the authorization grant count is high (easily achievable through normal chain usage), a single query can consume substantial resources. Multiple concurrent queries from the same or different attackers can bring nodes to their knees, making them unresponsive to legitimate users.
-
-**System Impact:** 
-This matters because RPC nodes are critical infrastructure for blockchain interaction. If RPC nodes become unresponsive due to resource exhaustion, users cannot submit transactions, query state, or interact with the chain. This effectively creates a DoS attack vector that bypasses all transaction-level protections (gas limits, fees) since queries are free.
+This vulnerability results in direct loss of funds. Unauthorized parties can gain access to and steal funds from accounts they were never authorized to access. The trust relationship between granter and grantee is fundamentally broken as grantees can re-delegate to arbitrary third parties. This affects all assets that can be controlled through authorizations including tokens, staking positions, and governance votes.
 
 ## Likelihood Explanation
-
-**Who Can Trigger:** 
-Any user with access to a public RPC endpoint can trigger this vulnerability. No authentication, authorization, or privileged access is required.
-
-**Conditions Required:** 
-- The chain must have a substantial number of authorization grants stored (achievable through normal usage or deliberate setup by the attacker)
-- The attacker must send queries with high pagination limits
-- No additional conditions or timing constraints are needed
-
-**Frequency:** 
-This can be exploited continuously. An attacker can send multiple concurrent queries repeatedly without any cost or restriction. The attack becomes more effective as the number of grants in the system grows organically through normal chain usage. With even moderate grant counts (tens of thousands), the resource consumption per query becomes significant.
+Any user who receives any authorization grant can exploit this vulnerability. The only conditions required are: (1) an initial authorization grant exists, and (2) the intermediate grantee creates a grant for `MsgExec` to a third party. This is trivially achievable through normal transaction submission with no special conditions, race conditions, or timing requirements. The vulnerability is persistent and can be exploited at any time.
 
 ## Recommendation
-
-Implement proper gas metering for query contexts:
-
-1. **Add query gas limits:** Replace the infinite gas meter in query contexts with a bounded gas meter that has a reasonable limit (e.g., similar to transaction gas limits or a separate query gas limit configuration).
-
-2. **Enforce maximum pagination limits:** Add validation to reject pagination requests exceeding a maximum reasonable limit (e.g., 1000 items) at the query handler level.
-
-3. **Optimize the GranteeGrants query:** Use a more efficient storage key structure that allows direct prefix iteration for a specific grantee, rather than iterating through all grants and filtering.
-
-4. **Add query rate limiting:** Implement rate limiting at the RPC level to prevent abuse of expensive query endpoints.
-
-The most critical fix is replacing the infinite gas meter with a bounded one for all query contexts.
-
-## Proof of Concept
-
-**File:** `x/authz/keeper/grpc_query_test.go`
-
-**Test Function:** Add the following test to demonstrate resource exhaustion:
+Add validation in the `Grant` method to explicitly reject authorization grants for `MsgExec` and `MsgGrant` message types:
 
 ```go
-func (suite *TestSuite) TestGranteeGrantsResourceExhaustion() {
-    require := suite.Require()
-    app, ctx, queryClient := suite.app, suite.ctx, suite.queryClient
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+    // ... existing code ...
     
-    // Setup: Create many grants from different granters to different grantees
-    // to simulate a realistic scenario with many authorization grants in the system
-    numGranters := 1000  // In production, this could be much higher
-    numGrantees := 100
+    t := authorization.MsgTypeURL()
     
-    // Create test addresses
-    granters := make([]sdk.AccAddress, numGranters)
-    grantees := make([]sdk.AccAddress, numGrantees)
-    
-    for i := 0; i < numGranters; i++ {
-        granters[i] = sdk.AccAddress(fmt.Sprintf("granter%d", i))
-    }
-    for i := 0; i < numGrantees; i++ {
-        grantees[i] = sdk.AccAddress(fmt.Sprintf("grantee%d", i))
+    // Prevent recursive delegation chains
+    if t == sdk.MsgTypeURL(&authz.MsgExec{}) || t == sdk.MsgTypeURL(&authz.MsgGrant{}) {
+        return nil, sdkerrors.ErrUnauthorized.Wrap("cannot grant authorization for MsgExec or MsgGrant to prevent delegation chains")
     }
     
-    // Create many grants (simulating normal chain usage over time)
-    now := ctx.BlockHeader().Time
-    newCoins := sdk.NewCoins(sdk.NewInt64Coin("steak", 100))
-    authorization := &banktypes.SendAuthorization{SpendLimit: newCoins}
-    
-    for i := 0; i < numGranters; i++ {
-        for j := 0; j < numGrantees; j++ {
-            err := app.AuthzKeeper.SaveGrant(ctx, grantees[j], granters[i], authorization, now.Add(time.Hour))
-            require.NoError(err)
-        }
+    if k.router.HandlerByTypeURL(t) == nil {
+        return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
     }
     
-    // Trigger: Query with a very high pagination limit for a single grantee
-    // This should iterate through ALL grants in the system (numGranters * numGrantees)
-    // filtering for the specific grantee
-    targetGrantee := grantees[0]
-    
-    // Measure resource consumption
-    startTime := time.Now()
-    
-    result, err := queryClient.GranteeGrants(gocontext.Background(), &authz.QueryGranteeGrantsRequest{
-        Grantee: targetGrantee.String(),
-        Pagination: &query.PageRequest{
-            Limit: math.MaxUint64, // Request unlimited pagination
-            CountTotal: true,       // Force iteration through all records
-        },
-    })
-    
-    elapsed := time.Since(startTime)
-    
-    // Observation: The query completes but takes excessive time and resources
-    require.NoError(err)
-    require.NotNil(result)
-    
-    // This query should have iterated through numGranters * numGrantees records
-    // filtering for the specific grantee, finding numGranters matches
-    require.Equal(uint64(numGranters), result.Pagination.Total)
-    
-    // Log the execution time - in a real attack scenario with millions of grants,
-    // this would take seconds to minutes, consuming substantial CPU and I/O
-    fmt.Printf("Query executed in %v for %d total grants, consuming unbounded gas\n", 
-        elapsed, numGranters*numGrantees)
-    
-    // The vulnerability is that there's no gas limit preventing this expensive operation
-    // The context has an infinite gas meter, so no out-of-gas error occurs
-    // Multiple concurrent such queries can exhaust node resources
+    // ... rest of existing code ...
 }
 ```
 
-**Setup:** The test creates a realistic scenario with many authorization grants between different address pairs.
+## Proof of Concept
+A test can be constructed following the pattern in `TestKeeperFees` [5](#0-4) :
 
-**Trigger:** A `GranteeGrants` query is sent with `Limit: math.MaxUint64` and `CountTotal: true`, forcing iteration through all grants in the system.
-
-**Observation:** The query completes successfully without any gas limit errors, despite iterating through thousands of grant records. The test demonstrates that with the infinite gas meter, there's no protection against this expensive operation. In a production environment with millions of grants, this query would consume substantial resources (CPU, memory, I/O) without any limit, and multiple concurrent such queries would amplify the resource exhaustion effect.
-
-The test confirms the vulnerability: queries use an infinite gas meter and have no effective resource limits, allowing unbounded resource consumption.
+- **setup**: Initialize three accounts (Alice, Bob, Charlie), fund Alice with 10,000 tokens
+- **action**: 
+  1. Alice grants Bob `SendAuthorization` with 100 token limit using `SaveGrant`
+  2. Bob grants Charlie `GenericAuthorization` for `MsgExec` using `SaveGrant`
+  3. Charlie constructs nested `MsgExec`: outer (grantee: Charlie, msgs: [inner MsgExec])
+  4. Inner `MsgExec` contains (grantee: Bob, msgs: [MsgSend from Alice to recipient, amount: 100])
+  5. Call `DispatchActions` with Charlie as grantee and the nested MsgExec
+- **result**: Transaction succeeds, 100 tokens transferred from Alice to recipient, despite Alice never authorizing Charlie
 
 ### Citations
 
-**File:** types/context.go (L272-272)
+**File:** x/authz/keeper/msg_server.go (L14-42)
 ```go
-		gasMeter:        NewInfiniteGasMeter(1, 1),
-```
-
-**File:** x/authz/keeper/grpc_query.go (L132-177)
-```go
-func (k Keeper) GranteeGrants(c context.Context, req *authz.QueryGranteeGrantsRequest) (*authz.QueryGranteeGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
-	}
-
-	grantee, err := sdk.AccAddressFromBech32(req.Grantee)
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx := sdk.UnwrapSDKContext(c)
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
+	}
 
-	authorizations, pageRes, err := query.GenericFilteredPaginate(k.cdc, store, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
+	authorization := msg.GetAuthorization()
+	if authorization == nil {
+		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
+	}
+
+	t := authorization.MsgTypeURL()
+	if k.router.HandlerByTypeURL(t) == nil {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+	}
+
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgGrantResponse{}, nil
+}
+```
+
+**File:** x/authz/generic_authorization.go (L23-26)
+```go
+// Accept implements Authorization.Accept.
+func (a GenericAuthorization) Accept(ctx sdk.Context, msg sdk.Msg) (AcceptResponse, error) {
+	return AcceptResponse{Accept: true}, nil
+}
+```
+
+**File:** x/authz/keeper/keeper.go (L76-139)
+```go
+func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
+	results := make([][]byte, len(msgs))
+
+	for i, msg := range msgs {
+		signers := msg.GetSigners()
+		if len(signers) != 1 {
+			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
+		}
+
+		granter := signers[0]
+
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
+
+		handler := k.router.Handler(msg)
+		if handler == nil {
+			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
+		}
+
+		msgResp, err := handler(ctx, msg)
 		if err != nil {
-			return nil, err
+			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
 		}
 
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
+		results[i] = msgResp.Data
+
+		// emit the events from the dispatched actions
+		events := msgResp.Events
+		sdkEvents := make([]sdk.Event, 0, len(events))
+		for _, event := range events {
+			e := event
+			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
+
+			sdkEvents = append(sdkEvents, sdk.Event(e))
 		}
 
-		authorizationAny, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
+		ctx.EventManager().EmitEvents(sdkEvents)
+	}
 
-		return &authz.GrantAuthorization{
-			Authorization: authorizationAny,
-			Expiration:    auth.Expiration,
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-		}, nil
-	}, func() *authz.Grant {
-		return &authz.Grant{}
+	return results, nil
+}
+```
+
+**File:** x/authz/module/module.go (L44-46)
+```go
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	authz.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+	authz.RegisterMsgServer(cfg.MsgServer(), am.keeper)
+```
+
+**File:** x/authz/keeper/keeper_test.go (L126-197)
+```go
+func (s *TestSuite) TestKeeperFees() {
+	app, addrs := s.app, s.addrs
+
+	granterAddr := addrs[0]
+	granteeAddr := addrs[1]
+	recipientAddr := addrs[2]
+	s.Require().NoError(simapp.FundAccount(app.BankKeeper, s.ctx, granterAddr, sdk.NewCoins(sdk.NewInt64Coin("steak", 10000))))
+	now := s.ctx.BlockHeader().Time
+	s.Require().NotNil(now)
+
+	smallCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 20))
+	someCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 123))
+
+	msgs := authz.NewMsgExec(granteeAddr, []sdk.Msg{
+		&banktypes.MsgSend{
+			Amount:      sdk.NewCoins(sdk.NewInt64Coin("steak", 2)),
+			FromAddress: granterAddr.String(),
+			ToAddress:   recipientAddr.String(),
+		},
 	})
-	if err != nil {
-		return nil, err
-	}
 
-	return &authz.QueryGranteeGrantsResponse{
-		Grants:     authorizations,
-		Pagination: pageRes,
-	}, nil
-```
+	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
 
-**File:** baseapp/abci.go (L757-759)
-```go
-	ctx := sdk.NewContext(
-		cacheMS, checkStateCtx.BlockHeader(), true, app.logger,
-	).WithMinGasPrices(app.minGasPrices).WithBlockHeight(height)
-```
+	s.T().Log("verify dispatch fails with invalid authorization")
+	executeMsgs, err := msgs.GetMessages()
+	s.Require().NoError(err)
+	result, err := app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
 
-**File:** types/query/filtered_pagination.go (L212-246)
-```go
-	for ; iterator.Valid(); iterator.Next() {
-		if iterator.Error() != nil {
-			return nil, nil, iterator.Error()
-		}
+	s.Require().Nil(result)
+	s.Require().NotNil(err)
 
-		protoMsg := constructor()
+	s.T().Log("verify dispatch executes with correct information")
+	// grant authorization
+	err = app.AuthzKeeper.SaveGrant(s.ctx, granteeAddr, granterAddr, &banktypes.SendAuthorization{SpendLimit: smallCoin}, now)
+	s.Require().NoError(err)
+	authorization, _ := app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
+	s.Require().NotNil(authorization)
 
-		err := cdc.Unmarshal(iterator.Value(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
+	s.Require().Equal(authorization.MsgTypeURL(), bankSendAuthMsgType)
 
-		val, err := onResult(iterator.Key(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
+	executeMsgs, err = msgs.GetMessages()
+	s.Require().NoError(err)
 
-		if val.Size() != 0 {
-			// Previously this was the "accumulate" flag
-			if numHits >= offset && numHits < end {
-				results = append(results, val)
-			}
-			numHits++
-		}
+	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
+	s.Require().NoError(err)
+	s.Require().NotNil(result)
 
-		if numHits == end+1 {
-			if nextKey == nil {
-				nextKey = iterator.Key()
-			}
+	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
+	s.Require().NotNil(authorization)
 
-			if !countTotal {
-				break
-			}
-		}
-	}
-```
+	s.T().Log("verify dispatch fails with overlimit")
+	// grant authorization
 
-**File:** store/types/gas.go (L252-258)
-```go
-func (g *infiniteGasMeter) IsPastLimit() bool {
-	return false
+	msgs = authz.NewMsgExec(granteeAddr, []sdk.Msg{
+		&banktypes.MsgSend{
+			Amount:      someCoin,
+			FromAddress: granterAddr.String(),
+			ToAddress:   recipientAddr.String(),
+		},
+	})
+
+	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
+	executeMsgs, err = msgs.GetMessages()
+	s.Require().NoError(err)
+
+	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
+	s.Require().Nil(result)
+	s.Require().NotNil(err)
+
+	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
+	s.Require().NotNil(authorization)
 }
-
-func (g *infiniteGasMeter) IsOutOfGas() bool {
-	return false
-}
-```
-
-**File:** types/query/pagination.go (L20-20)
-```go
-const MaxLimit = math.MaxUint64
 ```

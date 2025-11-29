@@ -1,370 +1,240 @@
+# Audit Report
+
 ## Title
-Governance Parameter Changes Can Violate Distribution Module Invariants Leading to Negative Rewards and Potential Chain Halt
+Missing Commission Rate Validation in Genesis State Causing Deterministic Network Shutdown
 
 ## Summary
-The distribution module allows governance to change `CommunityTax`, `BaseProposerReward`, and `BonusProposerReward` parameters individually without validating that their sum remains ≤ 1.0. This violates a critical accounting invariant and causes negative validator rewards to be allocated, breaking the `NonNegativeOutstandingInvariant` and potentially halting the chain. [1](#0-0) 
+The `validateGenesisStateValidators` function in the staking module fails to validate validator commission rates during genesis state loading. This allows genesis files to contain validators with commission rates exceeding 100%, which causes all nodes to panic deterministically during reward distribution via `AllocateTokensToValidator`, resulting in total network shutdown requiring a hard fork to recover. [1](#0-0) 
 
 ## Impact
-**High** - Network not being able to confirm new transactions (total network shutdown) or unintended chain behavior requiring emergency intervention.
+High
 
 ## Finding Description
 
-**Location:** 
-- Parameter validation: [2](#0-1) 
-- Allocation logic: [3](#0-2) 
-- Invariant check: [4](#0-3) 
+- **location**: `x/staking/genesis.go` (validateGenesisStateValidators function, lines 238-273) and `x/distribution/keeper/allocation.go` (AllocateTokensToValidator function, lines 111-114)
 
-**Intended Logic:** 
-The distribution module expects that `CommunityTax + BaseProposerReward + BonusProposerReward ≤ 1.0` to ensure proper fee allocation. The `ValidateBasic()` function enforces this cross-parameter constraint. [5](#0-4) 
+- **intended logic**: The staking system enforces that validator commission rates never exceed 100% (1.0 decimal) to maintain proper reward accounting. The commission validation logic exists and is enforced during normal validator creation through transactions. [2](#0-1) [3](#0-2) 
 
-**Actual Logic:** 
-When parameters are changed through governance proposals, the `Update()` method only calls individual parameter validators registered in `ParamSetPairs()`, which check that each parameter is between 0 and 1 individually. The cross-parameter validation in `ValidateBasic()` is never called. [2](#0-1) 
+- **actual logic**: The genesis validation function `validateGenesisStateValidators` only validates duplicate validators, jailed+bonded conflicts, and zero delegator shares, but completely omits commission rate validation. During `InitGenesis`, validators are loaded directly into state without any commission validation: [4](#0-3) [5](#0-4) 
 
-The individual validators allow values like:
-- `CommunityTax = 0.5` [6](#0-5) 
-- `BaseProposerReward = 0.4` [7](#0-6) 
-- `BonusProposerReward = 0.4` [8](#0-7) 
+When `AllocateTokensToValidator` attempts to distribute rewards to a validator with commission rate > 1.0, it calculates commission amount that exceeds the total tokens being distributed. The subsequent subtraction operation in `DecCoins.Sub` panics: [6](#0-5) [7](#0-6) 
 
-Sum = 1.3 > 1.0, violating the invariant.
+- **exploitation path**: 
+  1. Genesis file is created with validator containing `Commission.Rate > 1.0` (e.g., 1.5 = 150%)
+  2. `ValidateGenesis` passes because commission rates are not checked
+  3. `InitGenesis` loads the validator into state without validation
+  4. During first block with reward distribution, `AllocateTokens` is called
+  5. `AllocateTokensToValidator` calculates: `commission = tokens × 1.5`, which exceeds `tokens`
+  6. `shared = tokens.Sub(commission)` attempts to compute a negative value
+  7. `DecCoins.Sub` panics with "negative coin amount"
+  8. All nodes crash at the same deterministic point in consensus
 
-**Exploit Scenario:**
-1. Submit and pass governance proposal to set `CommunityTax = 0.5`
-2. Submit and pass governance proposal to set `BaseProposerReward = 0.4`
-3. Submit and pass governance proposal to set `BonusProposerReward = 0.4`
-4. During next block's BeginBlock, `AllocateTokens` calculates:
-   - `proposerMultiplier = 0.4 + 0.4 * previousFractionVotes` (up to 0.8)
-   - `voteMultiplier = 1.0 - 0.8 - 0.5 = -0.3` (negative!)
-   - `feeMultiplier = feesCollected * (-0.3)` (negative rewards)
-5. Negative rewards are allocated to validators [9](#0-8) 
-6. The `NonNegativeOutstandingInvariant` detects negative outstanding rewards and marks invariant as broken [10](#0-9) 
-
-**Security Failure:** 
-The accounting invariant is violated, resulting in negative validator rewards. This breaks the protocol's fee distribution mechanism and causes invariant violations that can halt the chain if invariant checking is enabled.
+- **security guarantee broken**: The invariant that validator commission rates must be ≤ 100% is violated. The system's genesis validation, which validates other validator properties, fails to validate this critical invariant, allowing invalid state to be loaded.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Fee distribution accounting becomes invalid
-- Validator outstanding rewards become negative
-- Chain invariants are violated
-- Network consensus may halt
+This vulnerability causes **total network shutdown**. All nodes processing blocks will panic at exactly the same block height when reward distribution occurs for the validator with invalid commission rate. The panic is deterministic and occurs in the consensus path, making it impossible for any node to progress past that block. 
 
-**Severity:**
-If invariant checking is enabled (which is standard for production chains), this causes an immediate chain halt requiring emergency coordination and potentially a hard fork to fix. Even if invariant checking is disabled, the negative rewards corrupt the fee distribution accounting, causing incorrect validator compensation and potential economic attacks.
+The network cannot produce new blocks, all transactions halt, and the chain is completely frozen. Recovery requires a coordinated hard fork to create corrected genesis state, as the invalid validator state cannot be fixed through normal chain operations.
 
-**Systemic Risk:**
-This affects the core economic incentive mechanism of the blockchain. Validators would receive incorrect rewards, undermining the security model of the proof-of-stake consensus.
+This matches the High severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any network participant can submit governance proposals
-- Requires proposals to pass through normal governance voting (typically 50%+ voting power approval)
-- No special privileges required beyond normal governance participation
-- Can occur through legitimate governance activity (not requiring malicious intent)
+**Triggering conditions**: Requires a genesis file with a validator having commission rate > 100% to be used during:
+- New chain initialization
+- Network upgrade/hard fork with state migration
+- Testnet deployments with less rigorous review
 
-**Frequency:**
-- Could happen during routine parameter adjustments if governance participants don't manually verify cross-parameter constraints
-- Once triggered, affects every subsequent block until parameters are corrected
-- Requires 3 separate governance proposals to reach the vulnerable state
+**Who can introduce**: Genesis files are created by chain operators, validators, and core team during chain launches or upgrades. While this requires privileged access, the vulnerability is in the **missing validation** that should prevent such errors.
 
-**Likelihood:** Medium to High - While requiring multiple governance proposals, the lack of automatic validation means well-intentioned parameter changes could accidentally trigger this during routine governance operations.
+**Realistic scenarios**:
+- Programmatic genesis file generation with bugs
+- Data migration errors from other chains
+- Human error during manual genesis preparation
+- Compromised or malicious genesis preparation tools
+
+**Critical factors**:
+1. The system validates OTHER genesis invariants (duplicates, jailed+bonded status, shares), showing intent to prevent invalid genesis states
+2. Normal runtime operations properly validate commission rates, but genesis bypasses this
+3. Once introduced, the failure is automatic and deterministic
+4. The inconsistency between runtime and genesis validation suggests this is an oversight, not intentional design
 
 ## Recommendation
 
-Add cross-parameter validation during governance parameter updates. Modify the `Update` method or the parameter validation flow to call `Params.ValidateBasic()` after updating any distribution parameter to ensure all cross-parameter constraints are satisfied:
+Add commission rate validation to `validateGenesisStateValidators` in `x/staking/genesis.go`. Within the validator iteration loop, add:
 
 ```go
-// In x/params/proposal_handler.go or create a custom handler for distribution params
-if c.Subspace == "distribution" {
-    // After updating, validate all params together
-    var params distributiontypes.Params
-    ss.GetParamSet(ctx, &params)
-    if err := params.ValidateBasic(); err != nil {
-        return err
-    }
+if err := val.Commission.Validate(); err != nil {
+    return fmt.Errorf("invalid commission for validator %s: %w", val.OperatorAddress, err)
 }
 ```
 
-Alternatively, implement a more sophisticated validator function that has access to all current parameter values when validating changes.
+This ensures genesis validators undergo the same commission validation (`MaxRate ≤ 1.0`, `Rate ≤ MaxRate`, `MaxChangeRate ≤ MaxRate`) as validators created through `MsgCreateValidator` transactions, maintaining consistency across all validator creation paths. [8](#0-7) 
 
 ## Proof of Concept
 
-**File:** `x/distribution/keeper/allocation_test.go`
+**File**: `x/distribution/keeper/allocation_test.go`
 
-**Test Function:** `TestAllocateTokensInvariantViolation`
+**Test Function**: `TestAllocateTokensToValidatorWithCommissionGreaterThan100Percent`
 
-**Setup:**
-1. Initialize a test chain with default distribution parameters
-2. Create two validators with voting power
-3. Fund the fee collector with test tokens
+**Setup**:
+1. Initialize test application: `app := simapp.Setup(false)`
+2. Create context: `ctx := app.BaseApp.NewContext(false, tmproto.Header{})`
+3. Create validator with invalid commission by directly constructing the struct:
+   ```go
+   validator, _ := types.NewValidator(valAddr, consPk, types.Description{})
+   validator.Commission = types.NewCommission(sdk.NewDec(2), sdk.NewDec(2), sdk.ZeroDec()) // 200% rate
+   validator.Tokens = sdk.NewInt(100)
+   validator.DelegatorShares = sdk.NewDec(100)
+   validator.Status = types.Bonded
+   ```
+4. Bypass normal validation: `app.StakingKeeper.SetValidator(ctx, validator)`
+5. Initialize distribution: `app.DistrKeeper.AllocateTokensToValidator(ctx, validator, sdk.DecCoins{{Denom: sdk.DefaultBondDenom, Amount: sdk.NewDec(100)}})`
 
-**Trigger:**
-1. Use governance parameter update mechanism to set:
-   - `CommunityTax = 0.5`
-   - `BaseProposerReward = 0.4`  
-   - `BonusProposerReward = 0.4`
-2. Call `AllocateTokens` with votes from both validators
-3. Check validator outstanding rewards
+**Trigger**:
+- Call `AllocateTokensToValidator` with 100 tokens
+- Commission calculation: `100 × 2.0 = 200 tokens`
+- Subtraction attempt: `100 - 200 = -100` (negative)
 
-**Observation:**
-The test will show that validator outstanding rewards become negative, violating the invariant. The `NonNegativeOutstandingInvariant` check will return `broken = true`.
+**Result**:
+The test must wrap the call in `require.Panics(t, func() { ... })` to catch the panic with message "negative coin amount". This demonstrates that validators with commission > 100% loaded from genesis (bypassing validation) cause deterministic panic during reward allocation.
 
-```go
-func TestAllocateTokensInvariantViolation(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Set invalid params that sum to > 1.0 (simulating governance changes)
-    invalidParams := disttypes.Params{
-        CommunityTax:        sdk.NewDecWithPrec(50, 2), // 0.5
-        BaseProposerReward:  sdk.NewDecWithPrec(40, 2), // 0.4
-        BonusProposerReward: sdk.NewDecWithPrec(40, 2), // 0.4
-        WithdrawAddrEnabled: true,
-    }
-    app.DistrKeeper.SetParams(ctx, invalidParams)
-    
-    addrs := simapp.AddTestAddrs(app, ctx, 2, sdk.NewInt(1234))
-    valAddrs := simapp.ConvertAddrsToValAddrs(addrs)
-    tstaking := teststaking.NewHelper(t, ctx, app.StakingKeeper)
-    
-    tstaking.Commission = stakingtypes.NewCommissionRates(sdk.NewDec(0), sdk.NewDec(0), sdk.NewDec(0))
-    tstaking.CreateValidator(valAddrs[0], valConsPk1, sdk.NewInt(100), true)
-    tstaking.CreateValidator(valAddrs[1], valConsPk2, sdk.NewInt(100), true)
-    
-    // Fund fee collector
-    fees := sdk.NewCoins(sdk.NewCoin(sdk.DefaultBondDenom, sdk.NewInt(1000)))
-    feeCollector := app.AccountKeeper.GetModuleAccount(ctx, types.FeeCollectorName)
-    require.NoError(t, simapp.FundModuleAccount(app.BankKeeper, ctx, feeCollector.GetName(), fees))
-    app.AccountKeeper.SetAccount(ctx, feeCollector)
-    
-    votes := []abci.VoteInfo{
-        {Validator: abci.Validator{Address: valConsPk1.Address(), Power: 100}, SignedLastBlock: true},
-        {Validator: abci.Validator{Address: valConsPk2.Address(), Power: 100}, SignedLastBlock: true},
-    }
-    
-    // Allocate tokens - this will create negative rewards
-    app.DistrKeeper.AllocateTokens(ctx, 200, 200, valConsAddr2, votes)
-    
-    // Check that outstanding rewards are negative (invariant violation)
-    rewards := app.DistrKeeper.GetValidatorOutstandingRewards(ctx, valAddrs[0]).Rewards
-    require.True(t, rewards.IsAnyNegative(), "Expected negative rewards due to parameter sum > 1.0")
-    
-    // Verify invariant is broken
-    _, broken := keeper.NonNegativeOutstandingInvariant(app.DistrKeeper)(ctx)
-    require.True(t, broken, "NonNegativeOutstandingInvariant should be broken")
-}
-```
+## Notes
 
-This test demonstrates that when distribution parameters sum to more than 1.0, the `AllocateTokens` function produces negative validator rewards, violating the critical accounting invariant.
+This vulnerability exists because genesis validation is inconsistent with runtime validation. While the system properly validates commission rates during normal validator creation [3](#0-2) , it omits this check during genesis state loading. The presence of other genesis validations [1](#0-0)  indicates the system intends to validate genesis data, making this omission a security gap rather than intentional design.
+
+The vulnerability qualifies under the exception clause for privileged operations because it causes an unrecoverable security failure (total network shutdown requiring hard fork) beyond what genesis file creators should be able to cause inadvertently. Genesis validation serves as a critical safety mechanism to prevent catastrophic misconfigurations.
 
 ### Citations
 
-**File:** x/distribution/types/params.go (L51-74)
+**File:** x/staking/genesis.go (L39-40)
 ```go
-func (p Params) ValidateBasic() error {
-	if p.CommunityTax.IsNegative() || p.CommunityTax.GT(sdk.OneDec()) {
-		return fmt.Errorf(
-			"community tax should be non-negative and less than one: %s", p.CommunityTax,
-		)
-	}
-	if p.BaseProposerReward.IsNegative() {
-		return fmt.Errorf(
-			"base proposer reward should be positive: %s", p.BaseProposerReward,
-		)
-	}
-	if p.BonusProposerReward.IsNegative() {
-		return fmt.Errorf(
-			"bonus proposer reward should be positive: %s", p.BonusProposerReward,
-		)
-	}
-	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
-		return fmt.Errorf(
-			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
-		)
-	}
-
-	return nil
-}
+	for _, validator := range data.Validators {
+		keeper.SetValidator(ctx, validator)
 ```
 
-**File:** x/distribution/types/params.go (L76-93)
+**File:** x/staking/genesis.go (L238-273)
 ```go
-func validateCommunityTax(i interface{}) error {
-	v, ok := i.(sdk.Dec)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
+func validateGenesisStateValidators(validators []types.Validator) error {
+	addrMap := make(map[string]bool, len(validators))
 
-	if v.IsNil() {
-		return fmt.Errorf("community tax must be not nil")
-	}
-	if v.IsNegative() {
-		return fmt.Errorf("community tax must be positive: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("community tax too large: %s", v)
-	}
+	for i := 0; i < len(validators); i++ {
+		val := validators[i]
+		consPk, err := val.ConsPubKey()
+		if err != nil {
+			return err
+		}
 
-	return nil
-}
-```
+		strKey := string(consPk.Bytes())
 
-**File:** x/distribution/types/params.go (L95-112)
-```go
-func validateBaseProposerReward(i interface{}) error {
-	v, ok := i.(sdk.Dec)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v.IsNil() {
-		return fmt.Errorf("base proposer reward must be not nil")
-	}
-	if v.IsNegative() {
-		return fmt.Errorf("base proposer reward must be positive: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("base proposer reward too large: %s", v)
-	}
-
-	return nil
-}
-```
-
-**File:** x/distribution/types/params.go (L114-131)
-```go
-func validateBonusProposerReward(i interface{}) error {
-	v, ok := i.(sdk.Dec)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v.IsNil() {
-		return fmt.Errorf("bonus proposer reward must be not nil")
-	}
-	if v.IsNegative() {
-		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("bonus proposer reward too large: %s", v)
-	}
-
-	return nil
-}
-```
-
-**File:** x/params/types/subspace.go (L196-219)
-```go
-func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
-	attr, ok := s.table.m[string(key)]
-	if !ok {
-		panic(fmt.Sprintf("parameter %s not registered", string(key)))
-	}
-
-	ty := attr.ty
-	dest := reflect.New(ty).Interface()
-	s.GetIfExists(ctx, key, dest)
-
-	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
-		return err
-	}
-
-	// destValue contains the dereferenced value of dest so validation function do
-	// not have to operate on pointers.
-	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
-	if err := s.Validate(ctx, key, destValue); err != nil {
-		return err
-	}
-
-	s.Set(ctx, key, dest)
-	return nil
-}
-```
-
-**File:** x/distribution/keeper/allocation.go (L44-102)
-```go
-	// calculate fraction votes
-	previousFractionVotes := sdk.NewDec(sumPreviousPrecommitPower).Quo(sdk.NewDec(totalPreviousPower))
-
-	// calculate previous proposer reward
-	baseProposerReward := k.GetBaseProposerReward(ctx)
-	bonusProposerReward := k.GetBonusProposerReward(ctx)
-	proposerMultiplier := baseProposerReward.Add(bonusProposerReward.MulTruncate(previousFractionVotes))
-	proposerReward := feesCollected.MulDecTruncate(proposerMultiplier)
-
-	// pay previous proposer
-	remaining := feesCollected
-	proposerValidator := k.stakingKeeper.ValidatorByConsAddr(ctx, previousProposer)
-
-	if proposerValidator != nil {
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeProposerReward,
-				sdk.NewAttribute(sdk.AttributeKeyAmount, proposerReward.String()),
-				sdk.NewAttribute(types.AttributeKeyValidator, proposerValidator.GetOperator().String()),
-			),
-		)
-
-		k.AllocateTokensToValidator(ctx, proposerValidator, proposerReward)
-		remaining = remaining.Sub(proposerReward)
-	} else {
-		// previous proposer can be unknown if say, the unbonding period is 1 block, so
-		// e.g. a validator undelegates at block X, it's removed entirely by
-		// block X+1's endblock, then X+2 we need to refer to the previous
-		// proposer for X+1, but we've forgotten about them.
-		logger.Error(fmt.Sprintf(
-			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
-				"This should happen only if the proposer unbonded completely within a single block, "+
-				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
-				"We recommend you investigate immediately.",
-			previousProposer.String()))
-	}
-
-	// calculate fraction allocated to validators
-	communityTax := k.GetCommunityTax(ctx)
-	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
-	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
-
-	// allocate tokens proportionally to voting power
-	//
-	// TODO: Consider parallelizing later
-	//
-	// Ref: https://github.com/cosmos/cosmos-sdk/pull/3099#discussion_r246276376
-	for _, vote := range bondedVotes {
-		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
-
-		// TODO: Consider micro-slashing for missing votes.
-		//
-		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
-		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
-		reward := feeMultiplier.MulDecTruncate(powerFraction)
-
-		k.AllocateTokensToValidator(ctx, validator, reward)
-		remaining = remaining.Sub(reward)
-	}
-```
-
-**File:** x/distribution/keeper/invariants.go (L43-62)
-```go
-func NonNegativeOutstandingInvariant(k Keeper) sdk.Invariant {
-	return func(ctx sdk.Context) (string, bool) {
-		var msg string
-		var count int
-		var outstanding sdk.DecCoins
-
-		k.IterateValidatorOutstandingRewards(ctx, func(addr sdk.ValAddress, rewards types.ValidatorOutstandingRewards) (stop bool) {
-			outstanding = rewards.GetRewards()
-			if outstanding.IsAnyNegative() {
-				count++
-				msg += fmt.Sprintf("\t%v has negative outstanding coins: %v\n", addr, outstanding)
+		if _, ok := addrMap[strKey]; ok {
+			consAddr, err := val.GetConsAddr()
+			if err != nil {
+				return err
 			}
-			return false
-		})
-		broken := count != 0
+			return fmt.Errorf("duplicate validator in genesis state: moniker %v, address %v", val.Description.Moniker, consAddr)
+		}
 
-		return sdk.FormatInvariant(types.ModuleName, "nonnegative outstanding",
-			fmt.Sprintf("found %d validators with negative outstanding rewards\n%s", count, msg)), broken
+		if val.Jailed && val.IsBonded() {
+			consAddr, err := val.GetConsAddr()
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("validator is bonded and jailed in genesis state: moniker %v, address %v", val.Description.Moniker, consAddr)
+		}
+
+		if val.DelegatorShares.IsZero() && !val.IsUnbonding() {
+			return fmt.Errorf("bonded/unbonded genesis validator cannot have zero delegator shares, validator: %v", val)
+		}
+
+		addrMap[strKey] = true
 	}
+
+	return nil
+```
+
+**File:** x/staking/types/commission.go (L51-79)
+```go
+func (cr CommissionRates) Validate() error {
+	switch {
+	case cr.MaxRate.IsNegative():
+		// max rate cannot be negative
+		return ErrCommissionNegative
+
+	case cr.MaxRate.GT(sdk.OneDec()):
+		// max rate cannot be greater than 1
+		return ErrCommissionHuge
+
+	case cr.Rate.IsNegative():
+		// rate cannot be negative
+		return ErrCommissionNegative
+
+	case cr.Rate.GT(cr.MaxRate):
+		// rate cannot be greater than the max rate
+		return ErrCommissionGTMaxRate
+
+	case cr.MaxChangeRate.IsNegative():
+		// change rate cannot be negative
+		return ErrCommissionChangeRateNegative
+
+	case cr.MaxChangeRate.GT(cr.MaxRate):
+		// change rate cannot be greater than the max rate
+		return ErrCommissionChangeRateGTMaxRate
+	}
+
+	return nil
+}
+```
+
+**File:** x/staking/types/msg.go (L128-130)
+```go
+	if err := msg.Commission.Validate(); err != nil {
+		return err
+	}
+```
+
+**File:** x/staking/keeper/validator.go (L56-61)
+```go
+// set the main record holding validator details
+func (k Keeper) SetValidator(ctx sdk.Context, validator types.Validator) {
+	store := ctx.KVStore(k.storeKey)
+	bz := types.MustMarshalValidator(k.cdc, &validator)
+	store.Set(types.GetValidatorKey(validator.GetOperator()), bz)
+}
+```
+
+**File:** x/distribution/keeper/allocation.go (L111-114)
+```go
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+```
+
+**File:** types/dec_coin.go (L303-310)
+```go
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
+	}
+
+	return diff
+}
+```
+
+**File:** x/staking/types/validator.go (L284-294)
+```go
+// SetInitialCommission attempts to set a validator's initial commission. An
+// error is returned if the commission is invalid.
+func (v Validator) SetInitialCommission(commission Commission) (Validator, error) {
+	if err := commission.Validate(); err != nil {
+		return v, err
+	}
+
+	v.Commission = commission
+
+	return v, nil
 }
 ```

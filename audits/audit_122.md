@@ -1,249 +1,245 @@
-## Audit Report
+# Audit Report
 
-### Title
-Transaction Replay Attack Vulnerability When DisableSeqnoCheck is Enabled for SIGN_MODE_DIRECT Transactions
+## Title
+Minor Upgrade Detection Bypass via Malformed JSON Leading to Network Shutdown
 
-### Summary
-When the `DisableSeqnoCheck` parameter is set to `true`, transactions using `SIGN_MODE_DIRECT` (the default signing mode) can be replayed indefinitely, enabling attackers to execute the same transaction multiple times. This occurs because the sequence number check is bypassed, while the signature verification still succeeds using the original sequence number embedded in the transaction's AuthInfo.
+## Summary
+The upgrade module fails to validate JSON syntax in the `Plan.Info` field during governance proposal submission and scheduling. When malformed JSON is present, the `UpgradeDetails()` parsing silently fails, returning an empty struct that causes the upgrade to be incorrectly treated as a major release. Validators who update their binaries early (following the documented minor upgrade protocol) will experience node panics, potentially causing network-wide consensus failure if ≥30% of validators are affected.
 
-### Impact
-**High** - Direct loss of funds
+## Impact
+Medium
 
-### Finding Description
+## Finding Description
 
 **Location:** 
-- Primary vulnerability: [1](#0-0) 
-- Signature verification using transaction's AuthInfo: [2](#0-1) 
+- [1](#0-0) 
+- [2](#0-1) 
+- [3](#0-2) 
 
 **Intended Logic:**
-The sequence number mechanism is designed to prevent replay attacks. Each account maintains a sequence counter that increments with each transaction. The system should reject any transaction where the signature's sequence number doesn't match the current account sequence, preventing the same transaction from being executed twice.
+When an upgrade plan specifies `{"upgradeType":"minor"}` in the `Info` field, the `UpgradeDetails()` function should successfully parse this JSON. The `IsMinorRelease()` check should return true, allowing validators to safely update their binaries before the scheduled upgrade height without triggering a panic. The `Plan.ValidateBasic()` function should ensure that only valid upgrade plans are accepted through governance.
 
 **Actual Logic:**
-When `DisableSeqnoCheck` is enabled:
-1. The sequence number check at [1](#0-0)  is bypassed
-2. For `SIGN_MODE_DIRECT`, signature verification uses `AuthInfoBytes` directly from the transaction [3](#0-2) , which contains the original sequence number in the `SignerInfo` structure [4](#0-3) 
-3. The `SignDoc` for verification is constructed as: `BodyBytes + AuthInfoBytes + ChainID + AccountNumber` [5](#0-4) 
-4. Since `AuthInfoBytes` come from the original transaction and are not reconstructed, the signature remains valid even after the account sequence has been incremented
-5. The transaction executes successfully and increments the sequence [6](#0-5) 
+The `Plan.ValidateBasic()` function validates the plan's name, height, and deprecated fields but does NOT validate the JSON syntax in the `Info` field. [1](#0-0)  When `BeginBlocker` executes, it calls `plan.UpgradeDetails()` which attempts to parse the JSON. [4](#0-3)  If the JSON is malformed (e.g., `{upgradeType:minor}` missing quotes), `json.Unmarshal` fails and returns an error along with an empty `UpgradeDetails{}` struct. The error is only logged and ignored. [2](#0-1)  The empty struct has `UpgradeType = ""`, causing `IsMinorRelease()` to return false. The code then falls through to the major upgrade logic, and if a handler exists (because validators updated early), the node panics with "BINARY UPDATED BEFORE TRIGGER!". [5](#0-4) 
 
-**Exploit Scenario:**
-1. Alice creates and signs a transaction to send 100 tokens to Bob using sequence number 0
-2. The transaction is broadcast and successfully executed
-3. Alice's account sequence is incremented to 1
-4. An attacker (or Bob) captures the original transaction bytes and rebroadcasts them
-5. Since `DisableSeqnoCheck` is true, the sequence check is bypassed
-6. The signature verification succeeds because it uses the same `AuthInfoBytes` (containing sequence 0) from the replayed transaction
-7. The transaction executes again, sending another 100 tokens to Bob
-8. Steps 4-7 can be repeated indefinitely until Alice's account is drained
+**Exploitation Path:**
+1. An attacker (or accidental human error) submits a governance proposal with malformed JSON in the `Info` field (e.g., `{upgradeType:minor}` instead of `{"upgradeType":"minor"}`)
+2. The proposal passes validation because `ValidateBasic()` doesn't check JSON syntax
+3. The governance proposal is approved through standard voting
+4. The upgrade plan is scheduled via `ScheduleUpgrade()`, which also doesn't validate JSON [6](#0-5) 
+5. Validators, believing the upgrade is minor (based on proposal description or external communications), update their binaries before the scheduled height
+6. When `BeginBlocker` executes before the scheduled height, the JSON parsing fails silently
+7. The upgrade is incorrectly classified as major release
+8. Each validator node with the updated handler panics
+9. If ≥30% of validators are affected, the network experiences severe degradation or halts consensus (if >33% are affected)
 
-**Security Failure:**
-The replay protection mechanism is completely bypassed. The fundamental security invariant that "each signed transaction can only be executed once" is violated, enabling unlimited replay attacks and direct theft of funds.
+**Security Guarantee Broken:**
+The upgrade type detection mechanism is a critical security feature that allows safe early binary updates for minor releases. By silently failing to parse upgrade type information and defaulting to restrictive major upgrade behavior, the system violates the documented minor upgrade protocol and creates a vector for network-wide availability attacks.
 
-### Impact Explanation
+## Impact Explanation
 
-**Affected Assets:** All user funds in accounts when `DisableSeqnoCheck` is enabled.
+The impact affects network availability and validator node operation:
 
-**Severity of Damage:**
-- Any transaction (token transfers, delegations, contract calls, etc.) can be replayed unlimited times
-- Attackers can drain user accounts by replaying withdrawal transactions
-- Automated systems or exchanges could suffer massive losses from replayed deposit/withdrawal transactions
-- The attack is completely silent - users may not notice until significant funds are lost
+- **Validator Panics:** All validators who updated their binaries early (following documented minor upgrade best practices) will experience node crashes with the "BINARY UPDATED BEFORE TRIGGER!" panic message
+- **Network Degradation:** If 30-33% of validators are affected, the network continues operating but with degraded consensus quality and reduced safety margins
+- **Network Halt:** If >33% of validators are affected, the network cannot reach the 2/3+ consensus threshold and completely halts, unable to produce new blocks
+- **Recovery Complexity:** Affected validators must either roll back their binaries or coordinate to skip the upgrade height, requiring emergency off-chain coordination
+- **Economic Impact:** Network downtime affects all users, dApps, and economic activity on the chain
 
-**System Impact:**
-This fundamentally breaks the blockchain's security model. Users cannot safely perform any transactions when this parameter is enabled, making the chain unusable for financial operations.
+This matches the Medium severity impact: "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network" (for 30-33% affected) or "Network not being able to confirm new transactions (total network shutdown)" (for >33% affected).
 
-### Likelihood Explanation
+## Likelihood Explanation
 
-**Who can trigger it:** Any network participant who can observe transaction bytes (i.e., anyone with access to the mempool or block data).
+**Triggering Parties:**
+- Any participant who can submit and pass governance proposals (requires governance token holdings and community support)
+- Accidental trigger through human error when crafting proposals (JSON syntax errors are common)
 
-**Required conditions:**
-- The `DisableSeqnoCheck` parameter must be set to `true` [7](#0-6) 
-- Transactions must use `SIGN_MODE_DIRECT` (which is the default signing mode)
+**Required Conditions:**
+1. Governance proposal containing malformed JSON in the `Info` field must be submitted and approved
+2. Validators must believe the upgrade is a minor release (through proposal description, official communications, documentation)
+3. Validators must update their binaries before the scheduled upgrade height
+4. `BeginBlock` must execute with the updated handlers present
 
-**Frequency:** 
-Once enabled, this vulnerability can be exploited continuously. Every transaction becomes replayable, and attackers can drain accounts systematically. The test suite even demonstrates that replaying with the same sequence succeeds when this parameter is enabled [8](#0-7) .
+**Likelihood Assessment:**
+- **Moderate to High:** JSON syntax errors are common in human-crafted text. Missing quotes, trailing commas, or incorrect escaping are frequent mistakes
+- **Realistic Scenario:** Validators rely on external communications and documentation to determine upgrade types. If the proposal description states "minor upgrade" but the JSON is malformed, validators have no way to detect the issue until runtime
+- **No Early Warning:** The malformed JSON is only detected when `BeginBlocker` executes, not during proposal validation or submission
+- **Coordination Problem:** Validators typically update in batches before minor releases, making it likely that multiple validators would be affected simultaneously
 
-### Recommendation
+## Recommendation
 
-**Immediate Fix:** Never enable `DisableSeqnoCheck` in production environments. This parameter should be removed entirely or restricted to testing/development environments only.
-
-**Alternative Fix:** If there's a legitimate use case for disabling sequence checks, implement a different replay protection mechanism such as:
-1. Maintain a nonce/hash registry of executed transactions
-2. Add a time-based expiration to transactions
-3. Use a different signature scheme that doesn't rely solely on sequence numbers
-
-**Code-level Fix:** Add validation to prevent `DisableSeqnoCheck` from being enabled on mainnet, or modify the signature verification logic to implement alternative replay protection when sequence checks are disabled.
-
-### Proof of Concept
-
-**File:** `x/auth/ante/ante_test.go`
-
-**Test Function:** Add the following test function to demonstrate the replay attack:
+Add JSON validation to the upgrade plan validation flow to reject malformed JSON early:
 
 ```go
-func (suite *AnteTestSuite) TestReplayAttackWithDisableSeqnoCheck() {
-    suite.SetupTest(false)
-    
-    // Enable DisableSeqnoCheck
-    authParams := types.Params{
-        MaxMemoCharacters:      types.DefaultMaxMemoCharacters,
-        TxSigLimit:             types.DefaultTxSigLimit,
-        TxSizeCostPerByte:      types.DefaultTxSizeCostPerByte,
-        SigVerifyCostED25519:   types.DefaultSigVerifyCostED25519,
-        SigVerifyCostSecp256k1: types.DefaultSigVerifyCostSecp256k1,
-        DisableSeqnoCheck:      true,
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+    if err := plan.ValidateBasic(); err != nil {
+        return err
     }
-    suite.app.AccountKeeper.SetParams(suite.ctx, authParams)
     
-    // Create test account
-    accounts := suite.CreateTestAccounts(1)
-    feeAmount := testdata.NewTestFeeAmount()
-    gasLimit := testdata.NewTestGasLimit()
+    // Validate upgrade details if Info is provided
+    if plan.Info != "" {
+        if _, err := plan.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
+                "invalid upgrade info JSON: %v", err)
+        }
+    }
     
-    // Create and sign transaction with sequence 0
-    msg := testdata.NewTestMsg(accounts[0].acc.GetAddress())
-    privs := []cryptotypes.PrivKey{accounts[0].priv}
-    accNums := []uint64{0}
-    accSeqs := []uint64{0}
-    
-    suite.txBuilder = suite.clientCtx.TxConfig.NewTxBuilder()
-    suite.Require().NoError(suite.txBuilder.SetMsgs(msg))
-    suite.txBuilder.SetFeeAmount(feeAmount)
-    suite.txBuilder.SetGasLimit(gasLimit)
-    
-    // Create and execute first transaction
-    tx, err := suite.CreateTestTx(privs, accNums, accSeqs, suite.ctx.ChainID())
-    suite.Require().NoError(err)
-    
-    // Get initial account sequence
-    acc := suite.app.AccountKeeper.GetAccount(suite.ctx, accounts[0].acc.GetAddress())
-    initialSeq := acc.GetSequence()
-    suite.Require().Equal(uint64(0), initialSeq)
-    
-    // Execute transaction first time
-    newCtx, err := suite.anteHandler(suite.ctx, tx, false)
-    suite.Require().NoError(err)
-    suite.ctx = newCtx
-    
-    // Verify sequence was incremented
-    acc = suite.app.AccountKeeper.GetAccount(suite.ctx, accounts[0].acc.GetAddress())
-    suite.Require().Equal(uint64(1), acc.GetSequence())
-    
-    // REPLAY ATTACK: Execute the SAME transaction bytes again
-    // This should fail normally but succeeds with DisableSeqnoCheck=true
-    newCtx, err = suite.anteHandler(suite.ctx, tx, false)
-    suite.Require().NoError(err) // Transaction succeeds - THIS IS THE VULNERABILITY
-    suite.ctx = newCtx
-    
-    // Verify sequence was incremented again
-    acc = suite.app.AccountKeeper.GetAccount(suite.ctx, accounts[0].acc.GetAddress())
-    suite.Require().Equal(uint64(2), acc.GetSequence())
-    
-    // REPLAY ATTACK AGAIN: Execute the SAME transaction bytes a third time
-    newCtx, err = suite.anteHandler(suite.ctx, tx, false)
-    suite.Require().NoError(err) // Still succeeds - unlimited replay possible
-    
-    acc = suite.app.AccountKeeper.GetAccount(suite.ctx, accounts[0].acc.GetAddress())
-    suite.Require().Equal(uint64(3), acc.GetSequence())
+    // ... rest of function
 }
 ```
 
-**Setup:** The test initializes a blockchain context with `DisableSeqnoCheck` set to `true` and creates a test account with initial sequence 0.
+Alternatively, enhance `Plan.ValidateBasic()` to include JSON validation:
 
-**Trigger:** The test creates a single transaction signed with sequence 0, then executes it three times using the exact same transaction bytes (representing replay attacks).
+```go
+func (p Plan) ValidateBasic() error {
+    // ... existing validations ...
+    
+    // Validate JSON syntax in Info field if present
+    if p.Info != "" {
+        if _, err := p.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, 
+                fmt.Sprintf("invalid JSON in Info field: %v", err))
+        }
+    }
+    
+    return nil
+}
+```
 
-**Observation:** All three executions succeed without errors, and the account sequence increments each time (0→1→2→3), proving that the same transaction can be replayed indefinitely. In a normal configuration with sequence checks enabled, the second and third executions would fail with `ErrWrongSequence`. This test demonstrates the complete bypass of replay protection.
+## Proof of Concept
+
+**File:** `x/upgrade/abci_test.go`
+
+**Setup:** 
+- Initialize test suite at height 10 with no skip heights
+- Schedule upgrade at height 20 with malformed JSON: `{upgradeType:minor}` (missing quotes around key and value)
+
+**Action:**
+1. Submit governance proposal with malformed JSON upgrade info
+2. Register upgrade handler (simulating validator updating binary early for minor release)
+3. Execute `BeginBlock` at height 15 (before scheduled height of 20)
+
+**Expected Result (Bug):**
+- Node panics with "BINARY UPDATED BEFORE TRIGGER!" message
+- This demonstrates that malformed JSON bypasses minor release detection and triggers major upgrade panic logic
+
+**Expected Result (With Valid JSON):**
+- Same scenario with valid JSON `{"upgradeType":"minor"}` should NOT panic
+- This proves the issue is specifically the malformed JSON handling
+
+**Test Function:**
+```go
+func TestMalformedJSONBypassesMinorUpgradeDetection(t *testing.T) {
+    s := setupTest(10, map[int64]bool{})
+    malformedMinorUpgradeInfo := `{upgradeType:minor}` // Missing quotes
+    
+    err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{
+        Title: "Minor Upgrade Test",
+        Plan: types.Plan{Name: "test_minor", Height: 20, Info: malformedMinorUpgradeInfo},
+    })
+    require.NoError(t, err) // Proposal accepted despite malformed JSON
+    
+    s.keeper.SetUpgradeHandler("test_minor", func(_ sdk.Context, _ types.Plan, vm module.VersionMap) (module.VersionMap, error) {
+        return vm, nil
+    })
+    
+    newCtx := s.ctx.WithBlockHeight(15)
+    req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
+    
+    // PANICS due to malformed JSON bypassing minor release detection
+    require.Panics(t, func() {
+        s.module.BeginBlock(newCtx, req)
+    })
+}
+```
+
+**Run Command:** `go test -v ./x/upgrade -run TestMalformedJSONBypassesMinorUpgradeDetection`
+
+## Notes
+
+This vulnerability is particularly dangerous because:
+
+1. **Silent Failure:** The JSON parsing error is only logged, not caught during validation, providing no early warning to operators
+
+2. **Documented Protocol Violation:** The minor/major upgrade distinction is documented behavior that validators rely on for safe binary updates
+
+3. **Coordination Attack Surface:** The issue can cause widespread simultaneous panics if multiple validators act on the same malformed proposal
+
+4. **Human Error Vector:** JSON syntax errors are common and could occur accidentally, making this a realistic non-adversarial failure mode
+
+The fix is straightforward: add JSON syntax validation during the proposal validation phase to reject malformed upgrade plans before they can be scheduled.
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L270-278)
+**File:** x/upgrade/types/plan.go (L21-36)
 ```go
-		if sig.Sequence != acc.GetSequence() {
-			params := svd.ak.GetParams(ctx)
-			if !params.GetDisableSeqnoCheck() {
-				return ctx, sdkerrors.Wrapf(
-					sdkerrors.ErrWrongSequence,
-					"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-				)
+func (p Plan) ValidateBasic() error {
+	if !p.Time.IsZero() {
+		return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
+	}
+	if p.UpgradedClientState != nil {
+		return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
+	}
+	if len(p.Name) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
+	}
+	if p.Height <= 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
+	}
+
+	return nil
+}
+```
+
+**File:** x/upgrade/types/plan.go (L57-69)
+```go
+// UpgradeDetails parses and returns a details struct from the Info field of a Plan
+// The upgrade.pb.go is generated from proto, so this is separated here
+func (p Plan) UpgradeDetails() (UpgradeDetails, error) {
+	if p.Info == "" {
+		return UpgradeDetails{}, nil
+	}
+	var details UpgradeDetails
+	if err := json.Unmarshal([]byte(p.Info), &details); err != nil {
+		// invalid json, assume no upgrade details
+		return UpgradeDetails{}, err
+	}
+	return details, nil
+}
+```
+
+**File:** x/upgrade/abci.go (L75-78)
+```go
+	details, err := plan.UpgradeDetails()
+	if err != nil {
+		ctx.Logger().Error("failed to parse upgrade details", "err", err)
+	}
+```
+
+**File:** x/upgrade/abci.go (L82-97)
+```go
+	if details.IsMinorRelease() {
+		// if not yet present, then emit a scheduled log (every 100 blocks, to reduce logs)
+		if !k.HasHandler(plan.Name) && !k.IsSkipHeight(plan.Height) {
+			if ctx.BlockHeight()%100 == 0 {
+				ctx.Logger().Info(BuildUpgradeScheduledMsg(plan))
 			}
 		}
-```
-
-**File:** x/auth/ante/sigverify.go (L352-369)
-```go
-func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
-	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
+		return
 	}
 
-	// increment sequence of all signers
-	for _, addr := range sigTx.GetSigners() {
-		acc := isd.ak.GetAccount(ctx, addr)
-		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
-			panic(err)
-		}
-
-		isd.ak.SetAccount(ctx, acc)
+	// if we have a handler for a non-minor upgrade, that means it updated too early and must stop
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
 	}
-
-	return next(ctx, tx, simulate)
-}
 ```
 
-**File:** x/auth/tx/direct.go (L29-43)
+**File:** x/upgrade/keeper/keeper.go (L177-180)
 ```go
-func (signModeDirectHandler) GetSignBytes(mode signingtypes.SignMode, data signing.SignerData, tx sdk.Tx) ([]byte, error) {
-	if mode != signingtypes.SignMode_SIGN_MODE_DIRECT {
-		return nil, fmt.Errorf("expected %s, got %s", signingtypes.SignMode_SIGN_MODE_DIRECT, mode)
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+	if err := plan.ValidateBasic(); err != nil {
+		return err
 	}
-
-	protoTx, ok := tx.(*wrapper)
-	if !ok {
-		return nil, fmt.Errorf("can only handle a protobuf Tx, got %T", tx)
-	}
-
-	bodyBz := protoTx.getBodyBytes()
-	authInfoBz := protoTx.getAuthInfoBytes()
-
-	return DirectSignBytes(bodyBz, authInfoBz, data.ChainID, data.AccountNumber)
-}
-```
-
-**File:** x/auth/tx/direct.go (L47-54)
-```go
-func DirectSignBytes(bodyBytes, authInfoBytes []byte, chainID string, accnum uint64) ([]byte, error) {
-	signDoc := types.SignDoc{
-		BodyBytes:     bodyBytes,
-		AuthInfoBytes: authInfoBytes,
-		ChainId:       chainID,
-		AccountNumber: accnum,
-	}
-	return signDoc.Marshal()
-```
-
-**File:** types/tx/tx.pb.go (L414-417)
-```go
-	// sequence is the sequence of the account, which describes the
-	// number of committed transactions signed by a given address. It is used to
-	// prevent replay attacks.
-	Sequence uint64 `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
-```
-
-**File:** x/auth/types/params.go (L27-27)
-```go
-	KeyDisableSeqnoCheck      = []byte("KeyDisableSeqnoCheck")
-```
-
-**File:** x/auth/ante/ante_test.go (L1194-1202)
-```go
-		{
-			"test sending it again succeeds (disable seqno check is true)",
-			func() {
-				privs, accNums, accSeqs = []cryptotypes.PrivKey{accounts[0].priv}, []uint64{0}, []uint64{0}
-			},
-			false,
-			true,
-			nil,
-		},
 ```

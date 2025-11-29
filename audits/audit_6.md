@@ -1,231 +1,223 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Unmetered Transaction Decoding Allows CheckTx Resource Exhaustion Without Fee Payment
+Array Index Out of Bounds Panic in Multisignature Gas Consumption Causing Network-Wide Denial of Service
 
 ## Summary
-Transaction decoding in CheckTx occurs before gas metering and fee validation, allowing attackers to consume significant CPU resources by submitting large transactions with insufficient fees. The expensive protobuf unmarshaling and validation operations execute before the node can verify that the transaction pays adequate fees to cover these costs.
+The `ConsumeMultisignatureVerificationGas` function in the ante handler chain accesses array elements without bounds checking, allowing an attacker to craft a malformed multisignature transaction that causes all validator nodes to panic and crash simultaneously, resulting in total network shutdown. [1](#0-0) 
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
 **Location:** 
-- Primary: [1](#0-0) 
-- Secondary: [2](#0-1) 
-- AnteHandler ordering: [3](#0-2) 
+- File: `x/auth/ante/sigverify.go`
+- Function: `ConsumeMultisignatureVerificationGas`
+- Lines: 459-460 (array access without bounds checking)
 
-**Intended Logic:** 
-CheckTx should only consume node resources proportional to the fees that will be paid by the transaction. Operations that require significant CPU time should occur after validating that adequate fees are attached, or be gas-metered so that insufficient gas causes early rejection.
+**Intended Logic:**
+The function should safely consume gas for each signature in a multisignature transaction by iterating through valid indices only. Array bounds should be validated before any indexing operations to prevent panics.
 
 **Actual Logic:**
-The transaction decoding flow executes expensive operations before any fee or gas validation:
+The function iterates based on `size := sig.BitArray.Count()` and directly accesses:
+- `pubkey.GetPubKeys()[i]` at line 459 without verifying `i < len(pubkey.GetPubKeys())`
+- `sig.Signatures[sigIndex]` at line 460 without verifying `sigIndex < len(sig.Signatures)`
 
-1. At CheckTx entry, the raw transaction bytes are decoded via `app.txDecoder(req.Tx)` [4](#0-3) 
+The necessary validation exists in `VerifyMultisignature` but executes in `SigVerificationDecorator`, which runs AFTER `SigGasConsumeDecorator` in the ante handler chain. [2](#0-1) 
 
-2. The decoder performs multiple expensive operations without gas metering:
-   - ADR-027 format validation that iterates through all transaction bytes [5](#0-4) 
-   - Unknown field rejection that parses the entire protobuf structure [6](#0-5) 
-   - Multiple protobuf unmarshal operations for TxRaw, TxBody, and AuthInfo [7](#0-6) 
+**Exploitation Path:**
 
-3. In runTx, `validateBasicTxMsgs` executes before the AnteHandler [8](#0-7) 
+1. Attacker creates a transaction with a multisig account containing N pubkeys (e.g., N=2)
 
-4. The gas meter is only set up in SetUpContextDecorator, which is the first AnteHandler [9](#0-8) 
+2. Attacker crafts malformed `MultiSignatureData` by manipulating the protobuf message to contain:
+   - A `CompactBitArray` with `Count()` returning M where M > N (e.g., M=10)
+   - Bit(s) set at indices beyond N-1 (e.g., index 5)
+   - Any signatures array [3](#0-2) 
 
-5. Fee validation only occurs in DeductFeeDecorator, after several other decorators have already executed [10](#0-9) 
+3. Transaction flows through ante handler chain in this order:
+   - `SetPubKeyDecorator` (line 55)
+   - `ValidateSigCountDecorator` (line 56)
+   - **`SigGasConsumeDecorator` (line 57)** ← Panics here
+   - `SigVerificationDecorator` (line 58) ← Never reached [4](#0-3) 
 
-**Exploit Scenario:**
-1. Attacker creates transactions approaching the maximum block size (which can be 20-30MB in Sei networks based on simulation parameters [11](#0-10) )
-2. Sets the transaction fee to zero or below the minimum gas price threshold
-3. Submits many such transactions to validator nodes
-4. Each transaction causes expensive decoding operations before being rejected for insufficient fees
-5. The fee check occurs in `CheckTxFeeWithValidatorMinGasPrices` only during CheckTx mode [12](#0-11) , but by then the decoding cost has already been paid
+4. When loop executes with `i` from 0 to M-1:
+   - When `i >= N` and `BitArray.GetIndex(i)` returns true
+   - Accessing `pubkey.GetPubKeys()[i]` triggers index out of bounds panic
+   - Validator node crashes immediately
 
-**Security Failure:**
-The system violates the principle that resources consumed during transaction validation should be proportional to fees paid. An attacker can consume substantial validator CPU resources for transaction decoding without paying any fees, as the expensive decoding happens before fee validation.
+**Security Guarantee Broken:**
+Memory safety invariant is violated - array accesses must be bounds-checked. The system assumes validation occurs before gas consumption, but the ante handler ordering breaks this assumption.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- Validator node CPU cycles consumed for protobuf decoding
-- Mempool processing throughput degraded by spam transactions
-- Network-wide resources as the attack can target all validators simultaneously
+**Affected Components:**
+- All validator nodes processing transactions
+- Network consensus mechanism
+- Block production and transaction finality
 
 **Severity:**
-An attacker can continuously submit maximum-sized transactions with zero fees, causing each validator to:
-- Decode large protobuf structures (potentially 20-30MB per transaction)
-- Perform ADR-027 validation iterating through all bytes
-- Execute multiple nested unmarshaling operations
-- Only then reject the transaction for insufficient fees
+A single malformed transaction broadcast to the network causes ALL validator nodes to simultaneously panic and crash during transaction processing in the mempool/ante handler stage. This results in:
 
-This creates a multiplication effect: the larger the transaction, the more CPU consumed before rejection, yet no fees are paid. Over time, this can increase node resource consumption by at least 30% compared to legitimate traffic, meeting the Medium severity threshold for "Increasing network processing node resource consumption by at least 30% without brute force actions."
+- Complete network shutdown - no new blocks can be produced
+- Total loss of network availability
+- Requires coordinated manual intervention to restart all validator nodes
+- Attacker can maintain persistent denial of service by repeatedly broadcasting malformed transactions
+- No recovery mechanism without manual intervention
 
-**System Impact:**
-- Validator nodes spend excessive CPU on spam transactions
-- Legitimate transactions may be delayed or dropped due to degraded mempool performance
-- Node operators face increased infrastructure costs without compensation
-- The attack is sustainable since it requires minimal resources from the attacker (just network bandwidth) but consumes significant victim resources
+This constitutes a critical availability vulnerability classified as "Network not being able to confirm new transactions (total network shutdown)" per the severity criteria.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any network participant can submit transactions via RPC
-- No special privileges or conditions required
-- Attack can occur during normal network operation
+**Who Can Trigger:**
+Any network participant can execute this attack. No special privileges, validator status, staking requirements, or permissions are needed.
+
+**Conditions Required:**
+- Attacker constructs a multisig transaction with malformed `MultiSignatureData`
+- Transaction must only pass basic protobuf decoding (no semantic validation required)
+- No other prerequisites
 
 **Frequency:**
-- Can be executed continuously and repeatedly
-- Limited only by network bandwidth of the attacker
-- Each malicious transaction consumes resources on every validator node
-- The attack is economically favorable: attacker pays zero fees but forces expensive computation
-
-**Probability:**
-High likelihood of exploitation because:
-- The attack surface is exposed to any network participant
-- No fees are required to trigger the resource consumption
-- The code path is executed on every CheckTx call
-- Detection is difficult as transactions appear initially valid until fee checking
+- Can be exploited immediately upon discovery
+- Single transaction affects all validators simultaneously
+- Attack can be repeated indefinitely to maintain network shutdown
+- High probability of exploitation given:
+  - Zero barrier to entry
+  - Trivial to construct malformed protobuf messages
+  - Deterministic outcome
 
 ## Recommendation
 
-Implement one or more of the following mitigations:
+Add bounds validation in `ConsumeMultisignatureVerificationGas` before the indexing loop:
 
-1. **Add preliminary size-based rejection:** Before decoding, check that `len(req.Tx) * TxSizeCostPerByte` does not exceed a reasonable threshold relative to typical fee amounts. Reject obviously oversized transactions early.
-
-2. **Implement decode-time gas metering:** Modify the decoder to accept a gas meter parameter and consume gas during decoding operations proportional to the data size processed. This would require passing a pre-initialized gas meter into the decoder.
-
-3. **Cache decoded transactions:** After successful decoding, cache the decoded transaction object keyed by transaction hash, so repeated CheckTx calls (common in mempool rechecks) don't require re-decoding.
-
-4. **Rate-limit by source:** Implement connection-level rate limiting for transactions that fail fee validation, to prevent sustained spam from a single source.
-
-The most straightforward fix is option 1: add a simple size check before decoding that rejects transactions where `size * TxSizeCostPerByte > maxAllowedUnpaidGas`, where `maxAllowedUnpaidGas` could be a small multiple of the typical minimum transaction fee.
-
-## Proof of Concept
-
-**Test File:** `baseapp/abci_checktx_exploit_test.go` (new file)
-
-**Setup:**
-- Initialize a test app with default ante handlers
-- Configure minimum gas prices to enforce fee requirements
-- Create an account with sufficient balance for legitimate transactions
-
-**Trigger:**
-1. Construct a transaction with maximum allowable size (approaching BlockParams.MaxBytes)
-2. Include a large memo field to increase transaction size
-3. Set gas limit to a minimal value (e.g., 10,000)
-4. Set fee amount to zero
-5. Sign and encode the transaction
-6. Call CheckTx with this transaction
-7. Measure CPU time consumed before rejection
-
-**Observation:**
-The test should demonstrate that:
-- The transaction is rejected for insufficient fees (expected behavior)
-- But significant CPU time (measurable via benchmarking) was consumed during decoding before the rejection
-- This decoding cost is not reflected in any gas charges or fee payments
-- An attacker could repeat this attack pattern to exhaust node resources
-
-**Test Code Structure:**
-```
-func TestCheckTxUnmeteredDecodingExploit(t *testing.T) {
-    // Setup app with ante handlers
-    // Create large transaction with zero fees
-    // Measure time before and after CheckTx call
-    // Assert transaction was rejected for insufficient fees
-    // Assert significant time was consumed during decoding
-    // Calculate resource consumption per transaction
-    // Demonstrate that 1000 such transactions would consume excessive resources
+```go
+func ConsumeMultisignatureVerificationGas(
+    meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
+    params types.Params, accSeq uint64,
+) error {
+    size := sig.BitArray.Count()
+    pubKeys := pubkey.GetPubKeys()
+    
+    // Validate array bounds before accessing
+    if len(pubKeys) != size {
+        return fmt.Errorf("bit array size %d does not match pubkey count %d", size, len(pubKeys))
+    }
+    
+    numSetBits := sig.BitArray.NumTrueBitsBefore(size)
+    if len(sig.Signatures) != numSetBits {
+        return fmt.Errorf("signature count %d does not match set bits %d", len(sig.Signatures), numSetBits)
+    }
+    
+    sigIndex := 0
+    for i := 0; i < size; i++ {
+        // ... existing logic
+    }
+    return nil
 }
 ```
 
-The PoC would show that an attacker can craft transactions that consume CPU resources for decoding operations that are never paid for through gas fees, violating the principle that CheckTx resource consumption should be proportional to fees paid.
+Alternative: Reorder the ante handler chain to execute `SigVerificationDecorator` before `SigGasConsumeDecorator`, though this may affect gas accounting semantics.
+
+## Proof of Concept
+
+**Test File:** `x/auth/ante/sigverify_test.go`
+
+**Setup:**
+1. Create a multisig public key with 2 sub-keys using `kmultisig.NewLegacyAminoPubKey(2, pubkeys)`
+2. Create a `CompactBitArray` with size 10 (larger than the 2 pubkeys)
+3. Set bit at index 5 (beyond the pubkey array bounds)
+4. Construct `MultiSignatureData` with this malformed BitArray
+
+**Action:**
+Call `ConsumeMultisignatureVerificationGas` with the malformed signature data:
+```go
+params := types.DefaultParams()
+meter := sdk.NewInfiniteGasMeter(1, 1)
+ante.ConsumeMultisignatureVerificationGas(meter, malformedSig, multisigPubKey, params, 0)
+```
+
+**Result:**
+Function panics with "index out of range" error when attempting to access `pubkey.GetPubKeys()[5]` on line 459, since the pubkey array only contains 2 elements. This demonstrates that any attacker can crash validator nodes by broadcasting such a transaction.
 
 ## Notes
 
-This vulnerability is particularly concerning because:
-- Block sizes in Sei can be configured to 20-30MB for high throughput
-- Each validator independently processes CheckTx for incoming transactions
-- The attack can target all validators simultaneously
-- No fees are paid for failed transactions
-- Detection requires deep performance monitoring rather than simple transaction analysis
+The vulnerability exists because the system relies on defense-in-depth with validation in `VerifyMultisignature`, but the ante handler chain processes gas consumption before signature verification. The `CompactBitArray.Count()` method returns a value based on protobuf fields that can be arbitrarily set by an attacker, with no semantic validation against the actual multisig pubkey count until after the vulnerable code executes.
 
 ### Citations
 
-**File:** baseapp/abci.go (L225-231)
+**File:** x/auth/ante/sigverify.go (L445-470)
 ```go
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
+// ConsumeMultisignatureVerificationGas consumes gas from a GasMeter for verifying a multisig pubkey signature
+func ConsumeMultisignatureVerificationGas(
+	meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
+	params types.Params, accSeq uint64,
+) error {
+
+	size := sig.BitArray.Count()
+	sigIndex := 0
+
+	for i := 0; i < size; i++ {
+		if !sig.BitArray.GetIndex(i) {
+			continue
+		}
+		sigV2 := signing.SignatureV2{
+			PubKey:   pubkey.GetPubKeys()[i],
+			Data:     sig.Signatures[sigIndex],
+			Sequence: accSeq,
+		}
+		err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
+		if err != nil {
+			return err
+		}
+		sigIndex++
 	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
+
+	return nil
 ```
 
-**File:** x/auth/tx/decoder.go (L16-76)
+**File:** crypto/keys/multisig/multisig.go (L50-66)
 ```go
-func DefaultTxDecoder(cdc codec.ProtoCodecMarshaler) sdk.TxDecoder {
-	return func(txBytes []byte) (sdk.Tx, error) {
-		// Make sure txBytes follow ADR-027.
-		err := rejectNonADR027TxRaw(txBytes)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
+func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
+	bitarray := sig.BitArray
+	sigs := sig.Signatures
+	size := bitarray.Count()
+	pubKeys := m.GetPubKeys()
+	// ensure bit array is the correct size
+	if len(pubKeys) != size {
+		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
+	}
+	// ensure size of signature list
+	if len(sigs) < int(m.Threshold) || len(sigs) > size {
+		return fmt.Errorf("signature size is incorrect %d", len(sigs))
+	}
+	// ensure at least k signatures are set
+	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
+		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
+	}
+```
 
-		var raw tx.TxRaw
+**File:** x/auth/tx/sigs.go (L66-85)
+```go
+	case *tx.ModeInfo_Multi_:
+		multi := modeInfo.Multi
 
-		// reject all unknown proto fields in the root TxRaw
-		err = unknownproto.RejectUnknownFieldsStrict(txBytes, &raw, cdc.InterfaceRegistry())
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		err = cdc.Unmarshal(txBytes, &raw)
+		sigs, err := decodeMultisignatures(sig)
 		if err != nil {
 			return nil, err
 		}
 
-		var body tx.TxBody
-
-		// allow non-critical unknown fields in TxBody
-		txBodyHasUnknownNonCriticals, err := unknownproto.RejectUnknownFields(raw.BodyBytes, &body, true, cdc.InterfaceRegistry())
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
+		sigv2s := make([]signing.SignatureData, len(sigs))
+		for i, mi := range multi.ModeInfos {
+			sigv2s[i], err = ModeInfoAndSigToSignatureData(mi, sigs[i])
+			if err != nil {
+				return nil, err
+			}
 		}
 
-		err = cdc.Unmarshal(raw.BodyBytes, &body)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		var authInfo tx.AuthInfo
-
-		// reject all unknown proto fields in AuthInfo
-		err = unknownproto.RejectUnknownFieldsStrict(raw.AuthInfoBytes, &authInfo, cdc.InterfaceRegistry())
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		err = cdc.Unmarshal(raw.AuthInfoBytes, &authInfo)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		theTx := &tx.Tx{
-			Body:       &body,
-			AuthInfo:   &authInfo,
-			Signatures: raw.Signatures,
-		}
-
-		return &wrapper{
-			tx:                           theTx,
-			bodyBz:                       raw.BodyBytes,
-			authInfoBz:                   raw.AuthInfoBytes,
-			txBodyHasUnknownNonCriticals: txBodyHasUnknownNonCriticals,
+		return &signing.MultiSignatureData{
+			BitArray:   multi.Bitarray,
+			Signatures: sigv2s,
 		}, nil
-	}
-}
 ```
 
 **File:** x/auth/ante/ante.go (L47-60)
@@ -243,70 +235,5 @@ func DefaultTxDecoder(cdc codec.ProtoCodecMarshaler) sdk.TxDecoder {
 		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
 		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
 		NewIncrementSequenceDecorator(options.AccountKeeper),
-	}
-```
-
-**File:** baseapp/baseapp.go (L923-925)
-```go
-	if err := validateBasicTxMsgs(msgs); err != nil {
-		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
-	}
-```
-
-**File:** x/auth/ante/setup.go (L42-52)
-```go
-func (sud SetUpContextDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (newCtx sdk.Context, err error) {
-	// all transactions must implement GasTx
-	gasTx, ok := tx.(GasTx)
-	if !ok {
-		// Set a gas meter with limit 0 as to prevent an infinite gas meter attack
-		// during runTx.
-		newCtx = sud.gasMeterSetter(simulate, ctx, 0, tx)
-		return newCtx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "Tx must be GasTx")
-	}
-
-	newCtx = sud.gasMeterSetter(simulate, ctx, gasTx.GetGas(), tx)
-```
-
-**File:** x/auth/ante/fee.go (L134-145)
-```go
-func (dfd DeductFeeDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	fee, priority, err := dfd.txFeeChecker(ctx, tx, simulate, dfd.paramsKeeper)
-	if err != nil {
-		return ctx, err
-	}
-	if err := dfd.checkDeductFee(ctx, tx, fee); err != nil {
-		return ctx, err
-	}
-
-	newCtx := ctx.WithPriority(priority)
-
-	return next(newCtx, tx, simulate)
-```
-
-**File:** x/simulation/params.go (L162-162)
-```go
-		Block: &tmproto.BlockParams{
-```
-
-**File:** x/auth/ante/validator_tx_fee.go (L29-46)
-```go
-	if ctx.IsCheckTx() && !simulate {
-		minGasPrices := GetMinimumGasPricesWantedSorted(feeParams.GetGlobalMinimumGasPrices(), ctx.MinGasPrices())
-		if !minGasPrices.IsZero() {
-			requiredFees := make(sdk.Coins, len(minGasPrices))
-
-			// Determine the required fees by multiplying each required minimum gas
-			// price by the gas limit, where fee = ceil(minGasPrice * gasLimit).
-			glDec := sdk.NewDec(int64(gas))
-			for i, gp := range minGasPrices {
-				fee := gp.Amount.Mul(glDec)
-				requiredFees[i] = sdk.NewCoin(gp.Denom, fee.Ceil().RoundInt())
-			}
-
-			if !feeCoins.IsAnyGTE(requiredFees) {
-				return nil, 0, sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "insufficient fees; got: %s required: %s", feeCoins, requiredFees)
-			}
-		}
 	}
 ```

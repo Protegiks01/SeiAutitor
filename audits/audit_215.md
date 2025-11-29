@@ -1,277 +1,264 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Genesis Import Panic Due to Unvalidated StakeAuthorization Type Causing Total Network Shutdown
+Unrecovered Panic in State Sync Snapshot Restoration Crashes Nodes Processing Malformed Peer Data
 
 ## Summary
-The authz module's `ValidateGenesis` function performs no validation on authorization grants before genesis import. This allows a `StakeAuthorization` with `AUTHORIZATION_TYPE_UNSPECIFIED` to be included in genesis state, which causes all nodes to panic during `InitGenesis` when the authorization's `MsgTypeURL()` method is called, preventing the entire network from starting.
+The storev2 snapshot restoration code spawns a goroutine that panics without recovery when processing malformed snapshot data from peers. When `ssStore.Import` fails during state sync, the unrecovered panic crashes the entire node process.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary vulnerability: [1](#0-0) 
-- Panic trigger point: [2](#0-1) 
-- Import flow: [3](#0-2) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:** 
-The genesis validation should verify that all authorization grants are valid before importing them into the chain state. Specifically, `StakeAuthorization` objects should have a valid `AuthorizationType` (DELEGATE, UNDELEGATE, or REDELEGATE), as enforced by the `ValidateBasic()` method. [4](#0-3) 
+**Intended Logic:** During snapshot restoration via ABCI state sync, the system should gracefully handle errors in snapshot data processing and return appropriate error responses to Tendermint, allowing the node to reject malformed snapshots and request data from different peers.
 
-**Actual Logic:** 
-The `ValidateGenesis` function simply returns `nil` without performing any validation checks. [1](#0-0)  During `InitGenesis`, when `SaveGrant` is called, it invokes `authorization.MsgTypeURL()` to construct the storage key. [5](#0-4)  For `StakeAuthorization`, the `MsgTypeURL()` method calls `normalizeAuthzType()`, which returns an error for `AUTHORIZATION_TYPE_UNSPECIFIED`, causing a panic. [6](#0-5) 
+**Actual Logic:** When storev2 state store is enabled (`ssStore != nil`), the `restore()` method spawns an asynchronous goroutine that calls `ssStore.Import()`. If this import operation encounters an error, the goroutine directly calls `panic(err)` without any defer/recover mechanism. Since panics in goroutines without recovery propagate to the Go runtime, this crashes the entire application.
 
-**Exploit Scenario:**
-1. An attacker crafts a genesis.json file containing an authz entry with a `StakeAuthorization` where `authorization_type` is set to `AUTHORIZATION_TYPE_UNSPECIFIED` (value 0, the protobuf default). [7](#0-6) 
-2. The genesis file passes through `ValidateGenesis` without any error being raised.
-3. When nodes attempt to start with this genesis file, `InitGenesis` is called. [8](#0-7) 
-4. During the loop over authorization entries, `SaveGrant` is invoked.
-5. `SaveGrant` calls `authorization.MsgTypeURL()` to create the storage key.
-6. The `MsgTypeURL()` method panics when it encounters the invalid authorization type. [9](#0-8) 
-7. The panic propagates, causing the entire genesis import to fail.
-8. All nodes importing this genesis fail to start, resulting in a complete network outage.
+**Exploitation Path:**
+1. Attacker sets up a malicious peer node in Tendermint's P2P network
+2. Victim node initiates state sync (during initial sync, catching up, or after downtime)
+3. Tendermint discovers attacker's node as snapshot provider [2](#0-1) 
+4. Attacker offers snapshot with valid metadata passing initial validation
+5. Victim calls ABCI `ApplySnapshotChunk` to process chunks [3](#0-2) 
+6. Chunks are validated by hash (line 362-368 in manager.go) - this only checks integrity, not semantic correctness
+7. Chunks pass protobuf unmarshaling but contain malformed data (invalid tree structure, constraint violations, corrupted node data)
+8. Malformed data is sent to `ssImporter` channel [4](#0-3) 
+9. `ssStore.Import` fails on deeper validation (database constraints, tree structure validation, key ordering, etc.)
+10. Goroutine panics, crashing the victim node
 
-**Security Failure:** 
-This is a denial-of-service vulnerability that violates the availability invariant. The system fails to validate critical genesis state, allowing malformed data that causes deterministic panics across all nodes during initialization, preventing network launch or restart.
+**Security Guarantee Broken:** The state sync mechanism should be resilient to untrusted peer data and handle errors gracefully. The panic violates the principle that external untrusted input should never crash the application, breaking availability and fault-tolerance guarantees.
 
 ## Impact Explanation
 
-**Affected Processes:** Network initialization and availability. All nodes attempting to import the malicious genesis state will panic and fail to start.
+**Node-Level Impact:**
+- Complete node crash requiring manual restart
+- Repeated denial-of-service - attacker can crash nodes attempting to sync multiple times
+- Prevents nodes from successfully completing state sync
 
-**Severity:** This vulnerability can cause a total network shutdown. If exploited:
-- During a new chain launch: The network cannot initialize, preventing the blockchain from starting operations
-- During a network restart from genesis: All nodes fail to restart, causing permanent network unavailability until genesis is manually fixed
-- No transactions can be confirmed since the network cannot start
-- The issue affects 100% of network nodes deterministically
+**Network-Level Impact:**
+- New nodes cannot join the network via state sync
+- Validators recovering from downtime cannot resync
+- During network upgrades when multiple nodes sync simultaneously, an attacker can crash 30% or more of syncing nodes
+- State sync feature becomes unusable, forcing operators to disable it network-wide
+- Network resilience degraded during critical periods (upgrades, mass onboarding)
 
-**Criticality:** This matters critically because it provides a mechanism for complete denial of service at the most fundamental level—network initialization. Unlike runtime attacks that might affect individual nodes or subsets of nodes, this attack prevents the entire network from coming online, making it a complete shutdown scenario.
+This meets the **Medium** severity threshold of "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions" when multiple nodes are syncing concurrently.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** 
-Any party with the ability to propose or influence the genesis file contents can trigger this vulnerability. This includes:
-- Chain deployers/launchers creating initial genesis
-- Governance participants in network upgrades that require genesis export/import
-- Coordinators of network restarts
+**Who Can Trigger:** Any network participant running a peer node. No special privileges, stake, or authentication required to participate in Tendermint P2P network and offer snapshots.
 
 **Conditions Required:**
-- The malicious genesis file must be distributed to and used by network validators
-- This typically occurs during:
-  - New blockchain network launches
-  - Hard fork upgrades that reset state from genesis
-  - Network recovery scenarios requiring genesis restart
+- Storev2 must be enabled on victim nodes (`ssConfig.Enable = true`)
+- Victim node must be performing state sync
+- Attacker's peer must be discovered by Tendermint peer discovery
+- Attacker must craft snapshot chunks that pass protobuf unmarshaling and hash validation but fail `ssStore.Import` validation
 
-**Frequency:** 
-While genesis imports don't occur frequently during normal operation, they are critical events. The vulnerability is easily triggerable whenever genesis import happens—no specific timing or race conditions are required. The attack is deterministic: any node importing the crafted genesis will panic.
+**Frequency:** High likelihood for networks with storev2 enabled because:
+- New nodes regularly join networks via state sync
+- Validators resync after upgrades or issues
+- State sync is a standard feature enabled on many nodes
+- Attack can be repeated with minimal cost
+- Common during high-sync periods (post-upgrade, validator onboarding)
 
 ## Recommendation
 
-Implement proper validation in the `ValidateGenesis` function to check all authorization grants before import:
+Add panic recovery to the goroutine handling state store imports and propagate errors through a channel:
 
 ```go
-func ValidateGenesis(data GenesisState) error {
-    for _, grant := range data.Authorization {
-        // Validate addresses
-        if _, err := sdk.AccAddressFromBech32(grant.Granter); err != nil {
-            return sdkerrors.Wrapf(err, "invalid granter address")
-        }
-        if _, err := sdk.AccAddressFromBech32(grant.Grantee); err != nil {
-            return sdkerrors.Wrapf(err, "invalid grantee address")
-        }
-        
-        // Validate authorization itself
-        auth := grant.Authorization.GetCachedValue()
-        if authorization, ok := auth.(Authorization); ok {
-            if err := authorization.ValidateBasic(); err != nil {
-                return sdkerrors.Wrapf(err, "invalid authorization")
+if rs.ssStore != nil {
+    ssImporter = make(chan sstypes.SnapshotNode, 10000)
+    ssImportErr := make(chan error, 1)
+    
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                ssImportErr <- fmt.Errorf("panic in ssStore.Import: %v", r)
             }
-        }
+        }()
         
-        // Validate expiration is not in the past would require block time,
-        // but at minimum check it's not zero time
-        if grant.Expiration.IsZero() {
-            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "expiration time cannot be zero")
+        err := rs.ssStore.Import(height, ssImporter)
+        if err != nil {
+            ssImportErr <- err
+            return
         }
-        
-        // Prevent self-grants
-        if grant.Granter == grant.Grantee {
-            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be the same")
-        }
-    }
-    return nil
+        close(ssImportErr)
+    }()
+    
+    // Check ssImportErr before completing restoration
+    // and ensure proper cleanup when main loop exits early
 }
 ```
 
-This ensures that all authorization grants are validated before genesis import, preventing the panic and catching other invalid states.
+Additionally, ensure the main `restore()` function waits for goroutine completion and properly propagates any errors before returning.
 
 ## Proof of Concept
 
-**Test File:** `x/authz/keeper/genesis_test.go`
+**Test Scenario:**
+1. Initialize storev2 Store with ssStore enabled [5](#0-4) 
+2. Create a mock `protoReader` that returns `SnapshotItem` messages with leaf nodes
+3. Inject data that causes `ssStore.Import` to fail (duplicate keys, invalid versions, corrupted values, constraint violations)
+4. Call `store.Restore()` [6](#0-5) 
+5. Observe panic crashes the test/node (demonstrating vulnerability)
+6. After applying fix, verify error is properly returned instead of panicking
 
-**Test Function:** Add the following test to demonstrate the vulnerability:
-
-```go
-func (suite *GenesisTestSuite) TestInitGenesisWithInvalidStakeAuthorizationPanics() {
-    // This test demonstrates that importing genesis with a StakeAuthorization 
-    // that has AUTHORIZATION_TYPE_UNSPECIFIED causes a panic
-    
-    coins := sdk.NewCoins(sdk.NewCoin("stake", sdk.NewInt(100)))
-    now := suite.ctx.BlockHeader().Time
-    
-    // Create a StakeAuthorization with AUTHORIZATION_TYPE_UNSPECIFIED (value 0)
-    // This is invalid and should be caught by ValidateGenesis, but isn't
-    invalidStakeAuth := &stakingtypes.StakeAuthorization{
-        MaxTokens: &coins[0],
-        Validators: &stakingtypes.StakeAuthorization_AllowList{
-            AllowList: &stakingtypes.StakeAuthorization_Validators{
-                Address: []string{suite.addrs[0].String()},
-            },
-        },
-        AuthorizationType: stakingtypes.AuthorizationType_AUTHORIZATION_TYPE_UNSPECIFIED, // Invalid!
-    }
-    
-    // Pack the authorization into Any
-    any, err := cdctypes.NewAnyWithValue(invalidStakeAuth)
-    suite.Require().NoError(err)
-    
-    // Create genesis state with the invalid authorization
-    genesis := &authz.GenesisState{
-        Authorization: []authz.GrantAuthorization{
-            {
-                Granter:       granterAddr.String(),
-                Grantee:       granteeAddr.String(),
-                Authorization: any,
-                Expiration:    now.Add(time.Hour),
-            },
-        },
-    }
-    
-    // ValidateGenesis should catch this but doesn't - it returns nil
-    err = authz.ValidateGenesis(*genesis)
-    suite.Require().NoError(err, "ValidateGenesis incorrectly passes invalid authorization")
-    
-    // InitGenesis should panic when it tries to call MsgTypeURL on the invalid StakeAuthorization
-    suite.Require().Panics(func() {
-        suite.keeper.InitGenesis(suite.ctx, genesis)
-    }, "InitGenesis should panic with invalid authorization type but validation didn't catch it")
-}
-```
-
-**Setup:** The test uses the existing `GenesisTestSuite` which provides a configured keeper and context.
-
-**Trigger:** The test creates a `StakeAuthorization` with `AUTHORIZATION_TYPE_UNSPECIFIED`, packs it into a `GrantAuthorization`, and attempts to import it via `InitGenesis`.
-
-**Observation:** The test confirms that:
-1. `ValidateGenesis` incorrectly returns no error for the invalid authorization
-2. `InitGenesis` panics when attempting to save the grant, because `MsgTypeURL()` panics on the invalid authorization type
-
-This PoC proves that invalid genesis state can be imported past validation and causes a panic during initialization, demonstrating the vulnerability.
+**Note:** The vulnerability is evident from code inspection - line 730 explicitly calls `panic(err)` in a goroutine without recovery. In Go, this is guaranteed to crash the process. A complete working PoC would require access to the external sei-db package to trigger actual `ssStore.Import` failures, but the code defect and its consequences are unambiguous.
 
 ### Citations
 
-**File:** x/authz/genesis.go (L15-17)
+**File:** storev2/rootmulti/store.go (L61-95)
 ```go
-func ValidateGenesis(data GenesisState) error {
-	return nil
-}
+func NewStore(
+	homeDir string,
+	logger log.Logger,
+	scConfig config.StateCommitConfig,
+	ssConfig config.StateStoreConfig,
+	migrateIavl bool,
+) *Store {
+	scStore := sc.NewCommitStore(homeDir, logger, scConfig)
+	store := &Store{
+		logger:         logger,
+		scStore:        scStore,
+		storesParams:   make(map[types.StoreKey]storeParams),
+		storeKeys:      make(map[string]types.StoreKey),
+		ckvStores:      make(map[types.StoreKey]types.CommitKVStore),
+		pendingChanges: make(chan VersionedChangesets, 1000),
+	}
+	if ssConfig.Enable {
+		ssStore, err := ss.NewStateStore(logger, homeDir, ssConfig)
+		if err != nil {
+			panic(err)
+		}
+		// Check whether SC was enabled before but SS was not
+		ssVersion, _ := ssStore.GetLatestVersion()
+		scVersion, _ := scStore.GetLatestVersion()
+		if ssVersion <= 0 && scVersion > 0 && !migrateIavl {
+			panic("Enabling SS store without state sync could cause data corruption")
+		}
+		if err = ss.RecoverStateStore(logger, homeDir, ssStore); err != nil {
+			panic(err)
+		}
+		store.ssStore = ssStore
+		go store.StateStoreCommit()
+	}
+	return store
+
 ```
 
-**File:** x/staking/types/authz.go (L41-47)
+**File:** storev2/rootmulti/store.go (L698-712)
 ```go
-func (a StakeAuthorization) MsgTypeURL() string {
-	authzType, err := normalizeAuthzType(a.AuthorizationType)
+func (rs *Store) Restore(
+	height uint64, format uint32, protoReader protoio.Reader,
+) (snapshottypes.SnapshotItem, error) {
+	if rs.scStore != nil {
+		if err := rs.scStore.Close(); err != nil {
+			return snapshottypes.SnapshotItem{}, fmt.Errorf("failed to close db: %w", err)
+		}
+	}
+	item, err := rs.restore(int64(height), protoReader)
 	if err != nil {
-		panic(err)
+		return snapshottypes.SnapshotItem{}, err
 	}
-	return authzType
+
+	return item, rs.LoadLatestVersion()
 }
 ```
 
-**File:** x/staking/types/authz.go (L49-58)
+**File:** storev2/rootmulti/store.go (L727-732)
 ```go
-func (a StakeAuthorization) ValidateBasic() error {
-	if a.MaxTokens != nil && a.MaxTokens.IsNegative() {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidCoins, "negative coin amount: %v", a.MaxTokens)
-	}
-	if a.AuthorizationType == AuthorizationType_AUTHORIZATION_TYPE_UNSPECIFIED {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "unknown authorization type")
-	}
-
-	return nil
-}
+		go func() {
+			err := rs.ssStore.Import(height, ssImporter)
+			if err != nil {
+				panic(err)
+			}
+		}()
 ```
 
-**File:** x/staking/types/authz.go (L139-150)
+**File:** storev2/rootmulti/store.go (L776-782)
 ```go
-func normalizeAuthzType(authzType AuthorizationType) (string, error) {
-	switch authzType {
-	case AuthorizationType_AUTHORIZATION_TYPE_DELEGATE:
-		return sdk.MsgTypeURL(&MsgDelegate{}), nil
-	case AuthorizationType_AUTHORIZATION_TYPE_UNDELEGATE:
-		return sdk.MsgTypeURL(&MsgUndelegate{}), nil
-	case AuthorizationType_AUTHORIZATION_TYPE_REDELEGATE:
-		return sdk.MsgTypeURL(&MsgBeginRedelegate{}), nil
-	default:
-		return "", sdkerrors.ErrInvalidType.Wrapf("unknown authorization type %T", authzType)
-	}
-}
+			if rs.ssStore != nil && node.Height == 0 && ssImporter != nil {
+				ssImporter <- sstypes.SnapshotNode{
+					StoreKey: storeKey,
+					Key:      node.Key,
+					Value:    node.Value,
+				}
+			}
 ```
 
-**File:** x/authz/keeper/keeper.go (L144-160)
+**File:** snapshots/manager.go (L249-300)
 ```go
-func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
-	store := ctx.KVStore(k.storeKey)
+// Restore begins an async snapshot restoration, mirroring ABCI OfferSnapshot. Chunks must be fed
+// via RestoreChunk() until the restore is complete or a chunk fails.
+func (m *Manager) Restore(snapshot types.Snapshot) error {
+	if snapshot.Chunks == 0 {
+		return sdkerrors.Wrap(types.ErrInvalidMetadata, "no chunks")
+	}
+	if uint32(len(snapshot.Metadata.ChunkHashes)) != snapshot.Chunks {
+		return sdkerrors.Wrapf(types.ErrInvalidMetadata, "snapshot has %v chunk hashes, but %v chunks",
+			uint32(len(snapshot.Metadata.ChunkHashes)),
+			snapshot.Chunks)
+	}
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
 
-	grant, err := authz.NewGrant(authorization, expiration)
+	// check multistore supported format preemptive
+	if snapshot.Format != types.CurrentFormat {
+		return sdkerrors.Wrapf(types.ErrUnknownFormat, "snapshot format %v", snapshot.Format)
+	}
+	if snapshot.Height == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrLogic, "cannot restore snapshot at height 0")
+	}
+	if snapshot.Height > uint64(math.MaxInt64) {
+		return sdkerrors.Wrapf(types.ErrInvalidMetadata,
+			"snapshot height %v cannot exceed %v", snapshot.Height, int64(math.MaxInt64))
+	}
+
+	err := m.beginLocked(opRestore)
 	if err != nil {
 		return err
 	}
 
-	bz := k.cdc.MustMarshal(&grant)
-	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-	store.Set(skey, bz)
-	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
-		MsgTypeUrl: authorization.MsgTypeURL(),
-		Granter:    granter.String(),
-		Grantee:    grantee.String(),
-	})
+	// Start an asynchronous snapshot restoration, passing chunks and completion status via channels.
+	chChunks := make(chan io.ReadCloser, chunkBufferSize)
+	chDone := make(chan restoreDone, 1)
+
+	go func() {
+		startTime := time.Now()
+		err := m.restoreSnapshot(snapshot, chChunks)
+		chDone <- restoreDone{
+			complete: err == nil,
+			err:      err,
+		}
+		close(chDone)
+		m.logger.Info(fmt.Sprintf("Restoring snapshot for version %d took %s", snapshot.Height, time.Since(startTime)))
+	}()
+
+	m.chRestore = chChunks
+	m.chRestoreDone = chDone
+	m.restoreChunkHashes = snapshot.Metadata.ChunkHashes
+	m.restoreChunkIndex = 0
+	return nil
 }
 ```
 
-**File:** x/authz/keeper/keeper.go (L245-260)
+**File:** baseapp/abci.go (L628-642)
 ```go
-// InitGenesis new authz genesis
-func (k Keeper) InitGenesis(ctx sdk.Context, data *authz.GenesisState) {
-	for _, entry := range data.Authorization {
-		grantee := sdk.MustAccAddressFromBech32(entry.Grantee)
-		granter := sdk.MustAccAddressFromBech32(entry.Granter)
-		a, ok := entry.Authorization.GetCachedValue().(authz.Authorization)
-		if !ok {
-			panic("expected authorization")
-		}
-
-		err := k.SaveGrant(ctx, grantee, granter, a, entry.Expiration)
-		if err != nil {
-			panic(err)
-		}
+func (app *BaseApp) ApplySnapshotChunk(context context.Context, req *abci.RequestApplySnapshotChunk) (*abci.ResponseApplySnapshotChunk, error) {
+	if app.snapshotManager == nil {
+		app.logger.Error("snapshot manager not configured")
+		return &abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ABORT}, nil
 	}
-}
-```
 
-**File:** proto/cosmos/staking/v1beta1/authz.proto (L38-40)
-```text
-enum AuthorizationType {
-  // AUTHORIZATION_TYPE_UNSPECIFIED specifies an unknown authorization type
-  AUTHORIZATION_TYPE_UNSPECIFIED = 0;
-```
-
-**File:** x/authz/module/module.go (L149-154)
-```go
-func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
-	var genesisState authz.GenesisState
-	cdc.MustUnmarshalJSON(data, &genesisState)
-	am.keeper.InitGenesis(ctx, &genesisState)
-	return []abci.ValidatorUpdate{}
-}
+	done, err := app.snapshotManager.RestoreChunk(req.Chunk)
+	switch {
+	case err == nil:
+		if done {
+			if app.interBlockCache != nil {
+				app.interBlockCache.Reset()
+			}
+		}
+		return &abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil
 ```

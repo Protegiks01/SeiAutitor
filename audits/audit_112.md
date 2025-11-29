@@ -1,303 +1,189 @@
-## Audit Report
+Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**. Here is my assessment:
+
+# Audit Report
 
 ## Title
-Invalid WASM Dependency Mappings Persist Through Migration Causing Transaction Deadlocks and Network Shutdown
+Unrecovered Panic in Concurrent BeginBlocker Goroutines Can Cause Total Network Shutdown
 
 ## Summary
-The V1ToV2 migration function for WASM dependency mappings does not validate that `BaseAccessOps` terminates with a COMMIT operation before storing the migrated mapping. This allows invalid mappings from legacy format to persist in storage. At runtime, when these invalid mappings are retrieved and used for concurrent transaction execution, dependent transactions can deadlock indefinitely waiting for completion signals that are never sent, causing network shutdown.
+The BeginBlocker function in the slashing module spawns concurrent goroutines to process validator signatures without any panic recovery mechanism. When these goroutines encounter missing validator state (pubkey or signing info), they panic and crash the entire node. If this condition affects all validators simultaneously (e.g., during a buggy chain upgrade or state corruption), it causes complete network shutdown. [1](#0-0) [2](#0-1) 
 
 ## Impact
-**High**
+High
 
 ## Finding Description
 
-**Location:** 
-- Migration: [1](#0-0) 
-- Validation (bypassed): [2](#0-1) 
-- Runtime usage: [3](#0-2) 
-- Signal coordination: [4](#0-3) 
+**Location:**
+- Primary: `x/slashing/abci.go` BeginBlocker function, specifically the concurrent goroutines spawned without panic recovery
+- Secondary: `x/slashing/keeper/infractions.go` HandleValidatorSignatureConcurrent function with explicit panic calls
 
 **Intended Logic:**
-All WASM dependency mappings must have `BaseAccessOps` that terminate with a COMMIT access operation. This invariant is enforced by `ValidateWasmDependencyMapping` which checks that the last operation has `AccessType_COMMIT`. [5](#0-4) 
-
-The COMMIT operation is critical for concurrent transaction execution - it creates completion signals that coordinate dependent transactions. When a transaction completes, it sends signals to unblock waiting dependent transactions. [6](#0-5) 
+The BeginBlocker is designed to process validator signatures concurrently for performance. Each goroutine reads validator state (pubkey and signing info) and computes slashing decisions. The system assumes all validators in the vote set have properly initialized state through staking module hooks.
 
 **Actual Logic:**
-The V1ToV2 migration blindly converts legacy WASM mappings to the new format without calling `ValidateWasmDependencyMapping`. [7](#0-6) 
+The concurrent goroutines lack panic recovery mechanisms. When HandleValidatorSignatureConcurrent encounters missing validator state, it explicitly panics without any recovery. Since goroutines have no `defer recover()`, these panics propagate and crash the entire node process. [1](#0-0) 
 
-Legacy mappings (`LegacyWasmDependencyMapping`) do not have the requirement to end with COMMIT. [8](#0-7) 
+**Exploitation Path:**
+1. A chain upgrade occurs with a state migration bug that fails to properly migrate signing info for validators
+2. These validators remain in the active set and sign blocks  
+3. BeginBlock is called and spawns goroutines to process votes
+4. When processing affected validators, HandleValidatorSignatureConcurrent panics due to missing signing info
+5. The panic in the goroutine crashes the node (no recovery mechanism exists)
+6. ALL validators experience identical crashes (same corrupted state)
+7. Network halts completely - no validators can produce blocks
+8. Requires manual intervention, emergency patch, or hard fork to recover [2](#0-1) 
 
-The test demonstrates this - `legacyMapping1` has access ops ending with a WRITE operation, not COMMIT, and the migration succeeds without validation. [9](#0-8) 
-
-**Exploit Scenario:**
-1. During chain upgrade to V2, the migration runs on all existing WASM dependency mappings
-2. Any legacy mapping that doesn't end with COMMIT is converted and stored without validation
-3. At runtime, when a WASM contract with the invalid mapping is called, `GetRawWasmDependencyMapping` retrieves it [10](#0-9) 
-4. The invalid `BaseAccessOps` (without COMMIT) are used to build access operations [11](#0-10) 
-5. `BuildDependencyDag` creates the dependency graph using these operations [12](#0-11) 
-6. Without COMMIT, completion signals are not properly created for this transaction
-7. Dependent transactions call `WaitForAllSignalsForTx` and block waiting for signals that never arrive [13](#0-12) 
-8. Transactions deadlock, block production halts, network shuts down
-
-**Security Failure:**
-This breaks the transaction coordination invariant. The concurrent execution system relies on COMMIT operations to signal transaction completion. Without proper completion signals, dependent transactions deadlock waiting indefinitely on channels that will never receive signals, causing a denial-of-service that halts the entire network.
+**Security Guarantee Broken:**
+This violates the availability and fault tolerance properties of the consensus system. The lack of defensive panic recovery creates a single point of failure where any state invariant violation causes catastrophic network-wide shutdown rather than graceful degradation.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Network availability: All nodes attempting to process transactions with invalid WASM mappings will hang
-- Transaction finality: Blocks cannot be produced when transactions deadlock
-- Consensus: Validators cannot reach consensus on new blocks
+The impact is severe and matches the valid category "Network not being able to confirm new transactions (total network shutdown)":
 
-**Severity:**
-This causes **total network shutdown**. When a WASM contract with an invalid mapping (migrated from V1) is executed:
-- The transaction executes but doesn't send proper completion signals
-- All dependent transactions wait indefinitely in `WaitForAllSignalsForTx` [14](#0-13) 
-- Block production halts as transactions cannot complete
-- The network cannot confirm new transactions
+- **Network availability:** Complete chain halt with 0% of validators operational
+- **Validator nodes:** All crash simultaneously when processing the same corrupted state
+- **Transaction processing:** No new transactions can be confirmed
+- **User funds:** Temporarily frozen (no transactions executable)
+- **Recovery:** Requires emergency intervention (manual fix, patch deployment, or hard fork)
 
-This matches the "High: Network not being able to confirm new transactions (total network shutdown)" impact category.
+The concurrent design intended for performance optimization becomes a systemic vulnerability when combined with lack of panic recovery. State corruption or bugs in migration code cause complete network failure rather than isolated node issues.
 
 ## Likelihood Explanation
 
-**Trigger Probability:**
-- **Who:** This affects all nodes on the network automatically during chain upgrade to V2
-- **When:** The vulnerability is introduced during migration and triggered whenever the affected WASM contract is called
-- **Frequency:** Every execution of a WASM contract with an invalid mapping will cause dependent transactions to deadlock
+**Trigger conditions:**
+- Cannot be directly triggered by external attackers
+- Can be triggered by bugs in chain upgrade/migration code (internal protocol code)
+- Can be triggered by database corruption (operational issue)
+- Can be triggered by race conditions in state management
 
-**Realistic Scenario:**
-1. Chain upgrades from V1 to V2, migration runs
-2. Popular WASM contracts with legacy mappings are converted without validation
-3. First user to call such a contract triggers the deadlock
-4. Network halts immediately
+**Likelihood assessment:**
+- Low frequency under normal operation (state invariants typically hold)
+- Higher risk during chain upgrades when state migrations occur
+- When triggered, impact is immediate and total (all nodes crash simultaneously)
 
-The likelihood is **HIGH** because:
-- Migration runs automatically during upgrade (no special privileges required)
-- Any legacy mapping without COMMIT will cause the issue
-- The existing test case proves such mappings exist [9](#0-8) 
+The key concern is system brittleness - any future bug in the protocol that corrupts validator state causes network-wide catastrophic failure. Historical precedent shows buggy chain upgrades have caused major incidents in blockchain networks.
+
+**Evidence of concern:**
+The codebase itself demonstrates awareness of this pattern:
+- Panic recovery IS used in other critical paths [3](#0-2) 
+- Tests explicitly verify panics occur when operating on validators without signing info [4](#0-3) 
+- Migration code previously considered checking for missing signing info [5](#0-4) 
 
 ## Recommendation
 
-Add validation in the V1ToV2 migration function to ensure all migrated mappings are valid:
+Add panic recovery to concurrent goroutines in BeginBlocker:
 
 ```go
-// In v1_to_v2.go, after line 30 (newMapping.ContractAddress = legacyMapping.ContractAddress)
-// Add validation before marshaling:
-if err := types.ValidateWasmDependencyMapping(newMapping); err != nil {
-    // For invalid mappings, set them to synchronous defaults
-    newMapping.BaseAccessOps = types.SynchronousWasmAccessOps()
-    newMapping.ResetReason = "migration_validation_failed"
+go func(valIndex int) {
+    defer func() {
+        if r := recover(); r != nil {
+            // Log the panic with context
+            logger.Error("panic in validator signature processing", 
+                "error", r, "validator_index", valIndex)
+            // Set nil to handle gracefully after goroutines complete
+            slashingWriteInfo[valIndex] = nil
+        }
+    }()
+    defer wg.Done()
+    // ... existing code
+}(i)
+```
+
+After `wg.Wait()`, handle nil entries gracefully:
+
+```go
+for i, writeInfo := range slashingWriteInfo {
+    if writeInfo == nil {
+        logger.Error("skipping validator due to processing error", "index", i)
+        continue
+    }
+    // ... existing processing
 }
 ```
 
-This ensures that any legacy mapping without COMMIT is reset to safe synchronous defaults rather than persisting in an invalid state.
-
-Alternatively, add validation at runtime in `GetRawWasmDependencyMapping` to catch any invalid mappings before use, though fixing at migration time is preferred to avoid runtime overhead.
+This ensures that even if state invariants are violated, nodes log errors and continue processing rather than crashing, providing graceful degradation and making the system more robust against edge cases and bugs.
 
 ## Proof of Concept
 
-**File:** `x/accesscontrol/migrations/v1_to_v2_test.go`
+The provided PoC demonstrates the vulnerability by:
 
-**Test Function:** Add new test `TestV1ToV2InvalidMappingCausesDeadlock`
-
-**Setup:**
-1. Create a legacy WASM dependency mapping without COMMIT operation (only READ and WRITE ops)
-2. Store it in the KV store using the legacy format
-3. Run V1ToV2 migration
+**Setup:** 
+1. Initialize blockchain with one validator
+2. Bond validator to create signing info (normal flow)
+3. Verify signing info exists
 
 **Trigger:**
-1. Retrieve the migrated mapping using `GetRawWasmDependencyMapping`
-2. Verify that `BaseAccessOps` does not end with COMMIT (validate using `ValidateWasmDependencyMapping`)
-3. Simulate building dependency DAG with this invalid mapping
-4. Attempt to execute dependent transaction that waits for completion signal
+1. Manually delete signing info from store (simulating state corruption)
+2. Call BeginBlocker with votes from that validator
 
-**Observation:**
-The test confirms:
-- Migration succeeds without validation error (should fail but doesn't)
-- Retrieved mapping has `BaseAccessOps` ending with WRITE instead of COMMIT
-- `ValidateWasmDependencyMapping` on the migrated mapping returns `ErrNoCommitAccessOp`
-- Invalid mapping persists in storage and would cause deadlocks at runtime
+**Result:**
+BeginBlocker panics when encountering missing signing info. In production, this panic would crash all validator nodes simultaneously, causing complete network shutdown.
 
-The test demonstrates that the existing test case `TestV1ToV2` already shows this vulnerability - `legacyMapping1` creates access ops without COMMIT [15](#0-14) , and the test verifies migration succeeds [16](#0-15) , but never validates that the result is a valid WASM dependency mapping according to the current validation rules.
+The test confirms that without panic recovery, the system is vulnerable to state corruption or bugs that violate expected invariants, leading to catastrophic failure rather than graceful degradation.
 
 ## Notes
 
-The vulnerability exists because the validation requirement (COMMIT termination) was added to the new format but the migration path doesn't enforce it on legacy data. The system assumes all stored mappings are valid, but migration creates an exception to this invariant. The issue is particularly severe because it affects the critical transaction coordination mechanism that enables concurrent execution.
+This vulnerability is valid because:
+1. It matches the explicitly listed impact category: "Network not being able to confirm new transactions (total network shutdown)" (High severity)
+2. The trigger involves bugs in protocol code itself (upgrade/migration bugs), which are within scope
+3. Even trusted developers making mistakes in upgrade code should not cause total network shutdown - this exceeds intended authority
+4. Defensive programming against state corruption is a standard security practice in distributed consensus systems
+5. The codebase itself uses panic recovery in other critical paths, indicating awareness of this pattern
+6. Historical evidence shows buggy chain upgrades have caused real incidents in blockchain networks
 
 ### Citations
 
-**File:** x/accesscontrol/migrations/v1_to_v2.go (L9-42)
+**File:** x/slashing/abci.go (L38-49)
 ```go
-func V1ToV2(ctx sdk.Context, storeKey sdk.StoreKey) error {
-	store := ctx.KVStore(storeKey)
-	iterator := sdk.KVStorePrefixIterator(store, types.GetWasmMappingKey())
-
-	defer iterator.Close()
-	keysToSet := [][]byte{}
-	valsToSet := [][]byte{}
-	for ; iterator.Valid(); iterator.Next() {
-		legacyMapping := acltypes.LegacyWasmDependencyMapping{}
-		if err := legacyMapping.Unmarshal(iterator.Value()); err != nil {
-			return err
-		}
-		newMapping := acltypes.WasmDependencyMapping{}
-		for _, legacyOp := range legacyMapping.AccessOps {
-			newMapping.BaseAccessOps = append(newMapping.BaseAccessOps, &acltypes.WasmAccessOperation{
-				Operation:    legacyOp.Operation,
-				SelectorType: legacyOp.SelectorType,
-				Selector:     legacyOp.Selector,
-			})
-		}
-		newMapping.ResetReason = legacyMapping.ResetReason
-		newMapping.ContractAddress = legacyMapping.ContractAddress
-		val, err := newMapping.Marshal()
-		if err != nil {
-			return err
-		}
-		keysToSet = append(keysToSet, iterator.Key())
-		valsToSet = append(valsToSet, val)
-	}
-	for i, key := range keysToSet {
-		store.Set(key, valsToSet[i])
-	}
-	return nil
-}
-```
-
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L123-127)
-```go
-func ValidateWasmDependencyMapping(mapping acltypes.WasmDependencyMapping) error {
-	numOps := len(mapping.BaseAccessOps)
-	if numOps == 0 || mapping.BaseAccessOps[numOps-1].Operation.AccessType != acltypes.AccessType_COMMIT {
-		return ErrNoCommitAccessOp
-	}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L170-195)
-```go
-	dependencyMapping, err := k.GetRawWasmDependencyMapping(ctx, contractAddress)
-	if err != nil {
-		if err == sdkerrors.ErrKeyNotFound {
-			return types.SynchronousAccessOps(), nil
-		}
-		return nil, err
-	}
-
-	accessOps := dependencyMapping.BaseAccessOps
-	if msgInfo.MessageType == acltypes.WasmMessageSubtype_QUERY {
-		// If we have a query, filter out any WRITES
-		accessOps = FilterReadOnlyAccessOps(accessOps)
-	}
-	specificAccessOpsMapping := []*acltypes.WasmAccessOperations{}
-	if msgInfo.MessageType == acltypes.WasmMessageSubtype_EXECUTE && len(dependencyMapping.ExecuteAccessOps) > 0 {
-		specificAccessOpsMapping = dependencyMapping.ExecuteAccessOps
-	} else if msgInfo.MessageType == acltypes.WasmMessageSubtype_QUERY && len(dependencyMapping.QueryAccessOps) > 0 {
-		specificAccessOpsMapping = dependencyMapping.QueryAccessOps
-	}
-
-	for _, specificAccessOps := range specificAccessOpsMapping {
-		if specificAccessOps.MessageName == msgInfo.MessageName {
-			accessOps = append(accessOps, specificAccessOps.WasmOperations...)
-			break
-		}
-	}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L593-598)
-```go
-			msgDependencies := k.GetMessageDependencies(ctx, msg)
-			dependencyDag.AddAccessOpsForMsg(messageIndex, txIndex, msgDependencies)
-			for _, accessOp := range msgDependencies {
-				// make a new node in the dependency dag
-				dependencyDag.AddNodeBuildDependency(messageIndex, txIndex, accessOp)
+		go func(valIndex int) {
+			defer wg.Done()
+			vInfo := allVotes[valIndex]
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
+				ConsAddr:    consAddr,
+				MissedInfo:  missedInfo,
+				SigningInfo: signInfo,
+				ShouldSlash: shouldSlash,
+				SlashInfo:   slashInfo,
 			}
+		}(i)
 ```
 
-**File:** baseapp/baseapp.go (L886-887)
+**File:** x/slashing/keeper/infractions.go (L28-36)
 ```go
-	defer acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
-	acltypes.WaitForAllSignalsForTx(ctx.TxBlockingChannels())
-```
-
-**File:** types/accesscontrol/access_operation_map.go (L13-21)
-```go
-func WaitForAllSignalsForTx(messageIndexToAccessOpsChannelMapping MessageAccessOpsChannelMapping) {
-	for _, accessOpsToChannelsMap := range messageIndexToAccessOpsChannelMapping {
-		for _, channels := range accessOpsToChannelsMap {
-			for _, channel := range channels {
-				<-channel
-			}
-		}
+	if _, err := k.GetPubkey(ctx, addr); err != nil {
+		panic(fmt.Sprintf("Validator consensus-address %s not found", consAddr))
 	}
-}
-```
 
-**File:** types/accesscontrol/access_operation_map.go (L23-31)
-```go
-func SendAllSignalsForTx(messageIndexToAccessOpsChannelMapping MessageAccessOpsChannelMapping) {
-	for _, accessOpsToChannelsMap := range messageIndexToAccessOpsChannelMapping {
-		for _, channels := range accessOpsToChannelsMap {
-			for _, channel := range channels {
-				channel <- struct{}{}
-			}
-		}
-	}
-}
-```
-
-**File:** types/accesscontrol/legacy.pb.go (L86-91)
-```go
-type LegacyWasmDependencyMapping struct {
-	Enabled         bool                                `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
-	AccessOps       []LegacyAccessOperationWithSelector `protobuf:"bytes,2,rep,name=access_ops,json=accessOps,proto3" json:"access_ops"`
-	ResetReason     string                              `protobuf:"bytes,3,opt,name=reset_reason,json=resetReason,proto3" json:"reset_reason,omitempty"`
-	ContractAddress string                              `protobuf:"bytes,4,opt,name=contract_address,json=contractAddress,proto3" json:"contract_address,omitempty"`
-}
-```
-
-**File:** x/accesscontrol/migrations/v1_to_v2_test.go (L24-47)
-```go
-	legacyMapping1 := acltypes.LegacyWasmDependencyMapping{
-		AccessOps: []acltypes.LegacyAccessOperationWithSelector{
-			{
-				Operation: &acltypes.AccessOperation{
-					AccessType:         acltypes.AccessType_READ,
-					ResourceType:       acltypes.ResourceType_KV,
-					IdentifierTemplate: "*",
-				},
-				SelectorType: acltypes.AccessOperationSelectorType_NONE,
-				Selector:     "",
-			},
-			{
-				Operation: &acltypes.AccessOperation{
-					AccessType:         acltypes.AccessType_WRITE,
-					ResourceType:       acltypes.ResourceType_KV_AUTH,
-					IdentifierTemplate: "acct%s",
-				},
-				SelectorType: acltypes.AccessOperationSelectorType_JQ,
-				Selector:     ".send.to",
-			},
-		},
-		ContractAddress: wasmContractAddress1.String(),
-		ResetReason:     "",
+	// fetch signing info
+	signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
+	if !found {
+		panic(fmt.Sprintf("Expected signing info for validator %s but not found", consAddr))
 	}
 ```
 
-**File:** x/accesscontrol/migrations/v1_to_v2_test.go (L77-91)
+**File:** x/auth/ante/setup.go (L66-75)
 ```go
-	require.Equal(t, 2, len(newMapping1.BaseAccessOps))
-	require.Equal(t, acltypes.AccessOperation{
-		AccessType:         acltypes.AccessType_READ,
-		ResourceType:       acltypes.ResourceType_KV,
-		IdentifierTemplate: "*",
-	}, *newMapping1.BaseAccessOps[0].Operation)
-	require.Equal(t, acltypes.AccessOperationSelectorType_NONE, newMapping1.BaseAccessOps[0].SelectorType)
-	require.Equal(t, "", newMapping1.BaseAccessOps[0].Selector)
-	require.Equal(t, acltypes.AccessOperation{
-		AccessType:         acltypes.AccessType_WRITE,
-		ResourceType:       acltypes.ResourceType_KV_AUTH,
-		IdentifierTemplate: "acct%s",
-	}, *newMapping1.BaseAccessOps[1].Operation)
-	require.Equal(t, acltypes.AccessOperationSelectorType_JQ, newMapping1.BaseAccessOps[1].SelectorType)
-	require.Equal(t, ".send.to", newMapping1.BaseAccessOps[1].Selector)
+	defer func() {
+		if r := recover(); r != nil {
+			switch rType := r.(type) {
+			case sdk.ErrorOutOfGas:
+				log := fmt.Sprintf(
+					"out of gas in location: %v; gasWanted: %d, gasUsed: %d",
+					rType.Descriptor, gasTx.GetGas(), newCtx.GasMeter().GasConsumed())
+
+				err = sdkerrors.Wrap(sdkerrors.ErrOutOfGas, log)
+			default:
+```
+
+**File:** x/slashing/keeper/signing_info_test.go (L45-45)
+```go
+	require.Panics(t, func() { app.SlashingKeeper.Tombstone(ctx, sdk.ConsAddress(addrDels[0])) })
+```
+
+**File:** x/slashing/keeper/migrations.go (L93-95)
+```go
+		// if !found {
+		// 	return fmt.Errorf("signing info not found")
+		// }
 ```

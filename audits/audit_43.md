@@ -1,302 +1,264 @@
 # Audit Report
 
 ## Title
-Recursive UnpackAny Operations Execute Without Gas Metering Leading to Resource Exhaustion DoS
+Fee Grant Bypass via Authz MsgExec - AllowedMsgAllowance Validation Only Checks Outer Messages
 
 ## Summary
-The recursive `UnpackAny()` function processes protobuf `Any` message unpacking during transaction decoding without charging gas, occurring before the gas meter is initialized. This allows attackers to craft transactions with deeply nested `Any` structures that consume significant CPU resources during `CheckTx` without paying proportional gas fees, enabling a denial-of-service attack.
+The feegrant module's `AllowedMsgAllowance` only validates top-level transaction messages, failing to check inner messages contained within authz `MsgExec`. This allows grantees to bypass message type restrictions and have fee granters pay for unauthorized transaction types.
 
 ## Impact
-**Medium**
+**Direct loss of funds**
 
 ## Finding Description
 
-**Location:** 
-- Primary: `codec/types/interface_registry.go` lines 243-313 (statefulUnpacker.UnpackAny method) [1](#0-0) 
+**Location:**
+- Fee deduction ante handler: `x/auth/ante/fee.go` line 168
+- Allowance validation: `x/feegrant/filtered_fee.go` lines 65-109  
+- Message type checking: `x/feegrant/filtered_fee.go` lines 98-109
+- MsgExec execution: `x/authz/keeper/msg_server.go` lines 72-77
 
-- Transaction decoding flow: `x/auth/tx/decoder.go` line 32 [2](#0-1) 
+**Intended Logic:**
+When a fee granter creates an `AllowedMsgAllowance`, they specify which message types the grantee can execute using their fee grant. The feegrant module should validate that ALL messages in a transaction (including nested messages) match the allowed message types before deducting fees from the granter's account.
 
-- Unmarshal calls UnpackInterfaces: `codec/proto_codec.go` lines 80-90 [3](#0-2) 
+**Actual Logic:**
+The fee deduction ante handler calls `UseGrantedFees` with `sdkTx.GetMsgs()`, which only returns top-level transaction messages. [1](#0-0)  When a transaction contains a `MsgExec`, the validation in `AllowedMsgAllowance.Accept` [2](#0-1)  only checks if `MsgExec` itself is in the allowed list by calling `allMsgTypesAllowed` [3](#0-2) , completely ignoring the inner messages that will be extracted and executed later via `DispatchActions`. [4](#0-3) 
 
-- CheckTx flow: `baseapp/abci.go` lines 225-231 [4](#0-3) 
+**Exploitation Path:**
+1. Attacker (Bob) obtains a fee grant from Alice with `AllowedMsgAllowance` that includes `MsgExec` in the allowed messages list
+2. Attacker obtains authz permission from Charlie to execute arbitrary messages (e.g., `MsgBurn`) on Charlie's behalf
+3. Attacker creates a transaction containing:
+   - Outer message: `MsgExec` wrapping a `MsgBurn` message
+   - FeeGranter field: Alice's address
+4. Transaction enters ante handler - fee validation sees only `[MsgExec]` from `sdkTx.GetMsgs()`
+5. `AllowedMsgAllowance` checks if `MsgExec` is allowed (it is) and approves
+6. Alice's account pays the transaction fees
+7. `MsgExec` handler extracts inner `MsgBurn` message using `GetMessages()` [5](#0-4) 
+8. `MsgBurn` executes via `DispatchActions` without fee grant validation [6](#0-5) 
+9. Alice paid fees for `MsgBurn`, which was NOT in her allowed messages list
 
-**Intended Logic:** 
-Transaction decoding should consume gas proportional to the computational work performed. Expensive operations like recursive protobuf unmarshaling should be metered to prevent resource exhaustion attacks.
-
-**Actual Logic:** 
-The `UnpackAny()` function is called during transaction decoding in `txDecoder`, which happens BEFORE the gas meter is set up in the `AnteHandler`. The recursion limits are:
-- `MaxUnpackAnyRecursionDepth = 10` 
-- `MaxUnpackAnySubCalls = 100` [5](#0-4) 
-
-At line 260 of `interface_registry.go`, each call decrements `r.maxCalls.count--`, but no gas is consumed from any gas meter. When the transaction decoder returns an error at line 228 of `baseapp/abci.go`, gas charged is 0. [6](#0-5) 
-
-**Exploit Scenario:**
-1. Attacker crafts a transaction with nested `authz.MsgExec` messages containing multiple layers of `Any`-wrapped messages
-2. Each `MsgExec.Msgs` field can contain multiple `Any` structures, each triggering `UnpackAny` [7](#0-6) 
-
-3. The transaction is structured to hit close to the 100 `UnpackAny` call limit (vs. 1-2 calls for normal transactions)
-4. When the transaction reaches a validator node during `CheckTx`:
-   - `txDecoder` is called at line 226 of `baseapp/abci.go`
-   - `UnpackInterfaces` recursively processes all nested `Any` fields
-   - Up to 100 protobuf unmarshal operations execute
-   - All CPU work happens before gas metering begins at line 947 of `baseapp/baseapp.go` [8](#0-7) 
-
-5. Transaction can then fail validation (e.g., invalid signature) and be rejected with zero gas charged
-6. Attacker floods the network with such transactions, each consuming 50-100x more CPU than normal transactions during `CheckTx`
-
-**Security Failure:** 
-This breaks the gas metering invariant that computational resources must be paid for. The system allows CPU-intensive operations (recursive protobuf unmarshaling) to execute without cost, enabling resource exhaustion denial-of-service attacks.
+**Security Guarantee Broken:**
+The message type filtering mechanism of `AllowedMsgAllowance` is completely bypassed. Fee granters cannot restrict which message types consume their grants when `MsgExec` is included in the allowed list.
 
 ## Impact Explanation
 
-**Affected Process:** Network transaction processing and mempool validation during `CheckTx`.
+This vulnerability results in direct loss of funds for fee granters through unauthorized fee deductions. The fee granter's token balance decreases to pay transaction fees for message types they explicitly did not authorize. 
 
-**Severity:** An attacker can exploit the 50-100x amplification factor (100 `UnpackAny` calls vs. 1-2 for normal transactions) to:
-- Increase validator CPU consumption during `CheckTx` by orders of magnitude
-- Slow down transaction processing and mempool operations
-- Degrade network performance without paying gas fees
-- Create congestion that delays legitimate transactions
-
-Since `CheckTx` is designed to be lightweight and quickly filter invalid transactions, forcing validators to perform 100 expensive unmarshal operations per transaction (without gas payment) constitutes a resource exhaustion attack that can increase node resource consumption by well over 30%.
-
-**System Impact:** This affects network availability and performance. While it doesn't cause permanent damage, it allows attackers to degrade service quality and increase operational costs for validators without proportional economic cost to the attacker.
+The severity is amplified because:
+- The entire security model of `AllowedMsgAllowance` is defeated - it cannot fulfill its core purpose
+- Attackers can systematically drain fee grants by wrapping any unauthorized message type in `MsgExec`
+- Multiple parties can collaborate (one provides authz grants, another exploits the fee grant)
+- It's reasonable for fee granters to include `MsgExec` in allowed messages for legitimate authz usage, making this a realistic scenario
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any network participant can submit transactions to `CheckTx`.
+**Who Can Trigger:**
+Any user who has:
+1. A fee grant with `AllowedMsgAllowance` that includes `MsgExec` in the allowed messages
+2. Authz permissions from any other account to execute messages on their behalf
 
-**Conditions required:** 
-- Attacker needs to construct valid transaction bytes with nested `Any` structures
-- No special privileges, keys, or network position required
-- Works against all validators running standard code
+**Conditions Required:**
+- Normal blockchain operation - no special network conditions
+- The fee granter must have included `MsgExec` in the allowed messages list (common for users who want to enable authz features)
+- The grantee must have authz grants from other accounts (easily obtainable)
 
-**Frequency:** Can be exploited continuously by sending a stream of malicious transactions. Each transaction triggers the vulnerability during its `CheckTx` processing. The attack is limited only by network bandwidth and basic transaction size limits, not by gas costs.
-
-**Ease of exploitation:** High - attackers can programmatically generate such transactions using standard SDK message types like `authz.MsgExec` with nested message structures.
+**Frequency:**
+This can be exploited repeatedly until the fee grant is exhausted. Each transaction drains fees from the granter for unauthorized message types. The exploit is deterministic with no timing dependencies or race conditions.
 
 ## Recommendation
 
-Implement gas metering for `UnpackAny` operations by:
+Modify the fee grant validation to recursively extract and validate ALL messages, including those nested within `MsgExec`:
 
-1. **Short-term mitigation:** Reduce `MaxUnpackAnySubCalls` to a lower value (e.g., 20-30) to limit the amplification factor while maintaining compatibility with legitimate use cases.
+1. In the ante handler, before calling `UseGrantedFees`, extract all messages including nested ones from `MsgExec`
+2. Implement a recursive helper function:
+```go
+func extractAllMessages(msgs []sdk.Msg) []sdk.Msg {
+    allMsgs := []sdk.Msg{}
+    for _, msg := range msgs {
+        allMsgs = append(allMsgs, msg)
+        if execMsg, ok := msg.(*authz.MsgExec); ok {
+            innerMsgs, err := execMsg.GetMessages()
+            if err == nil {
+                allMsgs = append(allMsgs, extractAllMessages(innerMsgs)...)
+            }
+        }
+    }
+    return allMsgs
+}
+```
+3. Pass all extracted messages (including nested ones) to `UseGrantedFees` for validation
+4. Update `AllowedMsgAllowance` to validate all message types, not just outer wrappers
 
-2. **Long-term solution:** Introduce a lightweight gas meter during transaction decoding that charges for `UnpackAny` operations:
-   - Create a decode-time gas meter with a fixed limit
-   - Charge a fixed amount per `UnpackAny` call (e.g., 1000 gas)
-   - Reject transactions that exceed the decode gas limit before entering the main transaction processing flow
-   - This decode gas can be separate from and in addition to the execution gas limit
-
-3. **Alternative approach:** Move `UnpackInterfaces` to after gas meter initialization in the `AnteHandler`, though this would require restructuring the transaction processing pipeline.
+This ensures the allowance validates actual messages being executed, not just wrapper messages.
 
 ## Proof of Concept
 
-**File:** `codec/types/interface_registry_dos_test.go` (new test file)
-
 **Setup:**
-```go
-// Create a deeply nested MsgExec structure with multiple layers
-// Each layer contains multiple Any-wrapped messages to maximize UnpackAny calls
-```
+1. Initialize chain with three accounts: Alice (fee granter), Bob (grantee/attacker), Charlie (authz granter)
+2. Fund Alice and Charlie with tokens
+3. Alice creates a fee grant to Bob with `AllowedMsgAllowance` allowing `["/cosmos.bank.v1beta1.MsgSend", "/cosmos.authz.v1beta1.MsgExec"]`
+4. Charlie creates an authz grant to Bob allowing execution of `"/cosmos.bank.v1beta1.MsgBurn"`
+5. Record Alice's initial balance
 
 **Trigger:**
-1. Construct a transaction with `authz.MsgExec` containing an array of nested `MsgExec` messages
-2. Each nested message contains multiple `Any`-wrapped messages (e.g., bank.MsgSend wrapped in Any)
-3. Structure the nesting to approach the 100 call limit
-4. Encode the transaction to bytes and call the transaction decoder
-5. Measure the number of `UnpackAny` calls (patch the code to count calls)
-6. Compare CPU time consumed vs. a normal transaction with 1-2 `UnpackAny` calls
+1. Bob constructs a `MsgExec` message containing a `MsgBurn` message (to burn Charlie's tokens)
+2. Bob creates a transaction with:
+   - Messages: `[MsgExec]` containing the `MsgBurn`
+   - FeeGranter: Alice's address
+   - FeePayer: Bob's address
+3. Submit transaction through ante handler chain and message router
 
-**Observation:**
-- Normal transaction: ~1-2 `UnpackAny` calls, minimal decode time
-- Malicious transaction: ~90-100 `UnpackAny` calls, 50-100x more decode time
-- Both transactions charge 0 gas if validation fails post-decode
-- Demonstrates the amplification factor that enables the DoS attack
+**Expected Result (Vulnerability):**
+1. Transaction succeeds - ante handler does not reject it
+2. Alice's balance decreases by the fee amount (she paid fees)  
+3. Charlie's tokens are burned (inner message executed successfully)
+4. Alice paid fees for `MsgBurn`, which was NOT in her allowed messages list
 
-The test confirms that an attacker can force validators to perform orders of magnitude more computational work during `CheckTx` without paying gas, validating the resource exhaustion vulnerability.
+**Observed Behavior:**
+The fee grant's message type restrictions are bypassed. `AllowedMsgAllowance` only validated that `MsgExec` was allowed, never checking the inner `MsgBurn` message type. Alice's funds were used to pay fees for an unauthorized message type, demonstrating direct loss of funds.
+
+## Notes
+
+This vulnerability exists at the architectural level where fee validation (ante handler) and message execution (message router) are separated. The fee validation sees only the transaction structure before unpacking, while message execution later unpacks and dispatches nested messages. This temporal separation combined with the lack of recursive message extraction creates the bypass opportunity.
 
 ### Citations
 
-**File:** codec/types/interface_registry.go (L15-21)
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-	// MaxUnpackAnySubCalls extension point that defines the maximum number of sub-calls allowed during the unpacking
-	// process of protobuf Any messages.
-	MaxUnpackAnySubCalls = 100
-
-	// MaxUnpackAnyRecursionDepth extension point that defines the maximum allowed recursion depth during protobuf Any
-	// message unpacking.
-	MaxUnpackAnyRecursionDepth = 10
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
 ```
 
-**File:** codec/types/interface_registry.go (L243-313)
+**File:** x/feegrant/filtered_fee.go (L65-86)
 ```go
-func (r *statefulUnpacker) UnpackAny(any *Any, iface interface{}) error {
-	if r.maxDepth <= 0 {
-		return errors.New("max depth exceeded")
-	}
-	if r.maxCalls.count <= 0 {
-		return errors.New("call limit exceeded")
-	}
-	// here we gracefully handle the case in which `any` itself is `nil`, which may occur in message decoding
-	if any == nil {
-		return nil
+func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+	if !a.allMsgTypesAllowed(ctx, msgs) {
+		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
 	}
 
-	if any.TypeUrl == "" {
-		// if TypeUrl is empty return nil because without it we can't actually unpack anything
-		return nil
-	}
-
-	r.maxCalls.count--
-
-	rv := reflect.ValueOf(iface)
-	if rv.Kind() != reflect.Ptr {
-		return errors.New("UnpackAny expects a pointer")
-	}
-
-	rt := rv.Elem().Type()
-
-	cachedValue := any.GetCachedValue()
-	if cachedValue != nil {
-		if reflect.TypeOf(cachedValue).AssignableTo(rt) {
-			rv.Elem().Set(reflect.ValueOf(cachedValue))
-			return nil
-		}
-	}
-
-	imap, found := r.registry.interfaceImpls[rt]
-	if !found {
-		return fmt.Errorf("no registered implementations of type %+v", rt)
-	}
-
-	typ, found := imap[any.TypeUrl]
-	if !found {
-		return fmt.Errorf("no concrete type registered for type URL %s against interface %T", any.TypeUrl, iface)
-	}
-
-	// Firstly check if the type implements proto.Message to avoid
-	// unnecessary invocations to reflect.New
-	if !typ.Implements(protoMessageType) {
-		return fmt.Errorf("can't proto unmarshal %T", typ)
-	}
-
-	msg := reflect.New(typ.Elem()).Interface().(proto.Message)
-	err := proto.Unmarshal(any.Value, msg)
+	allowance, err := a.GetAllowance()
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	err = UnpackInterfaces(msg, r.cloneForRecursion())
+	remove, err := allowance.Accept(ctx, fee, msgs)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	rv.Elem().Set(reflect.ValueOf(msg))
-
-	newAnyWithCache, err := NewAnyWithValue(msg)
+	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	*any = *newAnyWithCache
-	return nil
+    return remove, nil
 }
 ```
 
-**File:** x/auth/tx/decoder.go (L32-32)
+**File:** x/feegrant/filtered_fee.go (L98-109)
 ```go
-		err = cdc.Unmarshal(txBytes, &raw)
-```
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
 
-**File:** codec/proto_codec.go (L80-90)
-```go
-func (pc *ProtoCodec) Unmarshal(bz []byte, ptr ProtoMarshaler) error {
-	err := ptr.Unmarshal(bz)
-	if err != nil {
-		return err
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
+		}
 	}
-	err = types.UnpackInterfaces(ptr, pc.interfaceRegistry)
-	if err != nil {
-		return err
-	}
-	return nil
+
+	return true
 }
 ```
 
-**File:** baseapp/abci.go (L225-231)
+**File:** x/authz/keeper/msg_server.go (L72-77)
 ```go
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
+	msgs, err := msg.GetMessages()
 	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
-```
-
-**File:** x/authz/msgs.go (L105-114)
-```go
-func (msg MsgExec) UnpackInterfaces(unpacker cdctypes.AnyUnpacker) error {
-	for _, x := range msg.Msgs {
-		var msgExecAuthorized sdk.Msg
-		err := unpacker.UnpackAny(x, &msgExecAuthorized)
-		if err != nil {
-			return err
-		}
+		return nil, err
 	}
 
-	return nil
+	results, err := k.DispatchActions(ctx, grantee, msgs)
 ```
 
-**File:** baseapp/baseapp.go (L927-976)
+**File:** x/authz/msgs.go (L198-209)
 ```go
-	if app.anteHandler != nil {
-		var anteSpan trace.Span
-		if app.TracingEnabled {
-			// trace AnteHandler
-			_, anteSpan = app.TracingInfo.StartWithContext("AnteHandler", ctx.TraceSpanContext())
-			defer anteSpan.End()
+func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
+	msgs := make([]sdk.Msg, len(msg.Msgs))
+	for i, msgAny := range msg.Msgs {
+		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
+		if !ok {
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
 		}
-		var (
-			anteCtx sdk.Context
-			msCache sdk.CacheMultiStore
-		)
-		// Branch context before AnteHandler call in case it aborts.
-		// This is required for both CheckTx and DeliverTx.
-		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2772
-		//
-		// NOTE: Alternatively, we could require that AnteHandler ensures that
-		// writes do not happen if aborted/failed.  This may have some
-		// performance benefits, but it'll be more difficult to get right.
-		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
-		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
+		msgs[i] = msg
+	}
 
-		if !newCtx.IsZero() {
-			// At this point, newCtx.MultiStore() is a store branch, or something else
-			// replaced by the AnteHandler. We want the original multistore.
-			//
-			// Also, in the case of the tx aborting, we need to track gas consumed via
-			// the instantiated gas meter in the AnteHandler, so we update the context
-			// prior to returning.
-			//
-			// This also replaces the GasMeter in the context where GasUsed was initalized 0
-			// and updated with gas consumed in the ante handler runs
-			// The GasMeter is a pointer and its passed to the RunMsg and tracks the consumed
-			// gas there too.
-			ctx = newCtx.WithMultiStore(ms)
+	return msgs, nil
+}
+```
+
+**File:** x/authz/keeper/keeper.go (L76-139)
+```go
+func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
+	results := make([][]byte, len(msgs))
+
+	for i, msg := range msgs {
+		signers := msg.GetSigners()
+		if len(signers) != 1 {
+			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
 		}
-		defer func() {
-			if newCtx.DeliverTxCallback() != nil {
-				newCtx.DeliverTxCallback()(ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx)))
+
+		granter := signers[0]
+
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
 			}
-		}()
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
 
-		events := ctx.EventManager().Events()
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
 
-		if err != nil {
-			return gInfo, nil, nil, 0, nil, nil, ctx, err
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
 		}
-		// GasMeter expected to be set in AnteHandler
-		gasWanted = ctx.GasMeter().Limit()
-		gasEstimate = ctx.GasEstimate()
+
+		handler := k.router.Handler(msg)
+		if handler == nil {
+			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
+		}
+
+		msgResp, err := handler(ctx, msg)
+		if err != nil {
+			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
+		}
+
+		results[i] = msgResp.Data
+
+		// emit the events from the dispatched actions
+		events := msgResp.Events
+		sdkEvents := make([]sdk.Event, 0, len(events))
+		for _, event := range events {
+			e := event
+			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
+
+			sdkEvents = append(sdkEvents, sdk.Event(e))
+		}
+
+		ctx.EventManager().EmitEvents(sdkEvents)
+	}
+
+	return results, nil
+}
 ```

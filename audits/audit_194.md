@@ -1,440 +1,229 @@
-## Audit Report
+Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**. Here is my audit report:
+
+---
+
+Audit Report
 
 ## Title
-Unmetered Expensive Iteration in GenericFilteredPaginate Allows Query-Based DoS Attack
+MsgExec Bypasses ValidateBasic Allowing Invalid Weighted Votes with Manipulated Total Weights
 
 ## Summary
-The `GenericFilteredPaginate` function in `x/authz/keeper/grpc_query.go` can iterate through significantly more records than the specified pagination limit when filters reject many results. Combined with infinite gas meters used for gRPC queries, this enables unprivileged attackers to force expensive operations on query nodes without gas protection, leading to resource exhaustion.
+The `MsgExec` message in the authz module does not call `ValidateBasic()` on its inner messages, allowing malformed `MsgVoteWeighted` messages with total weight not equal to 1.0 to bypass validation. When a user executes their own vote through `MsgExec`, the "implicitly accept" code path skips both authorization and validation checks, enabling governance voting power manipulation.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary: `types/query/filtered_pagination.go`, lines 122-254 (`GenericFilteredPaginate` function)
-- Usage: `x/authz/keeper/grpc_query.go`, line 145 (`GranteeGrants` query)
-- Context creation: `baseapp/abci.go`, line 712 (`CreateQueryContext` function)
-- Gas meter: `types/context.go`, line 272 (infinite gas meter initialization) [1](#0-0) [2](#0-1) [3](#0-2) 
+**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
 
-**Intended Logic:** 
-The pagination system should limit query operations to iterate through approximately `limit` number of records, with gas metering providing protection against expensive operations. Filters should efficiently narrow results without causing excessive iteration.
+**Intended logic:** All transaction messages should pass through `ValidateBasic()` during `CheckTx` to ensure stateless validation. For `MsgVoteWeighted`, this includes verifying total weight equals exactly 1.0 and no duplicate options exist. [5](#0-4) 
 
-**Actual Logic:** 
-In `GenericFilteredPaginate`, the loop only increments `numHits` when `val.Size() != 0` (line 229-235). When filtering callbacks return nil or empty results (Size() == 0), the iteration continues without incrementing `numHits`. This means if many records are filtered out, the function iterates through far more than `limit` records to find enough matching results. [4](#0-3) 
+**Actual logic:** When `MsgExec` contains inner messages, `MsgExec.ValidateBasic()` only validates the grantee address and messages array existence - it does NOT call `ValidateBasic()` on inner messages. During execution in `DispatchActions()`, when granter equals grantee (self-execution), the code "implicitly accepts" and skips authorization checks, proceeding directly to message execution without validation. The governance `AddVote()` handler only validates individual option validity via `ValidWeightedVoteOption()`, not total weight sum or duplicates. [6](#0-5) 
 
-In the `GranteeGrants` query, the store prefix is only `GrantKey` (0x01), causing iteration over ALL grants system-wide. The filter checks if the grantee matches, returning nil for non-matches (line 152-154). [5](#0-4) 
+**Exploitation path:**
+1. Attacker constructs a `MsgVoteWeighted` with invalid weights (e.g., YES: 0.8, NO: 0.7, total: 1.5)
+2. Attacker wraps this in `MsgExec` where Grantee = their own address and the inner vote's Voter = their own address
+3. Transaction passes `CheckTx` because `MsgExec.ValidateBasic()` doesn't validate inner messages
+4. During `DeliverTx`, `DispatchActions()` sees granter (from inner message signer) == grantee (from MsgExec) and "implicitly accepts" without authorization or validation checks
+5. The invalid vote is executed and stored
+6. During tally, voting power is multiplied by each option's weight, amplifying the attacker's effective voting power beyond their actual stake
 
-Furthermore, gRPC queries use contexts created with infinite gas meters that never enforce limits: [6](#0-5) [7](#0-6) 
-
-**Exploit Scenario:**
-1. Attacker creates many authorization grants (e.g., 10,000 grants) between various granter/grantee pairs via standard transactions
-2. Attacker repeatedly queries `GranteeGrants` for a target grantee address that has very few matching grants (e.g., only 10 grants)
-3. With `limit=10` in the pagination request, the intended behavior would iterate ~10-20 records
-4. Actual behavior: the function iterates through all 10,000 grants to find the 10 matches
-5. Each iteration consumes CPU for: iterator operations, protobuf unmarshaling, callback execution
-6. With no gas limit (infinite gas meter), there's no automatic termination
-7. Repeated queries cause sustained resource consumption on query nodes
-
-**Security Failure:** 
-This breaks the resource accounting and DoS protection mechanisms. The infinite gas meter for queries, combined with unbound iteration in filtered pagination, allows unprivileged users to trigger expensive operations without cost or limit.
+**Security guarantee broken:** The validation invariant that all messages must pass `ValidateBasic()` before execution is violated. This breaks the governance integrity assumption that each voter's weight distribution must sum to exactly 1.0.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- Query node CPU and memory resources
-- Network RPC endpoint availability
-- Node responsiveness to legitimate queries
+An attacker can manipulate their effective voting power by submitting votes with total weight > 1.0. For example, with total weight = 1.5, a voter with 10% of staking power effectively casts 15% of the vote weight. This can swing close proposal outcomes, allowing minority stakeholders to pass or reject proposals against the true will of the majority.
 
-**Severity:**
-An attacker can force query nodes to perform 100-1000x more iterations than the pagination limit suggests. For example:
-- With 100,000 total grants and a query for a grantee with 10 grants
-- Pagination limit of 10 causes ~100,000 iterations instead of ~10-20
-- Each iteration: ~30 gas flat + 3 gas/byte for keys/values + unmarshaling cost + callback cost
-- Even with gas tracking (but no limit), this represents 10,000x resource consumption
-
-This enables:
-- Sustained resource exhaustion attacks on query endpoints
-- Degraded service for legitimate users querying the same endpoints
-- Potential node crashes under memory pressure from large iterations
-- Economic attack with minimal attacker cost (just gRPC requests)
-
-**Why This Matters:**
-Query endpoints are critical infrastructure for applications, wallets, and explorers. Their availability directly impacts user experience and protocol usability. This vulnerability allows cheap attacks (no transaction fees) to degrade or deny service.
+While this doesn't directly steal funds, it corrupts the governance process which controls critical protocol operations including parameter changes, community pool spending, and protocol upgrades. The tally calculation multiplies voting power by option weights without validation, directly incorporating the manipulated weights into final results. [7](#0-6) 
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant with the ability to:
-1. Create authorization grants (requires normal transaction fees to setup)
-2. Send gRPC queries (no authentication or cost required)
+**Who can trigger:** Any user with voting power (staked tokens or delegations) can exploit this vulnerability.
 
-**Conditions Required:**
-- Moderate number of existing grants in the system (realistic in production)
-- Target grantee with sparse grant distribution (attacker-controllable)
-- No special privileges or timing requirements
+**Conditions required:** 
+- An active governance proposal in voting period
+- Single transaction submission containing MsgExec with invalid inner MsgVoteWeighted
 
-**Frequency:**
-- Can be triggered immediately and repeatedly
-- Each query request triggers the vulnerability
-- Attacker can automate continuous queries
-- More effective as the total number of grants grows over time
-
-**Likelihood Assessment:** High
-The attack is trivial to execute, requires no special privileges, has no direct cost to the attacker (gRPC queries are free), and becomes more effective as the system grows naturally with usage.
+**Frequency:** Can be exploited during any proposal's voting period. No special setup, timing requirements, or authorization grants needed - the attacker simply submits MsgExec executing their own vote. Multiple attackers can independently exploit this on the same proposal.
 
 ## Recommendation
 
-**Immediate Mitigation:**
-1. Add a configurable gas limit for gRPC query contexts to replace the infinite gas meter
-2. Add a hard iteration limit (e.g., 10x the pagination limit) in `GenericFilteredPaginate` to prevent excessive iteration regardless of filter results
+Add validation of inner messages in `MsgExec.ValidateBasic()`:
 
-**Long-term Fix:**
-Redesign the storage key structure for grants to enable efficient prefix filtering by grantee. For `GranteeGrants` queries, create a secondary index with key format: `0x02<granteeAddressLen><granteeAddress><granterAddressLen><granterAddress><msgType>` to enable direct iteration over a specific grantee's grants without scanning the entire grant space.
-
-**Specific Code Changes:**
-In `types/query/filtered_pagination.go`, add an iteration counter:
 ```go
-maxIterations := limit * 10 // configurable multiplier
-iterationCount := uint64(0)
-for ; iterator.Valid(); iterator.Next() {
-    iterationCount++
-    if iterationCount > maxIterations {
-        return results, &PageResponse{NextKey: iterator.Key()}, 
-            fmt.Errorf("exceeded maximum iterations")
+func (msg MsgExec) ValidateBasic() error {
+    _, err := sdk.AccAddressFromBech32(msg.Grantee)
+    if err != nil {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
     }
-    // ... rest of logic
+
+    if len(msg.Msgs) == 0 {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+    }
+
+    // Validate inner messages
+    msgs, err := msg.GetMessages()
+    if err != nil {
+        return err
+    }
+    
+    for _, innerMsg := range msgs {
+        if err := innerMsg.ValidateBasic(); err != nil {
+            return sdkerrors.Wrapf(err, "invalid inner message")
+        }
+    }
+
+    return nil
 }
 ```
+
+This ensures all messages undergo stateless validation regardless of how they are submitted, maintaining the security invariant.
 
 ## Proof of Concept
 
-**File:** `x/authz/keeper/grpc_query_test.go`
+**Test scenario:**
+1. **Setup:** Create a governance proposal in voting period and a voter account with voting power
+2. **Action:** Submit `MsgExec` with Grantee = voter address, containing `MsgVoteWeighted` with Voter = same address and invalid weights (total > 1.0)
+3. **Result:** Transaction succeeds, invalid vote is stored, and during tally the voter's power is multiplied by the inflated weight sum
 
-**Test Function:** Add the following test to demonstrate the excessive iteration issue:
+The vulnerability can be reproduced by:
+- Creating a `MsgVoteWeighted` with options [YES: 0.8, NO: 0.7] (total: 1.5)
+- Verifying it fails `ValidateBasic()` when submitted directly
+- Wrapping it in `MsgExec` where grantee = voter
+- Observing that `MsgExec.ValidateBasic()` passes
+- Executing and confirming the vote is stored with total weight 1.5
+- During tally, confirming the voter's power is multiplied by 1.5 total instead of 1.0
 
-```go
-func (suite *TestSuite) TestGranteeGrantsExcessiveIteration() {
-    require := suite.Require()
-    app, ctx, queryClient := suite.app, suite.ctx, suite.queryClient
-    
-    // Setup: Create many grants to various grantees
-    now := ctx.BlockHeader().Time
-    newCoins := sdk.NewCoins(sdk.NewInt64Coin("steak", 100))
-    authorization := &banktypes.SendAuthorization{SpendLimit: newCoins}
-    
-    // Create 1000 grants with different granters/grantees
-    // but only 5 grants for our target grantee (addrs[0])
-    numNoiseGrants := 1000
-    numTargetGrants := 5
-    
-    // Create noise grants (not matching our target grantee)
-    for i := 0; i < numNoiseGrants; i++ {
-        // Create fake addresses for granters and grantees
-        granter := sdk.AccAddress([]byte(fmt.Sprintf("granter%d", i)))
-        grantee := sdk.AccAddress([]byte(fmt.Sprintf("grantee%d", i)))
-        err := app.AuthzKeeper.SaveGrant(ctx, grantee, granter, authorization, now.Add(time.Hour))
-        require.NoError(err)
-    }
-    
-    // Create target grants (matching our target grantee addrs[0])
-    for i := 0; i < numTargetGrants; i++ {
-        granter := sdk.AccAddress([]byte(fmt.Sprintf("target_granter%d", i)))
-        err := app.AuthzKeeper.SaveGrant(ctx, suite.addrs[0], granter, authorization, now.Add(time.Hour))
-        require.NoError(err)
-    }
-    
-    // Track gas before query
-    gasBefore := ctx.GasMeter().GasConsumed()
-    
-    // Query for grants to addrs[0] with pagination limit of 10
-    // Expected: iterate ~10-20 records
-    // Actual: iterates through ALL 1005 grants to find the 5 matches
-    result, err := queryClient.GranteeGrants(gocontext.Background(), &authz.QueryGranteeGrantsRequest{
-        Grantee: suite.addrs[0].String(),
-        Pagination: &query.PageRequest{
-            Limit: 10,
-        },
-    })
-    
-    require.NoError(err)
-    require.Len(result.Grants, numTargetGrants)
-    
-    // Measure gas consumed
-    gasAfter := ctx.GasMeter().GasConsumed()
-    gasConsumed := gasAfter - gasBefore
-    
-    // With infinite gas meter, this won't panic, but gas is still tracked
-    // The gas consumed will be proportional to the total iterations (~1005)
-    // not the pagination limit (10)
-    
-    // Expected gas: ~10 iterations * (30 + 3*keysize + 3*valuesize)
-    // Actual gas: ~1005 iterations * (30 + 3*keysize + 3*valuesize)
-    expectedGasPerIteration := uint64(30 + 3*50 + 3*100) // rough estimate
-    expectedReasonableGas := expectedGasPerIteration * 20 // 2x pagination limit
-    
-    // This assertion will fail, demonstrating excessive iteration
-    require.Less(gasConsumed, expectedReasonableGas,
-        "Gas consumed (%d) indicates iteration through all grants, not just limit", gasConsumed)
-}
-```
+**Note:** The report's mention of creating a self-grant (granter = grantee) is unnecessary, as `MsgGrant.ValidateBasic()` prevents this at line 64-66. However, the vulnerability still exists through direct self-execution via MsgExec without any grant. [8](#0-7) 
 
-**Setup:**
-The test uses the existing `TestSuite` infrastructure in `x/authz/keeper/grpc_query_test.go`.
+---
 
-**Trigger:**
-The test creates 1000 "noise" grants with random grantees, plus 5 grants for the target grantee. Then queries with `limit=10` for the target grantee.
+## Notes
 
-**Observation:**
-The gas consumed will be proportional to ~1005 iterations (all grants) rather than ~10-20 iterations (pagination limit). The test assertion will fail, proving that the function iterates through far more records than the pagination limit, exposing the vulnerability. In a production environment with an infinite gas meter (as used in gRPC queries), this would cause unbounded resource consumption.
+This vulnerability qualifies as **Medium severity** under the category "A bug in the network code that results in unintended behavior" as it allows manipulation of governance voting outcomes, which is a critical protocol mechanism. While there is no direct fund loss from the vote manipulation itself, governance controls protocol parameters, upgrades, and community pool spending, making this a significant security issue.
 
 ### Citations
 
-**File:** types/query/filtered_pagination.go (L122-254)
+**File:** x/authz/msgs.go (L64-66)
 ```go
-// GenericFilteredPaginate does pagination of all the results in the PrefixStore based on the
-// provided PageRequest. `onResult` should be used to filter or transform the results.
-// `c` is a constructor function that needs to return a new instance of the type T (this is to
-// workaround some generic pitfalls in which we can't instantiate a T struct inside the function).
-// If key is provided, the pagination uses the optimized querying.
-// If offset is used, the pagination uses lazy filtering i.e., searches through all the records.
-// The resulting slice (of type F) can be of a different type than the one being iterated through
-// (type T), so it's possible to do any necessary transformation inside the onResult function.
-func GenericFilteredPaginate[T codec.ProtoMarshaler, F codec.ProtoMarshaler](
-	cdc codec.BinaryCodec,
-	prefixStore types.KVStore,
-	pageRequest *PageRequest,
-	onResult func(key []byte, value T) (F, error),
-	constructor func() T,
-) ([]F, *PageResponse, error) {
-	// if the PageRequest is nil, use default PageRequest
-	if pageRequest == nil {
-		pageRequest = &PageRequest{}
+	if granter.Equals(grantee) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be same")
+	}
+```
+
+**File:** x/authz/msgs.go (L221-232)
+```go
+func (msg MsgExec) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
 	}
 
-	offset := pageRequest.Offset
-	key := pageRequest.Key
-	limit := pageRequest.Limit
-	countTotal := pageRequest.CountTotal
-	reverse := pageRequest.Reverse
-	results := []F{}
-
-	if offset > 0 && key != nil {
-		return results, nil, fmt.Errorf("invalid request, either offset or key is expected, got both")
+	if len(msg.Msgs) == 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
 	}
 
-	if limit == 0 {
-		limit = DefaultLimit
-
-		// count total results when the limit is zero/not supplied
-		countTotal = true
-	}
-
-	if len(key) != 0 {
-		iterator := getIterator(prefixStore, key, reverse)
-		defer iterator.Close()
-
-		var (
-			numHits uint64
-			nextKey []byte
-		)
-
-		for ; iterator.Valid(); iterator.Next() {
-			if numHits == limit {
-				nextKey = iterator.Key()
-				break
-			}
-
-			if iterator.Error() != nil {
-				return nil, nil, iterator.Error()
-			}
-
-			protoMsg := constructor()
-
-			err := cdc.Unmarshal(iterator.Value(), protoMsg)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			val, err := onResult(iterator.Key(), protoMsg)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			if val.Size() != 0 {
-				results = append(results, val)
-				numHits++
-			}
-		}
-
-		return results, &PageResponse{
-			NextKey: nextKey,
-		}, nil
-	}
-
-	iterator := getIterator(prefixStore, nil, reverse)
-	defer iterator.Close()
-
-	end := offset + limit
-
-	var (
-		numHits uint64
-		nextKey []byte
-	)
-
-	for ; iterator.Valid(); iterator.Next() {
-		if iterator.Error() != nil {
-			return nil, nil, iterator.Error()
-		}
-
-		protoMsg := constructor()
-
-		err := cdc.Unmarshal(iterator.Value(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		val, err := onResult(iterator.Key(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if val.Size() != 0 {
-			// Previously this was the "accumulate" flag
-			if numHits >= offset && numHits < end {
-				results = append(results, val)
-			}
-			numHits++
-		}
-
-		if numHits == end+1 {
-			if nextKey == nil {
-				nextKey = iterator.Key()
-			}
-
-			if !countTotal {
-				break
-			}
-		}
-	}
-
-	res := &PageResponse{NextKey: nextKey}
-	if countTotal {
-		res.Total = numHits
-	}
-
-	return results, res, nil
+	return nil
 }
 ```
 
-**File:** x/authz/keeper/grpc_query.go (L143-169)
+**File:** x/authz/keeper/keeper.go (L87-111)
 ```go
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
 
-	authorizations, pageRes, err := query.GenericFilteredPaginate(k.cdc, store, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
-		if err != nil {
-			return nil, err
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
 		}
-
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
-		}
-
-		authorizationAny, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-
-		return &authz.GrantAuthorization{
-			Authorization: authorizationAny,
-			Expiration:    auth.Expiration,
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-		}, nil
-	}, func() *authz.Grant {
-		return &authz.Grant{}
-	})
 ```
 
-**File:** types/context.go (L261-272)
+**File:** x/gov/keeper/vote.go (L21-25)
 ```go
-// create a new context
-func NewContext(ms MultiStore, header tmproto.Header, isCheckTx bool, logger log.Logger) Context {
-	// https://github.com/gogo/protobuf/issues/519
-	header.Time = header.Time.UTC()
-	return Context{
-		ctx:             context.Background(),
-		ms:              ms,
-		header:          header,
-		chainID:         header.ChainID,
-		checkTx:         isCheckTx,
-		logger:          logger,
-		gasMeter:        NewInfiniteGasMeter(1, 1),
+	for _, option := range options {
+		if !types.ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
+		}
+	}
 ```
 
-**File:** baseapp/abci.go (L712-761)
+**File:** x/gov/keeper/tally.go (L59-62)
 ```go
-func (app *BaseApp) CreateQueryContext(height int64, prove bool) (sdk.Context, error) {
-	err := checkNegativeHeight(height)
-	if err != nil {
-		return sdk.Context{}, err
-	}
-
-	lastBlockHeight := app.LastBlockHeight()
-	if height > lastBlockHeight {
-		return sdk.Context{},
-			sdkerrors.Wrap(
-				sdkerrors.ErrInvalidHeight,
-				"cannot query with height in the future; please provide a valid height",
-			)
-	}
-
-	// when a client did not provide a query height, manually inject the latest
-	if height == 0 {
-		height = lastBlockHeight
-	}
-
-	if height <= 1 && prove {
-		return sdk.Context{},
-			sdkerrors.Wrap(
-				sdkerrors.ErrInvalidRequest,
-				"cannot query with proof when height <= 1; please provide a valid height",
-			)
-	}
-
-	var cacheMS types.CacheMultiStore
-	if height < app.migrationHeight && app.qms != nil {
-		cacheMS, err = app.qms.CacheMultiStoreWithVersion(height)
-	} else {
-		cacheMS, err = app.cms.CacheMultiStoreWithVersion(height)
-	}
-
-	if err != nil {
-		return sdk.Context{},
-			sdkerrors.Wrapf(
-				sdkerrors.ErrInvalidRequest,
-				"failed to load state at height %d; %s (latest height: %d)", height, err, lastBlockHeight,
-			)
-	}
-
-	checkStateCtx := app.checkState.Context()
-	// branch the commit-multistore for safety
-	ctx := sdk.NewContext(
-		cacheMS, checkStateCtx.BlockHeader(), true, app.logger,
-	).WithMinGasPrices(app.minGasPrices).WithBlockHeight(height)
-
-	return ctx, nil
+				for _, option := range vote.Options {
+					subPower := votingPower.Mul(option.Weight)
+					results[option.Option] = results[option.Option].Add(subPower)
+				}
 ```
 
-**File:** store/types/gas.go (L252-258)
+**File:** x/gov/keeper/tally.go (L82-85)
 ```go
-func (g *infiniteGasMeter) IsPastLimit() bool {
-	return false
+		for _, option := range val.Vote {
+			subPower := votingPower.Mul(option.Weight)
+			results[option.Option] = results[option.Option].Add(subPower)
+		}
+```
+
+**File:** x/gov/types/msgs.go (L243-274)
+```go
+func (msg MsgVoteWeighted) ValidateBasic() error {
+	if msg.Voter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, msg.Voter)
+	}
+
+	if len(msg.Options) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, WeightedVoteOptions(msg.Options).String())
+	}
+
+	totalWeight := sdk.NewDec(0)
+	usedOptions := make(map[VoteOption]bool)
+	for _, option := range msg.Options {
+		if !ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(ErrInvalidVote, option.String())
+		}
+		totalWeight = totalWeight.Add(option.Weight)
+		if usedOptions[option.Option] {
+			return sdkerrors.Wrap(ErrInvalidVote, "Duplicated vote option")
+		}
+		usedOptions[option.Option] = true
+	}
+
+	if totalWeight.GT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight overflow 1.00")
+	}
+
+	if totalWeight.LT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight lower than 1.00")
+	}
+
+	return nil
 }
+```
 
-func (g *infiniteGasMeter) IsOutOfGas() bool {
-	return false
+**File:** x/gov/types/vote.go (L80-85)
+```go
+func ValidWeightedVoteOption(option WeightedVoteOption) bool {
+	if !option.Weight.IsPositive() || option.Weight.GT(sdk.NewDec(1)) {
+		return false
+	}
+	return ValidVoteOption(option.Option)
 }
 ```

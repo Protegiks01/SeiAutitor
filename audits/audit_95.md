@@ -1,163 +1,173 @@
 # Audit Report
 
 ## Title
-WASM Dependency Registration Bypass Enables Denial-of-Service Through Forced Sequential Execution
+Network-Wide Denial of Service via Future-Height Evidence Submission Causing Panic in Slash Function
 
 ## Summary
-The `MsgRegisterWasmDependency` message handler is implemented as a no-op, preventing users from registering dependency mappings for WASM contracts. Contracts without dependency mappings automatically fall back to `SynchronousWasmAccessOps`, which forces all transactions calling those contracts to execute sequentially instead of in parallel. An attacker can exploit this by deploying contracts without dependency mappings or targeting existing unregistered contracts, causing significant performance degradation across the network.
+An attacker can submit evidence with a future block height through `MsgSubmitEvidence`, which bypasses all validation checks and causes all nodes to panic when the staking keeper's `Slash` function detects the future infraction height, resulting in a complete network shutdown.
 
 ## Impact
-**Medium**
+**Medium** - Network not being able to confirm new transactions (total network shutdown)
 
 ## Finding Description
 
-**Location:** 
-- [1](#0-0) 
-- [2](#0-1) 
-- [3](#0-2) 
+**Location:**
+- Primary validation gap: `x/evidence/types/evidence.go` lines 46-61 (ValidateBasic function)
+- Secondary validation gap: `x/evidence/keeper/infraction.go` lines 42-64 (age check logic)
+- Panic trigger: `x/staking/keeper/slash.go` lines 67-71 (future height check)
+- Call chain: `x/evidence/keeper/infraction.go` line 107 → `x/slashing/keeper/keeper.go` line 78 → `x/staking/keeper/slash.go` line 24
 
-**Intended Logic:** 
-The system is designed to allow WASM contracts to register dependency mappings via `MsgRegisterWasmDependency` transactions. These mappings specify which resources a contract accesses, enabling parallel execution of independent transactions. Contracts should be able to register their access patterns to optimize performance.
+**Intended Logic:**
+Evidence should only represent past infractions. The system is designed to reject any evidence claiming an infraction occurred at a future block height, as this is logically impossible and indicates malicious or corrupted data.
 
-**Actual Logic:** 
-The `RegisterWasmDependency` handler returns immediately without performing any registration [1](#0-0) . When `GetWasmDependencyAccessOps` encounters a contract without a registered mapping (returning `ErrKeyNotFound`), it falls back to `SynchronousAccessOps()` [2](#0-1) . This function returns access operations with `AccessType_UNKNOWN` on `ResourceType_ANY` with wildcard identifier `"*"` [3](#0-2) , which the DAG builder treats as conflicting with all other operations [4](#0-3) .
+**Actual Logic:**
+The validation flow has two critical gaps. First, the `Equivocation.ValidateBasic()` function only validates that `Height >= 1` but does not check if the height is in the future. [1](#0-0)  Second, in `HandleEquivocationEvidence`, when calculating the age of evidence, the expression `ageBlocks = ctx.BlockHeader().Height - infractionHeight` produces a negative value for future heights. [2](#0-1)  This negative value does not satisfy the "too old" rejection condition `ageBlocks > cp.Evidence.MaxAgeNumBlocks`. [3](#0-2) 
 
-**Exploit Scenario:**
-1. Attacker deploys multiple new WASM contracts to the network
-2. Since `MsgRegisterWasmDependency` is non-functional, these contracts have no dependency mappings (only genesis contracts have mappings [5](#0-4) )
-3. Attacker (or regular users) sends numerous transactions calling these contracts
-4. Each transaction calling an unmapped contract retrieves `SynchronousAccessOps` as fallback
-5. During DAG construction, these transactions create dependencies on ALL prior transactions and block ALL subsequent transactions [6](#0-5) 
-6. Parallel execution is completely disabled for these transactions, forcing sequential processing
+The evidence then proceeds to slashing where `distributionHeight = infractionHeight - sdk.ValidatorUpdateDelay` still results in a future height. [4](#0-3)  This value is passed through the slashing keeper [5](#0-4)  which forwards it to the staking keeper. [6](#0-5)  When the staking keeper's `Slash` function receives this future height as `infractionHeight`, it triggers a panic. [7](#0-6) 
 
-**Security Failure:** 
-This breaks the availability and performance guarantees of the parallel execution system. The denial-of-service manifests as forced sequential execution, drastically increasing block processing time and resource consumption on validator nodes.
+**Exploitation Path:**
+1. Attacker crafts a `MsgSubmitEvidence` with an `Equivocation` where `Height = currentBlockHeight + 100`
+2. The message is submitted through the standard transaction submission process [8](#0-7) 
+3. Message validation passes because `ValidateBasic()` only checks `Height >= 1`
+4. Transaction is included in a block and processed
+5. `HandleEquivocationEvidence` is invoked with `infractionHeight = currentBlockHeight + 100`
+6. Age check calculates: `ageBlocks = currentBlockHeight - (currentBlockHeight + 100) = -100`
+7. Since `-100` is NOT `> MaxAgeNumBlocks`, evidence is not rejected
+8. `distributionHeight = infractionHeight - 1 = currentBlockHeight + 99` 
+9. This future height is passed through slashing keeper to staking keeper
+10. Check `infractionHeight > ctx.BlockHeight()` evaluates to `true`, causing panic
+
+**Security Guarantee Broken:**
+This violates the availability guarantee of the blockchain. All nodes processing the malicious transaction will panic and halt, preventing the network from producing new blocks or processing any transactions.
 
 ## Impact Explanation
 
-This vulnerability affects the network's transaction processing capacity. When exploited:
+**Affected Processes:** Network availability and consensus
 
-- **Transaction throughput degradation**: Blocks containing transactions to unmapped contracts must process those transactions sequentially, reducing throughput by potentially 70-90% depending on the parallelism factor of the system.
-- **Block time increase**: Processing time increases proportionally to the number of forced-sequential transactions, potentially delaying blocks by 500% or more of the average block time.
-- **Resource exhaustion**: Validator nodes consume significantly more CPU time per transaction due to lost parallelism, increasing resource consumption by well over 30%.
-- **Network-wide impact**: All validators are affected simultaneously, as they all execute the same transactions and encounter the same sequential execution bottleneck.
+**Consequences:**
+- All validator nodes processing the block containing the malicious evidence will panic simultaneously
+- The network cannot progress to produce new blocks
+- All pending transactions remain unprocessed
+- Recovery requires coordinated manual intervention to restart nodes and potentially exclude the malicious transaction from the block
 
-This matters because Sei is designed as a high-performance blockchain with parallel execution as a core feature. Disabling this feature undermines the chain's value proposition and can make it unusable during attack periods.
+This is a critical availability vulnerability that enables a single unprivileged attacker to completely halt the entire blockchain network with a single transaction. The attacker needs no special privileges—only the ability to submit a transaction, which is a fundamental capability in any blockchain.
 
 ## Likelihood Explanation
 
-This vulnerability is **highly likely** to be triggered:
+**Who Can Trigger:** Any user with the ability to submit transactions to the network
 
-- **Who can trigger it**: Any user can deploy WASM contracts and send transactions to them. No special privileges required.
-- **Conditions required**: Simply requires deploying contracts and submitting transactions during normal network operation. The attack can start immediately after chain launch for any new contracts.
-- **Frequency**: Can be exploited continuously. An attacker can deploy multiple contracts and spam transactions to them in every block, maintaining constant degradation.
-- **Cost**: Attack cost is limited to normal gas fees for contract deployment and transaction execution, making it economically feasible.
-- **Detection difficulty**: Difficult to distinguish from legitimate contract usage, as transactions appear valid and pass all checks.
+**Required Conditions:**
+- Attacker must know a valid validator consensus address (publicly available information)
+- No special timing or state conditions required
+- Can be executed at any time during normal network operation
+
+**Frequency:** This attack can be executed immediately and repeatedly. Once discovered, it could be exploited continuously until patched, making it a severe and imminent threat.
 
 ## Recommendation
 
-Implement the `RegisterWasmDependency` message handler to actually register dependency mappings:
+Add explicit validation in `HandleEquivocationEvidence` to reject evidence from the future before any processing occurs:
 
 ```go
-func (k msgServer) RegisterWasmDependency(goCtx context.Context, msg *types.MsgRegisterWasmDependency) (*types.MsgRegisterWasmDependencyResponse, error) {
-    ctx := sdk.UnwrapSDKContext(goCtx)
+func (k Keeper) HandleEquivocationEvidence(ctx sdk.Context, evidence *types.Equivocation) {
+    logger := k.Logger(ctx)
+    consAddr := evidence.GetConsensusAddress()
     
-    // Validate the sender has authority (e.g., contract admin/deployer)
-    // Validate the dependency mapping structure
-    err := k.SetWasmDependencyMapping(ctx, msg.WasmDependencyMapping)
-    if err != nil {
-        return nil, err
+    infractionHeight := evidence.GetHeight()
+    
+    // Reject evidence from the future
+    if infractionHeight > ctx.BlockHeight() {
+        logger.Info(
+            "ignored equivocation; evidence from future height",
+            "validator", consAddr,
+            "infraction_height", infractionHeight,
+            "current_height", ctx.BlockHeight(),
+        )
+        return
     }
     
-    return &types.MsgRegisterWasmDependencyResponse{}, nil
+    // ... rest of the existing function
 }
 ```
 
-Additionally, consider:
-1. Requiring contracts to register dependency mappings during deployment
-2. Adding governance controls for updating dependency mappings of existing contracts
-3. Implementing rate limiting or gas premium for transactions to unmapped contracts to disincentivize the attack
-4. Providing tooling to automatically generate dependency mappings from contract code analysis
+This check should be placed immediately after retrieving the infraction height and before any age calculations or slashing operations.
 
 ## Proof of Concept
 
-**File**: `x/accesscontrol/keeper/keeper_test.go`
-
-**Test Function**: `TestUnmappedContractForcesSynchronousExecution`
+**Test Location:** `x/evidence/keeper/infraction_test.go`
 
 **Setup:**
-- Initialize a test application with two WASM contract addresses
-- Register a proper dependency mapping for Contract A (allowing parallel execution)
-- Do NOT register any mapping for Contract B (triggering the vulnerability)
-- Create two transactions: one calling Contract A, one calling Contract B
+- Initialize test context with block height 10
+- Create and register a validator with sufficient power
 
-**Trigger:**
-- Call `GetWasmDependencyAccessOps` for Contract B with a valid message
-- Observe that it returns `SynchronousAccessOps()` instead of specific dependencies
-- Build a DAG with both transactions and verify Contract B's transaction creates blocking dependencies
+**Action:**
+- Create `Equivocation` evidence with `Height = 50` (future height)
+- Call `HandleEquivocationEvidence` with this evidence
 
-**Observation:**
-The test confirms:
-1. Contract B without mapping returns `SynchronousAccessOps` [7](#0-6) 
-2. The returned access ops contain `AccessType_UNKNOWN` on `ResourceType_ANY` with `"*"` identifier [3](#0-2) 
-3. When building a DAG with multiple transactions to Contract B, each transaction depends on all previous ones
-4. Parallel execution is completely disabled for these transactions
+**Expected Result:**
+- The system should panic when the staking keeper's `Slash` function detects that `infractionHeight (49 after subtracting ValidatorUpdateDelay of 1) > ctx.BlockHeight() (10)`
+- This panic confirms the vulnerability—in production, this would crash all nodes processing this transaction
 
-The test demonstrates that the no-op handler [1](#0-0)  combined with the fallback behavior creates a denial-of-service vector through forced sequential execution.
+The test demonstrates that evidence with future heights bypasses all validation checks and triggers a panic that would cause network-wide denial of service.
+
+## Notes
+
+The severity is classified as **Medium** according to the impact criterion "Network not being able to confirm new transactions (total network shutdown)". While this represents a complete network halt, the classification follows the provided severity guidelines. The vulnerability is fully exploitable by any unprivileged user and requires immediate patching to prevent potential network-wide denial of service attacks.
 
 ### Citations
 
-**File:** x/accesscontrol/keeper/msg_server.go (L21-23)
+**File:** x/evidence/types/evidence.go (L50-52)
 ```go
-func (k msgServer) RegisterWasmDependency(goCtx context.Context, msg *types.MsgRegisterWasmDependency) (*types.MsgRegisterWasmDependencyResponse, error) {
-	return &types.MsgRegisterWasmDependencyResponse{}, nil
-}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L170-173)
-```go
-	dependencyMapping, err := k.GetRawWasmDependencyMapping(ctx, contractAddress)
-	if err != nil {
-		if err == sdkerrors.ErrKeyNotFound {
-			return types.SynchronousAccessOps(), nil
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L593-597)
-```go
-			msgDependencies := k.GetMessageDependencies(ctx, msg)
-			dependencyDag.AddAccessOpsForMsg(messageIndex, txIndex, msgDependencies)
-			for _, accessOp := range msgDependencies {
-				// make a new node in the dependency dag
-				dependencyDag.AddNodeBuildDependency(messageIndex, txIndex, accessOp)
-```
-
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L76-87)
-```go
-func SynchronousWasmAccessOps() []*acltypes.WasmAccessOperation {
-	return []*acltypes.WasmAccessOperation{
-		{
-			Operation:    &acltypes.AccessOperation{AccessType: acltypes.AccessType_UNKNOWN, ResourceType: acltypes.ResourceType_ANY, IdentifierTemplate: "*"},
-			SelectorType: acltypes.AccessOperationSelectorType_NONE,
-		},
-		{
-			Operation:    CommitAccessOp(),
-			SelectorType: acltypes.AccessOperationSelectorType_NONE,
-		},
+	if e.Height < 1 {
+		return fmt.Errorf("invalid equivocation height: %d", e.Height)
 	}
-}
 ```
 
-**File:** x/accesscontrol/types/graph.go (L304-308)
+**File:** x/evidence/keeper/infraction.go (L46-46)
 ```go
-	case acltypes.AccessType_WRITE, acltypes.AccessType_UNKNOWN:
-		// for write / unknown, we're blocked on prior writes, reads, and unknowns
-		nodeIDs = nodeIDs.Union(dag.getDependencyWrites(node, dependentResource))
-		nodeIDs = nodeIDs.Union(dag.getDependencyUnknowns(node, dependentResource))
-		nodeIDs = nodeIDs.Union(dag.getDependencyReads(node, dependentResource))
+	ageBlocks := ctx.BlockHeader().Height - infractionHeight
 ```
 
-**File:** x/accesscontrol/keeper/genesis.go (L19-20)
+**File:** x/evidence/keeper/infraction.go (L53-53)
 ```go
-	for _, wasmDependencyMapping := range genState.GetWasmDependencyMappings() {
-		err := k.SetWasmDependencyMapping(ctx, wasmDependencyMapping)
+		if ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks {
+```
+
+**File:** x/evidence/keeper/infraction.go (L101-101)
+```go
+	distributionHeight := infractionHeight - sdk.ValidatorUpdateDelay
+```
+
+**File:** x/evidence/keeper/infraction.go (L107-112)
+```go
+	k.slashingKeeper.Slash(
+		ctx,
+		consAddr,
+		k.slashingKeeper.SlashFractionDoubleSign(ctx),
+		evidence.GetValidatorPower(), distributionHeight,
+	)
+```
+
+**File:** x/slashing/keeper/keeper.go (L78-78)
+```go
+	k.sk.Slash(ctx, consAddr, distributionHeight, power, fraction)
+```
+
+**File:** x/staking/keeper/slash.go (L67-71)
+```go
+	case infractionHeight > ctx.BlockHeight():
+		// Can't slash infractions in the future
+		panic(fmt.Sprintf(
+			"impossible attempt to slash future infraction at height %d but we are at height %d",
+			infractionHeight, ctx.BlockHeight()))
+```
+
+**File:** x/evidence/keeper/msg_server.go (L23-29)
+```go
+func (ms msgServer) SubmitEvidence(goCtx context.Context, msg *types.MsgSubmitEvidence) (*types.MsgSubmitEvidenceResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	evidence := msg.GetEvidence()
+	if err := ms.Keeper.SubmitEvidence(ctx, evidence); err != nil {
+		return nil, err
+	}
 ```

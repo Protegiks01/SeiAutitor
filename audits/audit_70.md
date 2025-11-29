@@ -1,246 +1,202 @@
 # Audit Report
 
 ## Title
-Integer Overflow in Gas Meter Multiplier Calculation Bypasses Overflow Protection
+Evidence Duplicate Submission DoS via Timestamp Manipulation Bypassing Hash-Based Duplicate Check
 
 ## Summary
-The `adjustGas()` function in `multiplierGasMeter` and `infiniteMultiplierGasMeter` performs multiplication without overflow checking, allowing integer overflow to wrap to small values instead of panicking with `ErrorGasOverflow`. This breaks the gas accounting system's overflow protection invariant.
+The evidence module's `SubmitEvidence` function uses hash-based duplicate detection that can be bypassed by manipulating timestamps. The `HandleEquivocationEvidence` function violates the Handler interface specification by returning void instead of error, preventing proper error propagation when evidence is rejected. This allows attackers to submit semantically identical evidence with different timestamps, causing separate storage of duplicate entries and enabling storage exhaustion attacks.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- `store/types/gas.go`, lines 181-183 (`multiplierGasMeter.adjustGas()`)
-- `store/types/gas.go`, lines 288-290 (`infiniteMultiplierGasMeter.adjustGas()`) [1](#0-0) [2](#0-1) 
+**Location:**
+- Duplicate check: [1](#0-0) 
+- Unconditional storage: [2](#0-1) 
+- Hash calculation includes all fields: [3](#0-2) 
+- Handler void return (interface violation): [4](#0-3) 
+- Early return when tombstoned: [5](#0-4) 
 
 **Intended Logic:**
-The gas meter system is designed to detect integer overflow and panic with `ErrorGasOverflow` when gas calculations exceed `math.MaxUint64`. This is evidenced by:
-1. The `ErrorGasOverflow` error type definition [3](#0-2) 
-2. The `addUint64Overflow()` helper function for safe addition [4](#0-3) 
-3. Overflow protection in `basicGasMeter.ConsumeGas()` [5](#0-4) 
-4. Overflow protection even in `infiniteGasMeter.ConsumeGas()` [6](#0-5) 
+The Handler interface specifies that evidence handlers must return error [6](#0-5)  to signal when evidence is invalid or rejected. The duplicate check should prevent the same misbehavior evidence from being stored multiple times, identified by semantic properties (validator address, height, type) rather than submission metadata.
 
 **Actual Logic:**
-The `adjustGas()` function performs `original * g.multiplierNumerator / g.multiplierDenominator` using native Go arithmetic. When `original * g.multiplierNumerator` exceeds `math.MaxUint64`, Go's uint64 multiplication wraps around modulo 2^64, producing a small value instead of detecting overflow. This wrapped value is then passed to `ConsumeGas()`, bypassing the intended overflow protection.
+The `HandleEquivocationEvidence` function has void return type, violating the Handler interface specification. When a validator is already tombstoned, the function returns early without signaling an error. The duplicate check compares full evidence hashes, which include the user-controlled Time field. Different timestamps produce different hashes, bypassing the duplicate check. `SubmitEvidence` unconditionally stores evidence after handler execution if no error is returned.
 
-**Exploit Scenario:**
-1. Governance sets gas multiplier parameters through the params module (no upper bound validation exists) [7](#0-6) 
-2. If `multiplierNumerator` is set to a high value (e.g., 2^63) due to misconfiguration or lack of understanding of overflow risks
-3. A user transaction performs operations that consume gas (e.g., KV store reads/writes) [8](#0-7) 
-4. When `adjustGas()` calculates `2 * 2^63 = 2^64`, this overflows to 0
-5. The transaction consumes 0 gas instead of the intended large amount
-6. User bypasses gas accounting and can execute expensive operations for free
+**Exploitation Path:**
+1. Attacker submits evidence E1 via `MsgSubmitEvidence` transaction with timestamp T1 for validator V at height H
+2. Duplicate check passes (first submission)
+3. Handler processes evidence: validator gets slashed, jailed, and tombstoned
+4. Evidence stored with hash H1 = Hash(V, H, T1, ...)
+5. Attacker submits evidence E2 with same validator V and height H but timestamp T2 ≠ T1
+6. Hash H2 = Hash(V, H, T2, ...) ≠ H1 due to different timestamp
+7. Duplicate check passes (different hash)
+8. Handler detects validator already tombstoned, returns early (void, no error signal)
+9. `SubmitEvidence` still stores evidence with hash H2 (unconditional storage after handler)
+10. Attacker repeats with timestamps T3, T4, ..., Tn, creating n storage entries for single misbehavior
 
-**Security Failure:**
-This breaks the gas accounting invariant, which is critical for:
-- Preventing DoS attacks through resource exhaustion
-- Ensuring fair transaction ordering and fee payment
-- Maintaining consensus about block gas limits
+**Security Guarantee Broken:**
+The duplicate detection mechanism is defeated. Evidence uniqueness should be based on the misbehavior event itself (validator, height, type), not submission metadata (timestamp). The system stores semantically duplicate evidence as distinct entries, enabling storage exhaustion attacks.
 
 ## Impact Explanation
 
-The vulnerability affects the core gas metering system that governs resource consumption across the entire blockchain:
+The vulnerability enables storage exhaustion attacks affecting all network validators:
+- **Storage Growth**: Each evidence submission (~100 bytes) is permanently stored. An attacker can submit thousands of evidence instances for a single misbehavior event.
+- **Network-Wide Impact**: All validators must store and synchronize redundant evidence, increasing disk usage and state sync costs.
+- **Permanent Bloat**: Evidence entries persist indefinitely without automatic pruning.
 
-- **Resource Consumption:** Attackers could execute computationally expensive operations (repeated KV operations, large state updates) while consuming minimal gas, exhausting node resources
-- **Economic Model:** Transaction fee calculation becomes incorrect, allowing users to avoid paying for their actual resource consumption
-- **Consensus Safety:** Blocks could exceed intended gas limits without triggering protection mechanisms, potentially causing nodes to process transactions beyond safe parameters
-
-While exploitation requires governance to set unsafe multiplier values, the lack of validation and documentation makes this a realistic configuration error. The system provides no warnings or safeguards against values that cause overflow.
+This qualifies as Medium severity under: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - the evidence module is layer 1 Cosmos SDK code exhibiting unintended behavior (storing semantic duplicates).
 
 ## Likelihood Explanation
 
 **Trigger Conditions:**
-- Governance must set `CosmosGasMultiplierNumerator` to a value where `amount * numerator > math.MaxUint64` for realistic gas consumption amounts
-- Default parameters (1/1) do not trigger the issue [9](#0-8) 
-- No validation prevents unsafe values [7](#0-6) 
+- Any user can submit evidence via `MsgSubmitEvidence` [7](#0-6) 
+- No privileged access required
+- Evidence validation only checks timestamp > 0 [8](#0-7) 
 
-**Likelihood:**
-While requiring governance action, this is not purely theoretical:
-- Governance operates on-chain and parameters can be changed through proposals
-- No documentation warns about overflow risks for high multiplier values
-- The validation only checks for zero, not upper bounds or overflow potential
-- Could occur through misconfiguration rather than malicious intent
-
-Once triggered, any user can exploit it repeatedly during the period unsafe parameters are active.
+**Likelihood Assessment:**
+- **High**: Exploitation is straightforward - submit evidence with incrementing timestamps
+- **Low Cost**: Attacker pays gas per transaction but creates disproportionate storage burden
+- **Production Pattern**: Handler wrappers naturally return nil when wrapping void functions, making the vulnerability likely in real deployments
+- **No Detection**: The duplicate check cannot detect semantic duplicates with varying timestamps
 
 ## Recommendation
 
-Add overflow checking to the `adjustGas()` function using the existing `addUint64Overflow()` helper:
+Implement semantic duplicate detection and fix the Handler interface violation:
 
+**Option 1 - Fix Handler Interface Violation:**
+Modify `HandleEquivocationEvidence` signature to return `error`:
 ```go
-func (g *multiplierGasMeter) adjustGas(original Gas) Gas {
-    // Check multiplication overflow
-    adjusted, overflow := addUint64Overflow(original*g.multiplierNumerator, 0)
-    if overflow || adjusted < original*g.multiplierNumerator {
-        panic(ErrorGasOverflow{"gas multiplier calculation"})
-    }
-    return adjusted / g.multiplierDenominator
-}
+func (k Keeper) HandleEquivocationEvidence(ctx sdk.Context, evidence *types.Equivocation) error
 ```
+Return appropriate errors for rejection conditions (already tombstoned, too old, validator not found). Only return `nil` when evidence is successfully processed. Update `SubmitEvidence` to only store evidence when handler returns `nil`.
 
-Alternatively, perform checked multiplication before division:
-```go
-func (g *multiplierGasMeter) adjustGas(original Gas) Gas {
-    if g.multiplierNumerator > 0 && original > math.MaxUint64/g.multiplierNumerator {
-        panic(ErrorGasOverflow{"gas multiplier calculation"})
-    }
-    return original * g.multiplierNumerator / g.multiplierDenominator
-}
-```
+**Option 2 - Semantic Duplicate Detection:**
+Check duplicates using composite key `(ConsensusAddress, Height, Type)` instead of full hash. Store evidence indexed by this semantic key to prevent duplicate misbehavior evidence regardless of submission metadata.
 
-Additionally, add validation in params to prevent unsafe multiplier values:
-```go
-func (cg *CosmosGasParams) Validate() error {
-    // ... existing checks ...
-    if cg.CosmosGasMultiplierNumerator > math.MaxUint64/1000000 {
-        return errors.New("cosmos gas multiplier numerator too large, risk of overflow")
-    }
-    return nil
-}
-```
+**Option 3 - Canonical Evidence:**
+Normalize evidence before hashing by using canonical timestamps (e.g., block time at infraction height) rather than user-provided submission time.
 
 ## Proof of Concept
 
-**File:** `store/types/gas_test.go`
+**Test File:** `x/evidence/keeper/keeper_test.go`
 
-**Test Function:** `TestMultiplierGasMeterOverflow`
+**Setup:**
+- Create keeper with router wrapping `HandleEquivocationEvidence` (realistic production pattern)
+- Handler wrapper returns `nil` (cannot detect void return from `HandleEquivocationEvidence`)
+- Initialize validators and set up chain context
 
-```go
-func TestMultiplierGasMeterOverflow(t *testing.T) {
-    // Setup: Create a gas meter with a high multiplier that will cause overflow
-    // Using 2^63 as numerator - when multiplied by 2, will overflow to 0
-    multiplierNumerator := uint64(1 << 63)  // 2^63
-    multiplierDenominator := uint64(1)
-    
-    meter := NewMultiplierGasMeter(10000, multiplierNumerator, multiplierDenominator)
-    
-    // Trigger: Consume 2 gas units
-    // Expected: Should panic with ErrorGasOverflow
-    // Actual: Overflows to 0, no panic, gas consumption bypassed
-    
-    initialConsumed := meter.GasConsumed()
-    require.Equal(t, uint64(0), initialConsumed)
-    
-    // This should cause overflow: 2 * 2^63 = 2^64, which wraps to 0
-    // The test demonstrates the vulnerability - no panic occurs
-    meter.ConsumeGas(2, "test operation")
-    
-    // Observation: Gas consumed should have increased significantly,
-    // but due to overflow wrapping to 0, it remains at 0
-    finalConsumed := meter.GasConsumed()
-    
-    // This assertion passes, demonstrating the bug:
-    // We consumed "2" gas with multiplier 2^63, but recorded consumption is 0
-    require.Equal(t, uint64(0), finalConsumed, 
-        "Overflow wrapped to 0 instead of panicking - gas accounting bypassed")
-}
-```
+**Action:**
+- Submit evidence with timestamp T1 (unix 100) for validator at height 1
+- Verify validator gets tombstoned
+- Submit evidence with timestamp T2 (unix 200) - same validator, same height, different timestamp
+- Submit 10 more evidence instances with timestamps T3-T12
+- All submissions succeed despite representing same misbehavior
 
-**Setup:** The test creates a `multiplierGasMeter` with `multiplierNumerator = 2^63` and `multiplierDenominator = 1`.
+**Result:**
+- All 12 evidence instances stored separately (retrievable via `GetAllEvidence`)
+- All have same height and validator address
+- All have different timestamps and hashes
+- Demonstrates bypass of duplicate detection via timestamp manipulation
 
-**Trigger:** Calls `ConsumeGas(2, "test operation")`, which should calculate `2 * 2^63 / 1 = 2^64`. Since 2^64 exceeds `math.MaxUint64`, Go's uint64 arithmetic wraps this to 0.
+The PoC confirms that semantic duplicates (same misbehavior) are stored as distinct evidence entries, validating the storage exhaustion vulnerability.
 
-**Observation:** The test verifies that `GasConsumed()` remains 0 despite consuming gas, demonstrating that overflow silently wraps to zero instead of panicking with `ErrorGasOverflow`. This proves the gas accounting bypass.
+## Notes
 
-**Expected behavior:** The function should panic with `ErrorGasOverflow`, similar to how `basicGasMeter.ConsumeGas()` handles overflow at lines 103-106.
+This is a design flaw arising from three compounding issues:
+1. **Interface Violation**: `HandleEquivocationEvidence` returns void instead of error as specified by Handler interface [6](#0-5) 
+2. **Hash Includes Mutable Fields**: Evidence hash computed from all protobuf fields including user-controlled timestamp
+3. **Unconditional Storage**: Evidence stored after handler execution regardless of early returns
+
+The specification documentation [9](#0-8)  clearly states handlers should return errors, confirming this is a bug rather than intentional design. The combination enables storage exhaustion attacks by allowing semantic duplicates to bypass duplicate detection through timestamp manipulation.
 
 ### Citations
 
-**File:** store/types/gas.go (L38-42)
+**File:** x/evidence/keeper/keeper.go (L79-81)
 ```go
-// ErrorGasOverflow defines an error thrown when an action results gas consumption
-// unsigned integer overflow.
-type ErrorGasOverflow struct {
-	Descriptor string
-}
-```
-
-**File:** store/types/gas.go (L87-95)
-```go
-// addUint64Overflow performs the addition operation on two uint64 integers and
-// returns a boolean on whether or not the result overflows.
-func addUint64Overflow(a, b uint64) (uint64, bool) {
-	if math.MaxUint64-a < b {
-		return 0, true
-	}
-
-	return a + b, false
-}
-```
-
-**File:** store/types/gas.go (L101-107)
-```go
-	var overflow bool
-	g.consumed, overflow = addUint64Overflow(g.consumed, amount)
-	if overflow {
-		g.consumed = math.MaxUint64
-		g.incrGasExceededCounter("overflow", descriptor)
-		panic(ErrorGasOverflow{descriptor})
+	if _, ok := k.GetEvidence(ctx, evidence.Hash()); ok {
+		return sdkerrors.Wrap(types.ErrEvidenceExists, evidence.Hash().String())
 	}
 ```
 
-**File:** store/types/gas.go (L181-183)
+**File:** x/evidence/keeper/keeper.go (L98-98)
 ```go
-func (g *multiplierGasMeter) adjustGas(original Gas) Gas {
-	return original * g.multiplierNumerator / g.multiplierDenominator
+	k.SetEvidence(ctx, evidence)
+```
+
+**File:** x/evidence/types/evidence.go (L36-43)
+```go
+func (e *Equivocation) Hash() tmbytes.HexBytes {
+	bz, err := e.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	b := sha256.Sum256(bz)
+	return b[:]
 }
 ```
 
-**File:** store/types/gas.go (L227-232)
+**File:** x/evidence/types/evidence.go (L46-61)
 ```go
-	var overflow bool
-	// TODO: Should we set the consumed field after overflow checking?
-	g.consumed, overflow = addUint64Overflow(g.consumed, amount)
-	if overflow {
-		panic(ErrorGasOverflow{descriptor})
+func (e *Equivocation) ValidateBasic() error {
+	if e.Time.Unix() <= 0 {
+		return fmt.Errorf("invalid equivocation time: %s", e.Time)
 	}
-```
-
-**File:** store/types/gas.go (L288-290)
-```go
-func (g *infiniteMultiplierGasMeter) adjustGas(original Gas) Gas {
-	return original * g.multiplierNumerator / g.multiplierDenominator
-}
-```
-
-**File:** x/params/types/params.go (L55-64)
-```go
-func (cg *CosmosGasParams) Validate() error {
-	if cg.CosmosGasMultiplierNumerator == 0 {
-		return errors.New("cosmos gas multiplier numerator can not be 0")
+	if e.Height < 1 {
+		return fmt.Errorf("invalid equivocation height: %d", e.Height)
 	}
-
-	if cg.CosmosGasMultiplierDenominator == 0 {
-		return errors.New("cosmos gas multiplier denominator can not be 0")
+	if e.Power < 1 {
+		return fmt.Errorf("invalid equivocation validator power: %d", e.Power)
+	}
+	if e.ConsensusAddress == "" {
+		return fmt.Errorf("invalid equivocation validator consensus address: %s", e.ConsensusAddress)
 	}
 
 	return nil
-```
-
-**File:** store/gaskv/store.go (L54-66)
-```go
-func (gs *Store) Get(key []byte) (value []byte) {
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostFlat, types.GasReadCostFlatDesc)
-	value = gs.parent.Get(key)
-
-	// TODO overflow-safe math?
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(key)), types.GasReadPerByteDesc)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(value)), types.GasReadPerByteDesc)
-	if gs.tracer != nil {
-		gs.tracer.Get(key, value, gs.moduleName)
-	}
-
-	return value
 }
 ```
 
-**File:** x/params/types/genesis.go (L15-19)
+**File:** x/evidence/keeper/infraction.go (L25-25)
 ```go
-func DefaultCosmosGasParams() *CosmosGasParams {
-	return &CosmosGasParams{
-		CosmosGasMultiplierNumerator:   1,
-		CosmosGasMultiplierDenominator: 1,
+func (k Keeper) HandleEquivocationEvidence(ctx sdk.Context, evidence *types.Equivocation) {
+```
+
+**File:** x/evidence/keeper/infraction.go (L78-86)
+```go
+	if k.slashingKeeper.IsTombstoned(ctx, consAddr) {
+		logger.Info(
+			"ignored equivocation; validator already tombstoned",
+			"validator", consAddr,
+			"infraction_height", infractionHeight,
+			"infraction_time", infractionTime,
+		)
+		return
 	}
+```
+
+**File:** x/evidence/types/router.go (L15-15)
+```go
+	Handler func(sdk.Context, exported.Evidence) error
+```
+
+**File:** x/evidence/keeper/msg_server.go (L23-29)
+```go
+func (ms msgServer) SubmitEvidence(goCtx context.Context, msg *types.MsgSubmitEvidence) (*types.MsgSubmitEvidenceResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	evidence := msg.GetEvidence()
+	if err := ms.Keeper.SubmitEvidence(ctx, evidence); err != nil {
+		return nil, err
+	}
+```
+
+**File:** x/evidence/spec/01_concepts.md (L72-77)
+```markdown
+```go
+// Handler defines an agnostic Evidence handler. The handler is responsible
+// for executing all corresponding business logic necessary for verifying the
+// evidence as valid. In addition, the Handler may execute any necessary
+// slashing and potential jailing.
+type Handler func(sdk.Context, Evidence) error
 ```

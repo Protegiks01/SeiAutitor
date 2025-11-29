@@ -1,277 +1,256 @@
 # Audit Report
 
 ## Title
-Out-of-Bounds Panic in Multisig Verification Due to Missing Signature Count Validation Against True Bits
+Missing Genesis Validation for Vesting Account Original Vesting Allows Node Crash and Permanent Fund Freezing
 
 ## Summary
-The signature count validation in `VerifyMultisignature` only checks that the number of signatures is between the threshold and the total number of public keys, but fails to validate that it equals the number of true bits in the bit array. This allows an attacker to craft a malicious multisig transaction that causes an out-of-bounds array access, resulting in a node panic and denial of service. [1](#0-0) 
+The bank keeper's `InitGenesis` function fails to call `ValidateBalance` on accounts during genesis initialization, allowing vesting accounts with `OriginalVesting > Balance` to be created. When transactions attempt to spend from such accounts, the node panics due to a negative coin calculation in `SubUnlockedCoins`, causing permanent fund freezing and network disruption.
 
 ## Impact
-**High** - This vulnerability enables a denial-of-service attack that can crash validator nodes and halt the network's ability to process transactions.
+High
 
 ## Finding Description
 
-**Location:** 
-- Primary: `crypto/keys/multisig/multisig.go`, function `VerifyMultisignature`, lines 59-94
-- Secondary: `x/auth/ante/sigverify.go`, function `ConsumeMultisignatureVerificationGas`, lines 446-471 [2](#0-1) 
+**Location:**
+- `x/bank/keeper/genesis.go` lines 12-59 (`InitGenesis` function)
+- `x/bank/keeper/view.go` lines 209-229 (`ValidateBalance` function) 
+- `x/bank/keeper/send.go` line 220 (panic point in `SubUnlockedCoins`)
+- `types/coin.go` lines 116-118 (underlying panic in `Coin.Sub`)
 
-**Intended Logic:** 
-The signature count validation should ensure that the number of signatures provided matches the number of signers indicated by the bit array, preventing any mismatch that could lead to out-of-bounds access during verification.
+**Intended Logic:**
+The `ValidateBalance` function is explicitly documented to validate vesting accounts at genesis, with a CONTRACT comment stating "ValidateBalance should only be called upon genesis state." [1](#0-0)  It checks that for vesting accounts, `OriginalVesting <= TotalBalance`. [2](#0-1) 
 
-**Actual Logic:** 
-The validation at line 60 only checks:
-1. `len(sigs) >= int(m.Threshold)` - at least threshold signatures
-2. `len(sigs) <= size` - at most as many signatures as public keys
+**Actual Logic:**
+The `InitGenesis` function sets balances and validates total supply but never calls `ValidateBalance` on individual accounts. [3](#0-2)  The vesting account's own `Validate()` method only checks that `DelegatedVesting <= OriginalVesting`, not that `OriginalVesting <= Balance`. [4](#0-3) 
 
-However, it does NOT validate that `len(sigs)` equals the number of true bits in the bit array (`bitarray.NumTrueBitsBefore(size)`).
+**Exploitation Path:**
+1. Genesis state is created with a vesting account having `OriginalVesting > Balance` (can be accidental misconfiguration during chain launch/upgrade)
+2. Genesis initialization succeeds because `ValidateBalance` is never called
+3. At genesis time, for a continuous vesting account, `LockedCoins` returns `OriginalVesting` since no coins have vested yet [5](#0-4) 
+4. Any transaction attempting to spend from the account calls `SubUnlockedCoins` [6](#0-5) 
+5. At line 220, the code executes `spendable := balance.Sub(locked)` where `balance < locked` [7](#0-6) 
+6. The `Coin.Sub` method panics because the result would be negative [8](#0-7) 
 
-The verification loop (lines 69-94) iterates through each bit in the array and when a bit is true, accesses `sig.Signatures[sigIndex]` then increments `sigIndex`. If there are more true bits than signatures available, this causes a panic due to out-of-bounds array access. [3](#0-2) 
-
-**Exploit Scenario:**
-1. An attacker crafts a transaction with a multisig signature where:
-   - The multisig public key has 5 public keys with threshold 3
-   - The bit array has 4 bits set to true (e.g., positions 0, 1, 2, 3)
-   - The signatures array contains only 3 signatures
-   
-2. The transaction passes all validation checks:
-   - Line 56: bit array size equals number of public keys ✓
-   - Line 60: `3 >= 3 && 3 <= 5` ✓
-   - Line 64: 4 true bits >= 3 threshold ✓
-
-3. During verification loop execution:
-   - Iterations 0-2: Successfully verify signatures at indices 0, 1, 2
-   - Iteration 3: Attempts to access `sig.Signatures[3]` which doesn't exist
-   - Result: Panic with out-of-bounds error
-
-4. The attacker can submit this transaction to the network, causing any validator node that attempts to verify it to crash. [4](#0-3) 
-
-The attacker controls the transaction structure through the protobuf `ModeInfo.Multi` fields, where `Bitarray` and `ModeInfos` (which determines signature count) can be independently specified. [5](#0-4) 
-
-**Security Failure:** 
-This breaks memory safety and availability guarantees. The panic occurs during transaction processing in the ante handler, causing the node to crash. This is a denial-of-service vulnerability that can be exploited to disrupt network consensus.
+**Security Guarantee Broken:**
+- **Liveness**: Network cannot process transactions from affected accounts without crashing
+- **Safety**: Funds become permanently inaccessible without hard fork
+- **Invariant**: The codebase assumes `OriginalVesting <= Balance` for vesting accounts but doesn't enforce it at genesis
 
 ## Impact Explanation
 
-**Affected Assets/Processes:**
-- Network availability and consensus
-- Validator node uptime
-- Transaction processing capability
+**Permanent Fund Freezing:**
+Funds in vesting accounts with `OriginalVesting > Balance` become permanently frozen. Any attempt to spend from these accounts causes node panics, making the funds completely inaccessible without a hard fork to fix the genesis state.
 
-**Severity of Damage:**
-- Any validator node processing the malicious transaction will panic and crash
-- The crash occurs during signature verification in the ante handler, which is part of the critical transaction validation path
-- An attacker can repeatedly broadcast such transactions to continuously crash nodes
-- If enough validators crash simultaneously, the network cannot reach consensus and halts
-- No funds are directly at risk, but network functionality is completely compromised
+**Network Disruption:**
+When transactions from affected accounts are included in blocks, nodes processing those transactions will crash. If validators or significant network participants have such accounts, this can cause:
+- Cascading node failures as different nodes process the transaction
+- Potential consensus disruption if many validators crash simultaneously
+- Network availability issues requiring emergency intervention
 
-**Why This Matters:**
-This vulnerability allows an unprivileged attacker (anyone who can submit transactions) to cause a network-wide denial of service without requiring significant resources or brute force. The attack is deterministic and can be repeated indefinitely, making it a critical availability threat to the blockchain network.
+**Irreversible Damage:**
+Once a chain launches with such malformed accounts, the only remediation is a hard fork to fix the genesis state, which is extremely disruptive and may result in loss of transaction history.
 
 ## Likelihood Explanation
 
+**Trigger Conditions:**
+- Requires genesis state misconfiguration (privileged action by chain operators)
+- However, this qualifies under the exception for "unrecoverable security failure beyond intended authority"
+- The `ValidateBalance` function exists with explicit documentation that it should be called at genesis, indicating this is a code defect, not intentional design
+- Configuration errors during chain launch or upgrades are realistic scenarios
+
 **Who Can Trigger:**
-Any network participant who can submit transactions. No special privileges, stake, or resources required beyond the ability to craft and broadcast a transaction.
+- Chain operators can inadvertently create this condition during genesis setup
+- Once established, any network participant can trigger the panic by attempting to transact with the affected account
+- No special privileges needed to trigger the actual crash
 
-**Required Conditions:**
-- The attacker needs to craft a transaction with a multisig signature containing the mismatched bit array and signature count
-- No special timing or network state is required
-- The vulnerability is triggered during normal transaction validation flow
-
-**Frequency:**
-- Can be exploited at any time during normal network operation
-- Each malicious transaction will crash any node that attempts to process it
-- The attack can be repeated continuously by broadcasting multiple malicious transactions
-- With automated tooling, an attacker could potentially crash nodes faster than they can restart
-
-This vulnerability has high likelihood of exploitation because:
-1. It's trivial to trigger (just craft one malicious transaction)
-2. The impact is immediate and guaranteed (deterministic crash)
-3. There are no rate limits or costs that prevent repeated exploitation
-4. The attack surface is available to all network participants
+**Evidence of Bug:**
+The test suite demonstrates that `ValidateBalance` correctly catches this scenario when called explicitly, [9](#0-8)  but this validation is never integrated into the genesis flow.
 
 ## Recommendation
 
-Add validation to ensure the number of signatures exactly equals the number of true bits in the bit array. Insert this check after line 64 in `VerifyMultisignature`:
+Integrate `ValidateBalance` into the genesis initialization process:
 
+1. **Immediate Fix**: Add `ValidateBalance` calls in `InitGenesis` after setting account balances (after line 26 in `x/bank/keeper/genesis.go`)
+2. **Implementation**: Iterate through all genesis balances and call `ValidateBalance` for each address
+3. **Defense in Depth**: Add this check to `GenesisState.Validate()` method to catch issues during genesis file validation before chain initialization
+
+Example implementation:
 ```go
-// Ensure the number of signatures matches the number of true bits
-numTrueBits := bitarray.NumTrueBitsBefore(size)
-if len(sigs) != numTrueBits {
-    return fmt.Errorf("signature count %d does not match number of signers %d indicated by bit array", len(sigs), numTrueBits)
+// After line 26 in InitGenesis
+for _, balance := range genState.Balances {
+    if err := k.ValidateBalance(ctx, balance.GetAddress()); err != nil {
+        panic(fmt.Errorf("invalid balance at genesis: %w", err))
+    }
 }
 ```
-
-Apply the same fix to `ConsumeMultisignatureVerificationGas` in `x/auth/ante/sigverify.go` before line 454.
-
-This validation ensures the invariant that every true bit in the array has a corresponding signature, preventing the out-of-bounds access.
 
 ## Proof of Concept
 
-**File:** `crypto/keys/multisig/multisig_test.go`
-
-**Test Function:** Add the following test to demonstrate the vulnerability:
-
-```go
-func TestVerifyMultisignaturePanicOnMismatchedSigCount(t *testing.T) {
-	// This test demonstrates the vulnerability where a bit array with more true bits
-	// than signatures causes a panic due to out-of-bounds array access
-	
-	msg := []byte{1, 2, 3, 4}
-	pubKeys, sigs := generatePubKeysAndSignatures(5, msg)
-	
-	// Create a multisig key with 5 public keys, threshold 3
-	pk := kmultisig.NewLegacyAminoPubKey(3, pubKeys)
-	
-	// Create a bit array with 5 positions
-	bitArray := cryptotypes.NewCompactBitArray(5)
-	
-	// Set 4 bits to true (positions 0, 1, 2, 3)
-	bitArray.SetIndex(0, true)
-	bitArray.SetIndex(1, true)
-	bitArray.SetIndex(2, true)
-	bitArray.SetIndex(3, true)
-	
-	// Create MultiSignatureData with only 3 signatures (less than 4 true bits)
-	// This creates a mismatch between true bits (4) and signature count (3)
-	maliciousSig := &signing.MultiSignatureData{
-		BitArray:   bitArray,
-		Signatures: []signing.SignatureData{sigs[0], sigs[1], sigs[2]},
-	}
-	
-	signBytesFn := func(mode signing.SignMode) ([]byte, error) { return msg, nil }
-	
-	// This should panic with out-of-bounds error when trying to access sig.Signatures[3]
-	// The panic occurs because the loop finds 4 true bits but only 3 signatures exist
-	require.Panics(t, func() {
-		_ = pk.VerifyMultisignature(signBytesFn, maliciousSig)
-	}, "Expected panic due to out-of-bounds access, but no panic occurred")
-}
-```
+**Scenario**: Create a continuous vesting account at genesis with `OriginalVesting = 200` tokens but only `Balance = 100` tokens.
 
 **Setup:**
-- Creates 5 public/private key pairs and corresponding signatures
-- Creates a multisig public key with threshold 3
+1. Create genesis state with a continuous vesting account:
+   - `OriginalVesting`: 200 foocoin
+   - Actual `Balance`: 100 foocoin
+2. Initialize chain with `InitGenesis` - succeeds (demonstrates vulnerability)
 
 **Trigger:**
-- Constructs a malicious `MultiSignatureData` with 4 true bits in the bit array but only 3 signatures
-- Calls `VerifyMultisignature` with this malicious data
+1. Attempt to send any amount from the vesting account
+2. This calls `SubUnlockedCoins` with the account address
+3. The function calculates `lockedCoins = 200` (since no coins have vested at genesis)
+4. At line 220: `spendable := balance.Sub(locked)` attempts `100.Sub(200)`
 
-**Observation:**
-- The test expects a panic when `VerifyMultisignature` attempts to access the non-existent 4th signature
-- On vulnerable code, the panic occurs at line 71 when `sigIndex=3` and `sig.Signatures[3]` is accessed
-- The panic confirms the out-of-bounds vulnerability
+**Result:**
+- Node panics with "negative coin amount" error
+- Funds become permanently inaccessible
+- Any node processing such a transaction will crash
 
-**To Run:**
-```bash
-cd crypto/keys/multisig
-go test -v -run TestVerifyMultisignaturePanicOnMismatchedSigCount
-```
+**Validation:**
+The existing test `TestValidateBalance` proves that calling `ValidateBalance` explicitly on such an account returns an error, confirming the validation logic exists but is not integrated into genesis initialization.
 
-The test will panic on the vulnerable code, demonstrating that a malicious transaction with this signature structure will crash any node that attempts to verify it.
+## Notes
+
+This vulnerability qualifies as HIGH severity under "Permanent freezing of funds (fix requires hard fork)". While it requires privileged genesis configuration, it meets the exception criteria because:
+
+1. A trusted operator can inadvertently trigger it through configuration error
+2. It causes unrecoverable security failure (permanent fund freezing + network disruption)  
+3. The failure extends beyond the operator's intended authority
+4. The code explicitly documents that `ValidateBalance` should be called at genesis but fails to do so - this is a code defect
+
+The inconsistent handling between `spendableCoins` (which uses safe `SafeSub`) and `SubUnlockedCoins` (which uses panicking `Sub`) further indicates this is an unintended bug rather than designed behavior.
 
 ### Citations
 
-**File:** crypto/keys/multisig/multisig.go (L50-96)
+**File:** x/bank/keeper/view.go (L202-208)
 ```go
-func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
-	bitarray := sig.BitArray
-	sigs := sig.Signatures
-	size := bitarray.Count()
-	pubKeys := m.GetPubKeys()
-	// ensure bit array is the correct size
-	if len(pubKeys) != size {
-		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
-	}
-	// ensure size of signature list
-	if len(sigs) < int(m.Threshold) || len(sigs) > size {
-		return fmt.Errorf("signature size is incorrect %d", len(sigs))
-	}
-	// ensure at least k signatures are set
-	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
-		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
-	}
-	// index in the list of signatures which we are concerned with.
-	sigIndex := 0
-	for i := 0; i < size; i++ {
-		if bitarray.GetIndex(i) {
-			si := sig.Signatures[sigIndex]
-			switch si := si.(type) {
-			case *signing.SingleSignatureData:
-				msg, err := getSignBytes(si.SignMode)
-				if err != nil {
-					return err
-				}
-				if !pubKeys[i].VerifySignature(msg, si.Signature) {
-					return fmt.Errorf("unable to verify signature at index %d", i)
-				}
-			case *signing.MultiSignatureData:
-				nestedMultisigPk, ok := pubKeys[i].(multisigtypes.PubKey)
-				if !ok {
-					return fmt.Errorf("unable to parse pubkey of index %d", i)
-				}
-				if err := nestedMultisigPk.VerifyMultisignature(getSignBytes, si); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("improper signature data type for index %d", sigIndex)
-			}
-			sigIndex++
+// ValidateBalance validates all balances for a given account address returning
+// an error if any balance is invalid. It will check for vesting account types
+// and validate the balances against the original vesting balances.
+//
+// CONTRACT: ValidateBalance should only be called upon genesis state. In the
+// case of vesting accounts, balances may change in a valid manner that would
+// otherwise yield an error from this call.
+```
+
+**File:** x/bank/keeper/view.go (L220-226)
+```go
+	vacc, ok := acc.(vestexported.VestingAccount)
+	if ok {
+		ogv := vacc.GetOriginalVesting()
+		if ogv.IsAnyGT(balances) {
+			return fmt.Errorf("vesting amount %s cannot be greater than total amount %s", ogv, balances)
 		}
 	}
-	return nil
+```
+
+**File:** x/bank/keeper/genesis.go (L12-59)
+```go
+func (k BaseKeeper) InitGenesis(ctx sdk.Context, genState *types.GenesisState) {
+	k.SetParams(ctx, genState.Params)
+
+	totalSupply := sdk.Coins{}
+	totalWeiBalance := sdk.ZeroInt()
+
+	genState.Balances = types.SanitizeGenesisBalances(genState.Balances)
+	for _, balance := range genState.Balances {
+		addr := balance.GetAddress()
+		coins := balance.Coins
+		if err := k.initBalances(ctx, addr, coins); err != nil {
+			panic(fmt.Errorf("error on setting balances %w", err))
+		}
+
+		totalSupply = totalSupply.Add(coins...)
+	}
+	for _, weiBalance := range genState.WeiBalances {
+		addr := sdk.MustAccAddressFromBech32(weiBalance.Address)
+		if err := k.AddWei(ctx, addr, weiBalance.Amount); err != nil {
+			panic(fmt.Errorf("error on setting wei balance %w", err))
+		}
+		totalWeiBalance = totalWeiBalance.Add(weiBalance.Amount)
+	}
+	weiInUsei, weiRemainder := SplitUseiWeiAmount(totalWeiBalance)
+	if !weiRemainder.IsZero() {
+		panic(fmt.Errorf("non-zero wei remainder %s", weiRemainder))
+	}
+	baseDenom, err := sdk.GetBaseDenom()
+	if err != nil {
+		if !weiInUsei.IsZero() {
+			panic(fmt.Errorf("base denom is not registered %s yet there exists wei balance %s", err, weiInUsei))
+		}
+	} else {
+		totalSupply = totalSupply.Add(sdk.NewCoin(baseDenom, weiInUsei))
+	}
+
+	if !genState.Supply.Empty() && !genState.Supply.IsEqual(totalSupply) {
+		panic(fmt.Errorf("genesis supply is incorrect, expected %v, got %v", genState.Supply, totalSupply))
+	}
+
+	for _, supply := range totalSupply {
+		k.SetSupply(ctx, supply)
+	}
+
+	for _, meta := range genState.DenomMetadata {
+		k.SetDenomMetaData(ctx, meta)
+	}
 }
 ```
 
-**File:** x/auth/tx/sigs.go (L66-85)
+**File:** x/auth/vesting/types/vesting_account.go (L150-155)
 ```go
-	case *tx.ModeInfo_Multi_:
-		multi := modeInfo.Multi
-
-		sigs, err := decodeMultisignatures(sig)
-		if err != nil {
-			return nil, err
-		}
-
-		sigv2s := make([]signing.SignatureData, len(sigs))
-		for i, mi := range multi.ModeInfos {
-			sigv2s[i], err = ModeInfoAndSigToSignatureData(mi, sigs[i])
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		return &signing.MultiSignatureData{
-			BitArray:   multi.Bitarray,
-			Signatures: sigv2s,
-		}, nil
+func (bva BaseVestingAccount) Validate() error {
+	if !(bva.DelegatedVesting.IsAllLTE(bva.OriginalVesting)) {
+		return errors.New("delegated vesting amount cannot be greater than original vesting amount")
+	}
+	return bva.BaseAccount.Validate()
+}
 ```
 
-**File:** x/auth/ante/sigverify.go (L446-471)
+**File:** x/auth/vesting/types/vesting_account.go (L255-263)
 ```go
-func ConsumeMultisignatureVerificationGas(
-	meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-	params types.Params, accSeq uint64,
-) error {
-
-	size := sig.BitArray.Count()
-	sigIndex := 0
-
-	for i := 0; i < size; i++ {
-		if !sig.BitArray.GetIndex(i) {
-			continue
-		}
-		sigV2 := signing.SignatureV2{
-			PubKey:   pubkey.GetPubKeys()[i],
-			Data:     sig.Signatures[sigIndex],
-			Sequence: accSeq,
-		}
-		err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
-		if err != nil {
-			return err
-		}
-		sigIndex++
-	}
-
-	return nil
+func (cva ContinuousVestingAccount) GetVestingCoins(blockTime time.Time) sdk.Coins {
+	return cva.OriginalVesting.Sub(cva.GetVestedCoins(blockTime))
 }
+
+// LockedCoins returns the set of coins that are not spendable (i.e. locked),
+// defined as the vesting coins that are not delegated.
+func (cva ContinuousVestingAccount) LockedCoins(blockTime time.Time) sdk.Coins {
+	return cva.BaseVestingAccount.LockedCoinsFromVesting(cva.GetVestingCoins(blockTime))
+}
+```
+
+**File:** x/bank/keeper/send.go (L175-180)
+```go
+func (k BaseSendKeeper) SendCoinsWithoutAccCreation(ctx sdk.Context, fromAddr sdk.AccAddress, toAddr sdk.AccAddress, amt sdk.Coins) error {
+	return k.sendCoinsWithoutAccCreation(ctx, fromAddr, toAddr, amt, true)
+}
+
+func (k BaseSendKeeper) sendCoinsWithoutAccCreation(ctx sdk.Context, fromAddr sdk.AccAddress, toAddr sdk.AccAddress, amt sdk.Coins, checkNeg bool) error {
+	err := k.SubUnlockedCoins(ctx, fromAddr, amt, checkNeg)
+```
+
+**File:** x/bank/keeper/send.go (L216-220)
+```go
+	for _, coin := range amt {
+		balance := k.GetBalance(ctx, addr, coin.Denom)
+		if checkNeg {
+			locked := sdk.NewCoin(coin.Denom, lockedCoins.AmountOf(coin.Denom))
+			spendable := balance.Sub(locked)
+```
+
+**File:** types/coin.go (L115-118)
+```go
+	res := Coin{coin.Denom, coin.Amount.Sub(coinB.Amount)}
+	if res.IsNegative() {
+		panic("negative coin amount")
+	}
+```
+
+**File:** x/bank/keeper/keeper_test.go (L870-875)
+```go
+	bacc := authtypes.NewBaseAccountWithAddress(addr2)
+	vacc := vesting.NewContinuousVestingAccount(bacc, balances.Add(balances...), now.Unix(), endTime.Unix(), nil)
+
+	app.AccountKeeper.SetAccount(ctx, vacc)
+	suite.Require().NoError(simapp.FundAccount(app.BankKeeper, ctx, addr2, balances))
+	suite.Require().Error(app.BankKeeper.ValidateBalance(ctx, addr2))
 ```

@@ -1,246 +1,211 @@
-## Audit Report
+# Audit Report
 
-### Title
-Index Mismatch in SR25519 Batch Signature Verification Causes Authentication Bypass and DoS
+## Title
+Chain Fails to Start When Genesis Contains Wei Balances Due to Missing Base Denom Registration
 
-### Summary
-The SR25519 batch signature verifier in `x/auth/ante/batch_sigverify.go` contains a critical index mismatch bug that incorrectly maps batch verification results back to transaction indices. When batch verification fails due to invalid signatures, the error assignment logic uses the batch array index instead of the transaction index, causing valid transactions to be rejected (DoS) and potentially allowing invalid transactions to pass (authentication bypass). [1](#0-0) 
+## Summary
+The bank keeper's `InitGenesis` function panics during chain initialization when the genesis state contains wei balances but `sdk.RegisterDenom()` has never been called. Since `RegisterDenom()` is only invoked in test setup functions and never in the production application startup sequence, any genesis file containing wei balances will cause total network shutdown, preventing all validators from starting the chain. [1](#0-0) 
 
-### Impact
-**High**
+## Impact
+High
 
-This vulnerability breaks the fundamental security property of signature verification and can lead to:
-- Denial of Service: Valid transactions from legitimate users are rejected
-- Authentication Bypass: Transactions with invalid signatures may be accepted
-- Network reliability degradation: Unpredictable transaction processing behavior
+## Finding Description
 
-### Finding Description
+**Location:**
+- Primary: `x/bank/keeper/genesis.go`, lines 39-46 in the `InitGenesis` function
+- Secondary: `types/denom.go`, lines 48-54 in the `GetBaseDenom` function [1](#0-0) [2](#0-1) 
 
-**Location:** 
-`x/auth/ante/batch_sigverify.go`, lines 177-186, in the `VerifyTxs` method of `SR25519BatchVerifier` [2](#0-1) 
+**Intended logic:** 
+The code expects that `sdk.RegisterDenom()` is called during application startup to register the base denomination before `InitGenesis` processes wei balances. Wei balances (with 18-decimal precision) should be converted to the base denomination during genesis initialization for EVM compatibility. [3](#0-2) 
 
-**Intended Logic:**
-The batch verifier should collect SR25519 signatures from multiple transactions, verify them in batch for efficiency, and correctly report which specific transactions have invalid signatures. The `sigTxIndices` array (line 95) is created to track the mapping from batch signature index to original transaction index, as some transactions may have pre-verification errors and skip batch verification.
+**Actual logic:**
+`sdk.RegisterDenom()` is never called in the production startup path. The function only appears in test setup code. The package-level variable `baseDenom` remains an empty string. When `InitGenesis` processes wei balances:
+1. Wei balances are accumulated into `weiInUsei`
+2. The code calls `sdk.GetBaseDenom()` which returns an error ("no denom is registered") because `baseDenom` is empty
+3. Since `weiInUsei` is non-zero, the panic condition triggers
+4. All validator nodes fail with: "base denom is not registered ... yet there exists wei balance" [4](#0-3) [5](#0-4) [6](#0-5) 
 
-**Actual Logic:**
-When batch verification fails (`overall == false` at line 177), the code iterates through individual verification results. However, at line 180, it incorrectly uses the batch index `i` to set errors: `v.errors[i]`, when it should use `v.errors[sigTxIndices[i]]` to map back to the correct transaction index.
+**Exploitation path:**
+1. Chain operators prepare a genesis file with wei balances (a documented feature for EVM compatibility)
+2. Validators execute normal chain startup (`simd start`)
+3. During ABCI `InitChain`, the module manager calls `bank.InitGenesis`
+4. InitGenesis processes wei balances but panics due to unregistered base denomination
+5. All validator nodes crash before producing any blocks [7](#0-6) [8](#0-7) 
 
-**Exploit Scenario:**
-1. An attacker submits multiple transactions to the network, some with intentionally invalid SR25519 signatures
-2. These transactions are batched with legitimate user transactions during block processing
-3. Some transactions (e.g., transaction 0) may fail pre-verification checks (wrong sequence number, missing pubkey, etc.) and are not added to the batch verifier
-4. Valid transactions (e.g., indices 1, 2, 3, 4) are added to the batch as batch indices 0, 1, 2, 3
-5. The attacker's invalid signature at batch index 1 (transaction index 2) fails verification
-6. Due to the bug, the error is assigned to `v.errors[1]` (transaction index 1) instead of `v.errors[2]`
-7. Transaction 1 (valid) is rejected, transaction 2 (invalid) may pass through
+**Security guarantee broken:**
+Network availability - the chain cannot initialize and produce blocks despite using documented features correctly.
 
-**Security Failure:**
-- **Authentication bypass**: Invalid signatures may not be properly rejected
-- **Denial of Service**: Valid transactions are incorrectly rejected
-- **Integrity violation**: The core security invariant of "only properly signed transactions are processed" is broken
+## Impact Explanation
 
-### Impact Explanation
+This vulnerability causes complete network shutdown. When a genesis file contains wei balances:
+- 100% of validator nodes panic on startup with identical errors
+- The chain cannot produce any blocks or process transactions (zero throughput)
+- Network is completely non-functional until codebase is patched or genesis is modified
+- All users, validators, and applications depending on the network are affected
 
-**Affected Assets and Processes:**
-- Transaction processing integrity for all SR25519 signed transactions
-- Network availability for legitimate users whose valid transactions get rejected
-- Authentication security as the signature verification barrier is bypassed
+Wei balances are a core feature providing 18-decimal precision for EVM compatibility (similar to Ethereum's wei system with `OneUseiInWei = 1,000,000,000,000`). The feature is properly implemented throughout the banking module but the initialization sequence is broken. [9](#0-8) 
 
-**Severity of Damage:**
-- **Medium to High DoS**: Legitimate transactions are randomly rejected based on batch composition, degrading network reliability
-- **Authentication Bypass**: Transactions with invalid signatures can be accepted if the index mismatch causes their errors to be assigned elsewhere
-- **Unpredictable Behavior**: The exact failure pattern depends on which transactions have pre-verification errors, making the system unreliable
+## Likelihood Explanation
 
-**System Reliability:**
-This fundamentally breaks the trust model of the blockchain. Users cannot rely on:
-- Their valid transactions being processed
-- Invalid transactions being properly rejected
-- Deterministic transaction processing behavior
+The likelihood is HIGH for any chain attempting to use wei balances in genesis:
 
-### Likelihood Explanation
+**Triggering conditions:**
+- Genesis file contains non-zero wei balances in the bank module's `WeiBalances` field
+- Chain performs initial startup or restarts from genesis (e.g., during upgrades)
+- Normal chain startup procedure is followed
 
-**Who Can Trigger:**
-Any network participant can trigger this vulnerability by submitting transactions with invalid SR25519 signatures. No special privileges are required.
+**Probability factors:**
+- Wei balances are documented in the proto definition as a standard feature
+- EVM compatibility is a key feature of Sei (requiring wei precision)
+- Genesis files commonly initialize balances for token distribution
+- This will trigger 100% of the time when wei balances are present
+- Every validator is affected identically
 
-**Conditions Required:**
-- At least one transaction in a batch must have an invalid SR25519 signature
-- At least one transaction must have pre-verification errors (common scenarios: wrong sequence number, nil transaction, type conversion failure, missing pubkey)
-- The network must be using SR25519 signatures and batch verification (which is the intended optimization path)
+While controlled by chain operators (trusted role), using wei balances is a legitimate, documented use case - not misconfiguration. The resulting unrecoverable failure extends beyond the operators' intended authority.
 
-**Frequency:**
-This can occur during normal network operation and can be triggered frequently:
-- Pre-verification errors are common (sequence number mismatches, new accounts without pubkeys set)
-- Any user can submit invalid signatures intentionally or accidentally
-- The bug manifests deterministically once the conditions are met
+## Recommendation
 
-### Recommendation
-
-**Fix:**
-Modify the error assignment logic in `x/auth/ante/batch_sigverify.go` to use the correct transaction index mapping:
+Add `sdk.RegisterDenom()` call in the application initialization before modules are initialized. Implement in `simapp/simd/cmd/root.go` in the `initRootCmd` function before `cfg.Seal()`:
 
 ```go
-if !overall {
-    for i, individual := range individiauls {
-        if !individual {
-            v.errors[sigTxIndices[i]] = sdkerrors.Wrap(  // Use sigTxIndices[i] instead of i
-                sdkerrors.ErrUnauthorized,
-                "signature verification failed; please verify account number and chain-id",
-            )
-        }
+func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
+    cfg := sdk.GetConfig()
+    // Register the base denomination before sealing config
+    if err := sdk.RegisterDenom(sdk.DefaultBondDenom, sdk.OneDec()); err != nil {
+        panic(err)
     }
+    cfg.Seal()
+    // ... rest of function
 }
 ```
 
-**Additional Safety Check:**
-Add a bounds check to prevent potential panic if the arrays are misaligned:
-```go
-if !overall {
-    for i, individual := range individiauls {
-        if !individual && i < len(sigTxIndices) {
-            v.errors[sigTxIndices[i]] = sdkerrors.Wrap(
-                sdkerrors.ErrUnauthorized,
-                "signature verification failed; please verify account number and chain-id",
-            )
-        }
-    }
-}
-```
+This ensures the base denomination is registered before any module initialization occurs, matching the pattern used in all test files. [10](#0-9) 
 
-### Proof of Concept
-
-**File:** `x/auth/ante/batch_sigverify_test.go` (new test file)
-
-**Test Function:** `TestBatchVerifyIndexMismatch`
+## Proof of Concept
 
 **Setup:**
-1. Create a test context at block height 1 (to enable batch verification)
-2. Create 5 transactions with SR25519 signatures:
-   - Transaction 0: Invalid (nil transaction or pre-verification error)
-   - Transaction 1: Valid signature
-   - Transaction 2: Invalid signature (manipulated)
-   - Transaction 3: Valid signature
-   - Transaction 4: Valid signature
-3. Initialize SR25519BatchVerifier with account keeper and sign mode handler
+Create a genesis state with wei balances without calling `sdk.RegisterDenom()` to simulate production startup behavior.
 
-**Trigger:**
-1. Call `verifier.VerifyTxs(ctx, txs)` with the batch of 5 transactions
-2. Transaction 0 will fail pre-verification and not be added to batch
-3. Transactions 1-4 will be added to batch as indices 0-3
-4. Batch verification will return `overall=false` with `individiauls=[true, false, true, true]`
+**Action:**
+Call `InitGenesis` with the genesis state containing wei balances through the normal chain initialization sequence (ABCI `InitChain` → `app.InitChainer` → `app.mm.InitGenesis` → `bank.InitGenesis`). [11](#0-10) 
 
-**Observation:**
-```go
-// Expected behavior:
-// v.errors[0] should have error (pre-verification)
-// v.errors[1] should be nil (valid)
-// v.errors[2] should have error (invalid signature)
-// v.errors[3] should be nil (valid)
-// v.errors[4] should be nil (valid)
+**Result:**
+The function panics with error: "base denom is not registered no denom is registered yet there exists wei balance X", preventing the chain from starting. This can be verified by examining the existing test suite which always calls `sdk.RegisterDenom()` before testing genesis with wei balances, demonstrating awareness of this dependency.
 
-// Actual buggy behavior:
-// v.errors[0] has error (pre-verification) ✓
-// v.errors[1] has signature verification error ✗ (WRONG! tx 1 is valid)
-// v.errors[2] is nil ✗ (WRONG! tx 2 has invalid signature)
-// v.errors[3] is nil ✓
-// v.errors[4] is nil ✓
-
-assert.Nil(t, verifier.errors[1], "Transaction 1 should pass (valid signature)")
-assert.NotNil(t, verifier.errors[2], "Transaction 2 should fail (invalid signature)")
-// These assertions will fail on the vulnerable code, proving the bug
-```
-
-The test demonstrates that:
-1. Transaction 1 with a valid signature is incorrectly rejected
-2. Transaction 2 with an invalid signature is incorrectly accepted
-3. The index mismatch causes errors to be assigned to wrong transactions
-
-This PoC can be implemented using the existing test infrastructure from `x/auth/ante/sigverify_test.go` for creating test transactions and accounts with SR25519 keys using `sr25519.GenPrivKey()`.
+The vulnerability is reproducible 100% of the time when genesis contains wei balances and proves that production chains would experience total startup failure when attempting to use this documented feature.
 
 ### Citations
 
-**File:** x/auth/ante/batch_sigverify.go (L95-163)
+**File:** x/bank/keeper/genesis.go (L39-46)
 ```go
-	sigTxIndices := []int{}
-	sequenceNumberCache := map[uint64]uint64{}
-	for i := range txs {
-		if v.errors[i] != nil {
-			continue
+	baseDenom, err := sdk.GetBaseDenom()
+	if err != nil {
+		if !weiInUsei.IsZero() {
+			panic(fmt.Errorf("base denom is not registered %s yet there exists wei balance %s", err, weiInUsei))
 		}
-		for j := range sigsList[i] {
-			acc, err := GetSignerAcc(ctx, v.ak, signerAddressesList[i][j])
-			if err != nil {
-				v.errors[i] = err
-				continue
-			}
-
-			pubKey := acc.GetPubKey()
-			if pubKey == nil {
-				v.errors[i] = sdkerrors.Wrap(sdkerrors.ErrInvalidPubKey, "pubkey on account is not set")
-				continue
-			}
-			typedPubKey, ok := pubKey.(*sr25519.PubKey)
-			if !ok {
-				v.errors[i] = sdkerrors.Wrapf(
-					sdkerrors.ErrNotSupported,
-					"only sr25519 supported at the moment",
-				)
-				continue
-			}
-
-			accNum := acc.GetAccountNumber()
-
-			var seqNum uint64
-			if cachedSeq, ok := sequenceNumberCache[accNum]; ok {
-				seqNum = cachedSeq + 1
-				sequenceNumberCache[accNum] = seqNum
-			} else {
-				sequenceNumberCache[accNum] = acc.GetSequence()
-				seqNum = sequenceNumberCache[accNum]
-			}
-
-			sig := sigsList[i][j]
-			if sig.Sequence != seqNum {
-				params := v.ak.GetParams(ctx)
-				if !params.GetDisableSeqnoCheck() {
-					v.errors[i] = sdkerrors.Wrapf(
-						sdkerrors.ErrWrongSequence,
-						"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-					)
-					continue
-				}
-			}
-
-			switch data := sig.Data.(type) {
-			case *signing.SingleSignatureData:
-				chainID := ctx.ChainID()
-				signerData := authsigning.SignerData{
-					ChainID:       chainID,
-					AccountNumber: accNum,
-					Sequence:      acc.GetSequence(),
-				}
-				signBytes, err := v.signModeHandler.GetSignBytes(data.SignMode, signerData, txs[i])
-				if err != nil {
-					v.errors[i] = err
-					continue
-				}
-				err = v.verifier.Add(typedPubKey.Key, signBytes, data.Signature)
-				if err != nil {
-					v.errors[i] = err
-					continue
-				}
-				sigTxIndices = append(sigTxIndices, i)
+	} else {
+		totalSupply = totalSupply.Add(sdk.NewCoin(baseDenom, weiInUsei))
+	}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L177-186)
+**File:** types/denom.go (L14-31)
 ```go
-	if !overall {
-		for i, individual := range individiauls {
-			if !individual {
-				v.errors[i] = sdkerrors.Wrap(
-					sdkerrors.ErrUnauthorized,
-					"signature verification failed; please verify account number and chain-id",
-				)
-			}
+// RegisterDenom registers a denomination with a corresponding unit. If the
+// denomination is already registered, an error will be returned.
+func RegisterDenom(denom string, unit Dec) error {
+	if err := ValidateDenom(denom); err != nil {
+		return err
+	}
+
+	if _, ok := denomUnits[denom]; ok {
+		return fmt.Errorf("denom %s already registered", denom)
+	}
+
+	denomUnits[denom] = unit
+
+	if baseDenom == "" || unit.LT(denomUnits[baseDenom]) {
+		baseDenom = denom
+	}
+	return nil
+}
+```
+
+**File:** types/denom.go (L48-54)
+```go
+// GetBaseDenom returns the denom of smallest unit registered
+func GetBaseDenom() (string, error) {
+	if baseDenom == "" {
+		return "", fmt.Errorf("no denom is registered")
+	}
+	return baseDenom, nil
+}
+```
+
+**File:** simapp/simd/cmd/root.go (L149-152)
+```go
+func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
+	cfg := sdk.GetConfig()
+	cfg.Seal()
+
+```
+
+**File:** simapp/simd/main.go (L12-24)
+```go
+func main() {
+	rootCmd, _ := cmd.NewRootCmd()
+
+	if err := svrcmd.Execute(rootCmd, simapp.DefaultNodeHome); err != nil {
+		switch e := err.(type) {
+		case server.ErrorCode:
+			os.Exit(e.Code)
+
+		default:
+			os.Exit(1)
 		}
+	}
+}
+```
+
+**File:** x/bank/keeper/keeper_test.go (L100-101)
+```go
+func (suite *IntegrationTestSuite) SetupTest() {
+	sdk.RegisterDenom(sdk.DefaultBondDenom, sdk.OneDec())
+```
+
+**File:** simapp/app.go (L591-599)
+```go
+// InitChainer application update at chain initialization
+func (app *SimApp) InitChainer(ctx sdk.Context, req abci.RequestInitChain) abci.ResponseInitChain {
+	var genesisState GenesisState
+	if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
+		panic(err)
+	}
+	app.UpgradeKeeper.SetModuleVersionMap(ctx, app.mm.GetVersionMap())
+	return app.mm.InitGenesis(ctx, app.appCodec, genesisState, genesistypes.GenesisImportConfig{})
+}
+```
+
+**File:** proto/cosmos/bank/v1beta1/genesis.proto (L26-28)
+```text
+  // wei balances
+  repeated WeiBalance wei_balances = 5 [(gogoproto.nullable) = false];
+}
+```
+
+**File:** x/bank/keeper/send.go (L52-52)
+```go
+var OneUseiInWei sdk.Int = sdk.NewInt(1_000_000_000_000)
+```
+
+**File:** types/staking.go (L7-7)
+```go
+	DefaultBondDenom = "usei"
+```
+
+**File:** x/bank/keeper/genesis_test.go (L86-89)
+```go
+	weiBalances := []types.WeiBalance{
+		{Amount: sdk.OneInt(), Address: "cosmos1f9xjhxm0plzrh9cskf4qee4pc2xwp0n0556gh0"},
+		{Amount: keeper.OneUseiInWei.Sub(sdk.OneInt()), Address: "cosmos1m3h30wlvsf8llruxtpukdvsy0km2kum8g38c8q"},
 	}
 ```

@@ -1,184 +1,363 @@
-## Title
-Unlimited Fund Drainage via GenericAuthorization for Financial Messages
+After thorough analysis of the codebase and the security claim, I will provide my validation:
 
-## Summary
-The `GenericAuthorization.Accept` method always returns `Accept: true` without any usage limits or spend tracking. When accidentally granted for financial message types like `MsgSend`, it allows a grantee to execute unlimited transactions and drain the granter's entire account until the authorization expires, with no safeguards preventing this dangerous misconfiguration. [1](#0-0) 
+## Audit Report
 
-## Impact
-**High** - Direct loss of funds
+### Title
+Genesis Transaction Validation Bypass Enables Chain Startup Denial-of-Service
 
-## Finding Description
+### Summary
+A validation gap exists between the `CollectTxs` function (used during `collect-gentxs`) and `DeliverGenTxs` (used during chain genesis). The `CollectTxs` function does not call `ValidateBasic()` on genesis transaction messages, while `DeliverGenTxs` does call it and panics on validation failure. This allows an attacker to include invalid genesis transactions that pass initial validation but cause an unconditional panic during chain startup, preventing the network from ever starting.
+
+### Impact
+**High** - Network not being able to confirm new transactions (total network shutdown)
+
+### Finding Description
 
 **Location:** 
-- Primary issue: `x/authz/generic_authorization.go`, lines 24-26 (Accept method)
-- Grant creation: `x/authz/keeper/msg_server.go`, lines 14-42 (no validation)
-- CLI interface: `x/authz/client/cli/tx.go`, lines 101-107 (allows dangerous configs) [1](#0-0) [2](#0-1) [3](#0-2) 
+- Validation gap: [1](#0-0) 
+- Panic on validation failure: [2](#0-1) 
+- ValidateBasic checks: [3](#0-2) 
 
-**Intended Logic:**
-Authorizations for financial operations should track usage and enforce limits. The `SendAuthorization` implementation demonstrates this pattern by maintaining a `SpendLimit`, decrementing it on each use, and either deleting the grant when exhausted or returning an updated authorization with the reduced limit. [4](#0-3) 
+**Intended Logic:** 
+Genesis transactions should be thoroughly validated during the `collect-gentxs` phase to ensure only valid transactions are included in genesis.json. During chain startup, these pre-validated transactions should execute successfully without errors.
 
-**Actual Logic:**
-`GenericAuthorization.Accept` unconditionally returns `Accept: true` with neither `Delete` nor `Updated` set in the response. This means the authorization persists indefinitely until expiration, allowing unlimited executions. The system provides no validation to prevent granting `GenericAuthorization` for financial message types that should use limited authorizations.
+**Actual Logic:** 
+The `CollectTxs` function validates account balances and delegation amounts but does NOT call `ValidateBasic()` on the message itself. [4](#0-3)  It only performs balance checks, not message field validation.
 
-**Exploit Scenario:**
-1. User Alice wants to authorize Bob to send up to 1000 tokens on her behalf
-2. Alice accidentally creates a `GenericAuthorization` for `MsgSend` instead of a `SendAuthorization` with a proper spend limit
-3. Bob can now execute unlimited `MsgSend` transactions from Alice's account
-4. Bob drains Alice's entire balance (e.g., 1,000,000 tokens) through repeated executions
-5. The authorization remains active until its expiration date (potentially months away)
+However, during chain startup, the transaction delivery pipeline calls `validateBasicTxMsgs` [5](#0-4)  which calls `ValidateBasic()` on each message [6](#0-5) .
 
-The `DispatchActions` flow calls `authorization.Accept()` and respects the response, but `GenericAuthorization` never signals deletion or updates: [5](#0-4) 
+The `MsgCreateValidator.ValidateBasic()` performs critical validations that CollectTxs skips:
+- Empty description check (line 120-122)
+- Empty commission check (line 124-126)
+- Commission rate validation (line 128-130)
+- MinSelfDelegation positivity check (line 132-137)
+- Pubkey nil check (line 112-114)
 
-**Security Failure:**
-Authorization accounting and access control is completely bypassed. The system fails to enforce spend limits on financial operations, breaking the fundamental security invariant that authorized actions should be bounded and tracked.
+**Exploitation Path:**
+1. Attacker participating in genesis creates a gentx JSON file with empty `CommissionRates{}` or `Description{}`
+2. Places the file in the gentxs directory before `collect-gentxs` runs
+3. `CollectTxs` processes the transaction, validates balances, but skips `ValidateBasic()` call
+4. Invalid gentx is included in genesis.json
+5. During chain startup, `InitGenesis` is called [7](#0-6) 
+6. `InitGenesis` calls `DeliverGenTxs` which iterates through gentxs [8](#0-7) 
+7. For the invalid gentx, the delivery pipeline calls `ValidateBasic()` which returns an error
+8. `DeliverTx` returns a non-OK response
+9. Code unconditionally panics: `if !res.IsOK() { panic(res.Log) }` [9](#0-8) 
+10. Node crashes and cannot complete genesis
+11. All nodes using the same genesis.json experience the same panic
+12. Network cannot start
 
-## Impact Explanation
+**Security Guarantee Broken:** 
+The system fails to provide defense-in-depth validation. The validation boundary is inconsistent - some checks happen during collection, others only during delivery. This allows invalid data to bypass initial validation and cause system failure at a critical initialization phase.
 
-**Affected Assets:** All tokens in the granter's account that can be transferred via the authorized message type.
+### Impact Explanation
 
-**Severity of Damage:** 
-- Complete fund drainage: A grantee can transfer all available funds from the granter's account
-- No automatic termination: The authorization continues until expiration
-- Irreversible: Once funds are transferred, they cannot be recovered without the grantee's cooperation
+This vulnerability causes **complete network failure at genesis**:
 
-**System Impact:**
-This undermines the entire authz security model. Users cannot safely delegate limited permissions because the system allows unlimited authorization without safeguards. This could lead to massive fund losses across the network as users misuse `GenericAuthorization` for financial operations.
+- **Irrecoverable without manual intervention**: The chain cannot self-recover. Requires identifying the malicious gentx, removing it, and regenerating genesis.json
+- **Affects all nodes simultaneously**: Since all nodes use the same genesis.json, all validators fail to start
+- **Worse than post-genesis shutdown**: The network never reaches operational state. No blocks are produced, no transactions processed
+- **Trust erosion**: Delays network launch and undermines confidence in the genesis process
+- **Pre-consensus DoS**: Prevents the chain from even initializing consensus
 
-## Likelihood Explanation
+The impact severity matches the explicit criteria: "Network not being able to confirm new transactions (total network shutdown)".
 
-**Who can trigger:** Any grantee who receives a `GenericAuthorization` for a financial message type can exploit this, either maliciously or accidentally through repeated legitimate uses that exceed intended limits.
+### Likelihood Explanation
 
-**Required conditions:**
-- Granter creates `GenericAuthorization` for a financial message type (e.g., `MsgSend`, `MsgDelegate`)
-- This is easily done via CLI and is not prevented by any validation
-- The authorization has not yet expired
+**Who Can Trigger:**
+- Any genesis participant who can submit a gentx file
+- Malicious initial validators
+- Compromised genesis coordinators
+- Competitors seeking to sabotage a network launch
+
+**Required Conditions:**
+- Access to place a gentx file during genesis ceremony (standard for genesis participants)
+- Knowledge that empty commission/description fields bypass CollectTxs but fail ValidateBasic
+- Timing: must occur before `collect-gentxs` execution
 
 **Frequency:**
-This can occur during normal operation whenever users misunderstand the authorization types. The CLI explicitly supports creating `GenericAuthorization` for any message type, making this misconfiguration readily accessible. Given that `SendAuthorization` and `GenericAuthorization` are both available options, user confusion is highly likely, especially for users familiar with generic authorization patterns in other systems.
+While exploitable only during genesis (one-time window), the impact is catastrophic. The attack requires minimal sophistication - simply creating a JSON file with empty commission or description fields. An honest participant could even trigger this accidentally by making a mistake in their gentx configuration.
 
-## Recommendation
+**Key Point**: Even if genesis participants are considered "trusted roles," this qualifies under the exception clause: "even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." A single participant (trusted or not) making an error shouldn't be able to prevent the entire network from ever starting.
 
-Implement validation in the `Grant` message handler to reject `GenericAuthorization` for message types that have specialized authorization implementations with built-in limits:
+### Recommendation
 
-1. Maintain a registry of message types that require limited authorizations (e.g., `MsgSend` → `SendAuthorization`, `MsgDelegate` → `StakeAuthorization`)
-2. In `Keeper.Grant()`, check if the authorization is `GenericAuthorization` and the message type is in the restricted registry
-3. Return an error if `GenericAuthorization` is attempted for a restricted message type, instructing users to use the appropriate limited authorization
+Add `ValidateBasic()` validation in the `CollectTxs` function to ensure parity between collection-time and delivery-time validation:
 
-Alternatively, modify `GenericAuthorization` to accept an optional usage limit parameter that decrements on each use, similar to `SendAuthorization`'s spend limit pattern.
+```go
+// In x/genutil/collect.go, after line 139 (after getting msgs)
+msgs := genTx.GetMsgs()
+for _, msg := range msgs {
+    if err := msg.ValidateBasic(); err != nil {
+        return appGenTxs, persistentPeers, fmt.Errorf("gentx %s failed ValidateBasic: %w", fo.Name(), err)
+    }
+}
+```
 
-## Proof of Concept
+This closes the validation gap and ensures invalid gentxs are rejected during collection rather than causing a panic during genesis.
 
-**File:** `x/authz/keeper/keeper_test.go`
+### Proof of Concept
 
-**Test Function:** `TestGenericAuthorizationUnlimitedExploit` (add after existing tests)
+**File:** `x/genutil/gentx_test.go`
 
 **Setup:**
-- Initialize test app with 3 addresses: granter, grantee, recipient
-- Fund granter's account with 10,000 tokens
-- Create a `GenericAuthorization` for `MsgSend` (instead of `SendAuthorization`) with 1-hour expiration
+The existing test suite at lines 30-32 already demonstrates that empty CommissionRates{} can be constructed: [10](#0-9) 
 
-**Trigger:**
-- Execute 100 consecutive `MsgSend` transactions through `DispatchActions`, each sending 50 tokens
-- This transfers 5,000 tokens total, far exceeding any reasonable authorization intent
-- Continue executing until the granter's balance is exhausted
+**Test Case to Add:**
+Add the following test case to `TestDeliverGenTxs` (around line 211):
 
-**Observation:**
-- All 100+ transactions succeed without the authorization being deleted or updated
-- The granter's balance is fully drained
-- The authorization remains active in storage
-- Compare with a parallel test using `SendAuthorization` with a 50-token limit, which correctly fails after the first transaction
+```go
+{
+    "invalid gentx with empty commission causes panic",
+    func() {
+        _ = suite.setAccountBalance(addr1, 50)
+        
+        // Create MsgCreateValidator with empty commission
+        amount := sdk.NewInt64Coin(sdk.DefaultBondDenom, 10)
+        emptyComm := stakingtypes.CommissionRates{} // Invalid - empty commission
+        desc := stakingtypes.NewDescription("validator", "", "", "", "")
+        minSelfDel := sdk.OneInt()
+        
+        invalidMsg, err := stakingtypes.NewMsgCreateValidator(
+            sdk.ValAddress(pk1.Address()), 
+            pk1, 
+            amount, 
+            desc, 
+            emptyComm, // Will fail ValidateBasic during delivery
+            minSelfDel,
+        )
+        suite.Require().NoError(err) // Constructor doesn't validate
+        
+        tx, err := helpers.GenTx(
+            suite.encodingConfig.TxConfig,
+            []sdk.Msg{invalidMsg},
+            sdk.Coins{sdk.NewInt64Coin(sdk.DefaultBondDenom, 10)},
+            helpers.DefaultGenTxGas,
+            suite.ctx.ChainID(),
+            []uint64{0},
+            []uint64{0},
+            priv1,
+        )
+        suite.Require().NoError(err)
+        
+        genTxs = make([]json.RawMessage, 1)
+        genTx, err := suite.encodingConfig.TxConfig.TxJSONEncoder()(tx)
+        suite.Require().NoError(err)
+        genTxs[0] = genTx
+    },
+    false, // expPass = false, expecting panic
+},
+```
 
-This test demonstrates that `GenericAuthorization` allows unlimited fund drainage, while proper authorization implementations prevent this through spend tracking and automatic deletion.
+**Expected Result:**
+The test should panic when `DeliverGenTxs` is called (as verified by `suite.Require().Panics()` at line 272), confirming that an invalid gentx bypasses collection validation but causes a panic during genesis delivery.
+
+**Verification:**
+Run `go test -v ./x/genutil/... -run TestDeliverGenTxs` with this test case to observe the panic, proving the validation gap is exploitable.
+
+### Notes
+
+This vulnerability represents a critical validation gap in the genesis process. While genesis participants have a special role, the principle of defense-in-depth requires consistent validation at all boundaries. The fact that `CollectTxs` performs *some* validations (balances, funds) but not *all* validations (`ValidateBasic()`) creates an exploitable inconsistency.
+
+The existing test suite inadvertently uses invalid data (`comm = stakingtypes.CommissionRates{}`) but never actually delivers these messages through `DeliverGenTxs`, which is why the issue wasn't caught in testing.
 
 ### Citations
 
-**File:** x/authz/generic_authorization.go (L24-26)
+**File:** x/genutil/collect.go (L70-184)
 ```go
-func (a GenericAuthorization) Accept(ctx sdk.Context, msg sdk.Msg) (AcceptResponse, error) {
-	return AcceptResponse{Accept: true}, nil
+// CollectTxs processes and validates application's genesis Txs and returns
+// the list of appGenTxs, and persistent peers required to generate genesis.json.
+func CollectTxs(cdc codec.JSONCodec, txJSONDecoder sdk.TxDecoder, moniker, genTxsDir string,
+	genDoc tmtypes.GenesisDoc, genBalIterator types.GenesisBalancesIterator,
+) (appGenTxs []sdk.Tx, persistentPeers string, err error) {
+	// prepare a map of all balances in genesis state to then validate
+	// against the validators addresses
+	var appState map[string]json.RawMessage
+	if err := json.Unmarshal(genDoc.AppState, &appState); err != nil {
+		return appGenTxs, persistentPeers, err
+	}
+
+	var fos []os.FileInfo
+	fos, err = ioutil.ReadDir(genTxsDir)
+	if err != nil {
+		return appGenTxs, persistentPeers, err
+	}
+
+	balancesMap := make(map[string]bankexported.GenesisBalance)
+
+	genBalIterator.IterateGenesisBalances(
+		cdc, appState,
+		func(balance bankexported.GenesisBalance) (stop bool) {
+			balancesMap[balance.GetAddress().String()] = balance
+			return false
+		},
+	)
+
+	// addresses and IPs (and port) validator server info
+	var addressesIPs []string
+
+	for _, fo := range fos {
+		if fo.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(fo.Name(), ".json") {
+			continue
+		}
+
+		// get the genTx
+		jsonRawTx, err := ioutil.ReadFile(filepath.Join(genTxsDir, fo.Name()))
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		var genTx sdk.Tx
+		if genTx, err = txJSONDecoder(jsonRawTx); err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		appGenTxs = append(appGenTxs, genTx)
+
+		// the memo flag is used to store
+		// the ip and node-id, for example this may be:
+		// "528fd3df22b31f4969b05652bfe8f0fe921321d5@192.168.2.37:26656"
+
+		memoTx, ok := genTx.(sdk.TxWithMemo)
+		if !ok {
+			return appGenTxs, persistentPeers, fmt.Errorf("expected TxWithMemo, got %T", genTx)
+		}
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
+		}
+
+		// genesis transactions must be single-message
+		msgs := genTx.GetMsgs()
+
+		// TODO abstract out staking message validation back to staking
+		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
+
+		// validate delegator and validator addresses and funds against the accounts in the state
+		delAddr := msg.DelegatorAddress
+		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		delBal, delOk := balancesMap[delAddr]
+		if !delOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
+			}
+
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
+		}
+
+		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
+		if !valOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
+			}
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
+		}
+
+		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
+			return appGenTxs, persistentPeers, fmt.Errorf(
+				"insufficient fund for delegation %v: %v < %v",
+				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
+			)
+		}
+
+		// exclude itself from persistent peers
+		if msg.Description.Moniker != moniker {
+			addressesIPs = append(addressesIPs, nodeAddrIP)
+		}
+	}
+
+	sort.Strings(addressesIPs)
+	persistentPeers = strings.Join(addressesIPs, ",")
+
+	return appGenTxs, persistentPeers, nil
 }
 ```
 
-**File:** x/authz/keeper/msg_server.go (L14-42)
+**File:** x/genutil/gentx.go (L96-117)
 ```go
-func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
-	}
+func DeliverGenTxs(
+	ctx sdk.Context, genTxs []json.RawMessage,
+	stakingKeeper types.StakingKeeper, deliverTx deliverTxfn,
+	txEncodingConfig client.TxEncodingConfig,
+) ([]abci.ValidatorUpdate, error) {
 
-	granter, err := sdk.AccAddressFromBech32(msg.Granter)
-	if err != nil {
-		return nil, err
-	}
+	for _, genTx := range genTxs {
+		tx, err := txEncodingConfig.TxJSONDecoder()(genTx)
+		if err != nil {
+			panic(err)
+		}
 
-	authorization := msg.GetAuthorization()
-	if authorization == nil {
-		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
-	}
+		bz, err := txEncodingConfig.TxEncoder()(tx)
+		if err != nil {
+			panic(err)
+		}
 
-	t := authorization.MsgTypeURL()
-	if k.router.HandlerByTypeURL(t) == nil {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
+		}
 	}
-
-	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgGrantResponse{}, nil
-}
 ```
 
-**File:** x/authz/client/cli/tx.go (L101-107)
+**File:** x/staking/types/msg.go (L120-126)
 ```go
-			case "generic":
-				msgType, err := cmd.Flags().GetString(FlagMsgType)
-				if err != nil {
-					return err
-				}
+	if msg.Description == (Description{}) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "empty description")
+	}
 
-				authorization = authz.NewGenericAuthorization(msgType)
+	if msg.Commission == (CommissionRates{}) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "empty commission")
+	}
 ```
 
-**File:** x/bank/types/send_authorization.go (L26-40)
+**File:** baseapp/baseapp.go (L787-800)
 ```go
-func (a SendAuthorization) Accept(ctx sdk.Context, msg sdk.Msg) (authz.AcceptResponse, error) {
-	mSend, ok := msg.(*MsgSend)
-	if !ok {
-		return authz.AcceptResponse{}, sdkerrors.ErrInvalidType.Wrap("type mismatch")
-	}
-	limitLeft, isNegative := a.SpendLimit.SafeSub(mSend.Amount)
-	if isNegative {
-		return authz.AcceptResponse{}, sdkerrors.ErrInsufficientFunds.Wrapf("requested amount is more than spend limit")
-	}
-	if limitLeft.IsZero() {
-		return authz.AcceptResponse{Accept: true, Delete: true}, nil
+// validateBasicTxMsgs executes basic validator calls for messages.
+func validateBasicTxMsgs(msgs []sdk.Msg) error {
+	if len(msgs) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
 	}
 
-	return authz.AcceptResponse{Accept: true, Delete: false, Updated: &SendAuthorization{SpendLimit: limitLeft}}, nil
-}
+	for _, msg := range msgs {
+		err := msg.ValidateBasic()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 ```
 
-**File:** x/authz/keeper/keeper.go (L94-110)
+**File:** baseapp/baseapp.go (L923-923)
 ```go
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
+	if err := validateBasicTxMsgs(msgs); err != nil {
+```
 
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
-			}
-			if err != nil {
-				return nil, err
-			}
+**File:** x/genutil/genesis.go (L12-20)
+```go
+func InitGenesis(
+	ctx sdk.Context, stakingKeeper types.StakingKeeper,
+	deliverTx deliverTxfn, genesisState types.GenesisState,
+	txEncodingConfig client.TxEncodingConfig,
+) (validators []abci.ValidatorUpdate, err error) {
+	if len(genesisState.GenTxs) > 0 {
+		validators, err = DeliverGenTxs(ctx, genesisState.GenTxs, stakingKeeper, deliverTx, txEncodingConfig)
+	}
+	return
+```
 
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
+**File:** x/genutil/gentx_test.go (L30-32)
+```go
+	desc  = stakingtypes.NewDescription("testname", "", "", "", "")
+	comm  = stakingtypes.CommissionRates{}
+)
 ```

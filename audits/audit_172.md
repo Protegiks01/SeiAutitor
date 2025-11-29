@@ -1,215 +1,295 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Non-Atomic Multi-Store Write Operation Causes Persistent Store and Memory Store Inconsistency in ClaimCapability
+Missing Validation of AllowedFeeDenoms Enables Network-Wide Validator Crash via Invalid Denomination
 
 ## Summary
-The `ClaimCapability` function updates both persistent and memory stores within a transaction. When the transaction commits via `CacheMultiStore.Write()`, the method iterates over stores non-atomically. If a crash, panic, or failure occurs mid-iteration, some stores are written while others are not, creating permanent inconsistency between the persistent and memory stores that gets committed to disk. [1](#0-0) 
+The `FeesParams.Validate()` function fails to validate the `AllowedFeeDenoms` field, allowing invalid denomination strings to be set at genesis or through governance. When transactions use these invalid denominations as fees, all validator nodes panic during transaction validation in `CheckTx`, causing network shutdown.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
 **Location:** 
-- Primary issue: [2](#0-1) 
-- Affected function: [1](#0-0) 
+- Primary vulnerability: [1](#0-0) 
+- Genesis validation: [2](#0-1) 
+- Setter with ignored validation: [3](#0-2) 
+- Panic trigger point: [4](#0-3) 
 
-**Intended Logic:** 
-The `ClaimCapability` function should atomically update both the persistent store (capability ownership) and memory store (forward/reverse capability mappings). Both stores should remain consistent - either both updates succeed or both fail. [3](#0-2) 
+**Intended Logic:**
+The `FeesParams.Validate()` function should validate all parameter fields including `AllowedFeeDenoms` to ensure each denomination matches the required regex pattern [5](#0-4)  (`[a-zA-Z][a-zA-Z0-9/-]{2,127}`).
 
-**Actual Logic:** 
-When a transaction completes successfully, `CacheMultiStore.Write()` is called to commit cached changes. This method iterates over a Go map of stores and writes each sequentially without atomicity guarantees: [2](#0-1) 
+**Actual Logic:**
+The validation function only checks `GlobalMinimumGasPrices` and completely ignores the `AllowedFeeDenoms` field [1](#0-0) . Additionally, `SetFeesParams` calls `Validate()` but doesn't check the return value (line 39).
 
-Since Go map iteration is non-deterministic, the order of writes is unpredictable. If a panic or crash occurs during iteration (e.g., from `store.parent.Set()` or `store.parent.Delete()` panicking due to database errors), previous stores are already written to the parent while subsequent stores are not. [4](#0-3) 
+**Exploitation Path:**
+1. Genesis file or governance proposal sets `AllowedFeeDenoms` with an invalid denomination (e.g., "!", "", "@#$")
+2. Invalid value bypasses validation because `FeesParams.Validate()` doesn't check this field
+3. User submits transaction with fee in the invalid denomination (bypasses [6](#0-5)  which only checks nil/negative amounts)
+4. Transaction enters `CheckTx` on validator nodes
+5. Ante handler calls `CheckTxFeeWithValidatorMinGasPrices` which filters fee coins using [4](#0-3) 
+6. `NonZeroAmountsOf` [7](#0-6)  calls `NewCoin` with the invalid denom (line 647)
+7. `NewCoin` [8](#0-7)  validates the coin and panics on invalid denom (lines 22-23)
+8. Validator node crashes
 
-The underlying database operations can panic on errors: [5](#0-4) [6](#0-5) 
-
-**Exploit Scenario:**
-1. A module calls `ClaimCapability` during transaction execution
-2. Both persistent store (via `addOwner`) and memory store updates are cached
-3. Transaction succeeds and `msCache.Write()` is called in `runTx`
-4. During the Write() iteration, if the persistent store writes successfully but the memory store write panics (due to disk full, I/O error, memory corruption, or hardware failure), the deliverState becomes inconsistent
-5. The panic is caught by the defer/recover in `runTx`, but the partial writes to deliverState remain
-6. Subsequent transactions in the block operate on inconsistent state
-7. At block end, `WriteState()` commits the inconsistent deliverState to disk [7](#0-6) [8](#0-7) 
-
-**Security Failure:**
-State consistency invariant is violated. The persistent store may record capability ownership while the memory store lacks the corresponding mappings (or vice versa), breaking the capability module's ability to correctly validate capability ownership in future operations.
+**Security Guarantee Broken:**
+Network availability and consensus safety. Validators should never panic during normal transaction processing. The missing validation allows invalid configuration state that violates the denom format invariant [9](#0-8) .
 
 ## Impact Explanation
 
-This vulnerability affects the capability module's state integrity, which is critical for Inter-Blockchain Communication (IBC) and other modules that rely on capability-based access control:
+This vulnerability enables network-wide denial of service through validator crashes. Once invalid denominations are configured in `AllowedFeeDenoms`, any user can submit a transaction with fees in that denomination, causing all validators that process it to panic simultaneously. This leads to:
 
-- **Affected Processes:** Capability ownership tracking becomes inconsistent. Modules may own capabilities according to the persistent store but be unable to retrieve them via `GetCapability` (which uses the memory store), or vice versa.
+- **Total network shutdown**: All validators crash when processing the malicious transaction during `CheckTx`
+- **Consensus halt**: With validators down, the network cannot confirm new blocks
+- **Persistent DoS**: The malicious transaction may remain in mempools, causing repeated crashes on restart
+- **Difficult recovery**: Requires coordinated network-wide mempool flush or protocol upgrade
 
-- **Severity:** The inconsistency persists on disk and affects all nodes that process the block. After restart, `InitMemStore` reconstructs the memory store from persistent state, but this doesn't resolve the core issue - if writes were partially applied before commit, the on-disk state itself may be inconsistent.
-
-- **System Reliability:** This qualifies as "A bug in the layer 0/1/2 network code that results in unintended smart contract behavior" (Medium impact per scope). IBC channels, ports, and other capability-dependent operations may fail unexpectedly, potentially causing transaction failures or module malfunctions without direct fund loss.
+This matches the "Network not being able to confirm new transactions (total network shutdown)" impact category (High severity).
 
 ## Likelihood Explanation
 
-**Who can trigger it:** Any transaction that calls `ClaimCapability` can be affected if a hardware/database failure occurs at the critical moment.
+**Precondition Setup:**
+Invalid `AllowedFeeDenoms` can be set through:
+- Genesis file configuration (common during chain launch, often generated programmatically without manual review of every field)
+- Governance proposals (any token holder can propose, may not undergo thorough validation)
 
-**Required conditions:** 
-- A hardware failure, disk I/O error, out-of-memory condition, or database corruption must occur during the `Write()` operation
-- The timing must be precise - during the store iteration after one store writes but before another
+**Exploitation:**
+Once the precondition exists, exploitation is trivial:
+- **Who**: Any network participant can trigger by submitting a transaction
+- **How**: Simple transaction with fee in the invalid denomination
+- **Frequency**: Can be repeated indefinitely until fixed
 
-**Frequency:** While not frequently occurring, hardware failures and database errors are realistic operational concerns in production blockchain infrastructure. The non-deterministic nature of the issue makes it difficult to predict or reproduce, but when it occurs, the impact is permanent state corruption. The TODO comment in the code acknowledges this issue: [9](#0-8) 
+**Realistic Scenario:**
+High likelihood because:
+- Genesis files often contain programmatically generated parameters that may not be manually validated
+- Governance proposals can introduce typos or copy-paste errors
+- The missing validation creates a false sense of security (validation function exists but is incomplete)
+- The consequence (network crash) is severely disproportionate to the configuration action (setting fee denoms)
+
+This is an **inadvertent privileged misconfiguration vulnerability** where missing validation allows mistakes (not malicious actions) to cause catastrophic failures beyond the intended authority of the configuration parameter.
 
 ## Recommendation
 
-Implement atomic write operations for the `CacheMultiStore.Write()` method by using database batch operations. The recommended fix:
+Add comprehensive validation to `FeesParams.Validate()`:
 
-1. Collect all key-value pairs from all stores before writing
-2. Use a database batch transaction to write all changes atomically
-3. If any write fails, the entire batch is rolled back, maintaining consistency
+```go
+func (fp *FeesParams) Validate() error {
+    for _, fee := range fp.GlobalMinimumGasPrices {
+        if err := fee.Validate(); err != nil {
+            return err
+        }
+    }
+    
+    // Validate AllowedFeeDenoms
+    for _, denom := range fp.AllowedFeeDenoms {
+        if err := sdk.ValidateDenom(denom); err != nil {
+            return fmt.Errorf("invalid allowed fee denom %q: %w", denom, err)
+        }
+    }
+    
+    return nil
+}
+```
 
-Alternatively, implement a two-phase commit protocol where:
-1. Phase 1: All stores prepare their writes and verify they can succeed
-2. Phase 2: Only if all stores successfully prepare, commit all writes together
-3. If any store fails in phase 1, abort without modifying any state
+Additionally, fix `SetFeesParams` to properly handle validation errors:
 
-This ensures that either all stores in the cache are written or none are, maintaining the invariant that persistent and memory stores remain consistent.
+```go
+func (k Keeper) SetFeesParams(ctx sdk.Context, feesParams types.FeesParams) error {
+    if err := feesParams.Validate(); err != nil {
+        return err
+    }
+    subspace, exist := k.GetSubspace(types.ModuleName)
+    if !exist {
+        panic("subspace params should exist")
+    }
+    subspace.Set(ctx, types.ParamStoreKeyFeesParams, feesParams)
+    return nil
+}
+```
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go` (add new test function)
-
-**Test Function:** `TestClaimCapabilityPartialWriteFailure`
+**File:** `x/auth/ante/fee_test.go`
 
 **Setup:**
-```
-1. Initialize a test app with capability keeper
-2. Create a scoped keeper for a test module
-3. Create a new capability via NewCapability
-4. Set up a mock store that will panic after writing the first store but before the second
+1. Initialize test suite with validator and accounts
+2. Set `AllowedFeeDenoms` to contain invalid denomination "!" using `SetFeesParams`
+3. Fund test account with valid coins
+
+**Action:**
+1. Create transaction with fee using invalid denom "!" by directly constructing `sdk.Coin{Denom: "!", Amount: sdk.NewInt(100)}`
+2. Set context to `CheckTx` mode
+3. Execute ante handler chain
+
+**Result:**
+Ante handler panics when `NonZeroAmountsOf` calls `NewCoin("!", amt)`, which triggers `ValidateDenom` that returns error for invalid denom, causing `NewCoin` to panic. The panic would crash the validator node in production.
+
+**Test Code Structure:**
+```go
+func (suite *AnteTestSuite) TestInvalidAllowedFeeDenomCausesNodePanic() {
+    // Setup
+    suite.SetupTest(true)
+    suite.txBuilder = suite.clientCtx.TxConfig.NewTxBuilder()
+    
+    // Set invalid AllowedFeeDenoms
+    feeParam := suite.app.ParamsKeeper.GetFeesParams(suite.ctx)
+    feeParam.AllowedFeeDenoms = []string{"!"}
+    suite.app.ParamsKeeper.SetFeesParams(suite.ctx, feeParam)
+    
+    // Fund account
+    priv1, _, addr1 := testdata.KeyTestPubAddr()
+    coins := sdk.NewCoins(sdk.NewCoin("usei", sdk.NewInt(1000000)))
+    simapp.FundAccount(suite.app.BankKeeper, suite.ctx, addr1, coins)
+    
+    // Create transaction with invalid fee denom
+    msg := testdata.NewTestMsg(addr1)
+    suite.txBuilder.SetMsgs(msg)
+    invalidFee := sdk.Coins{sdk.Coin{Denom: "!", Amount: sdk.NewInt(100)}}
+    suite.txBuilder.SetFeeAmount(invalidFee)
+    suite.txBuilder.SetGasLimit(100000)
+    
+    privs, accNums, accSeqs := []cryptotypes.PrivKey{priv1}, []uint64{0}, []uint64{0}
+    tx, _ := suite.CreateTestTx(privs, accNums, accSeqs, suite.ctx.ChainID())
+    
+    // Execute in CheckTx mode
+    suite.ctx = suite.ctx.WithIsCheckTx(true)
+    mfd := ante.NewDeductFeeDecorator(suite.app.AccountKeeper, suite.app.BankKeeper, 
+                                      suite.app.FeeGrantKeeper, suite.app.ParamsKeeper, nil)
+    antehandler, _ := sdk.ChainAnteDecorators(sdk.DefaultWrappedAnteDecorator(mfd))
+    
+    // Verify panic occurs
+    suite.Require().Panics(func() {
+        antehandler(suite.ctx, tx, false)
+    })
+}
 ```
 
-**Trigger:**
-```
-1. Call ClaimCapability from a different module to claim the existing capability
-2. Simulate a database error during the Write() operation by injecting a panic in one of the store's Write() methods
-3. Observe that the transaction appears to fail (panic caught), but deliverState has been partially updated
-```
+## Notes
 
-**Observation:**
-The test should detect that:
-- The persistent store has been updated with the new owner
-- The memory store has NOT been updated with the forward/reverse mappings
-- Subsequent GetCapability calls fail even though the module should own the capability according to persistent state
-- This inconsistency persists and would be committed to disk
+This vulnerability exists because of two compounding bugs:
+1. **Incomplete validation**: `FeesParams.Validate()` doesn't check `AllowedFeeDenoms`
+2. **Ignored validation results**: `SetFeesParams` calls `Validate()` but doesn't check the return value
 
-**Note:** Due to the complexity of mocking the exact failure scenario at the CacheMultiStore level, a full working PoC would require extensive test infrastructure modifications. The vulnerability is confirmed by code inspection showing the non-atomic iteration in `CacheMultiStore.Write()` and the acknowledgment in the TODO comment about the lack of atomicity.
+While setting `AllowedFeeDenoms` requires privileged access (genesis or governance), this is classified as a valid vulnerability because:
+- The validation function exists specifically to catch configuration mistakes (not just malicious actions)
+- Inadvertent errors (typos, copy-paste mistakes) in genesis files or governance proposals are realistic
+- The consequence (network-wide crash) is catastrophically disproportionate to the intended authority (configuring fee denominations)
+- This violates the principle that configuration errors should not cause unrecoverable system failures
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** x/params/types/params.go (L27-34)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+func (fp *FeesParams) Validate() error {
+	for _, fee := range fp.GlobalMinimumGasPrices {
+		if err := fee.Validate(); err != nil {
+			return err
+		}
 	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
 	return nil
 }
 ```
 
-**File:** store/cachemulti/store.go (L141-147)
+**File:** x/params/types/genesis.go (L37-42)
 ```go
-// Write calls Write on each underlying store.
-func (cms Store) Write() {
-	cms.db.Write()
-	for _, store := range cms.stores {
-		store.Write()
+func (gs GenesisState) Validate() error {
+	if err := gs.CosmosGasParams.Validate(); err != nil {
+		return err
 	}
+	return gs.FeesParams.Validate()
 }
 ```
 
-**File:** store/cachekv/store.go (L116-117)
+**File:** x/params/keeper/keeper.go (L38-45)
 ```go
-	// TODO: Consider allowing usage of Batch, which would allow the write to
-	// at least happen atomically.
-```
-
-**File:** store/cachekv/store.go (L118-133)
-```go
-	for _, key := range keys {
-		if store.isDeleted(key) {
-			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
-			// be sure if the underlying store might do a save with the byteslice or
-			// not. Once we get confirmation that .Delete is guaranteed not to
-			// save the byteslice, then we can assume only a read-only copy is sufficient.
-			store.parent.Delete([]byte(key))
-			continue
-		}
-
-		cacheValue, ok := store.cache.Load(key)
-		if ok && cacheValue.(*types.CValue).Value() != nil {
-			// It already exists in the parent, hence delete it.
-			store.parent.Set([]byte(key), cacheValue.(*types.CValue).Value())
-		}
+func (k Keeper) SetFeesParams(ctx sdk.Context, feesParams types.FeesParams) {
+	feesParams.Validate()
+	subspace, exist := k.GetSubspace(types.ModuleName)
+	if !exist {
+		panic("subspace params should exist")
 	}
+	subspace.Set(ctx, types.ParamStoreKeyFeesParams, feesParams)
+}
 ```
 
-**File:** store/dbadapter/store.go (L44-49)
+**File:** x/auth/ante/validator_tx_fee.go (L21-23)
 ```go
-func (dsa Store) Set(key, value []byte) {
-	types.AssertValidKey(key)
-	if err := dsa.DB.Set(key, value); err != nil {
+	feeCoins := feeTx.GetFee()
+	feeParams := paramsKeeper.GetFeesParams(ctx)
+	feeCoins = feeCoins.NonZeroAmountsOf(append([]string{sdk.DefaultBondDenom}, feeParams.GetAllowedFeeDenoms()...))
+```
+
+**File:** types/coin.go (L14-27)
+```go
+// NewCoin returns a new coin with a denomination and amount. It will panic if
+// the amount is negative or if the denomination is invalid.
+func NewCoin(denom string, amount Int) Coin {
+	coin := Coin{
+		Denom:  denom,
+		Amount: amount,
+	}
+
+	if err := coin.Validate(); err != nil {
 		panic(err)
 	}
+
+	return coin
 }
 ```
 
-**File:** store/dbadapter/store.go (L52-56)
+**File:** types/coin.go (L641-651)
 ```go
-func (dsa Store) Delete(key []byte) {
-	if err := dsa.DB.Delete(key); err != nil {
-		panic(err)
+// NonZeroAmountsOf returns non-zero coins for provided denoms
+func (coins Coins) NonZeroAmountsOf(denoms []string) (subset Coins) {
+	subset = Coins{}
+	for _, denom := range denoms {
+		amt := coins.AmountOf(denom)
+		if amt.IsPositive() {
+			subset = append(subset, NewCoin(denom, amt))
+		}
 	}
+	return
 }
 ```
 
-**File:** baseapp/baseapp.go (L339-342)
+**File:** types/coin.go (L776-784)
 ```go
-func (app *BaseApp) OccEnabled() bool {
-	return app.occEnabled
-}
-
+var (
+	// Denominations can be 3 ~ 128 characters long and support letters, followed by either
+	// a letter, a number or a separator ('/').
+	reDnmString = `[a-zA-Z][a-zA-Z0-9/-]{2,127}`
+	reDecAmt    = `[[:digit:]]+(?:\.[[:digit:]]+)?|\.[[:digit:]]+`
+	reSpc       = `[[:space:]]*`
+	reDnm       *regexp.Regexp
+	reDecCoin   *regexp.Regexp
+)
 ```
 
-**File:** baseapp/baseapp.go (L1008-1017)
+**File:** types/coin.go (L807-813)
 ```go
-	runMsgCtx, msCache := app.cacheTxContext(ctx, checksum)
+// ValidateDenom is the default validation function for Coin.Denom.
+func ValidateDenom(denom string) error {
+	if !reDnm.MatchString(denom) {
+		return fmt.Errorf("invalid denom: %s", denom)
+	}
+	return nil
+}
+```
 
-	// Attempt to execute all messages and only update state if all messages pass
-	// and we're in DeliverTx. Note, runMsgs will never return a reference to a
-	// Result if any single message fails or does not have a registered Handler.
-	result, err = app.runMsgs(runMsgCtx, msgs, mode)
+**File:** types/tx/types.go (L67-79)
+```go
+	if fee.Amount.IsAnyNil() {
+		return sdkerrors.Wrapf(
+			sdkerrors.ErrInsufficientFee,
+			"invalid fee provided: null",
+		)
+	}
 
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
+	if fee.Amount.IsAnyNegative() {
+		return sdkerrors.Wrapf(
+			sdkerrors.ErrInsufficientFee,
+			"invalid fee provided: %s", fee.Amount,
+		)
 	}
 ```

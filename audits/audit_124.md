@@ -1,177 +1,246 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Sequence Cache Poisoning in SR25519 Batch Signature Verification Causes Valid Transactions to Fail
+Index Out of Bounds Panic in SetPubKeyDecorator Due to Missing Length Validation
 
 ## Summary
-The `SR25519BatchVerifier.VerifyTxs()` function at line 96 of `x/auth/ante/batch_sigverify.go` initializes a `sequenceNumberCache` that tracks expected sequence numbers across multiple transactions in a batch. However, when generating signature verification bytes at line 151, the code uses the account's current sequence from state (`acc.GetSequence()`) instead of the cached expected sequence number. This mismatch causes legitimate transactions from the same account to fail batch verification, effectively preventing users from submitting multiple transactions in a single block. [1](#0-0) 
+The `SetPubKeyDecorator` in the ante handler chain lacks validation to ensure the number of public keys from `AuthInfo.SignerInfos` matches the number of signers derived from transaction messages. This allows any user to craft transactions that pass `ValidateBasic()` but trigger index out of bounds panics during ante handler processing, causing validators to waste resources on malformed transactions.
 
 ## Impact
-**Medium**
+Low
 
 ## Finding Description
 
-**Location:** 
-The vulnerability occurs in the `SR25519BatchVerifier.VerifyTxs()` function in `x/auth/ante/batch_sigverify.go`, specifically:
-- Line 96: Sequence cache initialization
-- Lines 125-131: Cache update logic that increments expected sequence for subsequent transactions
-- Line 151: Incorrect use of state-based sequence instead of cached sequence for verification [2](#0-1) [3](#0-2) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:**
-The batch verifier is designed to efficiently verify multiple SR25519 signatures across transactions in a block. For accounts with multiple transactions in the same batch, the cache should track that the second transaction would have sequence N+1, the third would have N+2, etc., since sequences increment after each transaction execution.
+**Intended Logic:** 
+The `SetPubKeyDecorator` should safely iterate over public keys and match them with corresponding signers to validate and store public key information. It should reject transactions where the number of public keys doesn't match the number of signers.
 
-**Actual Logic:**
-When processing the second (and subsequent) transaction from the same account:
-1. The cache correctly calculates the expected sequence as `cachedSeq + 1` and validates that `sig.Sequence` matches this value
-2. However, when generating `SignerData` for verification at line 151, it uses `acc.GetSequence()` which still returns the original sequence from state (since state hasn't been updated yet during batch verification)
-3. The signature was originally created using the expected sequence number (e.g., 6), but verification attempts to validate it against sign bytes generated with the old sequence from state (e.g., 5)
-4. This causes the signature verification to fail even though the transaction is valid [4](#0-3) 
+**Actual Logic:** 
+The decorator retrieves `pubkeys` from `GetPubKeys()` which returns an array of length `len(AuthInfo.SignerInfos)` [2](#0-1) , and `signers` from `GetSigners()` which derives signers from transaction messages [3](#0-2) . These two arrays can have different lengths because they come from independent data sources.
 
-**Exploit Scenario:**
-1. A user creates two valid transactions from their account:
-   - Tx 0: Signed with sequence 5
-   - Tx 1: Signed with sequence 6
-2. Both transactions are included in the same block
-3. The batch verifier processes them:
-   - Tx 0: Cache stores sequence 5, generates sign bytes with sequence 5 → Verification succeeds ✓
-   - Tx 1: Cache expects sequence 6, validates `sig.Sequence == 6`, but generates sign bytes with sequence 5 → Verification fails ✗
-4. Tx 1 is rejected with an "unauthorized" error even though it's a valid transaction [5](#0-4) 
+The code loops over `pubkeys` and accesses `signers[i]` without validating that `i < len(signers)`, causing an index out of bounds panic when `len(pubkeys) > len(signers)`.
 
-**Security Failure:**
-This breaks the **transaction processing invariant** that valid, properly-signed transactions should be accepted. It causes a denial-of-service condition where users cannot submit multiple transactions from the same account within a single block, artificially limiting transaction throughput and degrading network performance.
+**Exploitation Path:**
+1. Attacker creates a transaction with one message having one unique signer (N=1)
+2. Sets `AuthInfo.SignerInfos` array to have 2 elements (M=2)
+3. Sets `Signatures` array to have 1 element (matching N signers)
+4. Transaction passes `ValidateBasic()` because it only checks `len(Signatures) == len(GetSigners())` (1 == 1) [4](#0-3) 
+5. During ante handler execution in `SetPubKeyDecorator`, the code loops over 2 pubkeys
+6. At iteration i=1, accessing `signers[1]` triggers an index out of bounds panic
+7. The panic is caught by recovery middleware [5](#0-4)  and the transaction is rejected
+
+**Security Guarantee Broken:**
+The ante handler chain should efficiently reject invalid transactions during validation, not after processing through multiple expensive decorators. This vulnerability allows transactions to bypass early validation and consume validator resources unnecessarily.
 
 ## Impact Explanation
 
-**Affected Process:** Transaction verification and block processing
+This vulnerability enables a denial-of-service attack vector where validators waste computational resources processing malformed transactions that should have been rejected during basic validation. Each malicious transaction forces validators to:
 
-**Severity:** When the batch verifier is enabled:
-- Users are prevented from submitting multiple transactions from the same account in a single block
-- This artificially limits transaction throughput and network capacity
-- Legitimate transactions are incorrectly rejected, causing user funds to remain locked until they retry with different sequencing
-- Network processing is impacted as valid transactions must be resubmitted across multiple blocks instead of being processed efficiently in batch
+1. Decode the transaction
+2. Execute multiple ante handler decorators (SetUpContext, RejectExtensionOptions, ValidateBasic, TxTimeoutHeight, ValidateMemo, ConsumeGasForTxSize, DeductFee) [6](#0-5) 
+3. Panic in SetPubKeyDecorator
+4. Process panic recovery and cleanup
 
-**System Reliability:** This bug undermines the fundamental purpose of batch verification (performance optimization) by introducing a correctness failure that makes it less reliable than sequential verification. It effectively creates a network constraint that doesn't exist in the sequential verification path.
+Since these transactions are rejected during CheckTx (mempool admission), the attacker doesn't pay gas fees but still consumes validator resources. This fits the **Low severity** category: "Causing network processing nodes to process transactions from the mempool beyond set parameters."
+
+The network continues to function and no funds are at risk, but validator efficiency is degraded when processing these malicious transactions.
 
 ## Likelihood Explanation
 
-**Who can trigger it:** Any network participant submitting normal transactions. No special privileges required.
+**Who can trigger it:**
+Any network participant can exploit this vulnerability. No special permissions or resources are required beyond the ability to submit transactions, which is available to all users.
 
-**Conditions required:** 
-- The batch verifier must be enabled and configured in the ante handler chain
-- A user submits multiple transactions from the same account that end up in the same block
-- This is a common pattern for users making multiple operations (e.g., multiple token transfers, DeFi interactions)
+**Required conditions:**
+- The default ante handler chain includes `SetPubKeyDecorator` (standard configuration)
+- Attacker can craft and submit protobuf transactions (standard capability)
 
-**Frequency:** This would occur during normal network operation whenever users submit multiple transactions. Given that batch processing is designed for high-throughput scenarios, this issue would manifest frequently in production use, affecting potentially hundreds or thousands of transactions per block.
+**Frequency:**
+This can be exploited repeatedly. An attacker can pre-generate batches of malicious transactions and submit them continuously. Each transaction deterministically triggers the panic during CheckTx. The attack can be sustained as long as the attacker maintains network connectivity.
 
 ## Recommendation
 
-Modify line 151 in `batch_sigverify.go` to use the cached expected sequence number instead of the state-based sequence:
+Add a length validation check in `SetPubKeyDecorator.AnteHandle` before the iteration loop:
 
 ```go
-signerData := authsigning.SignerData{
-    ChainID:       chainID,
-    AccountNumber: accNum,
-    Sequence:      seqNum,  // Use cached expected sequence instead of acc.GetSequence()
+func (spkd SetPubKeyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+    sigTx, ok := tx.(authsigning.SigVerifiableTx)
+    if !ok {
+        return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
+    }
+
+    pubkeys, err := sigTx.GetPubKeys()
+    if err != nil {
+        return ctx, err
+    }
+    signers := sigTx.GetSigners()
+    
+    // Add this validation check
+    if len(pubkeys) != len(signers) {
+        return ctx, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, 
+            "invalid number of pubkeys; expected: %d, got %d", len(signers), len(pubkeys))
+    }
+
+    for i, pk := range pubkeys {
+        // ... existing logic
+    }
 }
 ```
 
-This ensures that the sign bytes are generated using the same sequence number that was validated from the signature (line 134) and that the signer originally used when creating the signature. [6](#0-5) 
+This validation pattern is already implemented in the batch signature verifier [7](#0-6) , confirming that this check is necessary and should be consistently applied.
+
+Alternatively, add this check to `Tx.ValidateBasic()` to catch the issue earlier in the validation pipeline.
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/batch_sigverify_test.go` (new test file)
-
-**Test Function:** `TestSequenceCachePoisoning`
+While the provided PoC contains pseudo-code with incomplete sections, the vulnerability is evident from code analysis:
 
 **Setup:**
-1. Create a test application with account keeper and sign mode handler
-2. Initialize an SR25519BatchVerifier 
-3. Create a test account with initial sequence 5
-4. Fund the account and set its public key (SR25519)
+- Create a transaction with one message (one signer)
+- Manually construct `AuthInfo` with two `SignerInfo` elements  
+- Set `Signatures` array to one element
 
-**Trigger:**
-1. Create two transactions from the same account:
-   - Transaction 0: Signed with sequence 5
-   - Transaction 1: Signed with sequence 6 (valid next sequence)
-2. Call `verifier.VerifyTxs(ctx, []sdk.Tx{tx0, tx1})`
+**Action:**
+- Call `ValidateBasic()` - passes because `len(Signatures) == len(GetSigners())` (1 == 1)
+- Execute ante handler chain with `SetPubKeyDecorator`
 
-**Observation:**
-The test verifies that `verifier.errors[1]` contains an unauthorized error, demonstrating that the second valid transaction failed verification due to the sequence mismatch. The test would show:
-- `verifier.errors[0] == nil` (first transaction verified successfully)
-- `verifier.errors[1] != nil` (second transaction failed despite being valid)
-- The error message indicates signature verification failure
+**Result:**
+- `GetPubKeys()` returns 2 elements (from `AuthInfo.SignerInfos`)
+- `GetSigners()` returns 1 element (from message signers)
+- Loop iterates twice, at i=1 accessing `signers[1]` causes panic
+- Panic is caught and transaction rejected after wasting resources
 
-This proves that the sequence cache is "poisoned" by the first transaction, causing subsequent valid transactions from the same account to fail verification incorrectly.
+The vulnerability can be verified by constructing a properly formatted protobuf transaction with mismatched `SignerInfos` and `Signatures` lengths that satisfy the existing `ValidateBasic()` check.
 
-```go
-// Test code structure:
-func TestSequenceCachePoisoning(t *testing.T) {
-    // Setup: Create account with sequence 5, fund it, set SR25519 pubkey
-    // Create tx0 with sequence 5
-    // Create tx1 with sequence 6 
-    // Call verifier.VerifyTxs(ctx, []sdk.Tx{tx0, tx1})
-    // Assert: verifier.errors[0] == nil (tx0 succeeds)
-    // Assert: verifier.errors[1] != nil (tx1 fails - THIS IS THE BUG)
-    // Expected behavior: Both should succeed since both have valid signatures
-}
-```
+## Notes
 
-The test demonstrates that the vulnerability causes legitimate transactions to fail, confirming the sequence cache poisoning issue at line 96.
+The severity assessment differs from the report's claim:
+- **Report claims**: Medium ("30% resource consumption increase")
+- **Actual severity**: Low ("processing beyond set parameters")
+
+The Medium severity claim requires proof of "at least 30% resource consumption increase," which is not substantiated with measurements or benchmarks. The actual impact matches the Low severity category where transactions are processed further into the ante handler chain than they should be, causing inefficiency but not meeting the 30% threshold required for Medium severity.
+
+The vulnerability is valid and should be fixed, but the impact is resource inefficiency rather than a critical system failure.
 
 ### Citations
 
-**File:** x/auth/ante/batch_sigverify.go (L96-96)
+**File:** x/auth/ante/sigverify.go (L71-85)
 ```go
-	sequenceNumberCache := map[uint64]uint64{}
-```
-
-**File:** x/auth/ante/batch_sigverify.go (L125-131)
-```go
-			if cachedSeq, ok := sequenceNumberCache[accNum]; ok {
-				seqNum = cachedSeq + 1
-				sequenceNumberCache[accNum] = seqNum
-			} else {
-				sequenceNumberCache[accNum] = acc.GetSequence()
-				seqNum = sequenceNumberCache[accNum]
+	for i, pk := range pubkeys {
+		// PublicKey was omitted from slice since it has already been set in context
+		if pk == nil {
+			if !simulate {
+				continue
 			}
+			pk = simSecp256k1Pubkey
+		}
+		// Only make check if simulate=false
+		if !simulate && !bytes.Equal(pk.Address(), signers[i]) {
+			return ctx, sdkerrors.Wrapf(sdkerrors.ErrInvalidPubKey,
+				"pubKey does not match signer address %s with signer index: %d", signers[i], i)
+		}
+
+		acc, err := GetSignerAcc(ctx, spkd.ak, signers[i])
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L134-143)
+**File:** x/auth/tx/builder.go (L107-128)
 ```go
-			if sig.Sequence != seqNum {
-				params := v.ak.GetParams(ctx)
-				if !params.GetDisableSeqnoCheck() {
-					v.errors[i] = sdkerrors.Wrapf(
-						sdkerrors.ErrWrongSequence,
-						"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-					)
-					continue
-				}
-			}
+func (w *wrapper) GetPubKeys() ([]cryptotypes.PubKey, error) {
+	signerInfos := w.tx.AuthInfo.SignerInfos
+	pks := make([]cryptotypes.PubKey, len(signerInfos))
+
+	for i, si := range signerInfos {
+		// NOTE: it is okay to leave this nil if there is no PubKey in the SignerInfo.
+		// PubKey's can be left unset in SignerInfo.
+		if si.PublicKey == nil {
+			continue
+		}
+
+		pkAny := si.PublicKey.GetCachedValue()
+		pk, ok := pkAny.(cryptotypes.PubKey)
+		if ok {
+			pks[i] = pk
+		} else {
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "Expecting PubKey, got: %T", pkAny)
+		}
+	}
+
+	return pks, nil
+}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L147-153)
+**File:** types/tx/types.go (L94-99)
 ```go
-				chainID := ctx.ChainID()
-				signerData := authsigning.SignerData{
-					ChainID:       chainID,
-					AccountNumber: accNum,
-					Sequence:      acc.GetSequence(),
-				}
-				signBytes, err := v.signModeHandler.GetSignBytes(data.SignMode, signerData, txs[i])
+	if len(sigs) != len(t.GetSigners()) {
+		return sdkerrors.Wrapf(
+			sdkerrors.ErrUnauthorized,
+			"wrong number of signers; expected %d, got %d", len(t.GetSigners()), len(sigs),
+		)
+	}
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L176-186)
+**File:** types/tx/types.go (L111-132)
 ```go
-	overall, individiauls := v.verifier.Verify()
-	if !overall {
-		for i, individual := range individiauls {
-			if !individual {
-				v.errors[i] = sdkerrors.Wrap(
-					sdkerrors.ErrUnauthorized,
-					"signature verification failed; please verify account number and chain-id",
-				)
+func (t *Tx) GetSigners() []sdk.AccAddress {
+	var signers []sdk.AccAddress
+	seen := map[string]bool{}
+
+	for _, msg := range t.GetMsgs() {
+		for _, addr := range msg.GetSigners() {
+			if !seen[addr.String()] {
+				signers = append(signers, addr)
+				seen[addr.String()] = true
 			}
 		}
 	}
+
+	// ensure any specified fee payer is included in the required signers (at the end)
+	feePayer := t.AuthInfo.Fee.Payer
+	if feePayer != "" && !seen[feePayer] {
+		payerAddr := sdk.MustAccAddressFromBech32(feePayer)
+		signers = append(signers, payerAddr)
+	}
+
+	return signers
+}
+```
+
+**File:** baseapp/baseapp.go (L904-915)
+```go
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
+		}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
+```
+
+**File:** x/auth/ante/ante.go (L48-60)
+```go
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
+		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
+		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
+		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+		NewIncrementSequenceDecorator(options.AccountKeeper),
+	}
+```
+
+**File:** x/auth/ante/batch_sigverify.go (L66-68)
+```go
+		if len(pubkeys) != len(signerAddrs) {
+			v.errors[i] = sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "invalid number of pubkeys;  expected: %d, got %d", len(signerAddrs), len(pubkeys))
+			continue
 ```

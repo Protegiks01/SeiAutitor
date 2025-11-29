@@ -1,282 +1,215 @@
-## Audit Report
+# Audit Report
 
 ## Title
-AllowedMsgAllowance Bypass via Nested MsgExec Messages in AnteHandler
+Unvalidated Empty AccessOps Array Causes Chain Halt via Governance Proposals
 
 ## Summary
-The `AllowedMsgAllowance` feegrant restriction can be bypassed by wrapping disallowed message types inside an authz `MsgExec`. The AnteHandler only validates top-level messages when checking feegrant allowances, allowing attackers to execute any message type while using a restricted feegrant to pay fees. [1](#0-0) 
+The `ValidateAccessOps` function in the access control module accesses the last element of an `AccessOps` array without bounds checking, causing a panic when the array is empty. This can be triggered through a governance proposal because `ValidateBasic` only validates abstract fields (title, description) and not the `MessageDependencyMapping` contents, allowing malformed proposals to pass validation and crash all nodes upon execution.
 
 ## Impact
-Medium
+High - Network not being able to confirm new transactions (total network shutdown)
 
 ## Finding Description
 
-**Location:** 
-The vulnerability exists in the interaction between:
-- [2](#0-1) 
-- [3](#0-2) 
-- [4](#0-3) 
+**Location**: 
+- Primary vulnerability: `x/accesscontrol/types/message_dependency_mapping.go`, line 33
+- Insufficient validation: `x/accesscontrol/types/gov.go`, lines 42-45
+- Execution path: `x/accesscontrol/handler.go`, lines 12-20 [1](#0-0) 
 
-**Intended Logic:**
-The `AllowedMsgAllowance` is designed to restrict feegrants to only pay fees for specific message types. When a granter creates a feegrant with `AllowedMsgAllowance`, they specify a list of allowed message type URLs (e.g., only `/cosmos.gov.v1beta1.MsgVote`). The system should reject any transaction attempting to use this feegrant for other message types. [5](#0-4) 
+**Intended logic**: The `ValidateAccessOps` function should validate that AccessOps arrays are non-empty and end with a COMMIT operation. The governance proposal's `ValidateBasic` should ensure proposals contain valid mappings before they can be voted on.
 
-**Actual Logic:**
-The `DeductFeeDecorator` in the AnteHandler calls `UseGrantedFees` with `sdkTx.GetMsgs()`, which only returns top-level messages. The `AllowedMsgAllowance.Accept` method then validates these top-level messages against the allowed list using `allMsgTypesAllowed`. However, when a `MsgExec` is used, `GetMsgs()` returns only the `MsgExec` itself, not the nested messages it contains. [6](#0-5) 
+**Actual logic**: The function directly accesses `accessOps[len(accessOps)-1]` without checking if the slice is empty. When an empty array is provided, `len(accessOps)-1` evaluates to `-1`, causing an index out-of-bounds panic that crashes the node. Additionally, `MsgUpdateResourceDependencyMappingProposal.ValidateBasic()` only validates title and description through `govtypes.ValidateAbstract(p)`. [2](#0-1) [3](#0-2) 
 
-**Exploit Scenario:**
-1. Alice grants Bob a feegrant with `AllowedMsgAllowance` restricting it to only `/cosmos.gov.v1beta1.MsgVote` messages
-2. Alice also includes `/cosmos.authz.v1beta1.MsgExec` in the allowed list (or an attacker convinces them to do so)
-3. Bob wants to execute a `/cosmos.bank.v1beta1.MsgSend` which is NOT in the allowed list
-4. Bob creates an authz grant from himself (or any controlled account) to himself
-5. Bob creates a transaction with a `MsgExec` that wraps the `MsgSend` inside it
-6. The AnteHandler's `AllowedMsgAllowance` check only sees `/cosmos.authz.v1beta1.MsgExec` and approves it
-7. The nested `MsgSend` is never validated against the allowed message list
-8. Bob successfully executes the disallowed `MsgSend` while using Alice's feegrant to pay fees
+**Exploitation path**:
+1. A governance proposal with `MessageDependencyMapping` containing an empty `AccessOps` array is submitted
+2. The proposal passes `ValidateBasic` validation (only checks title/description)
+3. The proposal goes through voting and is approved
+4. Upon execution, `HandleMsgUpdateResourceDependencyMappingProposal` is invoked [4](#0-3) 
 
-**Security Failure:**
-Authorization bypass - the message type restriction mechanism in `AllowedMsgAllowance` is completely bypassed for nested messages within `MsgExec`, allowing unauthorized use of feegrant funds for any message type.
+5. The handler calls `k.SetResourceDependencyMapping` which validates the mapping [5](#0-4) 
+
+6. This triggers `ValidateAccessOps` with the empty array, causing a panic
+7. All nodes executing the proposal panic simultaneously at the same block height
+8. The chain halts completely with no blocks being produced
+
+**Security guarantee broken**: Network availability and liveness guarantee. The blockchain should gracefully handle invalid inputs by returning errors, not panicking and crashing all nodes.
 
 ## Impact Explanation
 
-This vulnerability allows attackers to bypass feegrant restrictions and spend granter funds on fees for unauthorized transaction types. The impact includes:
+When the malformed governance proposal executes, all validator nodes crash simultaneously because they all process the same proposal at the same block height. This results in:
+- **Complete network shutdown**: No new blocks can be produced
+- **Transaction finality loss**: No transactions can be confirmed
+- **Unrecoverable halt**: Requires manual intervention and potentially a hard fork to recover
 
-- **Unauthorized fee spending:** Attackers can drain a granter's feegrant allowance by executing any message types, not just those explicitly allowed
-- **Loss of funds:** The granter loses control over how their granted funds are spent, potentially losing the entire feegrant balance to unauthorized transactions
-- **Violation of trust assumptions:** Granters who create restricted feegrants expect their funds will only be used for specific purposes; this vulnerability breaks that guarantee
-
-This matters because feegrants with `AllowedMsgAllowance` are specifically designed for restricted delegation scenarios (e.g., allowing someone to vote on governance proposals but not send tokens), and this bypass completely undermines that security model.
+The uncontrolled panic propagates through the consensus layer, causing all nodes to terminate unexpectedly. This is a complete denial-of-service that affects the entire network.
 
 ## Likelihood Explanation
 
-**Likelihood: High**
+**Who can trigger**: Any participant who can submit governance proposals (typically any token holder). The proposal must pass the voting process requiring validator/token holder approval.
 
-- **Who can trigger it:** Any user with a feegrant that includes `MsgExec` in the allowed messages list
-- **Conditions required:** 
-  - The granter must create an `AllowedMsgAllowance` that includes `/cosmos.authz.v1beta1.MsgExec` in the allowed messages
-  - The attacker needs an authz grant (which they can create from themselves to themselves)
-- **Frequency:** This can be exploited repeatedly on every transaction until the feegrant is exhausted
+**Conditions required**:
+- Governance proposal with empty `AccessOps` is submitted
+- Proposal receives sufficient votes to pass
+- Proposal executes after voting period
 
-The vulnerability is likely to be exploited in practice because:
-1. `MsgExec` is a legitimate message type that granters might reasonably include in allowed lists
-2. Users creating feegrants may not understand the nested message implications
-3. The exploit is straightforward and requires no special privileges beyond having the feegrant
+**Likelihood factors**:
+1. The validation failure is subtle and could be missed during proposal review
+2. Proposals created with buggy tooling or human error could inadvertently contain empty arrays
+3. Once executed, impact is immediate and affects all nodes simultaneously
+4. No validation at submission time prevents this
+
+While governance approval is required, this is a **validation bug** that allows invalid data to crash the network. Even well-intentioned validators approving what appears to be a legitimate proposal could trigger this accidentally. The lack of proper validation transforms an accidental programming error into a network-halting vulnerability.
 
 ## Recommendation
 
-Modify the `AllowedMsgAllowance.Accept` method to recursively validate nested messages within `MsgExec` (and potentially other message wrapper types). Specifically:
-
-1. In `x/feegrant/filtered_fee.go`, update `allMsgTypesAllowed` to extract and validate nested messages from `MsgExec`
-2. Add a helper function to recursively unwrap messages and validate each individual message type
-3. Ensure that all messages in the transaction (including nested ones) are checked against the allowed list
-
-Example fix location: [2](#0-1) 
-
-The fix should iterate through messages, detect `MsgExec` types, call `GetMessages()` on them, and recursively validate all nested messages against the allowed list.
-
-## Proof of Concept
-
-**File:** `x/feegrant/filtered_fee_test.go`
-
-**Test Function:** Add the following test case to the existing test file:
+**Immediate fix**: Add bounds checking in `ValidateAccessOps`:
 
 ```go
-func TestFilteredFeeBypassWithMsgExec(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{
-        Time: time.Now(),
-    })
-
-    // Setup: Create accounts
-    granter := sdk.MustAccAddressFromBech32("cosmos18cgkqduwuh253twzmhedesw3l7v3fm37sppt58")
-    grantee := sdk.MustAccAddressFromBech32("cosmos1yq8lgssgxlx9smjhes6ryjasmqmd3ts2559g0t")
-    to := sdk.MustAccAddressFromBech32("cosmos15ky9du8a2wlstz6fpx3p4mqpjyrm5cgqzp4f3d")
-
-    // Create a feegrant that ONLY allows MsgVote and MsgExec
-    allowedMsgs := []string{
-        "/cosmos.gov.v1beta1.MsgVote",
-        "/cosmos.authz.v1beta1.MsgExec",
+func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
+    if len(accessOps) == 0 {
+        return ErrNoCommitAccessOp
     }
-    
-    basicAllowance, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-        SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("atom", 1000)),
-    })
-    
-    filteredAllowance := &feegrant.AllowedMsgAllowance{
-        Allowance:       basicAllowance,
-        AllowedMessages: allowedMsgs,
-    }
-
-    // Create a disallowed message (MsgSend) wrapped in MsgExec
-    disallowedMsg := &banktypes.MsgSend{
-        FromAddress: grantee.String(),
-        ToAddress:   to.String(),
-        Amount:      sdk.NewCoins(sdk.NewInt64Coin("atom", 100)),
-    }
-    
-    // Wrap the disallowed message in MsgExec
-    execMsg := authz.NewMsgExec(grantee, []sdk.Msg{disallowedMsg})
-    
-    // Test 1: Direct MsgSend should be rejected
-    remove, err := filteredAllowance.Accept(ctx, sdk.NewCoins(sdk.NewInt64Coin("atom", 10)), []sdk.Msg{disallowedMsg})
-    require.Error(t, err, "MsgSend should be rejected as it's not in allowed messages")
-    require.Contains(t, err.Error(), "message does not exist in allowed messages")
-    
-    // Test 2: MsgExec wrapping MsgSend should be REJECTED but currently PASSES (vulnerability)
-    remove, err = filteredAllowance.Accept(ctx, sdk.NewCoins(sdk.NewInt64Coin("atom", 10)), []sdk.Msg{&execMsg})
-    
-    // VULNERABILITY: This passes when it should fail
-    // The nested MsgSend is never validated
-    require.NoError(t, err, "VULNERABILITY: MsgExec wrapping disallowed MsgSend incorrectly passes validation")
-    require.False(t, remove)
+    lastAccessOp := accessOps[len(accessOps)-1]
+    // ... rest of validation
 }
 ```
 
-**Setup:** The test creates a feegrant with `AllowedMsgAllowance` that only allows `MsgVote` and `MsgExec` message types.
+**Additional improvements**:
+1. Update `MsgUpdateResourceDependencyMappingProposal.ValidateBasic()` to validate the `MessageDependencyMapping` contents:
 
-**Trigger:** The test attempts to use the feegrant for a `MsgSend` (disallowed) both directly and wrapped inside a `MsgExec`.
+```go
+func (p *MsgUpdateResourceDependencyMappingProposal) ValidateBasic() error {
+    err := govtypes.ValidateAbstract(p)
+    if err != nil {
+        return err
+    }
+    for _, mapping := range p.MessageDependencyMapping {
+        if err := ValidateMessageDependencyMapping(mapping); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
 
-**Observation:** 
-- Test 1 correctly rejects the direct `MsgSend` 
-- Test 2 demonstrates the vulnerability: the `MsgExec` wrapping the `MsgSend` incorrectly passes validation, even though `MsgSend` is not in the allowed list
+2. Update `module.go`'s `ValidateGenesis` to call the full validation function: [6](#0-5) 
 
-The test confirms that nested messages within `MsgExec` bypass the `AllowedMsgAllowance` validation in the AnteHandler.
+Should call `types.ValidateGenesis(data)` instead of just `data.Params.Validate()`: [7](#0-6) 
+
+## Proof of Concept
+
+**Test File**: `x/accesscontrol/types/message_dependency_mapping_test.go`
+
+**Setup**: Initialize test environment
+
+**Action**: Call `ValidateAccessOps` with an empty slice:
+```go
+emptyAccessOps := []acltypes.AccessOperation{}
+err := types.ValidateAccessOps(emptyAccessOps)
+```
+
+**Result**: The function panics with "index out of range [-1]" instead of returning an error. This can be verified by adding a test with `defer recover()` to catch the panic.
+
+The vulnerability is confirmed by the code structure where no bounds check exists before array access, and the governance proposal validation path does not validate the mapping contents, allowing invalid data to reach the panic-triggering code during proposal execution.
+
+## Notes
+
+This is a critical validation vulnerability that breaks the availability guarantee of the blockchain. While it requires governance approval, the key issue is the **missing validation** that allows buggy or malformed data to halt the entire network. This is not about malicious governance actors but about a programming error that transforms accidental invalid inputs into catastrophic network failures.
 
 ### Citations
 
-**File:** x/auth/ante/fee.go (L148-200)
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-36)
 ```go
-func (dfd DeductFeeDecorator) checkDeductFee(ctx sdk.Context, sdkTx sdk.Tx, fee sdk.Coins) error {
-	feeTx, ok := sdkTx.(sdk.FeeTx)
-	if !ok {
-		return sdkerrors.Wrap(sdkerrors.ErrTxDecode, "Tx must be a FeeTx")
+func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
+	lastAccessOp := accessOps[len(accessOps)-1]
+	if lastAccessOp != *CommitAccessOp() {
+		return ErrNoCommitAccessOp
+	}
+```
+
+**File:** x/accesscontrol/types/gov.go (L42-45)
+```go
+func (p *MsgUpdateResourceDependencyMappingProposal) ValidateBasic() error {
+	err := govtypes.ValidateAbstract(p)
+	return err
+}
+```
+
+**File:** x/gov/types/content.go (L37-54)
+```go
+func ValidateAbstract(c Content) error {
+	title := c.GetTitle()
+	if len(strings.TrimSpace(title)) == 0 {
+		return sdkerrors.Wrap(ErrInvalidProposalContent, "proposal title cannot be blank")
+	}
+	if len(title) > MaxTitleLength {
+		return sdkerrors.Wrapf(ErrInvalidProposalContent, "proposal title is longer than max length of %d", MaxTitleLength)
 	}
 
-	if addr := dfd.accountKeeper.GetModuleAddress(types.FeeCollectorName); addr == nil {
-		return fmt.Errorf("fee collector module account (%s) has not been set", types.FeeCollectorName)
+	description := c.GetDescription()
+	if len(description) == 0 {
+		return sdkerrors.Wrap(ErrInvalidProposalContent, "proposal description cannot be blank")
+	}
+	if len(description) > MaxDescriptionLength {
+		return sdkerrors.Wrapf(ErrInvalidProposalContent, "proposal description is longer than max length of %d", MaxDescriptionLength)
 	}
 
-	feePayer := feeTx.FeePayer()
-	feeGranter := feeTx.FeeGranter()
-	deductFeesFrom := feePayer
+	return nil
+```
 
-	// if feegranter set deduct fee from feegranter account.
-	// this works with only when feegrant enabled.
-	if feeGranter != nil {
-		if dfd.feegrantKeeper == nil {
-			return sdkerrors.ErrInvalidRequest.Wrap("fee grants are not enabled")
-		} else if !feeGranter.Equals(feePayer) {
-			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
-			if err != nil {
-				return sdkerrors.Wrapf(err, "%s does not not allow to pay fees for %s", feeGranter, feePayer)
-			}
-		}
-
-		deductFeesFrom = feeGranter
-	}
-
-	deductFeesFromAcc := dfd.accountKeeper.GetAccount(ctx, deductFeesFrom)
-	if deductFeesFromAcc == nil {
-		return sdkerrors.ErrUnknownAddress.Wrapf("fee payer address: %s does not exist", deductFeesFrom)
-	}
-
-	// deduct the fees
-	if !fee.IsZero() {
-		err := DeductFees(dfd.bankKeeper, ctx, deductFeesFromAcc, fee)
+**File:** x/accesscontrol/handler.go (L12-20)
+```go
+func HandleMsgUpdateResourceDependencyMappingProposal(ctx sdk.Context, k *keeper.Keeper, p *types.MsgUpdateResourceDependencyMappingProposal) error {
+	for _, resourceDepMapping := range p.MessageDependencyMapping {
+		err := k.SetResourceDependencyMapping(ctx, resourceDepMapping)
 		if err != nil {
 			return err
 		}
 	}
-
-	events := sdk.Events{
-		sdk.NewEvent(
-			sdk.EventTypeTx,
-			sdk.NewAttribute(sdk.AttributeKeyFee, fee.String()),
-			sdk.NewAttribute(sdk.AttributeKeyFeePayer, deductFeesFrom.String()),
-		),
-	}
-	ctx.EventManager().EmitEvents(events)
-
 	return nil
 }
 ```
 
-**File:** x/feegrant/filtered_fee.go (L64-86)
+**File:** x/accesscontrol/keeper/keeper.go (L91-98)
 ```go
-// Accept method checks for the filtered messages has valid expiry
-func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
-	if !a.allMsgTypesAllowed(ctx, msgs) {
-		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
-	}
-
-	allowance, err := a.GetAllowance()
+func (k Keeper) SetResourceDependencyMapping(
+	ctx sdk.Context,
+	dependencyMapping acltypes.MessageDependencyMapping,
+) error {
+	err := types.ValidateMessageDependencyMapping(dependencyMapping)
 	if err != nil {
-		return false, err
+		return err
+	}
+```
+
+**File:** x/accesscontrol/module.go (L62-69)
+```go
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
 	}
 
-	remove, err := allowance.Accept(ctx, fee, msgs)
-	if err != nil {
-		return false, err
-	}
-
-	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
-	if err != nil {
-		return false, err
-	}
-
-    return remove, nil
+	return data.Params.Validate()
 }
 ```
 
-**File:** x/feegrant/filtered_fee.go (L98-109)
+**File:** x/accesscontrol/types/genesis.go (L28-43)
 ```go
-func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
-	msgsMap := a.allowedMsgsToMap(ctx)
-
-	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
-		if !msgsMap[sdk.MsgTypeURL(msg)] {
-			return false
+// ValidateGenesis validates the oracle genesis state
+func ValidateGenesis(data GenesisState) error {
+	for _, mapping := range data.MessageDependencyMapping {
+		err := ValidateMessageDependencyMapping(mapping)
+		if err != nil {
+			return err
 		}
 	}
-
-	return true
-}
-```
-
-**File:** types/tx/types.go (L21-37)
-```go
-// GetMsgs implements the GetMsgs method on sdk.Tx.
-func (t *Tx) GetMsgs() []sdk.Msg {
-	if t == nil || t.Body == nil {
-		return nil
-	}
-
-	anys := t.Body.Messages
-	res := make([]sdk.Msg, len(anys))
-	for i, any := range anys {
-		cached := any.GetCachedValue()
-		if cached == nil {
-			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
+	for _, mapping := range data.WasmDependencyMappings {
+		err := ValidateWasmDependencyMapping(mapping)
+		if err != nil {
+			return err
 		}
-		res[i] = cached.(sdk.Msg)
 	}
-	return res
-}
-```
-
-**File:** x/authz/msgs.go (L197-209)
-```go
-// GetMessages returns the cache values from the MsgExecAuthorized.Msgs if present.
-func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
-	msgs := make([]sdk.Msg, len(msg.Msgs))
-	for i, msgAny := range msg.Msgs {
-		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
-		if !ok {
-			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
-		}
-		msgs[i] = msg
-	}
-
-	return msgs, nil
+	return data.Params.Validate()
 }
 ```

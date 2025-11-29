@@ -1,255 +1,181 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Precision Loss in BondedRatio Calculation Causes Excessive Inflation When Staking Ratio is Extremely Small
+Missing Underflow Protection in Commission Withdrawal and Zero-Token Validator Period Operations
 
 ## Summary
-The `BondedRatio` calculation in `x/staking/keeper/pool.go` suffers from precision loss when the ratio of bonded tokens to total staking supply is smaller than 10^-18. This causes the bonded ratio to incorrectly round to zero, leading to excessive inflation calculations in the mint module's `BeginBlocker` function.
+The distribution module's commission withdrawal operations directly call `Sub()` on outstanding rewards without protection against underflow, while delegation withdrawals use `Intersect()` to handle rounding errors. This asymmetry can cause transaction panics when outstanding rewards are depleted below commission amounts due to accumulated rounding errors from delegation withdrawals.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary issue: `x/staking/keeper/pool.go` lines 71-78 (BondedRatio function) [1](#0-0) 
+**Location:**
+- `x/distribution/keeper/keeper.go` line 120 (WithdrawValidatorCommission) [1](#0-0) 
 
-- Impact location: `x/mint/abci.go` lines 22-23 (BeginBlocker using bonded ratio) [2](#0-1) 
+- `x/distribution/keeper/validator.go` line 41 (IncrementValidatorPeriod for zero-token validators) [2](#0-1) 
 
-- Inflation calculation: `x/mint/types/minter.go` lines 52-54 (NextInflationRate) [3](#0-2) 
+- `x/distribution/keeper/hooks.go` line 34 (AfterValidatorRemoved) [3](#0-2) 
 
-**Intended Logic:** 
-The `BondedRatio` function should accurately calculate the fraction of staking tokens that are currently bonded as: `TotalBondedTokens / StakingTokenSupply`. This ratio is used by the mint module to adjust inflation rates - when the bonded ratio is low, inflation should increase to incentivize more staking.
+**Intended Logic:**
+Outstanding rewards should always be sufficient to cover all accumulated commission and delegation rewards since they were previously allocated together. When commission is withdrawn, the system should simply subtract the commission amount from outstanding.
 
-**Actual Logic:** 
-The calculation uses `sdk.Dec` which has 18 decimal places of precision. When `TotalBondedTokens` is extremely small relative to `StakingTokenSupply`, the division `(TotalBondedTokens * 10^18) / StakingTokenSupply` can result in a value less than 1 in the internal integer representation, causing it to round down to zero. [4](#0-3) 
+**Actual Logic:**
+The code acknowledges rounding errors occur during reward calculations "on the very final digits" and protects delegation withdrawals with `Intersect()` to cap withdrawals at available outstanding: [4](#0-3) 
 
-The `QuoInt` operation performs integer division on the internal big.Int representation. If `StakingTokenSupply > TotalBondedTokens * 10^18`, the result rounds to zero.
+However, commission withdrawals and other operations directly call `outstanding.Sub()` without this protection. The `DecCoins.Sub()` method panics if the result would be negative: [5](#0-4) 
 
-**Exploit Scenario:**
-This vulnerability manifests under specific chain conditions without requiring attacker action:
+When multiple delegators withdraw rewards with small rounding errors in their favor (each capped by `Intersect()`), the cumulative effect depletes outstanding beyond the delegation portion, eating into the commission reserve.
 
-1. A chain launches with a large token supply (e.g., 10 billion tokens with 18 decimals = 10^28 base units)
-2. Initial staking participation is extremely low (e.g., only 0.0000000001 tokens bonded = 10^8 base units)
-3. The actual bonded ratio is 10^8 / 10^28 = 10^-20
-4. Internal calculation: (10^8 * 10^18) / 10^28 = 0.1, which rounds to 0
-5. The mint module's `BeginBlocker` receives bondedRatio = 0 [5](#0-4) 
+**Exploitation Path:**
+1. Validator receives 100 tokens allocated: commission = 10, delegation rewards = 90, outstanding = 100
+2. Due to rounding in `QuoDecTruncate` operations during reward calculations, delegators' computed rewards slightly exceed their true share (e.g., 45.001 each instead of 45.000) [6](#0-5) 
 
-6. `NextInflationRate` calculates: `(1 - 0/0.67) * 0.13 = 0.13` (maximum rate increase)
-7. Inflation rapidly increases toward 20% maximum instead of the correct lower value
-8. Excessive tokens are minted each block based on incorrect inflation assumptions [6](#0-5) 
+3. First delegator withdraws: `Intersect(45.001, 100)` = 45.001, outstanding becomes 54.999
+4. Second delegator withdraws: `Intersect(45.001, 54.999)` = 45.001, outstanding becomes 9.998
+5. Validator attempts to withdraw commission of 10
+6. Call to `outstanding.Sub(10)` with outstanding = 9.998 panics with "negative coin amount"
+7. Transaction reverts, validator cannot withdraw commission
 
-**Security Failure:** 
-This breaks the accounting and economic invariant that inflation should be proportional to the actual bonded ratio. The system incorrectly treats a very small but non-zero bonded ratio as zero, causing excessive token minting and dilution of all token holders.
+**Security Guarantee Broken:**
+- Accounting invariant: outstanding rewards should always be >= sum of withdrawable commission and delegation rewards
+- Availability: validators should always be able to withdraw their recorded commission
+- Consistency: delegation withdrawals use protection but commission withdrawals do not
 
 ## Impact Explanation
 
-**Affected Assets and Processes:**
-- Token supply: Excessive new tokens are minted each block
-- Token value: All token holders suffer dilution from unwarranted inflation
-- Economic incentives: Validators receive disproportionately high rewards
-- Protocol economics: The intended relationship between staking participation and inflation is broken
+**Direct Impacts:**
+- Validators cannot withdraw commission (denial of service for specific validators)
+- Transaction panics consume gas without completing operations
+- Commission remains recorded in state but becomes temporarily unwithdrawable until outstanding is replenished through new allocations
 
-**Severity:**
-The excessive inflation causes:
-1. Economic damage through unwarranted token dilution (inflation could be at 20% when it should be much lower)
-2. Incorrect protocol state that compounds over time
-3. Broken game-theoretic assumptions about staking incentives
-4. Potential loss of trust in the protocol's economic model
+**Broader Impacts:**
+- Zero-token validators: When `IncrementValidatorPeriod` is called (via `BeforeDelegationCreated` hook), it can panic, preventing ANY user from delegating to that validator [7](#0-6) 
 
-This qualifies as **Medium** severity under "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior" as it causes incorrect protocol behavior affecting token economics.
+- Validator removal: The `AfterValidatorRemoved` cleanup operation can fail, preventing proper state cleanup when validators are removed
+
+This qualifies as "a bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity) because:
+- It affects Cosmos SDK distribution module (layer 0/1 code)
+- Causes unintended behavior (transaction panics preventing valid operations)
+- No permanent fund loss (commission still recorded, can be withdrawn when outstanding replenished)
+- Has broader impact beyond initiating validator (affects delegators and system cleanup)
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-This vulnerability can occur during normal chain operation when:
-- Total staking supply is very large (> 10^18 base units, common for tokens with 18 decimals and billion+ token supplies)
-- Bonded token amount is extremely small relative to supply (ratio < 10^-18)
-- Chain has enough validators to produce blocks (voting power uses Int, not Dec)
+**Who Can Trigger:**
+- Any delegator performing normal reward withdrawals (unknowingly contributes to depletion)
+- Any validator attempting commission withdrawal after sufficient depletion
+- System operations when validator tokens reach zero
 
-**Likelihood:**
-- **Who can trigger:** No specific attacker needed - occurs naturally based on chain configuration
-- **Conditions:** Most likely in:
-  - Chains with large initial token supplies and low early staking participation
-  - After mass unstaking events where most validators unbond
-  - Genesis configurations with high supply and minimal initial bonding
-- **Frequency:** Continuous once conditions are met - affects every block until bonded ratio increases above precision threshold
+**Conditions Required:**
+- Rounding errors accumulate during reward calculations using `QuoDecTruncate`
+- Multiple reward allocation and withdrawal cycles over time
+- The code explicitly acknowledges this edge case exists with comments about "rounding error withdrawing rewards from validator"
 
-While requiring specific conditions, this is **not theoretical** - chains with billions of tokens and decimal precision can realistically hit this edge case, especially during launch phases or low-staking periods.
+**Frequency:**
+- Low to Medium likelihood in normal operation
+- Higher probability with validators having many delegators and frequent withdrawal patterns
+- The developers' awareness (evidenced by `Intersect` protection for delegations) indicates this is a real concern, not theoretical
 
 ## Recommendation
 
-Implement a check for extremely small bonded ratios and handle them explicitly rather than allowing silent precision loss. Recommended fix in `x/staking/keeper/pool.go`:
+Apply the same `Intersect` protection used in delegation withdrawals to all operations that subtract from outstanding rewards:
 
+**For WithdrawValidatorCommission:**
 ```go
-func (k Keeper) BondedRatio(ctx sdk.Context) sdk.Dec {
-    stakeSupply := k.StakingTokenSupply(ctx)
-    if !stakeSupply.IsPositive() {
-        return sdk.ZeroDec()
-    }
-    
-    bondedTokens := k.TotalBondedTokens(ctx)
-    
-    // Check if ratio would suffer precision loss
-    // If bondedTokens * 10^18 < stakeSupply, the ratio is < 10^-18 and will round to zero
-    // In this case, return a small non-zero value to preserve the fact that some tokens are bonded
-    precisionThreshold := sdk.NewInt(1).Mul(sdk.NewInt(10).Power(18))
-    if bondedTokens.Mul(precisionThreshold).LT(stakeSupply) {
-        // Return minimum representable value instead of zero
-        return sdk.NewDecWithPrec(1, 18) // 10^-18
-    }
-    
-    return bondedTokens.ToDec().QuoInt(stakeSupply)
-}
+commissionDecCoins := sdk.NewDecCoinsFromCoins(commission...)
+commissionToWithdraw := commissionDecCoins.Intersect(outstanding)
+outstanding = outstanding.Sub(commissionToWithdraw)
 ```
 
-Alternatively, use higher precision for this critical calculation or ensure proper handling of sub-precision ratios in the inflation calculation logic.
+**For IncrementValidatorPeriod (zero tokens):**
+```go
+rewardsToMove := rewards.Rewards.Intersect(outstanding.GetRewards())
+outstanding.Rewards = outstanding.GetRewards().Sub(rewardsToMove)
+feePool.CommunityPool = feePool.CommunityPool.Add(rewardsToMove...)
+```
+
+**For AfterValidatorRemoved:**
+```go
+commissionToWithdraw := commission.Intersect(outstanding)
+outstanding = outstanding.Sub(commissionToWithdraw)
+```
+
+This ensures operations never panic due to insufficient outstanding balance while maintaining accounting accuracy.
 
 ## Proof of Concept
 
-**File:** `x/staking/keeper/pool_test.go` (create new file)
+**Test File:** `x/distribution/keeper/keeper_test.go`
 
-**Test Function:** `TestBondedRatioPrecisionLoss`
+**Setup:**
+1. Create validator with 10% commission rate
+2. Allocate 100 tokens: commission accumulates 10, outstanding = 100
+3. Manually set outstanding to 9 (simulating the cumulative effect of rounding errors from multiple delegation withdrawals with Intersect)
 
+**Action:**
 ```go
-package keeper_test
-
-import (
-    "testing"
-    
-    "github.com/stretchr/testify/require"
-    tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-    
-    "github.com/cosmos/cosmos-sdk/simapp"
-    sdk "github.com/cosmos/cosmos-sdk/types"
-    minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
-)
-
-func TestBondedRatioPrecisionLoss(t *testing.T) {
-    // Setup: Create a test app with large token supply and minimal bonding
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Configure mint params
-    mintParams := minttypes.DefaultParams()
-    app.MintKeeper.SetParams(ctx, mintParams)
-    minter := minttypes.DefaultInitialMinter()
-    app.MintKeeper.SetMinter(ctx, minter)
-    
-    // Simulate scenario: Large supply (10^28 base units), tiny bonded amount (10^8 base units)
-    // This represents 10 billion tokens with 18 decimals and only 0.0000000001 tokens bonded
-    // Actual ratio = 10^8 / 10^28 = 10^-20, which should NOT be zero
-    
-    // Note: In a real test, we'd need to mint tokens and bond them through the staking module
-    // For this PoC, we demonstrate the calculation issue directly
-    
-    largeSupply := sdk.NewInt(10).Power(28)  // 10^28 base units
-    tinyBonded := sdk.NewInt(10).Power(8)    // 10^8 base units
-    
-    // Calculate bonded ratio using the same logic as in pool.go
-    bondedRatio := tinyBonded.ToDec().QuoInt(largeSupply)
-    
-    // Trigger: The bonded ratio incorrectly rounds to zero due to precision loss
-    require.True(t, bondedRatio.IsZero(), 
-        "BondedRatio should incorrectly round to zero due to precision loss")
-    
-    // Observation: Even though there are bonded tokens, the ratio is zero
-    // This will cause NextInflationRate to treat it as 0% bonded
-    
-    // Calculate inflation with zero bonded ratio
-    inflationWithZero := minter.NextInflationRate(mintParams, sdk.ZeroDec())
-    
-    // Calculate what inflation SHOULD be with actual ratio (10^-20)
-    // For comparison, use a small but non-zero ratio
-    actualSmallRatio := sdk.NewDecWithPrec(1, 18) // 10^-18, closest we can represent
-    inflationWithSmallRatio := minter.NextInflationRate(mintParams, actualSmallRatio)
-    
-    // The inflation calculated with zero will be higher (closer to max 20%)
-    // than with the actual small ratio
-    require.True(t, inflationWithZero.GT(inflationWithSmallRatio),
-        "Inflation with zero ratio should be greater than with small ratio, "+
-        "demonstrating excessive inflation due to precision loss. "+
-        "Zero ratio inflation: %s, Small ratio inflation: %s",
-        inflationWithZero.String(), inflationWithSmallRatio.String())
-    
-    // This demonstrates that the precision loss causes incorrect inflation calculations
-    // In a real chain, this would result in excessive token minting
-}
+_, err := app.DistrKeeper.WithdrawValidatorCommission(ctx, valAddr)
 ```
 
-**Setup:** The test creates a simapp instance and configures the mint module with default parameters. It then simulates the precision loss scenario with a large token supply and minimal bonded tokens.
+**Expected Result:**
+Transaction panics with "negative coin amount" because the code attempts `outstanding.Sub(commission)` where outstanding (9) < commission (10), demonstrating the lack of underflow protection.
 
-**Trigger:** The test directly demonstrates that when `TotalBondedTokens` is 10^8 and `StakingTokenSupply` is 10^28, the division result rounds to zero due to `sdk.Dec`'s 18-decimal precision limitation.
-
-**Observation:** The test verifies that:
-1. The bonded ratio incorrectly rounds to zero despite bonded tokens existing
-2. This causes `NextInflationRate` to calculate a higher inflation rate than appropriate
-3. The difference in inflation rates demonstrates the economic impact of this precision loss
-
-To run this test:
-```bash
-cd x/staking/keeper
-go test -v -run TestBondedRatioPrecisionLoss
-```
-
-The test will confirm that the bonded ratio calculation suffers from precision loss, causing incorrect inflation calculations when the ratio is below the 10^-18 threshold.
+**Notes:**
+- The PoC manually manipulates outstanding to demonstrate the panic condition
+- In practice, this state would be reached through accumulated rounding errors across multiple delegation withdrawals
+- The code's explicit use of `Intersect` for delegation withdrawals with logging confirms the developers knew about rounding issues but didn't apply consistent protection
+- This creates an accounting vulnerability where the sum of what can be withdrawn exceeds outstanding due to asymmetric protections
 
 ### Citations
 
-**File:** x/staking/keeper/pool.go (L71-78)
+**File:** x/distribution/keeper/keeper.go (L119-120)
 ```go
-func (k Keeper) BondedRatio(ctx sdk.Context) sdk.Dec {
-	stakeSupply := k.StakingTokenSupply(ctx)
-	if stakeSupply.IsPositive() {
-		return k.TotalBondedTokens(ctx).ToDec().QuoInt(stakeSupply)
-	}
-
-	return sdk.ZeroDec()
-}
+	outstanding := k.GetValidatorOutstandingRewards(ctx, valAddr).Rewards
+	k.SetValidatorOutstandingRewards(ctx, valAddr, types.ValidatorOutstandingRewards{Rewards: outstanding.Sub(sdk.NewDecCoinsFromCoins(commission...))})
 ```
 
-**File:** x/mint/abci.go (L20-24)
+**File:** x/distribution/keeper/validator.go (L39-43)
 ```go
-	// recalculate inflation rate
-	totalStakingSupply := k.StakingTokenSupply(ctx)
-	bondedRatio := k.BondedRatio(ctx)
-	minter.Inflation = minter.NextInflationRate(params, bondedRatio)
-	minter.AnnualProvisions = minter.NextAnnualProvisions(params, totalStakingSupply)
+		outstanding := k.GetValidatorOutstandingRewards(ctx, val.GetOperator())
+		feePool.CommunityPool = feePool.CommunityPool.Add(rewards.Rewards...)
+		outstanding.Rewards = outstanding.GetRewards().Sub(rewards.Rewards)
+		k.SetFeePool(ctx, feePool)
+		k.SetValidatorOutstandingRewards(ctx, val.GetOperator(), outstanding)
 ```
 
-**File:** x/mint/types/minter.go (L44-67)
+**File:** x/distribution/keeper/validator.go (L48-48)
 ```go
-func (m Minter) NextInflationRate(params Params, bondedRatio sdk.Dec) sdk.Dec {
-	// The target annual inflation rate is recalculated for each previsions cycle. The
-	// inflation is also subject to a rate change (positive or negative) depending on
-	// the distance from the desired ratio (67%). The maximum rate change possible is
-	// defined to be 13% per year, however the annual inflation is capped as between
-	// 7% and 20%.
-
-	// (1 - bondedRatio/GoalBonded) * InflationRateChange
-	inflationRateChangePerYear := sdk.OneDec().
-		Sub(bondedRatio.Quo(params.GoalBonded)).
-		Mul(params.InflationRateChange)
-	inflationRateChange := inflationRateChangePerYear.Quo(sdk.NewDec(int64(params.BlocksPerYear)))
-
-	// adjust the new annual inflation for this next cycle
-	inflation := m.Inflation.Add(inflationRateChange) // note inflationRateChange may be negative
-	if inflation.GT(params.InflationMax) {
-		inflation = params.InflationMax
-	}
-	if inflation.LT(params.InflationMin) {
-		inflation = params.InflationMin
-	}
-
-	return inflation
-}
+		current = rewards.Rewards.QuoDecTruncate(val.GetTokens().ToDec())
 ```
 
-**File:** types/decimal.go (L335-339)
+**File:** x/distribution/keeper/hooks.go (L30-34)
 ```go
-// quotient
-func (d Dec) QuoInt(i Int) Dec {
-	mul := new(big.Int).Quo(d.i, i.i)
-	return Dec{mul}
-}
+	// force-withdraw commission
+	commission := h.k.GetValidatorAccumulatedCommission(ctx, valAddr).Commission
+	if !commission.IsZero() {
+		// subtract from outstanding
+		outstanding = outstanding.Sub(commission)
+```
+
+**File:** x/distribution/keeper/hooks.go (L79-81)
+```go
+func (h Hooks) BeforeDelegationCreated(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) {
+	val := h.k.stakingKeeper.Validator(ctx, valAddr)
+	h.k.IncrementValidatorPeriod(ctx, val)
+```
+
+**File:** x/distribution/keeper/delegation.go (L150-152)
+```go
+	// defensive edge case may happen on the very final digits
+	// of the decCoins due to operation order of the distribution mechanism.
+	rewards := rewardsRaw.Intersect(outstanding)
+```
+
+**File:** types/dec_coin.go (L303-306)
+```go
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
 ```

@@ -1,110 +1,126 @@
 # Audit Report
 
 ## Title
-Reward Theft via Authz-Enabled Withdraw Address Manipulation
+Nested MsgExec Authorization Bypass Allows Unauthorized Message Execution
 
 ## Summary
-The authz module allows a grantee to redirect a granter's staking rewards to an arbitrary address by first modifying the granter's withdraw address, then claiming rewards. When a granter grants authorization for both `MsgSetWithdrawAddress` and `MsgWithdrawDelegatorReward`, the grantee can steal all accumulated staking rewards by changing the withdraw address to their own address before claiming.
+A critical vulnerability in the x/authz module allows a grantee with `GenericAuthorization` for `MsgExec` to bypass authorization checks and execute arbitrary message types on behalf of the granter. By nesting `MsgExec` messages, an attacker exploits the "implicit accept" logic to execute unauthorized actions, resulting in direct loss of funds.
 
 ## Impact
 **High** - Direct loss of funds
 
 ## Finding Description
 
-**Location:**
-- Authz dispatch logic: [1](#0-0) 
-- Distribution withdraw address setter: [2](#0-1) 
-- Distribution reward withdrawal: [3](#0-2) 
-- Distribution message handler: [4](#0-3) 
+**Location:** [1](#0-0) [2](#0-1) 
 
-**Intended Logic:**
-The authz module is designed to allow a granter to delegate the ability to perform certain actions on their behalf. For distribution rewards, the intended behavior is that when a grantee claims rewards using authz, those rewards should be sent to the granter (the owner of the staked tokens) or their designated withdraw address.
+**Intended logic:** 
+The authorization system is designed to enforce fine-grained access control where a granter explicitly authorizes a grantee to execute specific message types on their behalf. The `DispatchActions` function verifies authorization when the message signer (granter) differs from the executing grantee. The "implicit accept" logic is intended to allow users to execute their own messages without requiring self-authorization.
 
-**Actual Logic:**
-The system fails to protect the withdraw address from being modified through authz. The authz module executes messages without modification [5](#0-4) , and the distribution module allows withdraw address changes without verifying whether the request comes directly from the delegator or through an authorization [2](#0-1) . When rewards are withdrawn, they are sent to whatever withdraw address is currently stored [6](#0-5) .
+**Actual logic:** 
+The vulnerability arises from three interacting behaviors:
+1. `MsgExec.GetSigners()` returns the `grantee` field of the MsgExec message, not the actual transaction signer
+2. When `DispatchActions` processes a nested `MsgExec`, it uses the inner MsgExec's grantee as the "granter" for authorization checks
+3. An attacker can set the inner MsgExec's grantee to the victim's address, causing subsequent messages to bypass authorization via the implicit accept path (granter == grantee)
 
-**Exploit Scenario:**
-1. Alice (granter) stakes tokens and accumulates rewards
-2. Alice grants Bob (grantee) authorization for both `MsgSetWithdrawAddress` and `MsgWithdrawDelegatorReward` (perhaps intending for Bob to claim rewards on her behalf when she's unavailable)
-3. Bob executes `MsgExec` containing `MsgSetWithdrawAddress` with `DelegatorAddress=Alice` and `WithdrawAddress=Bob`
-4. Bob executes `MsgExec` containing `MsgWithdrawDelegatorReward` with `DelegatorAddress=Alice`
-5. All of Alice's accumulated staking rewards are sent to Bob's address
-6. Bob can optionally reset Alice's withdraw address back to Alice's address to hide the attack
+**Exploitation path:**
+1. Alice grants Bob `GenericAuthorization` for `/cosmos.authz.v1beta1.MsgExec`
+2. Bob constructs a transaction with nested MsgExec messages:
+   - Outer `MsgExec`: grantee=Bob, msgs=[inner_MsgExec]
+   - Inner `MsgExec`: grantee=Alice, msgs=[MsgSend(from=Alice, to=Bob)]
+3. Bob signs and submits the transaction
+4. Outer MsgExec executes: `DispatchActions(ctx, Bob, [inner_MsgExec])` 
+   - inner_MsgExec.GetSigners() returns [Alice]
+   - Authorization check: Does Bob have MsgExec authorization from Alice? YES
+   - Inner MsgExec handler is invoked
+5. Inner MsgExec executes: `DispatchActions(ctx, Alice, [MsgSend])`
+   - MsgSend.GetSigners() returns [Alice]
+   - Check: Alice == Alice? YES
+   - Implicit accept triggered - NO authorization check
+   - MsgSend executes, transferring Alice's funds to Bob
 
-**Security Failure:**
-This breaks the authorization security model. The granter expects that authorizing reward claims will result in rewards being sent to their own address (or their previously set withdraw address), not to an arbitrary address chosen by the grantee. The vulnerability enables theft of staking rewards through a two-step attack combining authorized operations in an unintended sequence.
+**Security guarantee broken:** 
+The authorization invariant that a grantee can only execute message types explicitly authorized by the granter is violated. The system's fundamental security property of fine-grained access control is completely bypassed.
 
 ## Impact Explanation
 
-**Affected Assets:**
-All staking rewards accumulated by any delegator who has granted authz permissions for both `MsgSetWithdrawAddress` and `MsgWithdrawDelegatorReward`.
+This vulnerability enables direct theft of funds and complete account takeover. An attacker with only `MsgExec` authorization can:
 
-**Severity of Damage:**
-Complete loss of staking rewards for affected users. The grantee can claim 100% of the granter's accumulated rewards by redirecting them to their own address. This represents a direct financial loss that is irreversible once the rewards are transferred.
+- **Drain all funds**: Execute `MsgSend` to transfer the victim's entire balance
+- **Modify staking positions**: Delegate, undelegate, or redelegate tokens
+- **Cast governance votes**: Vote on proposals on behalf of the victim
+- **Execute any message type**: The bypass works for all message types in the system
 
-**System Security Impact:**
-This undermines user trust in the authz delegation mechanism. Users who grant permissions expecting their assets to remain secure will have their staking rewards stolen. The vulnerability affects a core protocol feature (staking rewards) and a fundamental trust mechanism (authorization delegation).
+The impact is severe because users might grant `MsgExec` authorization believing it provides limited delegation capability for nested authorization workflows, without realizing it grants complete account control. All funds controlled by accounts that have granted `GenericAuthorization` for `MsgExec` are at risk.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any grantee who has been granted authorization for both `MsgSetWithdrawAddress` and `MsgWithdrawDelegatorReward` message types by a granter with staking rewards.
+**Who can trigger:** Any user who receives `GenericAuthorization` for `MsgExec` from another account.
 
-**Conditions Required:**
-- Granter must have granted both message type authorizations to the grantee
-- Granter must have accumulated staking rewards
-- No additional rare conditions required - this can be executed at any time during normal network operation
+**Conditions required:**
+- The granter must grant authorization for `/cosmos.authz.v1beta1.MsgExec` to the attacker
+- This is the ONLY authorization required - no authorization for the actual message types being executed is needed
 
-**Frequency:**
-This attack can be executed immediately after authorization is granted and can be repeated for each new batch of accumulated rewards. While users may not commonly grant both permissions together, the scenario is realistic: a user might grant comprehensive permissions to a trusted service or bot that manages their staking operations. The vulnerability can be exploited 100% of the time when these conditions are met.
+**Frequency:** 
+- Exploitable immediately after receiving the authorization
+- Works during normal network operation
+- No special timing, state conditions, or coordination required  
+- No privileged access needed
+- Highly likely to be exploited if users grant MsgExec authorization for legitimate use cases
+
+The vulnerability is particularly dangerous because granting `MsgExec` authorization might appear reasonable for advanced authorization workflows involving nested delegations, making it likely that users would grant this authorization without understanding the security implications.
 
 ## Recommendation
 
-Implement a restriction in the distribution module's `SetWithdrawAddr` function to prevent withdraw address changes when executed through authz. Specifically:
+**Option 1 (Recommended):** Prevent granting authorization for `MsgExec` by adding validation in the `Grant` method: [3](#0-2) 
 
-1. Add a check to detect if the current transaction is being executed via authz (check if the message signer differs from the transaction signer in the context)
-2. If executed through authz, reject the withdraw address change operation
-3. Alternatively, create a separate authorization type for distribution that explicitly validates the withdraw address remains unchanged or only allows it to be set to the granter's address
+Add a check after line 31:
+```go
+if t == sdk.MsgTypeURL(&authz.MsgExec{}) {
+    return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "cannot grant authorization for MsgExec")
+}
+```
 
-The fix should be applied at: [2](#0-1) 
+**Option 2:** Track execution depth and disable implicit accept for nested executions by passing a context flag through `DispatchActions` to indicate when execution is within a MsgExec.
 
-A code-level fix would add validation before line 65 to detect authz execution context and reject withdraw address modifications in that case, or create a specialized distribution authorization type that enforces the invariant that rewards must flow to the granter.
+**Option 3:** Modify the implicit accept logic to check the actual transaction signer rather than using the result from `GetSigners()`.
+
+Option 1 is the simplest and safest fix, as nested MsgExec creates complex authorization chains that are inherently difficult to reason about securely.
 
 ## Proof of Concept
 
-**Test File:** `x/authz/keeper/keeper_test.go`
-
-**Test Function:** Add new test `TestAuthzWithdrawAddressExploit`
+**File:** `x/authz/keeper/keeper_test.go`
 
 **Setup:**
-1. Initialize SimApp with 3 test addresses: granter, grantee, attacker
-2. Fund granter account with staking tokens
-3. Create a validator and have granter delegate tokens to it
-4. Advance blocks to accumulate rewards for the granter
-5. Granter grants grantee authorization for `MsgSetWithdrawAddress` with `GenericAuthorization`
-6. Granter grants grantee authorization for `MsgWithdrawDelegatorReward` with `GenericAuthorization`
+- Initialize test accounts (Alice as victim/granter, Bob as attacker/grantee)
+- Fund Alice's account with 10,000 tokens using `simapp.FundAccount`
+- Alice grants Bob `GenericAuthorization` for `MsgExec` via `SaveGrant`
+- Verify Alice has NOT granted Bob `SendAuthorization` via `GetCleanAuthorization`
 
-**Trigger:**
-1. Grantee creates `MsgSetWithdrawAddress` with `DelegatorAddress=granter` and `WithdrawAddress=grantee`
-2. Wrap it in `MsgExec` and execute through authz keeper's `DispatchActions`
-3. Query and verify the withdraw address is now set to grantee's address
-4. Grantee creates `MsgWithdrawDelegatorReward` with `DelegatorAddress=granter`
-5. Wrap it in `MsgExec` and execute through authz keeper
-6. Check grantee's balance increased by the reward amount
+**Action:**
+- Bob constructs nested MsgExec:
+  - Outer: `authz.NewMsgExec(bobAddr, [inner_MsgExec])`
+  - Inner: `authz.NewMsgExec(aliceAddr, [MsgSend])`  
+  - Innermost: `banktypes.MsgSend{FromAddress: aliceAddr, ToAddress: bobAddr, Amount: 10000 tokens}`
+- Call `app.AuthzKeeper.DispatchActions(ctx, bobAddr, [inner_MsgExec])`
 
-**Observation:**
-The test demonstrates that:
-1. The withdraw address was successfully changed from granter to grantee via authz
-2. The rewards were sent to grantee's address instead of granter's address
-3. Granter lost their staking rewards to the grantee
-4. This confirms the granter's rewards were stolen through authorized but malicious operations
+**Result:**
+- The call succeeds (when it should fail due to lack of SendAuthorization)
+- Alice's balance is drained to zero
+- Bob receives all 10,000 tokens
+- This occurs despite Alice never granting Bob authorization for `MsgSend`
 
-The test would show that the grantee's balance increases by the full reward amount while the granter receives nothing, proving the vulnerability allows direct theft of staking rewards.
+The PoC demonstrates complete authorization bypass, enabling arbitrary message execution and direct fund theft with only `MsgExec` authorization.
+
+## Notes
+
+The vulnerability fundamentally breaks the x/authz module's security model by allowing a single authorization grant to effectively grant unlimited account access. The interaction between `MsgExec.GetSigners()` returning the grantee field and the implicit accept logic creates an authorization bypass that undermines the entire purpose of the authorization system.
 
 ### Citations
 
-**File:** x/authz/keeper/keeper.go (L76-138)
+**File:** x/authz/keeper/keeper.go (L74-139)
 ```go
+// DispatchActions attempts to execute the provided messages via authorization
+// grants from the message signer to the grantee.
 func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
 	results := make([][]byte, len(msgs))
 
@@ -168,144 +184,49 @@ func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []
 	}
 
 	return results, nil
-```
-
-**File:** x/distribution/keeper/keeper.go (L64-82)
-```go
-func (k Keeper) SetWithdrawAddr(ctx sdk.Context, delegatorAddr sdk.AccAddress, withdrawAddr sdk.AccAddress) error {
-	if k.blockedAddrs[withdrawAddr.String()] {
-		return sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to receive external funds", withdrawAddr)
-	}
-
-	if !k.GetWithdrawAddrEnabled(ctx) {
-		return types.ErrSetWithdrawAddrDisabled
-	}
-
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			types.EventTypeSetWithdrawAddress,
-			sdk.NewAttribute(types.AttributeKeyWithdrawAddress, withdrawAddr.String()),
-		),
-	)
-
-	k.SetDelegatorWithdrawAddr(ctx, delegatorAddr, withdrawAddr)
-	return nil
 }
 ```
 
-**File:** x/distribution/keeper/delegation.go (L139-211)
+**File:** x/authz/msgs.go (L212-218)
 ```go
-func (k Keeper) withdrawDelegationRewards(ctx sdk.Context, val stakingtypes.ValidatorI, del stakingtypes.DelegationI) (sdk.Coins, error) {
-	// check existence of delegator starting info
-	if !k.HasDelegatorStartingInfo(ctx, del.GetValidatorAddr(), del.GetDelegatorAddr()) {
-		return nil, types.ErrEmptyDelegationDistInfo
+func (msg MsgExec) GetSigners() []sdk.AccAddress {
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		panic(err)
 	}
-
-	// end current period and calculate rewards
-	endingPeriod := k.IncrementValidatorPeriod(ctx, val)
-	rewardsRaw := k.CalculateDelegationRewards(ctx, val, del, endingPeriod)
-	outstanding := k.GetValidatorOutstandingRewardsCoins(ctx, del.GetValidatorAddr())
-
-	// defensive edge case may happen on the very final digits
-	// of the decCoins due to operation order of the distribution mechanism.
-	rewards := rewardsRaw.Intersect(outstanding)
-	if !rewards.IsEqual(rewardsRaw) {
-		logger := k.Logger(ctx)
-		logger.Info(
-			"rounding error withdrawing rewards from validator",
-			"delegator", del.GetDelegatorAddr().String(),
-			"validator", val.GetOperator().String(),
-			"got", rewards.String(),
-			"expected", rewardsRaw.String(),
-		)
-	}
-
-	// truncate reward dec coins, return remainder to community pool
-	finalRewards, remainder := rewards.TruncateDecimal()
-
-	// add coins to user account
-	if !finalRewards.IsZero() {
-		withdrawAddr := k.GetDelegatorWithdrawAddr(ctx, del.GetDelegatorAddr())
-		err := k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, withdrawAddr, finalRewards)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// update the outstanding rewards and the community pool only if the
-	// transaction was successful
-	k.SetValidatorOutstandingRewards(ctx, del.GetValidatorAddr(), types.ValidatorOutstandingRewards{Rewards: outstanding.Sub(rewards)})
-	feePool := k.GetFeePool(ctx)
-	feePool.CommunityPool = feePool.CommunityPool.Add(remainder...)
-	k.SetFeePool(ctx, feePool)
-
-	// decrement reference count of starting period
-	startingInfo := k.GetDelegatorStartingInfo(ctx, del.GetValidatorAddr(), del.GetDelegatorAddr())
-	startingPeriod := startingInfo.PreviousPeriod
-	k.decrementReferenceCount(ctx, del.GetValidatorAddr(), startingPeriod)
-
-	// remove delegator starting info
-	k.DeleteDelegatorStartingInfo(ctx, del.GetValidatorAddr(), del.GetDelegatorAddr())
-
-	if finalRewards.IsZero() {
-		baseDenom, _ := sdk.GetBaseDenom()
-		if baseDenom == "" {
-			baseDenom = sdk.DefaultBondDenom
-		}
-
-		// Note, we do not call the NewCoins constructor as we do not want the zero
-		// coin removed.
-		finalRewards = sdk.Coins{sdk.NewCoin(baseDenom, sdk.ZeroInt())}
-	}
-
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			types.EventTypeWithdrawRewards,
-			sdk.NewAttribute(sdk.AttributeKeyAmount, finalRewards.String()),
-			sdk.NewAttribute(types.AttributeKeyValidator, val.GetOperator().String()),
-		),
-	)
-
-	return finalRewards, nil
+	return []sdk.AccAddress{grantee}
 }
 ```
 
-**File:** x/distribution/keeper/msg_server.go (L52-87)
+**File:** x/authz/keeper/msg_server.go (L14-42)
 ```go
-func (k msgServer) WithdrawDelegatorReward(goCtx context.Context, msg *types.MsgWithdrawDelegatorReward) (*types.MsgWithdrawDelegatorRewardResponse, error) {
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
-
-	valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
-	if err != nil {
-		return nil, err
-	}
-	delegatorAddress, err := sdk.AccAddressFromBech32(msg.DelegatorAddress)
-	if err != nil {
-		return nil, err
-	}
-	amount, err := k.WithdrawDelegationRewards(ctx, delegatorAddress, valAddr)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
 	if err != nil {
 		return nil, err
 	}
 
-	defer func() {
-		for _, a := range amount {
-			if a.Amount.IsInt64() {
-				telemetry.SetGaugeWithLabels(
-					[]string{"tx", "msg", "withdraw_reward"},
-					float32(a.Amount.Int64()),
-					[]metrics.Label{telemetry.NewLabel("denom", a.Denom)},
-				)
-			}
-		}
-	}()
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
+	}
 
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			sdk.EventTypeMessage,
-			sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
-			sdk.NewAttribute(sdk.AttributeKeySender, msg.DelegatorAddress),
-		),
-	)
-	return &types.MsgWithdrawDelegatorRewardResponse{}, nil
+	authorization := msg.GetAuthorization()
+	if authorization == nil {
+		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
+	}
+
+	t := authorization.MsgTypeURL()
+	if k.router.HandlerByTypeURL(t) == nil {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+	}
+
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgGrantResponse{}, nil
+}
 ```
