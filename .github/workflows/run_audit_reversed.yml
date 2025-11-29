@@ -2,9 +2,9 @@ name: Audit Reversed Automation
 
 on:
   workflow_dispatch:  # allows manual trigger from Actions tab
-  push:
-    branches:
-      - master
+#  push:
+#    branches:
+#      - master
 
 permissions:
   contents: write
@@ -52,7 +52,7 @@ jobs:
           
           echo "has_changes=true" >> $GITHUB_OUTPUT
           git commit -m "Auto-update: collections and reports"
-          git pull --rebase origin master  # Pull any remote changes first
+          git pull origin master --no-rebase  # Pull any remote changes first
           git push
 
       - name: Check if more questions remain

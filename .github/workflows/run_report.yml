@@ -2,6 +2,9 @@ name: Run Report Automation
 
 on:
   workflow_dispatch:  # allows manual trigger from Actions tab
+#  push:
+#    branches:
+#      - master
 
 permissions:
   contents: write
@@ -47,3 +50,29 @@ jobs:
           
           git diff --staged --quiet || git commit -m "Auto-update: collections and reports [skip ci]"
           git push
+
+      - name: Check if more questions remain
+        id: check_remaining
+        run: |
+          REMAINING=$(python3 -c '
+          from run_report import get_remaining_count
+
+          print(get_remaining_count())
+          ')
+
+          echo "remaining=$REMAINING" >> $GITHUB_OUTPUT
+          echo "Remaining questions: $REMAINING"
+
+      - name: Trigger next batch
+        if: ${{ fromJSON(steps.check_remaining.outputs.remaining) > 0  }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'run_report.yml',
+              ref: 'master'
+            });
+            console.log('Triggered next batch of 100 audits');

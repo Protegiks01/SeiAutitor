@@ -1,10 +1,11 @@
-name: Run Validation Report Automation
+name: Run Clean Up Automation
 
 on:
   workflow_dispatch:  # allows manual trigger from Actions tab
 #  push:
 #    branches:
 #      - master
+
 
 permissions:
   contents: write
@@ -34,19 +35,23 @@ jobs:
           pip install selenium webdriver-manager
           pip install -r requirements.txt || echo "No requirements.txt found, skipping"
 
-      - name: Run reports with virtual display
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          sudo apt-get install xclip
-          xvfb-run --auto-servernum python run_validator_report.py
+      - name: Run Clean up
+        run: python run_clean_up.py
+
 
       - name: Commit and push changes
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add validated.json || echo "No validated.json to add"
-          git add validated/*.md || echo "No audit files to add"
+          git add . || echo "No changes"
           
-          git diff --staged --quiet || git commit -m "Auto-update: validated and reports [skip ci]"
+          if git diff --staged --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          git commit -m "Auto-update: clean up and reports"
           git push
+
