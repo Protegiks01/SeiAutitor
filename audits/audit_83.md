@@ -1,279 +1,243 @@
 # Audit Report
 
 ## Title
-ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
+Stale Liveness Tracking State Persists After Validator Removal Causing Unfair Slashing on Consensus Key Reuse
 
 ## Summary
-The `ClaimCapability` function in the Cosmos SDK capability module allows a single module to claim the same capability object multiple times under different names. This causes forward-mapping corruption that breaks authentication invariants and creates permanent orphaned state in both memory and persistent storage. [1](#0-0) 
+When a validator is removed from the validator set after all delegations are unbonded, the slashing module's `AfterValidatorRemoved` hook fails to delete `ValidatorSigningInfo` and `ValidatorMissedBlockArray`. If the same consensus address later creates a new validator, the stale liveness tracking data persists, causing the new validator to inherit the previous validator's `MissedBlocksCounter` and face premature downtime slashing.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
+- **location**: `x/slashing/keeper/hooks.go:40-43` (AfterValidatorRemoved function)
 
-**Location:** `x/capability/keeper/keeper.go`, function `ClaimCapability` (lines 287-314)
+- **intended logic**: When a validator is completely removed from the validator set (all delegations unbonded), all associated slashing state should be cleaned up. If the same consensus address later creates a new validator, it should start with fresh liveness tracking: `MissedBlocksCounter=0`, fresh `StartHeight`, and an empty missed blocks array.
 
-**Intended Logic:** The ClaimCapability function should enforce a one-to-one relationship between a module and capability pair. Each module should maintain exactly one forward mapping per capability to enable consistent authentication. The capability module's design assumes that `AuthenticateCapability` will reliably verify ownership based on the forward mapping.
+- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation but does NOT delete the `ValidatorSigningInfo` or `ValidatorMissedBlockArray`. [1](#0-0)  These persist in storage keyed by consensus address. When a new validator with the same consensus address bonds, `AfterValidatorBonded` checks if signing info exists and only creates new info if not found. [2](#0-1)  Since the old signing info persists, the new validator inherits the stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
 
-**Actual Logic:** ClaimCapability only validates that the exact (module, name) tuple doesn't already exist in the owners set, but fails to check if the same module has already claimed the same capability under a different name. The vulnerability occurs because:
+- **exploitation path**: 
+  1. Validator accumulates missed blocks during operation (e.g., 200 out of 1000-block window, below slashing threshold of 501)
+  2. Validator's operator unbonds all delegations, causing `DelegatorShares` to reach zero [3](#0-2) 
+  3. `RemoveValidator` is called, deleting the `ValidatorByConsAddrKey` index [4](#0-3)  but leaving signing info intact
+  4. Later, the same consensus key creates a new validator (passes the `GetValidatorByConsAddr` check [5](#0-4)  since the index was deleted [6](#0-5) )
+  5. New validator bonds, triggering `AfterValidatorBonded` which finds existing signing info and reuses it
+  6. New validator inherits `MissedBlocksCounter=200` from previous lifecycle
+  7. If new validator misses 301 additional blocks, it reaches 501 total and gets slashed/jailed [7](#0-6) , whereas a fresh validator would need to miss 501 blocks from the start
 
-1. Owner validation in `addOwner` checks for duplicate (module, name) pairs via `CapabilityOwners.Set`: [2](#0-1) 
-
-The owner key is constructed as "module/name", so Owner("foo", "channel-1") and Owner("foo", "channel-2") are treated as distinct owners.
-
-2. The forward mapping key uses only (module, capability) as the composite key: [3](#0-2) 
-
-This causes overwrites when the same module claims the same capability with a different name.
-
-3. Each reverse mapping is created independently without cleanup of previous mappings: [4](#0-3) 
-
-**Exploitation Path:**
-
-1. Module "foo" claims capability: `ClaimCapability(ctx, cap, "channel-1")`
-   - Forward map: `foo/fwd/0xCAP` → "channel-1"
-   - Reverse map: `foo/rev/channel-1` → index
-   - Owners: [("foo", "channel-1")]
-
-2. Module "foo" claims same capability again: `ClaimCapability(ctx, cap, "channel-2")`
-   - Owner validation passes (different name means different owner key)
-   - Forward map **OVERWRITES**: `foo/fwd/0xCAP` → "channel-2" 
-   - New reverse map created: `foo/rev/channel-2` → index
-   - Owners: [("foo", "channel-1"), ("foo", "channel-2")]
-
-3. Authentication breaks for the original name: [5](#0-4) 
-
-`AuthenticateCapability(ctx, cap, "channel-1")` returns false because `GetCapabilityName` now returns "channel-2" instead of "channel-1".
-
-4. Release creates permanent orphaned state: [6](#0-5) 
-
-`ReleaseCapability` only cleans up the current forward-mapped name ("channel-2"), leaving the "channel-1" reverse mapping and owner entry permanently orphaned.
-
-**Security Guarantee Broken:** The capability authentication invariant is violated—modules cannot authenticate capabilities they legitimately own, and the cleanup mechanism leaves permanent inconsistent state.
+- **security guarantee broken**: The protocol invariant that each validator lifecycle has independent liveness tracking is violated. Validators cannot rely on getting a clean slate when creating a new validator with an existing consensus key after full unbonding and removal.
 
 ## Impact Explanation
+Validators who reuse consensus keys after complete unbonding and removal inherit stale missed block counters from their previous lifecycle. This causes them to be slashed and jailed after missing significantly fewer blocks than the configured `SignedBlocksWindow - MinSignedPerWindow` threshold. With default parameters (window=1000, min=500), a validator with inherited `MissedBlocksCounter=200` would be slashed after missing only 301 new blocks instead of 501, a 40% reduction in the downtime tolerance. 
 
-This vulnerability affects the capability module's core security mechanism used throughout the Cosmos SDK, particularly in IBC (Inter-Blockchain Communication):
+This results in:
+- Unfair economic penalties through slashing (loss of validator stake based on `SlashFractionDowntime` parameter)
+- Validators being incorrectly jailed and removed from the active set, losing block rewards and commission
+- Undermined fairness of the slashing mechanism, as validators with reused keys are treated differently than fresh validators
+- Potential operational disruption and discouragement of validator participation
 
-1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it. `AuthenticateCapability` will fail, preventing legitimate IBC channel operations and other capability-protected actions from executing correctly.
-
-2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last claimed name is properly cleaned up. The reverse mappings and owner entries for earlier names remain permanently orphaned in both the memory store and persistent storage, creating inconsistent state that cannot be recovered without a chain upgrade.
-
-3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate in memory and on-chain storage, consuming resources that can never be reclaimed through normal operations.
-
-This fits the **Medium** severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk"—the capability module is core Cosmos SDK infrastructure that can cause module misbehavior, though funds are not directly at risk.
+This qualifies as **Medium severity** under the impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
+This vulnerability can be triggered through normal validator operations without any malicious intent:
+- Validators performing infrastructure maintenance or upgrades who fully unbond temporarily
+- Validators who reuse existing consensus keys for operational simplicity (common practice to avoid key management complexity)
+- Any validator operator who accumulates some missed blocks (normal during network issues or node problems) before complete unbonding
 
-**Likelihood: Medium**
-
-This vulnerability can be triggered during normal chain operations:
-- Buggy module logic that doesn't properly track claimed capabilities
-- Retry or error recovery mechanisms attempting to re-claim already-claimed capabilities
-- State confusion in complex IBC handshake scenarios (e.g., crossing hellos with retries)
-- Module implementations that don't verify capability ownership before claiming
-
-The vulnerability requires specific conditions (claiming the same capability twice with different names), but:
-- No special privileges are required—any module can trigger this through normal operations
-- Can occur during legitimate operations if module code has edge-case handling issues
-- IBC channel handshakes involve complex state transitions where this could manifest
-- Once triggered, the corruption is permanent and cannot self-heal
+While complete unbonding followed by recreation with the same consensus key is not a frequent operation, it is a legitimate use case. The conditions required are all standard validator lifecycle operations accessible to any validator operator, making this a realistic edge case that affects the protocol's fairness guarantees.
 
 ## Recommendation
-
-Add a check in `ClaimCapability` to verify that the calling module hasn't already claimed the capability under any name:
+Modify the `AfterValidatorRemoved` hook in `x/slashing/keeper/hooks.go` to properly clean up all validator-related slashing state:
 
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-    // ... existing validation ...
-    
-    // Check if this module already owns this capability under any name
-    existingName := sk.GetCapabilityName(ctx, cap)
-    if existingName != "" {
-        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
-            "module %s already owns capability under name %s", sk.module, existingName)
-    }
-    
-    // ... rest of function ...
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+    // Clean up signing info
+    store := ctx.KVStore(k.storeKey)
+    store.Delete(types.ValidatorSigningInfoKey(address))
+    // Clean up missed blocks array
+    k.ClearValidatorMissedBlockBitArray(ctx, address)
 }
 ```
 
-This prevents forward-map corruption by ensuring each module can only claim a given capability object once, regardless of the name used.
+This ensures that when a validator is removed, all liveness tracking data is cleared, allowing a fresh start if the consensus address is later reused. This pattern follows the proper cleanup demonstrated by the distribution module's `AfterValidatorRemoved` hook. [8](#0-7) 
 
 ## Proof of Concept
 
-**Test Location:** `x/capability/keeper/keeper_test.go`
+**Test Location**: `x/slashing/keeper/keeper_test.go` (new test to add)  
+**Function**: `TestValidatorRemovalClearsMissedBlocks`
 
-**Setup:**
-- Create a scoped keeper for a test module
-- Use `NewCapability` to create an initial capability with name "original"
+**Setup**:
+1. Initialize test chain with slashing parameters (`SignedBlocksWindow=1000`, `MinSignedPerWindow=500`)
+2. Create and bond validator A with a specific consensus pubkey
+3. Simulate 200 blocks where validator does NOT sign (accumulate `MissedBlocksCounter=200`)
+4. Verify signing info exists with `MissedBlocksCounter=200` using `GetValidatorSigningInfo` [9](#0-8) 
 
-**Action:**
-1. Call `ClaimCapability(ctx, cap, "duplicate")` to claim the same capability object with a different name
-2. Verify that `AuthenticateCapability(ctx, cap, "original")` returns false (authentication broken)
-3. Call `ReleaseCapability(ctx, cap)`
-4. Verify that the "original" reverse mapping still exists in the memory store (orphaned state)
-5. Verify that Owner("module", "original") remains in the persistent owner set (state corruption)
+**Action**:
+1. Unbond all delegations from validator A
+2. Complete unbonding period and verify validator is removed from state
+3. Verify `GetValidatorByConsAddr` returns not found (index deleted)
+4. Create new validator B with the SAME consensus pubkey as validator A
+5. Bond the new validator
 
-**Result:**
-The vulnerability is confirmed by the code flow:
-- Forward map at line 303 uses only (module, cap) as key → overwrites on second claim
-- Reverse map at line 309 creates new entries without cleanup → accumulates orphaned mappings  
-- Authentication at line 279 relies on the overwritten forward map → fails for first name
-- Release at lines 323-340 only cleans up the last claimed name → leaves orphaned state
+**Result**:
+Query signing info for the consensus address - it incorrectly shows `MissedBlocksCounter=200` (inherited from removed validator A) instead of `MissedBlocksCounter=0` for a fresh validator. This proves the bug exists and demonstrates that the new validator starts with stale liveness tracking state, leading to premature slashing if it misses additional blocks.
 
-**Notes:**
+## Notes
 
-The existing test suite does not cover this scenario: [7](#0-6) 
-
-The `TestClaimCapability` function only tests claiming with the same name by the same module (which correctly fails at line 165) and claiming by different modules (which correctly succeeds at line 166), but does not test the same module claiming with different names—the exact vulnerability scenario.
+The slashing module specification [10](#0-9)  only mentions that `AfterValidatorRemoved` "removes a validator's consensus key" but does NOT mention cleaning up signing info or missed block data, indicating incomplete design. The only cleanup function `ClearValidatorMissedBlockBitArray` [11](#0-10)  exists but is only called during slashing operations [12](#0-11) , NOT during validator removal. No function exists to delete `ValidatorSigningInfo` when a validator is removed.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L275-280)
+**File:** x/slashing/keeper/hooks.go (L12-26)
 ```go
-func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
-	if strings.TrimSpace(name) == "" || cap == nil {
-		return false
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
 	}
-	return sk.GetCapabilityName(ctx, cap) == name
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** x/slashing/keeper/hooks.go (L40-43)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
+// AfterValidatorRemoved deletes the address-pubkey relation when a validator is removed,
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L319-356)
+**File:** x/staking/keeper/delegation.go (L789-792)
 ```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
 	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
-	}
+```
 
-	memStore := ctx.KVStore(sk.memKey)
+**File:** x/staking/keeper/validator.go (L36-45)
+```go
+func (k Keeper) GetValidatorByConsAddr(ctx sdk.Context, consAddr sdk.ConsAddress) (validator types.Validator, found bool) {
+	store := ctx.KVStore(k.storeKey)
 
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
-	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	opAddr := store.Get(types.GetValidatorByConsAddrKey(consAddr))
+	if opAddr == nil {
+		return validator, false
 	}
 
-	return nil
+	return k.GetValidator(ctx, opAddr)
 }
 ```
 
-**File:** x/capability/types/types.go (L46-58)
+**File:** x/staking/keeper/validator.go (L176-176)
 ```go
-func (co *CapabilityOwners) Set(owner Owner) error {
-	i, ok := co.Get(owner)
-	if ok {
-		// owner already exists at co.Owners[i]
-		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+```
+
+**File:** x/staking/keeper/msg_server.go (L52-54)
+```go
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
+	}
+```
+
+**File:** x/slashing/keeper/infractions.go (L96-96)
+```go
+	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+```
+
+**File:** x/distribution/keeper/hooks.go (L25-76)
+```go
+// AfterValidatorRemoved performs clean up after a validator is removed
+func (h Hooks) AfterValidatorRemoved(ctx sdk.Context, _ sdk.ConsAddress, valAddr sdk.ValAddress) {
+	// fetch outstanding
+	outstanding := h.k.GetValidatorOutstandingRewardsCoins(ctx, valAddr)
+
+	// force-withdraw commission
+	commission := h.k.GetValidatorAccumulatedCommission(ctx, valAddr).Commission
+	if !commission.IsZero() {
+		// subtract from outstanding
+		outstanding = outstanding.Sub(commission)
+
+		// split into integral & remainder
+		coins, remainder := commission.TruncateDecimal()
+
+		// remainder to community pool
+		feePool := h.k.GetFeePool(ctx)
+		feePool.CommunityPool = feePool.CommunityPool.Add(remainder...)
+		h.k.SetFeePool(ctx, feePool)
+
+		// add to validator account
+		if !coins.IsZero() {
+			accAddr := sdk.AccAddress(valAddr)
+			withdrawAddr := h.k.GetDelegatorWithdrawAddr(ctx, accAddr)
+
+			if err := h.k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, withdrawAddr, coins); err != nil {
+				panic(err)
+			}
+		}
 	}
 
-	// owner does not exist in the set of owners, so we insert at position i
-	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
-	copy(co.Owners[i+1:], co.Owners[i:])
-	co.Owners[i] = owner
+	// Add outstanding to community pool
+	// The validator is removed only after it has no more delegations.
+	// This operation sends only the remaining dust to the community pool.
+	feePool := h.k.GetFeePool(ctx)
+	feePool.CommunityPool = feePool.CommunityPool.Add(outstanding...)
+	h.k.SetFeePool(ctx, feePool)
 
-	return nil
-```
+	// delete outstanding
+	h.k.DeleteValidatorOutstandingRewards(ctx, valAddr)
 
-**File:** x/capability/types/keys.go (L35-37)
-```go
-func RevCapabilityKey(module, name string) []byte {
-	return []byte(fmt.Sprintf("%s/rev/%s", module, name))
+	// remove commission record
+	h.k.DeleteValidatorAccumulatedCommission(ctx, valAddr)
+
+	// clear slashes
+	h.k.DeleteValidatorSlashEvents(ctx, valAddr)
+
+	// clear historical rewards
+	h.k.DeleteValidatorHistoricalRewards(ctx, valAddr)
+
+	// clear current rewards
+	h.k.DeleteValidatorCurrentRewards(ctx, valAddr)
 }
 ```
 
-**File:** x/capability/types/keys.go (L41-50)
+**File:** x/slashing/keeper/signing_info.go (L34-38)
 ```go
-func FwdCapabilityKey(module string, cap *Capability) []byte {
-	// encode the key to a fixed length to avoid breaking consensus state machine
-	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
-	// the length 10 is picked so it's backward compatible on common architectures.
-	key := fmt.Sprintf("%#010p", cap)
-	if len(key) > 10 {
-		key = key[len(key)-10:]
-	}
-	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
+func (k Keeper) SetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress, info types.ValidatorSigningInfo) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&info)
+	store.Set(types.ValidatorSigningInfoKey(address), bz)
 }
 ```
 
-**File:** x/capability/keeper/keeper_test.go (L156-178)
+**File:** x/slashing/keeper/signing_info.go (L168-171)
 ```go
-func (suite *KeeperTestSuite) TestClaimCapability() {
-	sk1 := suite.keeper.ScopeToModule(banktypes.ModuleName)
-	sk2 := suite.keeper.ScopeToModule(stakingtypes.ModuleName)
-	sk3 := suite.keeper.ScopeToModule("foo")
-
-	cap, err := sk1.NewCapability(suite.ctx, "transfer")
-	suite.Require().NoError(err)
-	suite.Require().NotNil(cap)
-
-	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
-	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
-
-	got, ok := sk1.GetCapability(suite.ctx, "transfer")
-	suite.Require().True(ok)
-	suite.Require().Equal(cap, got)
-
-	got, ok = sk2.GetCapability(suite.ctx, "transfer")
-	suite.Require().True(ok)
-	suite.Require().Equal(cap, got)
-
-	suite.Require().Error(sk3.ClaimCapability(suite.ctx, cap, "  "))
-	suite.Require().Error(sk3.ClaimCapability(suite.ctx, nil, "transfer"))
+func (k Keeper) ClearValidatorMissedBlockBitArray(ctx sdk.Context, address sdk.ConsAddress) {
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
 }
+```
+
+**File:** x/slashing/spec/05_hooks.md (L15-17)
+```markdown
++ `AfterValidatorBonded` creates a `ValidatorSigningInfo` instance as described in the following section.
++ `AfterValidatorCreated` stores a validator's consensus key.
++ `AfterValidatorRemoved` removes a validator's consensus key.
+```
+
+**File:** x/slashing/abci.go (L58-60)
+```go
+		if writeInfo.ShouldSlash {
+			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
+			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
 ```

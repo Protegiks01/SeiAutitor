@@ -1,304 +1,255 @@
 # Audit Report
 
 ## Title
-Unbounded SignedBlocksWindow Parameter Enables Network-Wide Denial of Service via Memory Exhaustion
+OCC Blind Write Vulnerability: Concurrent MsgGrant Transactions Succeed Without Conflict Detection Leading to Silent State Loss
 
 ## Summary
-The `SignedBlocksWindow` parameter in the slashing module lacks upper bound validation in its validation function, allowing governance proposals to set arbitrarily large values (e.g., 1 billion) that cause simultaneous memory exhaustion across all validator nodes during block processing, resulting in network-wide shutdown requiring a hard fork to recover.
+When Optimistic Concurrency Control (OCC) is enabled, concurrent transactions creating grants for the same (grantee, granter, msgType) tuple both succeed and charge gas fees, but only the highest-indexed transaction's state persists. The `SaveGrant` method performs blind writes without reading first, and OCC validation only detects read-write conflicts, not write-write conflicts, causing silent state loss for lower-indexed transactions despite returning success. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:**
-- Parameter validation: [1](#0-0) 
-- Resize operation: [2](#0-1) 
-- Concurrent validator processing: [3](#0-2) 
-- Bool array allocation: [4](#0-3) 
+**Location:** 
+- Primary vulnerability: `x/authz/keeper/keeper.go:144-160` (SaveGrant method)
+- Missing validation: `store/multiversion/store.go:388-397` (ValidateTransactionState)
+- State persistence logic: `store/multiversion/store.go:399-435` (WriteLatestToStore)
+- Last-write-wins behavior: `store/multiversion/data_structures.go:60-79` (GetLatestNonEstimate)
 
 **Intended Logic:**
-The `SignedBlocksWindow` parameter defines a sliding window size for tracking validator liveness. Parameter validation should enforce reasonable bounds to prevent resource exhaustion and system instability, protecting against both malicious attacks and accidental misconfigurations.
+When a transaction creates or updates an authorization grant, concurrent transactions modifying the same grant should be detected as conflicts and properly serialized. A successful transaction (Code=0) must guarantee its state changes persist to the blockchain.
 
 **Actual Logic:**
-The `validateSignedBlocksWindow` function only verifies that the value is positive (`v > 0`) with no upper bound constraint. [1](#0-0) 
+The `SaveGrant` method performs a blind write operation by directly calling `store.Set(skey, bz)` without first reading the existing value. [1](#0-0)  This means the transaction's readset for that key remains empty.
 
-When the window size changes via governance proposal, the next block's `BeginBlocker` processes all validators concurrently in goroutines. [3](#0-2)  Each validator's `HandleValidatorSignatureConcurrent` detects the window size change and calls `ResizeMissedBlockArray`. [5](#0-4) 
+OCC validation via `ValidateTransactionState` only checks iterator consistency and read value consistency through `checkIteratorAtIndex` and `checkReadsetAtIndex`. [2](#0-1)  There is no validation for write-write conflicts. Since concurrent transactions don't read the grant key before writing, both have empty readsets for that key and both pass validation.
 
-The `ResizeMissedBlockArray` function allocates bool arrays proportional to the window size: `ParseBitGroupsToBoolArray` creates one array for parsing existing data, and `make([]bool, window)` creates another for the new window. [6](#0-5)  In Go, each bool uses 1 byte, so a window of 1 billion allocates approximately 1GB per array, totaling ~2GB per validator during resize.
+When `WriteLatestToStore` commits the final state, it calls `GetLatestNonEstimate()` for each key. [3](#0-2)  The `GetLatestNonEstimate` method descends the btree and returns only the highest-indexed value. [4](#0-3)  Earlier writes to the same key are silently discarded.
 
 **Exploitation Path:**
-1. An operator (accidentally via typo) or attacker submits a governance `ParameterChangeProposal` setting `SignedBlocksWindow` to 1,000,000,000
-2. Proposal passes through standard governance voting period (2+ days) [7](#0-6) 
-3. Parameter change executes via `handleParameterChangeProposal` when proposal passes [8](#0-7) 
-4. The `Update` function validates the new value, but validation only checks `v > 0` - passes with no upper bound check [1](#0-0) 
-5. On the next block's `BeginBlocker`, all validators (e.g., 100) are processed concurrently [3](#0-2) 
-6. Each validator's goroutine allocates ~2GB for array resizing (old + new arrays)
-7. With 100 validators: ~200GB allocated simultaneously across all validator nodes
-8. Validator nodes exhaust available memory, crash with OOM errors, or hang indefinitely
-9. Network halts as validators cannot process blocks, requiring coordinated hard fork to recover
+1. User submits Transaction A: MsgGrant(grantee, granter, MsgSend, limit=100)
+2. User submits Transaction B: MsgGrant(grantee, granter, MsgSend, limit=200) in same block
+3. Both transactions execute in parallel under OCC
+4. Both call `SaveGrant` [5](#0-4)  which performs `store.Set(key, value)` without prior `store.Get(key)`
+5. Neither transaction has read dependency on the key (empty readsets)
+6. Both pass `ValidateTransactionState` (no read conflicts detected)
+7. Both return Code=0 (success) and emit `EventGrant` events
+8. Both charge gas fees
+9. Only Transaction B's grant persists when `WriteLatestToStore` is called
+10. Transaction A's effect is silently lost despite returning success
 
 **Security Guarantee Broken:**
-The blockchain's availability and liveness guarantees are violated. Parameter validation serves as a defensive security boundary that should prevent governance actions from causing catastrophic system failures beyond the intended scope of parameter adjustment. While governance is trusted to tune network parameters, it should not be able to accidentally or intentionally trigger complete network shutdown requiring hard fork recovery through a single parameter value.
+This violates the atomicity and finality guarantee of blockchain transactions: a successful transaction (Code=0) must guarantee its state changes persist. The vulnerability also causes event log inconsistency where `EventGrant` is emitted for both transactions but only one grant exists in state.
 
 ## Impact Explanation
 
-**Affected Components:**
-- All validator nodes across the network
-- Network consensus and block production capability
-- Transaction processing and finality
+This vulnerability constitutes "a bug in the network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity). The OCC layer (network code) causes unintended behavior in the authz module with significant state inconsistency issues:
 
-**Consequences:**
-- **Total network shutdown**: All validators simultaneously attempt memory-exhaustive resize operations at the same block height, causing synchronized node failures
-- **Requires hard fork to recover**: Once validators crash at a specific block height, the chain cannot progress without coordinating a binary upgrade or hard fork to cap/revert the parameter value
-- **Can occur accidentally**: A simple typo when entering the parameter value (e.g., 100000000 instead of 100000 - adding extra zeros) would trigger this vulnerability during routine network maintenance
-- **Disproportionate impact**: The consequence (network-wide shutdown requiring hard fork) far exceeds the intended scope of parameter tuning
+1. **Wasted Gas Fees:** Users pay gas for transactions whose effects are silently discarded. Unlike transaction failures, these transactions return success (Code=0), misleading users.
 
-This matches the defined Medium severity impact: "Network not being able to confirm new transactions (total network shutdown)".
+2. **Event Log Inconsistency:** Both transactions emit `EventGrant` events, causing off-chain applications, indexers, and monitoring systems to have incorrect state. Applications relying on events will believe both grants were created.
+
+3. **State Consistency Violation:** Only one grant persists despite two successful transactions, breaking the invariant that successful transactions persist their changes.
+
+4. **Authorization Security Concern:** Since grants control spending limits and permissions, unpredictable grant persistence could lead to authorization mismatches where applications expect different limits than what exists on-chain.
 
 ## Likelihood Explanation
 
+**Trigger Conditions:**
+- OCC must be enabled
+- Multiple transactions targeting the same (grantee, granter, msgType) tuple in the same block
+- Transactions execute concurrently in OCC's parallel execution phase
+
 **Who Can Trigger:**
-Anyone capable of passing a governance proposal through standard voting mechanisms, which requires either:
-- Significant stake ownership (typically majority voting power)
-- Strong community support for the proposal
-- In validator-heavy networks, coordinated validator approval
+Any user can trigger this vulnerability by submitting normal MsgGrant transactions. No special privileges, unusual conditions, or attack setup is required.
 
-**Conditions Required:**
-- Single governance proposal submission and successful vote
-- No special timing requirements or state prerequisites
-- Occurs during normal block processing operations
-- No coordination needed beyond standard governance flow
+**Frequency:**
+- Occurs naturally when users submit concurrent grant updates or retry transactions
+- More likely under high transaction throughput
+- Particularly probable when frontends submit duplicate transactions
+- In production networks with OCC enabled, this could happen regularly during normal operation
 
-**Likelihood Factors:**
-- **High accidental trigger risk**: Network operators regularly adjust this parameter for optimization; entering wrong values (extra zeros) is a realistic human error
-- **Simple execution**: Only requires setting a large integer value through standard governance interface
-- **Expected parameter adjustment**: The parameter is meant to be tuned occasionally, increasing exposure to misconfiguration
-- **No technical sophistication needed**: Standard governance proposal submission
-
-The vulnerability has **moderate-to-high likelihood** because parameter changes are routine governance activities, and the absence of bounds checking means any large value (whether accidental or malicious) will trigger the issue.
+The inconsistency with the `update` method [6](#0-5)  which reads before writing suggests this is an oversight rather than intentional design.
 
 ## Recommendation
 
-**Immediate Fix:**
-Add upper bound validation to the `validateSignedBlocksWindow` function:
+Modify `SaveGrant` to read the existing grant first, even if just to check existence. This creates a read dependency that enables existing OCC conflict detection:
 
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-    v, ok := i.(int64)
-    if !ok {
-        return fmt.Errorf("invalid parameter type: %T", i)
-    }
+func (k Keeper) SaveGrant(...) error {
+    store := ctx.KVStore(k.storeKey)
+    skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
     
-    if v <= 0 {
-        return fmt.Errorf("signed blocks window must be positive: %d", v)
-    }
+    // Read to create OCC dependency (enables conflict detection)
+    _ = store.Get(skey)
     
-    // Add maximum bound to prevent memory exhaustion
-    const MaxSignedBlocksWindow = int64(1_000_000) // ~11 days at 1s block time
-    if v > MaxSignedBlocksWindow {
-        return fmt.Errorf("signed blocks window exceeds maximum allowed value (max %d): %d", MaxSignedBlocksWindow, v)
-    }
-    
-    return nil
+    grant, err := authz.NewGrant(authorization, expiration)
+    // ... rest of implementation
 }
 ```
 
-**Rationale:**
-- Current default is 108,000 blocks (~30 hours at 1s block time) [9](#0-8) 
-- Maximum of 1,000,000 blocks (~11 days) provides 10x operational headroom
-- Prevents both malicious attacks and accidental typos
-- Ensures memory requirements remain within reasonable bounds (tens of MB vs hundreds of GB)
-
-**Additional Safeguards:**
-Consider implementing incremental resize operations or memory usage monitoring if supporting larger window changes becomes necessary in future network upgrades.
+This approach is simpler and consistent with the existing `update` method pattern which already follows read-before-write.
 
 ## Proof of Concept
 
-**Test Structure:**
-```go
-// File: x/slashing/keeper/keeper_test.go
-func TestLargeSignedBlocksWindowMemoryExhaustion(t *testing.T) {
-    // Setup: Initialize test application and context
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Create test validators (reduced from production count for test feasibility)
-    numValidators := 10
-    validators := createTestValidators(app, ctx, numValidators)
-    
-    // Set initial reasonable window size
-    params := app.SlashingKeeper.GetParams(ctx)
-    params.SignedBlocksWindow = 100000 // Default-like value
-    app.SlashingKeeper.SetParams(ctx, params)
-    
-    // ACTION: Simulate governance proposal changing to extremely large window
-    params.SignedBlocksWindow = 50000000 // 50 million (reduced but still demonstrates issue)
-    app.SlashingKeeper.SetParams(ctx, params)
-    
-    // TRIGGER: Process next block with all validator signatures
-    // This attempts to resize arrays for all validators concurrently
-    req := abci.RequestBeginBlock{
-        LastCommitInfo: abci.LastCommitInfo{
-            Votes: createValidatorVotes(validators),
-        },
-    }
-    
-    // RESULT: Measure excessive memory allocation and performance degradation
-    startMem := getCurrentMemoryUsage()
-    startTime := time.Now()
-    
-    slashing.BeginBlocker(ctx, req, app.SlashingKeeper)
-    
-    duration := time.Since(startTime)
-    memoryUsed := getCurrentMemoryUsage() - startMem
-    
-    // Assertions demonstrating the vulnerability
-    // Even with reduced validator count (10) and window (50M), observe significant impact
-    assert.True(t, memoryUsed > 500*1024*1024, 
-        "Expected > 500MB memory allocation for 10 validators with 50M window")
-    assert.True(t, duration > 5*time.Second, 
-        "Expected significant processing time delay")
-    
-    // NOTE: With production parameters (100+ validators, 1 billion window),
-    // nodes would crash with out-of-memory errors, halting the network
-}
-```
+**Test File:** `x/authz/keeper/keeper_test.go`
 
-**Expected Behavior:**
-The test demonstrates that without upper bound validation:
-- Large window values cause excessive memory allocation (hundreds of MB even with reduced parameters)
-- Significant performance degradation (multi-second block processing delays)
-- With production parameters (100+ validators, 1 billion window), validator nodes would crash with OOM errors, causing complete network shutdown requiring hard fork recovery
+**Test Function:** `TestConcurrentGrantsOCCBlindWrite`
+
+**Setup:**
+1. Initialize SimApp with OCC enabled (`SetOccEnabled(true)`, `SetConcurrencyWorkers(2)`)
+2. Create test accounts: granter (addr[0]), grantee (addr[1])
+3. Fund granter account for gas fees
+4. Create two MsgGrant transactions for the same (grantee, granter, msgType) with different spend limits
+
+**Action:**
+1. Build Transaction A: MsgGrant with SpendLimit=100
+2. Build Transaction B: MsgGrant with SpendLimit=200 (same grantee, granter, msgType)
+3. Submit both transactions in the same block using `DeliverTxBatch` with OCC enabled
+4. Process the batch through the OCC scheduler
+
+**Expected Result:**
+1. Both transactions return Code=0 (success)
+2. Both transactions emit EventGrant events
+3. Both transactions charge gas
+4. Query final state shows only ONE grant exists (SpendLimit=200)
+5. Transaction A's SpendLimit=100 is silently lost despite success
+6. This violates the blockchain invariant that successful transactions persist their changes
 
 ## Notes
 
-This vulnerability qualifies as valid despite requiring governance action because:
-
-1. **Impact exceeds intended authority**: Parameter adjustment is meant for network tuning, not causing catastrophic failures requiring hard forks
-2. **Defensive security boundary**: Parameter validation should prevent system-breaking values regardless of who sets them
-3. **Accidental trigger**: Can occur through simple typos during legitimate maintenance operations
-4. **Severity classification**: Precisely matches the defined Medium impact: "Network not being able to confirm new transactions (total network shutdown)"
-5. **Unrecoverable failure**: Requires coordinated hard fork intervention, not normal governance or operational procedures
-
-The absence of upper bound validation represents a missing defensive safeguard that enables disproportionate consequences from routine parameter adjustments.
+The vulnerability is confirmed by the code flow analysis showing SaveGrant's blind write pattern combined with OCC's lack of write-write conflict detection. The inconsistency with the `update` method which reads before writing indicates this is an unintentional oversight rather than a design choice. No existing tests cover concurrent SaveGrant operations with OCC enabled, suggesting this scenario was not considered during development.
 
 ### Citations
 
-**File:** x/slashing/types/params.go (L13-13)
+**File:** x/authz/keeper/keeper.go (L51-72)
 ```go
-	DefaultSignedBlocksWindow   = int64(108000) // ~12 hours based on 0.4s block times
-```
+func (k Keeper) update(ctx sdk.Context, grantee sdk.AccAddress, granter sdk.AccAddress, updated authz.Authorization) error {
+	skey := grantStoreKey(grantee, granter, updated.MsgTypeURL())
+	grant, found := k.getGrant(ctx, skey)
+	if !found {
+		return sdkerrors.ErrNotFound.Wrap("authorization not found")
+	}
 
-**File:** x/slashing/types/params.go (L72-83)
-```go
-func validateSignedBlocksWindow(i interface{}) error {
-	v, ok := i.(int64)
+	msg, ok := updated.(proto.Message)
 	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
+		sdkerrors.ErrPackAny.Wrapf("cannot proto marshal %T", updated)
 	}
 
-	if v <= 0 {
-		return fmt.Errorf("signed blocks window must be positive: %d", v)
+	any, err := codectypes.NewAnyWithValue(msg)
+	if err != nil {
+		return err
 	}
 
+	grant.Authorization = any
+	store := ctx.KVStore(k.storeKey)
+	store.Set(skey, k.cdc.MustMarshal(&grant))
 	return nil
 }
 ```
 
-**File:** x/slashing/keeper/infractions.go (L52-54)
+**File:** x/authz/keeper/keeper.go (L144-160)
 ```go
-	if found && missedInfo.WindowSize != window {
-		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
-	}
-```
+func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
+	store := ctx.KVStore(k.storeKey)
 
-**File:** x/slashing/keeper/infractions.go (L157-181)
-```go
-func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
-	// we need to resize the missed block array AND update the signing info accordingly
-	switch {
-	case missedInfo.WindowSize < window:
-		// missed block array too short, lets expand it
-		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
-		newArray := make([]bool, window)
-		copy(newArray[0:index], boolArray[0:index])
-		if index+1 < missedInfo.WindowSize {
-			// insert `0`s corresponding to the difference between the new window size and old window size
-			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
-		}
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
-		missedInfo.WindowSize = window
-	case missedInfo.WindowSize > window:
-		// if window size is reduced, we would like to make a clean state so that no validators are unexpectedly jailed due to more recent missed blocks
-		newMissedBlocks := make([]bool, window)
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newMissedBlocks)
-		signInfo.MissedBlocksCounter = int64(0)
-		missedInfo.WindowSize = window
-		signInfo.IndexOffset = 0
-		index = 0
+	grant, err := authz.NewGrant(authorization, expiration)
+	if err != nil {
+		return err
 	}
-	return missedInfo, signInfo, index
+
+	bz := k.cdc.MustMarshal(&grant)
+	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
+	store.Set(skey, bz)
+	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
+		MsgTypeUrl: authorization.MsgTypeURL(),
+		Granter:    granter.String(),
+		Grantee:    grantee.String(),
+	})
 }
 ```
 
-**File:** x/slashing/abci.go (L35-50)
+**File:** store/multiversion/store.go (L388-397)
 ```go
-	allVotes := req.LastCommitInfo.GetVotes()
-	for i, _ := range allVotes {
-		wg.Add(1)
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
-			}
-		}(i)
-	}
-```
+func (s *Store) ValidateTransactionState(index int) (bool, []int) {
+	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
 
-**File:** x/slashing/keeper/signing_info.go (L109-116)
-```go
-func (k Keeper) ParseBitGroupsToBoolArray(bitGroups []uint64, window int64) []bool {
-	boolArray := make([]bool, window)
+	// TODO: can we parallelize for all iterators?
+	iteratorValid := s.checkIteratorAtIndex(index)
 
-	for i := int64(0); i < window; i++ {
-		boolArray[i] = k.GetBooleanFromBitGroups(bitGroups, i)
-	}
-	return boolArray
+	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
+
+	return iteratorValid && readsetValid, conflictIndices
 }
 ```
 
-**File:** x/gov/types/params.go (L14-17)
+**File:** store/multiversion/store.go (L399-435)
 ```go
-const (
-	DefaultPeriod          time.Duration = time.Hour * 24 * 2 // 2 days
-	DefaultExpeditedPeriod time.Duration = time.Hour * 24     // 1 day
-)
-```
+func (s *Store) WriteLatestToStore() {
+	// sort the keys
+	keys := []string{}
+	s.multiVersionMap.Range(func(key, value interface{}) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	sort.Strings(keys)
 
-**File:** x/params/proposal_handler.go (L26-42)
-```go
-func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
-	for _, c := range p.Changes {
-		ss, ok := k.GetSubspace(c.Subspace)
+	for _, key := range keys {
+		val, ok := s.multiVersionMap.Load(key)
 		if !ok {
-			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+			continue
 		}
-
-		k.Logger(ctx).Info(
-			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
-		)
-
-		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
-			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
+		if !found {
+			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
+			continue
+		}
+		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
+		if mvValue.IsEstimate() {
+			panic("should not have any estimate values when writing to parent store")
+		}
+		// if the value is deleted, then delete it from the parent store
+		if mvValue.IsDeleted() {
+			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
+			// be sure if the underlying store might do a save with the byteslice or
+			// not. Once we get confirmation that .Delete is guaranteed not to
+			// save the byteslice, then we can assume only a read-only copy is sufficient.
+			s.parentStore.Delete([]byte(key))
+			continue
+		}
+		if mvValue.Value() != nil {
+			s.parentStore.Set([]byte(key), mvValue.Value())
 		}
 	}
+}
+```
 
-	return nil
+**File:** store/multiversion/data_structures.go (L60-79)
+```go
+func (item *multiVersionItem) GetLatestNonEstimate() (MultiVersionValueItem, bool) {
+	item.mtx.RLock()
+	defer item.mtx.RUnlock()
+
+	var vItem *valueItem
+	var found bool
+	item.valueTree.Descend(func(bTreeItem btree.Item) bool {
+		// only return if non-estimate
+		item := bTreeItem.(*valueItem)
+		if item.IsEstimate() {
+			// if estimate, continue
+			return true
+		}
+		// else we want to return
+		vItem = item
+		found = true
+		return false
+	})
+	return vItem, found
+}
+```
+
+**File:** x/authz/keeper/msg_server.go (L36-36)
+```go
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
 ```

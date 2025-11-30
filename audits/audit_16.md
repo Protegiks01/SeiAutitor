@@ -1,281 +1,376 @@
-Based on my thorough analysis of the codebase, I can confirm this is a **valid vulnerability**. Let me present my validation:
-
-## Validation Findings
-
-I have verified the complete execution flow and confirmed all technical claims:
-
-**1. AnteHandler Entry Point Confirmed:** [1](#0-0) 
-
-The `DeductFeeDecorator.checkDeductFee` indeed calls `UseGrantedFees` with `sdkTx.GetMsgs()`, which only returns top-level messages.
-
-**2. GetMsgs() Returns Only Top-Level Messages:** [2](#0-1) 
-
-The implementation confirms it only iterates through `t.Body.Messages` without any nested message extraction logic.
-
-**3. AllowedMsgAllowance.Accept Validation:** [3](#0-2) 
-
-The Accept method calls `allMsgTypesAllowed` with only the messages passed to it, without unwrapping nested messages.
-
-**4. No Recursive Checking:** [4](#0-3) 
-
-The `allMsgTypesAllowed` method simply iterates through messages checking type URLs - no logic to unwrap `MsgExec` nested messages.
-
-**5. MsgExec Execution Path:** [5](#0-4) 
-
-During execution, MsgExec.Exec extracts nested messages via `GetMessages()` and passes them to `DispatchActions`.
-
-**6. Implicit Acceptance Logic:** [6](#0-5) 
-
-The critical vulnerability: when `granter.Equals(grantee)`, DispatchActions implicitly accepts without any authorization check. This means an attacker can execute their own messages wrapped in MsgExec without needing any prior authz grant.
-
-**7. Grant Self-to-Self Blocked in MsgGrant:** [7](#0-6) 
-
-This confirms the exploit is simpler than initially thought - no authz grant needed due to implicit acceptance.
-
----
-
 # Audit Report
 
 ## Title
-AllowedMsgAllowance Bypass via Nested MsgExec Messages
+Permanent Loss of Transaction Fees Due to Missing EndBlock Implementation in Bank Module
 
 ## Summary
-The `AllowedMsgAllowance` feegrant restriction mechanism can be completely bypassed by wrapping disallowed message types inside an authz `MsgExec`. The AnteHandler only validates top-level messages when checking feegrant allowances, while execution proceeds with nested messages that were never validated against the allowance restrictions.
+The bank module's deferred balance system deducts transaction fees from user accounts immediately (persisted to disk) and caches them in a memory-only store with the documented intent to flush to module accounts during EndBlock. However, the bank module completely lacks an EndBlock method implementation, causing `WriteDeferredBalances` to never be called in production. This results in permanent loss of all accumulated transaction fees when nodes restart, as the memory-only cache is cleared while user deductions remain persisted to disk.
 
 ## Impact
-Medium (Direct loss of funds - feegrant balance drainage for unauthorized transaction types)
+High
 
 ## Finding Description
 
-**Location:** 
-- `x/auth/ante/fee.go:168` (UseGrantedFees call with top-level messages only)
-- `types/tx/types.go:22-36` (GetMsgs returns only t.Body.Messages)
-- `x/feegrant/filtered_fee.go:65-86` (AllowedMsgAllowance.Accept)
-- `x/feegrant/filtered_fee.go:98-109` (allMsgTypesAllowed - no nested message unwrapping)
-- `x/authz/keeper/keeper.go:87-111` (DispatchActions implicit acceptance)
+**Location:**
+- Fee deduction entry point: [1](#0-0) 
+- Deferred send implementation: [2](#0-1) 
+- Bank module structure (no EndBlock): [3](#0-2) 
+- Memory store characteristics: [4](#0-3) 
 
-**Intended Logic:**
-When a granter creates an `AllowedMsgAllowance` with specific message type restrictions (e.g., only allowing `/cosmos.gov.v1beta1.MsgVote`), the system should validate ALL messages in a transaction - including nested messages within wrapper types like `MsgExec` - against the allowed list before deducting fees from the feegrant.
+**Intended logic:**
+The code documentation explicitly states the intended behavior: [5](#0-4) 
 
-**Actual Logic:**
-The `DeductFeeDecorator` only validates top-level messages obtained via `sdkTx.GetMsgs()`. When a transaction contains `MsgExec`, only the `MsgExec` message type itself is checked, never the nested messages inside it. During execution, the authz module's `DispatchActions` has implicit acceptance logic: if the message signer equals the MsgExec grantee, no authorization check occurs. This creates a complete bypass of the feegrant message type restrictions.
+The system is designed to: (1) immediately deduct fees via `SubUnlockedCoins` which persists to the IAVL store, (2) cache amounts in a deferred memory store indexed by transaction, and (3) flush all deferred balances to module accounts in EndBlock via `WriteDeferredBalances`.
 
-**Exploitation Path:**
-1. Granter creates `AllowedMsgAllowance` with: `["/cosmos.gov.v1beta1.MsgVote", "/cosmos.authz.v1beta1.MsgExec"]`
-2. Attacker (grantee) constructs transaction with top-level message: `MsgExec{Grantee: Self, Msgs: [MsgSend{From: Self, To: Victim, Amount: X}]}`
-3. AnteHandler phase: `UseGrantedFees` receives `[MsgExec]` from `GetMsgs()`, validates only `MsgExec` type (passes), deducts fee from granter's account
-4. Execution phase: `MsgExec.Exec` extracts nested `[MsgSend]`, calls `DispatchActions(Self, [MsgSend])`
-5. In `DispatchActions`: signer=Self, grantee=Self → implicit acceptance, no authorization check
-6. `MsgSend` executes successfully using feegrant funds, despite not being in allowed messages list
+**Actual logic:**
+- User fees are deducted immediately and persisted to disk through the SubUnlockedCoins call
+- Amounts are stored in a memory-only deferred cache that is "not committed as part of app state but maintained privately by each node"
+- The bank module AppModule struct (lines 107-210) contains no EndBlock method, failing to implement the `EndBlockAppModule` interface
+- Module manager skips modules lacking EndBlock: [6](#0-5) 
+- `WriteDeferredBalances` is never called in production code (verified by comprehensive grep - only appears in test files)
+- On node restart, memory stores are recreated fresh: [7](#0-6) 
+- User accounts retain reduced balances but module accounts never receive funds
 
-**Security Guarantee Broken:**
-The fundamental security guarantee of `AllowedMsgAllowance` - that feegrant funds will ONLY be used for explicitly approved message types - is completely violated for nested messages within `MsgExec`.
+**Exploitation path:**
+No attacker required - occurs during normal blockchain operation:
+1. User submits transaction with fees
+2. Ante handler calls DeductFees which invokes `DeferredSendCoinsFromAccountToModule`
+3. User balance reduced via SubUnlockedCoins (persisted to IAVL store)
+4. Amount cached in memory-only deferred store
+5. Block processing completes, EndBlock is called: [8](#0-7) 
+6. Bank module is skipped during EndBlock iteration (no EndBlock implementation)
+7. `WriteDeferredBalances` never called
+8. State committed with user balance reduced but module account unchanged
+9. Fees accumulate in memory cache across multiple blocks
+10. Node restarts (maintenance, upgrade, crash, or hardware operations)
+11. Memory store cleared, deferred cache emptied
+12. All accumulated fees permanently lost
+
+**Security guarantee broken:**
+Violates the fundamental accounting invariant that all deducted coins must exist somewhere in the system. The TotalSupply invariant correctly includes deferred balances during normal operation: [9](#0-8) 
+
+However, after restart when the cache is cleared, the invariant would fail as the sum of account balances would be less than total supply (user balances reduced without corresponding module credits).
 
 ## Impact Explanation
 
-This vulnerability enables complete unauthorized drainage of feegrant balances for ANY transaction type, regardless of the granter's intended restrictions. A granter who allocates funds specifically for governance voting (believing their funds will only pay for vote transactions) can have their entire feegrant balance drained for token transfers, staking operations, or any other message type. This breaks the trust model of restricted feegrants and represents a direct financial loss of the allocated funds to the granter.
+All transaction fees paid since the last node restart are permanently lost. This includes fees intended for the fee collector module which funds validator rewards and governance operations. The impact is severe because:
+
+- **Direct permanent fund loss**: Fees deducted from users never reach module accounts
+- **Continuous accumulation**: Every transaction contributes to the growing loss
+- **No recovery mechanism**: Once the memory store is cleared on restart, amounts are irrecoverable
+- **Network-wide issue**: Affects every validator and full node independently on each restart
+- **Invariant violation**: After restart, total supply accounting breaks (user balances reduced without corresponding module credits)
+
+The deferred cache is confirmed to be used in production: [10](#0-9) 
 
 ## Likelihood Explanation
 
-**Likelihood: High**
+**Very High** - Triggered continuously during normal blockchain operation:
 
-This vulnerability is highly likely to be exploited because:
-1. Granters commonly and reasonably include `MsgExec` in allowed message lists to enable authz-based operations
-2. No special permissions or prior setup required - any grantee with a feegrant containing `MsgExec` can exploit
-3. The exploit is straightforward: wrap any message in MsgExec with yourself as grantee
-4. Granters are unlikely to understand that including `MsgExec` effectively removes all message type restrictions
-5. The implicit acceptance logic in DispatchActions means no authz grant setup is needed
+- **Frequency**: Every transaction that pays fees (essentially all transactions) uses the deferred system via the ante handler
+- **Restart triggers**: Node restarts occur regularly for software updates, network upgrades, crashes, hardware maintenance, and datacenter operations
+- **No special conditions**: Happens automatically without attacker involvement or special circumstances
+- **Network-wide**: Every validator and full node experiences this loss independently
+
+The test file demonstrates that developers were aware `WriteDeferredBalances` must be called to credit module accounts: [11](#0-10) 
+
+However, this call was only implemented in tests (line 183), never in production EndBlock code.
 
 ## Recommendation
 
-Modify `x/feegrant/filtered_fee.go` to recursively validate nested messages:
+Add an EndBlock method to the bank module that calls `WriteDeferredBalances`. In `x/bank/module.go`, add:
 
-1. In `allMsgTypesAllowed()`, detect when a message is of type `MsgExec`
-2. For each `MsgExec` message, call its `GetMessages()` method to extract nested messages
-3. Recursively validate all nested messages against the allowed messages list
-4. Reject the transaction if ANY nested message (at any depth) has a type not in the allowed list
-
-Example implementation:
 ```go
-func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
-    msgsMap := a.allowedMsgsToMap(ctx)
-    return a.validateMessagesRecursive(ctx, msgs, msgsMap)
-}
-
-func (a *AllowedMsgAllowance) validateMessagesRecursive(ctx sdk.Context, msgs []sdk.Msg, msgsMap map[string]bool) bool {
-    for _, msg := range msgs {
-        ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
-        
-        // Check if message type is allowed
-        if !msgsMap[sdk.MsgTypeURL(msg)] {
-            return false
-        }
-        
-        // If message is MsgExec, recursively validate nested messages
-        if execMsg, ok := msg.(*authz.MsgExec); ok {
-            nestedMsgs, err := execMsg.GetMessages()
-            if err != nil {
-                return false
-            }
-            if !a.validateMessagesRecursive(ctx, nestedMsgs, msgsMap) {
-                return false
-            }
-        }
-    }
-    return true
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    am.keeper.WriteDeferredBalances(ctx)
+    return []abci.ValidatorUpdate{}
 }
 ```
+
+Verification steps:
+1. Confirm `WriteDeferredBalances` is called exactly once per block
+2. Verify fee collector module accounts receive all accumulated fees
+3. Ensure TotalSupply invariant passes consistently after node restarts
+4. Confirm deferred cache is empty at the end of each block
+5. Add monitoring to alert if deferred cache accumulates unexpectedly
 
 ## Proof of Concept
 
-**Test Location:** `x/feegrant/filtered_fee_test.go`
-
-**Test Function:** `TestFilteredFeeBypassWithMsgExec`
+The existing test demonstrates the vulnerability: [11](#0-10) 
 
 **Setup:**
-- Create feegrant with `AllowedMsgAllowance` allowing only `["/cosmos.gov.v1beta1.MsgVote", "/cosmos.authz.v1beta1.MsgExec"]`
-- Create `MsgSend` with sender = grantee
-- Create `MsgExec` with grantee = self, containing the `MsgSend` as nested message
+1. Initialize test app with bank keeper configured with deferred cache
+2. Create user account and fee collector module account  
+3. Fund user account with initial balance (900 usei)
 
 **Action:**
-- Test 1: Attempt transaction with direct `MsgSend` → correctly rejected
-- Test 2: Attempt transaction with `MsgExec` wrapping `MsgSend` → bypass succeeds
+1. Call ante handler twice (lines 170-171), which invokes `DeferredSendCoinsFromAccountToModule` each time
+2. Verify fee collector balance unchanged (lines 176-180) - fees are deferred, not immediately credited
+3. Manually call `WriteDeferredBalances` (line 183) - **THIS MANUAL CALL IS ONLY DONE IN TESTS**
+4. Verify fee collector balance increased by 2x fee amount (lines 185-193)
 
 **Result:**
-The vulnerability is confirmed when Test 2 passes validation despite `MsgSend` not being in the allowed messages list. The feegrant message type restriction is completely bypassed for nested messages within `MsgExec`.
+The test proves that without calling `WriteDeferredBalances`, module accounts never receive deferred fees. In production code, this call never happens because the bank module has no EndBlock method. When a node restarts, the memory store is cleared and all deferred fees are permanently lost while user account deductions remain persisted.
 
 ## Notes
 
-This is a critical design flaw in the interaction between the feegrant and authz modules. The vulnerability exists because:
-1. Fee validation happens at the AnteHandler level with only top-level messages
-2. Message execution happens later with full nested message extraction
-3. The authz module's implicit acceptance logic (when signer == grantee) requires no prior authorization setup
-
-The impact qualifies as "Direct loss of funds" because the feegrant balance can be completely drained for unauthorized purposes, representing a direct financial loss to the granter who allocated those funds with specific restrictions.
+This vulnerability represents a critical architectural flaw where the implementation is incomplete relative to the documented design. The deferred balance system was clearly intended to optimize gas costs by batching transfers to module accounts, but the critical EndBlock flush operation was never implemented in the bank module itself, only in test code. The memory-only nature of the deferred cache combined with the missing EndBlock creates an accounting black hole that permanently destroys transaction fees on every node restart.
 
 ### Citations
 
-**File:** x/auth/ante/fee.go (L168-168)
+**File:** x/auth/ante/fee.go (L208-208)
 ```go
-			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
 ```
 
-**File:** types/tx/types.go (L22-36)
+**File:** x/bank/keeper/keeper.go (L404-407)
 ```go
-func (t *Tx) GetMsgs() []sdk.Msg {
-	if t == nil || t.Body == nil {
-		return nil
-	}
-
-	anys := t.Body.Messages
-	res := make([]sdk.Msg, len(anys))
-	for i, any := range anys {
-		cached := any.GetCachedValue()
-		if cached == nil {
-			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
-		}
-		res[i] = cached.(sdk.Msg)
-	}
-	return res
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
 ```
 
-**File:** x/feegrant/filtered_fee.go (L65-86)
+**File:** x/bank/keeper/keeper.go (L408-432)
 ```go
-func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
-	if !a.allMsgTypesAllowed(ctx, msgs) {
-		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
-
-	allowance, err := a.GetAllowance()
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
 	if err != nil {
-		return false, err
+		return err
 	}
-
-	remove, err := allowance.Accept(ctx, fee, msgs)
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
-	if err != nil {
-		return false, err
-	}
-
-    return remove, nil
+	return nil
 }
 ```
 
-**File:** x/feegrant/filtered_fee.go (L98-109)
+**File:** x/bank/module.go (L107-210)
 ```go
-func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
-	msgsMap := a.allowedMsgsToMap(ctx)
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
 
-	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
-		if !msgsMap[sdk.MsgTypeURL(msg)] {
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
+}
+
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
+	}
+}
+
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
+
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
+}
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** types/module/module.go (L647-649)
+```go
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
+			continue
+```
+
+**File:** store/rootmulti/store.go (L1003-1008)
+```go
+	case types.StoreTypeMemory:
+		if _, ok := key.(*types.MemoryStoreKey); !ok {
+			return nil, fmt.Errorf("unexpected key type for a MemoryStoreKey; got: %s", key.String())
+		}
+
+		return mem.NewStore(), nil
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** simapp/app.go (L538-540)
+```go
+	endBlockResp := app.EndBlock(ctx, abci.RequestEndBlock{
+		Height: req.Height,
+	})
+```
+
+**File:** x/bank/keeper/invariants.go (L74-78)
+```go
+		// also iterate over deferred balances
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
 			return false
-		}
-	}
+		})
+```
 
-	return true
+**File:** x/auth/ante/fee_test.go (L138-194)
+```go
+func (suite *AnteTestSuite) TestLazySendToModuleAccount() {
+	suite.SetupTest(false) // setup
+	suite.txBuilder = suite.clientCtx.TxConfig.NewTxBuilder()
+
+	// keys and addresses
+	priv1, _, addr1 := testdata.KeyTestPubAddr()
+
+	// msg and signatures
+	msg := testdata.NewTestMsg(addr1)
+	feeAmount := testdata.NewTestFeeAmount()
+	gasLimit := testdata.NewTestGasLimit()
+	suite.Require().NoError(suite.txBuilder.SetMsgs(msg))
+	suite.txBuilder.SetFeeAmount(feeAmount)
+	suite.txBuilder.SetGasLimit(gasLimit)
+
+	privs, accNums, accSeqs := []cryptotypes.PrivKey{priv1}, []uint64{0}, []uint64{0}
+	tx, err := suite.CreateTestTx(privs, accNums, accSeqs, suite.ctx.ChainID())
+	suite.Require().NoError(err)
+
+	// Set account with insufficient funds
+	acc := suite.app.AccountKeeper.NewAccountWithAddress(suite.ctx, addr1)
+	suite.app.AccountKeeper.SetAccount(suite.ctx, acc)
+	err = simapp.FundAccount(suite.app.BankKeeper, suite.ctx, addr1, sdk.NewCoins(sdk.NewCoin("usei", sdk.NewInt(900))))
+	suite.Require().NoError(err)
+
+	feeCollectorAcc := suite.app.AccountKeeper.GetModuleAccount(suite.ctx, types.FeeCollectorName)
+	expectedFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+
+	dfd := ante.NewDeductFeeDecorator(suite.app.AccountKeeper, suite.app.BankKeeper, nil, suite.app.ParamsKeeper, nil)
+	antehandler, _ := sdk.ChainAnteDecorators(dfd)
+
+	// Set account with sufficient funds
+	antehandler(suite.ctx, tx, false)
+	_, err = antehandler(suite.ctx, tx, false)
+
+	suite.Require().Nil(err, "Tx errored after account has been set with sufficient funds")
+
+	// Fee Collector actual account balance should not have increased
+	resultFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+	suite.Assert().Equal(
+		expectedFeeCollectorBalance,
+		resultFeeCollectorBalance,
+	)
+
+	// Fee Collector actual account balance deposit coins into the fee collector account
+	suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
+
+	depositFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+
+	expectedAtomFee := feeAmount.AmountOf("usei")
+
+	suite.Assert().Equal(
+		// Called antehandler twice, expect fees to be deducted twice
+		expectedFeeCollectorBalance.Add(sdk.NewCoin("usei", expectedAtomFee)).Add(sdk.NewCoin("usei", expectedAtomFee)),
+		depositFeeCollectorBalance,
+	)
 }
-```
-
-**File:** x/authz/keeper/msg_server.go (L65-83)
-```go
-func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
-	}
-
-	msgs, err := msg.GetMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	results, err := k.DispatchActions(ctx, grantee, msgs)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgExecResponse{Results: results}, nil
-}
-```
-
-**File:** x/authz/keeper/keeper.go (L87-111)
-```go
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
-			}
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
-
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
-		}
-```
-
-**File:** x/authz/msgs.go (L64-66)
-```go
-	if granter.Equals(grantee) {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be same")
-	}
 ```

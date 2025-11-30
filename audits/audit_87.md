@@ -1,336 +1,318 @@
 # Audit Report
 
 ## Title
-Unbounded EndBlock Execution Time Due to Unlimited Processing of Mature Unbonding Delegations
+Missing Duplicate Validator Validation in Genesis Transaction Collection Causes Total Network Shutdown
 
 ## Summary
-The staking module's `EndBlock` function processes all mature unbonding delegations and redelegations without pagination, batching, or limits, allowing an attacker to cause significant block production delays by coordinating a large number of unbonding delegations to mature simultaneously.
+The `CollectTxs` function fails to validate for duplicate validator operator addresses or consensus public keys when collecting genesis transactions. This allows duplicate validators to be included in genesis.json, causing all network nodes to panic during chain initialization and preventing the blockchain from starting.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:**
-- `x/staking/keeper/delegation.go:374-392` - DequeueAllMatureUBDQueue processes all entries
-- `x/staking/keeper/delegation.go:609-627` - DequeueAllMatureRedelegationQueue processes all entries  
-- `x/staking/keeper/val_state_change.go:35-91` - BlockValidatorUpdates calls queue processing
-- `types/context.go:272` - NewContext sets infinite gas meter
-- `x/staking/keeper/delegation.go:862-906` - CompleteUnbonding performs state operations
+**Location:** 
+- `x/genutil/collect.go` (lines 101-183)
+- `x/genutil/gentx.go` (lines 113-116)
+- `x/staking/keeper/msg_server.go` (lines 42-54)
+- `baseapp/abci.go` (line 73)
 
 **Intended Logic:**
-EndBlock should complete within bounded time to maintain consistent block production. The staking module should process mature unbonding delegations efficiently without causing network-wide delays.
+During genesis ceremony, the `collect-gentxs` command should comprehensively validate all genesis transactions to ensure they can be successfully applied during chain initialization. This includes verifying that no two validators share the same operator address or consensus public key, as validators must be uniquely identifiable. Invalid genesis transactions should be rejected during collection with proper error messages before being committed to genesis.json.
 
 **Actual Logic:**
-The `DequeueAllMatureUBDQueue` function iterates through the entire unbonding queue without any limit, returning ALL mature entries. [1](#0-0)  The function uses an unbounded loop that appends all mature entries to the result slice. Similarly, `DequeueAllMatureRedelegationQueue` exhibits the same unbounded behavior. [2](#0-1) 
+The `CollectTxs` function only validates account balances and sufficient delegation funds. [1](#0-0)  After extracting each `MsgCreateValidator` message, the function never maintains tracking maps for validator addresses or consensus public keys to detect duplicates across multiple gentx files. The function simply appends all gentxs to the result set without duplicate checking.
 
-During `BlockValidatorUpdates`, all returned entries are processed sequentially, with each calling `CompleteUnbonding` [3](#0-2)  which performs state reads, bank keeper transfers, event emissions, and state writes. [4](#0-3) 
-
-The context used in EndBlock is created with an infinite gas meter, [5](#0-4)  providing no gas-based execution limits.
+Similarly, the `ValidateGenesis` function only checks that transactions decode correctly and contain `MsgCreateValidator` messages, but performs no duplicate validation. [2](#0-1)  The TODO comment at line 113 indicates incomplete validation.
 
 **Exploitation Path:**
-1. Attacker creates multiple delegator accounts (e.g., 1,000 accounts)
-2. Each account delegates tokens to multiple validators (up to 35 validators per default configuration) [6](#0-5) 
-3. Attacker initiates unbonding from all delegations within a narrow time window (e.g., 100 blocks)
-4. Each delegator-validator pair can have up to MaxEntries (default 7) unbonding entries [7](#0-6) 
-5. All unbonding transactions mature simultaneously after the unbonding period (3 weeks default) [8](#0-7) 
-6. When maturity occurs, EndBlock processes all entries (1,000 × 35 × 7 = 245,000) in a single block
-7. Each entry requires multiple state operations including bank transfers, causing significant processing delay
+1. During genesis ceremony, multiple validators generate gentx files independently
+2. A malicious genesis participant or configuration error causes a gentx to use the same validator operator address OR consensus public key as another validator
+3. Genesis coordinator runs `collect-gentxs` which calls `CollectTxs`
+4. `CollectTxs` validates both gentxs successfully (only checking account balances)
+5. Both duplicate gentxs are included in the final genesis.json file
+6. All validators download genesis.json and attempt to start their nodes
+7. During `InitChain` ABCI call, the chain initialization proceeds via `app.initChainer` [3](#0-2) 
+8. The genutil module's `InitGenesis` function invokes `DeliverGenTxs` to process genesis transactions
+9. First gentx successfully creates the validator
+10. Second gentx (duplicate) attempts to create the validator, but the staking handler detects the duplicate and returns `ErrValidatorOwnerExists` or `ErrValidatorPubKeyExists` [4](#0-3) 
+11. In `DeliverGenTxs`, the error result causes an immediate panic [5](#0-4) 
+12. The panic propagates through the InitChain call stack with no recovery mechanism
+13. All nodes crash during initialization - complete network shutdown
 
 **Security Guarantee Broken:**
-The system fails to maintain bounded execution time for consensus-critical operations (EndBlock). The `MaxEntries` parameter only limits entries per delegator-validator pair [9](#0-8)  and does not provide global protection against processing a large total number of entries in one block.
+The network availability guarantee is violated. A single malicious or misconfigured genesis participant can prevent the entire network from ever becoming operational, constituting a denial-of-service vulnerability at the genesis level that exceeds their intended authority.
 
 ## Impact Explanation
 
-Processing hundreds of thousands of unbonding delegations in a single EndBlock causes severe degradation of network performance:
+**Affected Systems:**
+All network nodes fail to complete chain initialization. The blockchain cannot start:
+- No blocks can be produced
+- No transactions can be processed
+- No consensus rounds can occur  
+- The network remains completely non-operational
 
-- **Block production delays**: Processing 245,000 entries, each requiring state reads, bank keeper transfers (`UndelegateCoinsFromModuleToAccount`), event emissions, and state writes, would cause massive computational overhead. Even conservative estimates suggest this would exceed 500% of normal block time.
+**Severity Justification:**
+This represents a total network shutdown where:
+- The chain is prevented from ever becoming operational
+- 100% of network nodes fail simultaneously during InitChain
+- Failure occurs before any normal consensus or transaction processing begins
+- No self-recovery mechanism exists
+- Manual remediation is required: identifying the problematic gentx, removing it from genesis.json, regenerating the genesis file, redistributing to all validators, and coordinating a restart
 
-- **Network-wide impact**: All validators must process the same EndBlock operations, causing simultaneous degradation across the entire network.
-
-- **Transaction confirmation delays**: Users attempting to submit transactions during the affected block(s) experience significant delays.
-
-- **Resource exhaustion**: Increased CPU, memory, and I/O usage on all validator nodes simultaneously.
-
-This qualifies as Medium severity under the defined impact category: "Temporary freezing of network transactions by delaying one block by 500% or more of the average block time."
+This matches the specified Medium severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant with sufficient tokens for delegations. The attack requires:
-- Initial capital for delegations (returned after unbonding, making the permanent cost only gas fees)
-- Gas fees for approximately 70,000 transactions (delegates + unbonds)
-- 3-week waiting period for unbonding maturity
+**Who can trigger it:**
+Any participant in the genesis ceremony who submits a gentx. While this is a privileged role, the vulnerability qualifies under the exception rule because even a trusted role can inadvertently trigger an unrecoverable security failure that exceeds their intended authority.
 
-**Economic Feasibility:**
-The permanent cost is primarily gas fees (~700 tokens at 0.01 token/tx estimate). The capital for delegations is temporary and returned after unbonding, making this economically feasible for a well-resourced attacker.
+**Realistic Scenarios:**
+1. **Accidental triggers:**
+   - Key generation software bugs producing duplicate keys
+   - Configuration file copy-paste errors
+   - Manual setup mistakes in multi-validator environments
+   - Backup/restore operations using outdated configurations
 
-**Repeatability:**
-The attack can be executed repeatedly. After tokens are recovered, the attacker can re-delegate and repeat the attack cycle.
+2. **Malicious triggers:**
+   - Disgruntled genesis participant intentionally submitting duplicate validator
+   - Contentious fork scenario where participant wants to sabotage launch
+   - Compromised genesis participant's system
 
-**Likelihood:** Medium - The attack requires planning and capital, but no special privileges or validator control. The 3-week delay allows preparation but also makes the attack detectable.
+3. **High-probability contexts:**
+   - Public/permissionless chain launches with many genesis validators
+   - Testnets where validator vetting is less rigorous
+   - Chains with decentralized genesis ceremony processes
+
+**Likelihood Assessment:**
+Once genesis.json contains duplicate validators, the attack succeeds with 100% reliability - every single node will fail to start. The impact (total network shutdown) vastly exceeds the intended authority of a genesis participant, who should only be able to control their own validator submission, not prevent the entire network from launching.
 
 ## Recommendation
 
-Implement bounded execution for EndBlock processing:
+Implement duplicate validator validation in the `CollectTxs` function:
 
-1. **Add pagination/batching:** Modify `DequeueAllMatureUBDQueue` and `DequeueAllMatureRedelegationQueue` to process a maximum number of entries per block (e.g., 1,000-5,000 entries). Store remaining entries for processing in subsequent blocks by not deleting the timeslice until all entries are processed.
+1. **Before the gentx processing loop**, initialize tracking maps:
+   ```go
+   seenValidatorAddrs := make(map[string]bool)
+   seenConsensusPubKeys := make(map[string]bool)
+   ```
 
-2. **Implement processing limit parameter:** Add a governance parameter `MaxUnbondingProcessPerBlock` that caps the number of unbonding/redelegation completions per block.
+2. **During the loop** (after extracting `MsgCreateValidator`):
+   - Check if `msg.ValidatorAddress` already exists in `seenValidatorAddrs`
+   - Extract the consensus public key from `msg.Pubkey` and check if it exists in `seenConsensusPubKeys`
+   - Return a descriptive error if either duplicate is detected
+   - Add both to their respective maps after validation passes
 
-3. **Add monitoring:** Implement telemetry to track the number of entries processed per block to detect potential attacks early.
+3. **Error message format:**
+   ```go
+   return appGenTxs, persistentPeers, fmt.Errorf(
+       "duplicate validator detected in gentx %s: validator address %s already exists",
+       fo.Name(), msg.ValidatorAddress)
+   ```
 
-4. **Consider circuit breaker:** Add a mechanism that defers remaining work if cumulative processing cost exceeds a threshold.
+This ensures duplicate validators are caught during the collection phase (where they fail gracefully with an error message) rather than during chain initialization (where they cause a panic and total network failure).
 
-Example fix structure:
-```go
-const MaxUBDProcessPerBlock = 1000
-
-func (k Keeper) DequeueAllMatureUBDQueue(ctx sdk.Context, currTime time.Time) (matureUnbonds []types.DVPair) {
-    // Iterate with counter, break when limit reached
-    // Only delete timeslice if all entries processed
-    // Partially processed timeslices remain for next block
-}
-```
+Additionally, consider enhancing the `ValidateGenesis` function to perform similar checks as a secondary validation layer.
 
 ## Proof of Concept
 
-**Conceptual PoC (scaled demonstration):**
+The vulnerability can be reproduced with the following test structure in `x/genutil/gentx_test.go`:
 
 **Setup:**
-1. Create 100 delegator accounts (scaled down from full attack)
-2. Create 5 validators
-3. Each delegator creates 7 unbonding entries per validator
-4. Total: 100 × 5 × 7 = 3,500 unbonding entries
+1. Create test application context with simapp
+2. Fund two different accounts (addr1, addr2) with sufficient token balances
+3. Create two `MsgCreateValidator` messages:
+   - First: uses addr1 as delegator, valAddr1 as operator, pubkey1 as consensus key
+   - Second: uses addr2 as delegator, valAddr1 as operator (duplicate), pubkey2 as consensus key
+4. Encode both messages as properly signed genesis transactions
+5. Create a genesis state containing both gentxs
 
 **Action:**
-1. Initiate all unbonding transactions within a narrow time window (e.g., 100 blocks)
-2. Fast-forward blockchain time to unbonding completion time
-3. Trigger EndBlock processing
-4. Measure EndBlock execution time
+```go
+validators, err := genutil.DeliverGenTxs(
+    ctx, 
+    genesisState.GenTxs, 
+    app.StakingKeeper, 
+    app.BaseApp.DeliverTx,
+    encodingConfig.TxConfig,
+)
+```
 
 **Expected Result:**
-- All 3,500 unbonding entries are processed in a single EndBlock call
-- No pagination or limit prevents unbounded execution
-- Processing time scales linearly with entry count
-- Full attack (245,000 entries) would cause proportionally longer delays (70× this scenario)
+The function panics when processing the second gentx because:
+1. First gentx successfully creates validator with valAddr1
+2. Second gentx attempts to create validator with same valAddr1
+3. `CreateValidator` handler returns `ErrValidatorOwnerExists`
+4. `DeliverGenTxs` executes `panic(res.Log)`
 
-**Code Evidence:**
-The unbounded iteration in `DequeueAllMatureUBDQueue` [10](#0-9)  confirms all mature entries are appended without any counter or limit check. The subsequent processing loop in `BlockValidatorUpdates` [11](#0-10)  processes each returned entry without any batching mechanism.
+The test should use `require.Panics()` to verify the panic occurs, confirming that duplicate validators in genesis transactions cause total initialization failure. The existing test suite already confirms this panic behavior. [6](#0-5) 
+
+**Alternative PoC** (testing duplicate consensus pubkey):
+Repeat the above but use the same consensus pubkey in both `MsgCreateValidator` messages while keeping different operator addresses. This triggers `ErrValidatorPubKeyExists` with the same panic result.
 
 ## Notes
 
-This vulnerability represents a design flaw in the unbonding queue processing mechanism. While the `MaxEntries` parameter provides per-pair protection, it does not prevent an attacker from creating many pairs across multiple accounts to overwhelm EndBlock processing. The lack of global processing limits makes the network vulnerable to coordinated DoS attacks that are economically feasible and repeatable.
+The vulnerability exists due to validation being improperly split across two phases:
+
+1. **Collection phase** (`CollectTxs`) - Only validates account balances and account existence, missing validator uniqueness checks
+2. **Delivery phase** (`DeliverGenTxs`) - Validates validator uniqueness through the staking handler, but uses panic for failure handling
+
+This architectural gap allows malicious gentxs to pass initial validation but trigger unrecoverable panics during deployment. The proper solution is to move validator uniqueness validation to the collection phase where errors can be returned gracefully, preventing problematic genesis files from being created in the first place.
+
+The TODO comment at line 138 of collect.go ("TODO abstract out staking message validation back to staking") suggests the developers recognized that staking validation is incomplete in the current implementation. [7](#0-6)
 
 ### Citations
 
-**File:** x/staking/keeper/delegation.go (L264-274)
+**File:** x/genutil/collect.go (L101-183)
 ```go
-// HasMaxUnbondingDelegationEntries - check if unbonding delegation has maximum number of entries.
-func (k Keeper) HasMaxUnbondingDelegationEntries(ctx sdk.Context,
-	delegatorAddr sdk.AccAddress, validatorAddr sdk.ValAddress,
-) bool {
-	ubd, found := k.GetUnbondingDelegation(ctx, delegatorAddr, validatorAddr)
-	if !found {
-		return false
-	}
+	for _, fo := range fos {
+		if fo.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(fo.Name(), ".json") {
+			continue
+		}
 
-	return len(ubd.Entries) >= int(k.MaxEntries(ctx))
-}
-```
+		// get the genTx
+		jsonRawTx, err := ioutil.ReadFile(filepath.Join(genTxsDir, fo.Name()))
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
 
-**File:** x/staking/keeper/delegation.go (L374-392)
-```go
-func (k Keeper) DequeueAllMatureUBDQueue(ctx sdk.Context, currTime time.Time) (matureUnbonds []types.DVPair) {
-	store := ctx.KVStore(k.storeKey)
+		var genTx sdk.Tx
+		if genTx, err = txJSONDecoder(jsonRawTx); err != nil {
+			return appGenTxs, persistentPeers, err
+		}
 
-	// gets an iterator for all timeslices from time 0 until the current Blockheader time
-	unbondingTimesliceIterator := k.UBDQueueIterator(ctx, ctx.BlockHeader().Time)
-	defer unbondingTimesliceIterator.Close()
+		appGenTxs = append(appGenTxs, genTx)
 
-	for ; unbondingTimesliceIterator.Valid(); unbondingTimesliceIterator.Next() {
-		timeslice := types.DVPairs{}
-		value := unbondingTimesliceIterator.Value()
-		k.cdc.MustUnmarshal(value, &timeslice)
+		// the memo flag is used to store
+		// the ip and node-id, for example this may be:
+		// "528fd3df22b31f4969b05652bfe8f0fe921321d5@192.168.2.37:26656"
 
-		matureUnbonds = append(matureUnbonds, timeslice.Pairs...)
+		memoTx, ok := genTx.(sdk.TxWithMemo)
+		if !ok {
+			return appGenTxs, persistentPeers, fmt.Errorf("expected TxWithMemo, got %T", genTx)
+		}
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
+		}
 
-		store.Delete(unbondingTimesliceIterator.Key())
-	}
+		// genesis transactions must be single-message
+		msgs := genTx.GetMsgs()
 
-	return matureUnbonds
-}
-```
+		// TODO abstract out staking message validation back to staking
+		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
 
-**File:** x/staking/keeper/delegation.go (L609-627)
-```go
-func (k Keeper) DequeueAllMatureRedelegationQueue(ctx sdk.Context, currTime time.Time) (matureRedelegations []types.DVVTriplet) {
-	store := ctx.KVStore(k.storeKey)
+		// validate delegator and validator addresses and funds against the accounts in the state
+		delAddr := msg.DelegatorAddress
+		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
 
-	// gets an iterator for all timeslices from time 0 until the current Blockheader time
-	redelegationTimesliceIterator := k.RedelegationQueueIterator(ctx, ctx.BlockHeader().Time)
-	defer redelegationTimesliceIterator.Close()
-
-	for ; redelegationTimesliceIterator.Valid(); redelegationTimesliceIterator.Next() {
-		timeslice := types.DVVTriplets{}
-		value := redelegationTimesliceIterator.Value()
-		k.cdc.MustUnmarshal(value, &timeslice)
-
-		matureRedelegations = append(matureRedelegations, timeslice.Triplets...)
-
-		store.Delete(redelegationTimesliceIterator.Key())
-	}
-
-	return matureRedelegations
-}
-```
-
-**File:** x/staking/keeper/delegation.go (L862-906)
-```go
-func (k Keeper) CompleteUnbonding(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) (sdk.Coins, error) {
-	ubd, found := k.GetUnbondingDelegation(ctx, delAddr, valAddr)
-	if !found {
-		return nil, types.ErrNoUnbondingDelegation
-	}
-
-	bondDenom := k.GetParams(ctx).BondDenom
-	balances := sdk.NewCoins()
-	ctxTime := ctx.BlockHeader().Time
-
-	delegatorAddress, err := sdk.AccAddressFromBech32(ubd.DelegatorAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	// loop through all the entries and complete unbonding mature entries
-	for i := 0; i < len(ubd.Entries); i++ {
-		entry := ubd.Entries[i]
-		if entry.IsMature(ctxTime) {
-			ubd.RemoveEntry(int64(i))
-			i--
-
-			// track undelegation only when remaining or truncated shares are non-zero
-			if !entry.Balance.IsZero() {
-				amt := sdk.NewCoin(bondDenom, entry.Balance)
-				if err := k.bankKeeper.UndelegateCoinsFromModuleToAccount(
-					ctx, types.NotBondedPoolName, delegatorAddress, sdk.NewCoins(amt),
-				); err != nil {
-					return nil, err
-				}
-
-				balances = balances.Add(amt)
+		delBal, delOk := balancesMap[delAddr]
+		if !delOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
 			}
+
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
+		}
+
+		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
+		if !valOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
+			}
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
+		}
+
+		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
+			return appGenTxs, persistentPeers, fmt.Errorf(
+				"insufficient fund for delegation %v: %v < %v",
+				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
+			)
+		}
+
+		// exclude itself from persistent peers
+		if msg.Description.Moniker != moniker {
+			addressesIPs = append(addressesIPs, nodeAddrIP)
 		}
 	}
 
-	// set the unbonding delegation or remove it if there are no more entries
-	if len(ubd.Entries) == 0 {
-		k.RemoveUnbondingDelegation(ctx, ubd)
-	} else {
-		k.SetUnbondingDelegation(ctx, ubd)
-	}
+	sort.Strings(addressesIPs)
+	persistentPeers = strings.Join(addressesIPs, ",")
 
-	return balances, nil
+	return appGenTxs, persistentPeers, nil
+```
+
+**File:** x/genutil/types/genesis_state.go (L98-120)
+```go
+// ValidateGenesis validates GenTx transactions
+func ValidateGenesis(genesisState *GenesisState, txJSONDecoder sdk.TxDecoder) error {
+	for i, genTx := range genesisState.GenTxs {
+		var tx sdk.Tx
+		tx, err := txJSONDecoder(genTx)
+		if err != nil {
+			return err
+		}
+
+		msgs := tx.GetMsgs()
+		if len(msgs) != 1 {
+			return errors.New(
+				"must provide genesis Tx with exactly 1 CreateValidator message")
+		}
+
+		// TODO: abstract back to staking
+		if _, ok := msgs[0].(*stakingtypes.MsgCreateValidator); !ok {
+			return fmt.Errorf(
+				"genesis transaction %v does not contain a MsgCreateValidator", i)
+		}
+	}
+	return nil
 }
 ```
 
-**File:** x/staking/keeper/val_state_change.go (L35-91)
+**File:** baseapp/abci.go (L73-73)
 ```go
-	// Remove all mature unbonding delegations from the ubd queue.
-	matureUnbonds := k.DequeueAllMatureUBDQueue(ctx, ctx.BlockHeader().Time)
-	for _, dvPair := range matureUnbonds {
-		addr, err := sdk.ValAddressFromBech32(dvPair.ValidatorAddress)
-		if err != nil {
-			panic(err)
-		}
-		delegatorAddress := sdk.MustAccAddressFromBech32(dvPair.DelegatorAddress)
+	resp := app.initChainer(app.deliverState.ctx, *req)
+```
 
-		balances, err := k.CompleteUnbonding(ctx, delegatorAddress, addr)
-		if err != nil {
-			continue
-		}
-
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeCompleteUnbonding,
-				sdk.NewAttribute(sdk.AttributeKeyAmount, balances.String()),
-				sdk.NewAttribute(types.AttributeKeyValidator, dvPair.ValidatorAddress),
-				sdk.NewAttribute(types.AttributeKeyDelegator, dvPair.DelegatorAddress),
-			),
-		)
+**File:** x/staking/keeper/msg_server.go (L42-54)
+```go
+	// check to see if the pubkey or sender has been registered before
+	if _, found := k.GetValidator(ctx, valAddr); found {
+		return nil, types.ErrValidatorOwnerExists
 	}
 
-	// Remove all mature redelegations from the red queue.
-	matureRedelegations := k.DequeueAllMatureRedelegationQueue(ctx, ctx.BlockHeader().Time)
-	for _, dvvTriplet := range matureRedelegations {
-		valSrcAddr, err := sdk.ValAddressFromBech32(dvvTriplet.ValidatorSrcAddress)
-		if err != nil {
-			panic(err)
-		}
-		valDstAddr, err := sdk.ValAddressFromBech32(dvvTriplet.ValidatorDstAddress)
-		if err != nil {
-			panic(err)
-		}
-		delegatorAddress := sdk.MustAccAddressFromBech32(dvvTriplet.DelegatorAddress)
+	pk, ok := msg.Pubkey.GetCachedValue().(cryptotypes.PubKey)
+	if !ok {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "Expecting cryptotypes.PubKey, got %T", pk)
+	}
 
-		balances, err := k.CompleteRedelegation(
-			ctx,
-			delegatorAddress,
-			valSrcAddr,
-			valDstAddr,
-		)
-		if err != nil {
-			continue
-		}
-
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeCompleteRedelegation,
-				sdk.NewAttribute(sdk.AttributeKeyAmount, balances.String()),
-				sdk.NewAttribute(types.AttributeKeyDelegator, dvvTriplet.DelegatorAddress),
-				sdk.NewAttribute(types.AttributeKeySrcValidator, dvvTriplet.ValidatorSrcAddress),
-				sdk.NewAttribute(types.AttributeKeyDstValidator, dvvTriplet.ValidatorDstAddress),
-			),
-		)
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
 	}
 ```
 
-**File:** types/context.go (L261-281)
+**File:** x/genutil/gentx.go (L113-116)
 ```go
-// create a new context
-func NewContext(ms MultiStore, header tmproto.Header, isCheckTx bool, logger log.Logger) Context {
-	// https://github.com/gogo/protobuf/issues/519
-	header.Time = header.Time.UTC()
-	return Context{
-		ctx:             context.Background(),
-		ms:              ms,
-		header:          header,
-		chainID:         header.ChainID,
-		checkTx:         isCheckTx,
-		logger:          logger,
-		gasMeter:        NewInfiniteGasMeter(1, 1),
-		minGasPrice:     DecCoins{},
-		eventManager:    NewEventManager(),
-		evmEventManager: NewEVMEventManager(),
-
-		txBlockingChannels:   make(acltypes.MessageAccessOpsChannelMapping),
-		txCompletionChannels: make(acltypes.MessageAccessOpsChannelMapping),
-		txMsgAccessOps:       make(map[int][]acltypes.AccessOperation),
-	}
-}
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
+		}
 ```
 
-**File:** x/staking/types/params.go (L21-21)
+**File:** x/genutil/gentx_test.go (L272-277)
 ```go
-	DefaultUnbondingTime time.Duration = time.Hour * 24 * 7 * 3
-```
-
-**File:** x/staking/types/params.go (L24-24)
-```go
-	DefaultMaxValidators uint32 = 35
-```
-
-**File:** x/staking/types/params.go (L27-27)
-```go
-	DefaultMaxEntries uint32 = 7
+				suite.Require().Panics(func() {
+					genutil.DeliverGenTxs(
+						ctx, genTxs, suite.app.StakingKeeper, suite.app.BaseApp.DeliverTx,
+						suite.encodingConfig.TxConfig,
+					)
+				})
 ```

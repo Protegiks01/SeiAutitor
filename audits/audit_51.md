@@ -1,358 +1,245 @@
+After thorough investigation of the codebase, I can now provide my validation assessment.
+
 # Audit Report
 
 ## Title
-Race Condition in CheckTx Allows Duplicate Nonce Transactions to Enter Mempool
+Consensus Failure Due to Non-Deterministic skipUpgradeHeights Configuration Causing Permanent Chain Split
 
 ## Summary
-A race condition exists in concurrent CheckTx execution that allows multiple transactions with identical sequence numbers (nonces) from the same account to pass validation and enter the mempool simultaneously. The sequence validation and increment operations lack atomic synchronization across concurrent CheckTx calls. [1](#0-0) 
+The upgrade module's `skipUpgradeHeights` mechanism allows validators to bypass scheduled upgrades via the `--unsafe-skip-upgrades` CLI flag. This local per-node configuration creates non-deterministic state transitions: validators with skip configured delete the upgrade plan from consensus state and continue, while validators without skip panic and halt. This causes an unrecoverable consensus failure and permanent network partition requiring a hard fork.
 
 ## Impact
-Low
+High
 
 ## Finding Description
 
 **Location:**
-- Primary: IncrementSequenceDecorator in [2](#0-1) 
-- Sequence validation: SigVerificationDecorator in [3](#0-2) 
-- Cache creation: [4](#0-3) 
+- Primary divergence point: [1](#0-0) 
+- State modification in skip path: [2](#0-1) 
+- State deletion from consensus: [3](#0-2) 
+- Local configuration storage: [4](#0-3) 
+- CLI flag parsing: [5](#0-4) 
 
 **Intended Logic:**
-The sequence number system should ensure only one transaction per sequence number from each account can be accepted into the mempool. The checkState tracks sequence numbers across CheckTx calls, and IncrementSequenceDecorator increments the sequence to prevent replay attacks. [5](#0-4) 
+The upgrade module ensures all validators execute scheduled upgrades at the same block height to maintain consensus determinism. The documentation indicates coordination is required: [6](#0-5) 
 
 **Actual Logic:**
-When concurrent CheckTx calls execute for the same account, each creates an isolated cached context via `cacheTxContext` that lazily reads from the shared checkState. The read-validate-increment-write sequence is not atomic:
-
-1. Thread A: Reads account (sequence=0), validates, increments to 1 in cache
-2. Thread B (concurrent): Reads account (sequence=0 still), validates, increments to 1 in cache
-3. Both execute `msCache.Write()` writing sequence=1 back to checkState
-4. Both transactions with sequence=0 have passed validation
-
-The `checkTxStateLock` exists [6](#0-5)  but is only used in `setCheckState` and `GetCheckCtx`, not during CheckTx execution itself.
+The `skipUpgradeHeights` is a local per-node map with no validation ensuring all validators share the same configuration. During BeginBlock at an upgrade height:
+1. Validators WITH skip configured: Call `skipUpgrade()` which executes `ClearUpgradePlan(ctx)`, deleting the upgrade plan from the KV store (modifying consensus state)
+2. Validators WITHOUT skip: Skip the skip path, find no handler, panic via `panicUpgradeNeeded()` before committing state
 
 **Exploitation Path:**
-1. Attacker creates two different transactions (different content = different hashes) from the same account with identical sequence=0
-2. Submits both transactions concurrently to a node
-3. Both CheckTx calls execute in parallel, race condition occurs
-4. Both pass SigVerificationDecorator (both see sequence=0)
-5. Both pass IncrementSequenceDecorator (non-atomic increment)
-6. Both enter mempool (mempool deduplicates by hash, not nonce)
-7. During block execution, only one succeeds; others fail with sequence mismatch
+1. Governance schedules an upgrade at height H via standard proposal
+2. Before height H, due to miscommunication or emergency response, some validators configure `--unsafe-skip-upgrades=H` while others don't
+3. At height H during BeginBlock:
+   - Validators with skip: Clear upgrade plan from consensus state, continue processing, commit modified state, produce AppHash without plan
+   - Validators without skip: Panic before state commit, cannot participate in consensus
+4. Network partitions based on voting power distribution:
+   - If ≥2/3 voting power has skip: Chain continues on one fork, validators without skip permanently stuck
+   - If <2/3 voting power has skip: Chain cannot reach consensus, total network halt
+5. No in-protocol recovery mechanism exists; requires coordinated hard fork
 
 **Security Guarantee Broken:**
-The invariant that only one transaction per sequence number per account exists in the mempool at any time is violated.
+Consensus determinism - the fundamental invariant that all validators must execute identical state transitions for the same block height. The code allows different validators to execute different state modifications based on local configuration, violating this core consensus property.
 
 ## Impact Explanation
 
-This vulnerability allows mempool pollution where multiple transactions with duplicate nonces coexist in the mempool. Consequences include:
+**Consequences:**
+- **Permanent chain split**: Validators diverge into incompatible state machines at the upgrade height with no recovery path
+- **Network partition severity depends on validator configuration**:
+  - If ≥2/3 validators skip: Chain continues without non-skipping validators (permanent exclusion)
+  - If <2/3 validators skip: Total network shutdown (cannot reach consensus threshold)
+- **Requires hard fork**: No in-protocol mechanism exists to reconcile the divergent states; requires social consensus and coordinated emergency hard fork
+- **Transaction safety compromised**: All transactions in blocks after the divergence are at risk
 
-1. **Resource Waste**: Nodes validate, store, and propagate invalid transactions that will ultimately fail in DeliverTx
-2. **Mempool Space Reduction**: Duplicate-nonce transactions consume mempool slots, reducing space for legitimate transactions  
-3. **Network Bandwidth**: Invalid transactions are propagated across the network unnecessarily
-
-This directly matches the Low severity impact criterion: "Causing network processing nodes to process transactions from the mempool beyond set parameters" - nodes process and store multiple transactions for the same nonce when design parameters dictate only one should be valid.
+This precisely matches the High severity impact category: "Unintended permanent chain split requiring hard fork (network partition requiring hard fork)".
 
 ## Likelihood Explanation
 
-**Likelihood: High**
+**Trigger Conditions:**
+1. Scheduled upgrade exists in state (normal governance operation)
+2. Validators use `--unsafe-skip-upgrades` flag (designed emergency mechanism)
+3. Not all validators coordinate on identical skip configurations
+4. Upgrade height is reached
 
-- **Who can trigger**: Any user with an account can exploit this
-- **Prerequisites**: Simply requires submitting multiple transactions with the same nonce concurrently - no special privileges, no complex setup
-- **Frequency**: Can occur naturally during normal network operation whenever transactions arrive concurrently, which is common in production
-- **Cost**: Attacker must pay gas fees for each transaction, but failed transactions still consume network resources
-
-The vulnerability is particularly exploitable because CheckTx is explicitly designed to handle concurrent requests (as evidenced by the cached context architecture [7](#0-6) ), yet no synchronization protects the sequence number validation flow.
+**Probability Assessment:**
+Moderate to High during upgrade emergencies. The mechanism is specifically designed for emergencies (flag named "unsafe-skip-upgrades"), precisely when coordination is most difficult. While validators are privileged actors, the consequence (permanent chain split requiring hard fork) exceeds validators' intended authority - they intend to skip a problematic upgrade, not destroy network consensus. This represents inadvertent operational misconfiguration during emergency situations when coordination is inherently most difficult.
 
 ## Recommendation
 
-Implement per-account locking around sequence number validation and increment operations:
+**Primary Fix - Remove State Modification from Skip Path:**
+Modify `skipUpgrade()` to NOT delete the upgrade plan from consensus state. The upgrade plan remains in consensus state (maintaining determinism) but is locally ignored by nodes with skip configured. All validators maintain identical state regardless of skip configuration.
 
-**Option 1: Per-Account Lock Manager**
-Add a lock manager to IncrementSequenceDecorator that acquires locks for all transaction signers before performing sequence operations, ensuring atomic read-validate-increment-write sequences.
+**Alternative Fix - Governance-Based Skip:**
+Include skip decisions in the upgrade plan itself via governance parameters, ensuring all validators agree on skip decisions before reaching the upgrade height through on-chain consensus.
 
-**Option 2: Serialize CheckTx Per Account**  
-Use the existing `checkTxStateLock` or add per-account synchronization at the CheckTx entry point to ensure only one CheckTx per account executes at a time.
+**Immediate Mitigation:**
+- Add prominent documentation warning that ALL validators MUST coordinate identical `--unsafe-skip-upgrades` values
+- Add startup validation that logs critical warnings when skip heights are configured
+- Consider requiring governance approval for skip decisions to ensure network-wide coordination
 
 ## Proof of Concept
 
-**File**: `baseapp/deliver_tx_test.go` (new test function)
+**Test Location:** `x/upgrade/abci_test.go`
 
-**Setup**:
-1. Initialize test application with account at sequence=0
-2. Create two different transactions (tx1, tx2) from same account, both with sequence=0
-3. Ensure different message content so transaction hashes differ
+**Setup:**
+Simulate two validators with different skip configurations to demonstrate consensus failure:
+- Validator A: Initialize with `setupTest(10, map[int64]bool{15: true})` - has skip configured for height 15
+- Validator B: Initialize with `setupTest(10, map[int64]bool{})` - no skip configured
+- Both validators schedule the same upgrade at height 15 via governance proposal
 
-**Action**:
-Launch two goroutines calling CheckTx simultaneously with both transactions
+**Action:**
+Execute BeginBlock at height 15 on both validators
 
-**Result**:
-Both CheckTx calls return success (Code=0), proving both duplicate-nonce transactions were accepted. The checkState sequence is only incremented to 1 (not 2), demonstrating the race condition allowed both to read the initial sequence=0 and pass validation. This can be verified against the existing TestCheckTx [8](#0-7)  which expects successive CheckTx calls to see each other's effects - a property violated by the concurrent race condition.
+**Expected Result:**
+- Validator A: Executes successfully (skip configured), clears upgrade plan from state via `ClearUpgradePlan()`, continues processing
+- Validator B: Panics via `panicUpgradeNeeded()` (no skip, no handler), halts before committing
+- State divergence: Validator A has no upgrade plan in store, Validator B retains it
+- Consensus failure: Validators cannot agree on block validity at height 15, producing different AppHashes
+
+The existing tests [7](#0-6)  and [8](#0-7)  only test single validators in isolation and do not expose the multi-validator consensus failure scenario.
 
 ## Notes
 
-The vulnerability exists because the state access pattern creates isolated cache branches that don't synchronize sequence reads across concurrent executions. While individual cache write operations use mutex protection [9](#0-8) , this doesn't prevent the TOCTOU race in the complete read-check-increment-write sequence. The state struct's mutex [10](#0-9)  only protects struct field access, not the logical sequence validation operations. The mempool's hash-based deduplication cannot prevent different transactions with identical nonces from coexisting when they have different transaction hashes.
+This vulnerability is particularly critical because:
+
+1. **Emergency Context**: The flag is explicitly designed for emergencies when coordination is inherently most difficult
+2. **No Safeguards**: Zero code-level validation prevents mismatched configurations across validators
+3. **Silent Until Failure**: Validators are unaware of others' configurations until the upgrade height triggers consensus failure
+4. **Irreversible Damage**: Once triggered, requires social consensus and coordinated hard fork to resolve - no in-protocol recovery
+5. **Documentation Gap**: While documentation mentions coordination is needed, the implementation provides no enforcement mechanism
+
+The root cause is allowing consensus-critical state transitions to depend on local per-node configuration without any validation or coordination mechanism, fundamentally violating consensus determinism. While validators are privileged actors, the consequence (permanent chain split requiring hard fork) exceeds their intended authority and control.
 
 ### Citations
 
-**File:** baseapp/abci.go (L209-231)
+**File:** x/upgrade/abci.go (L61-72)
 ```go
-func (app *BaseApp) CheckTx(ctx context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTxV2, error) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "check_tx")
-
-	var mode runTxMode
-
-	switch {
-	case req.Type == abci.CheckTxType_New:
-		mode = runTxModeCheck
-
-	case req.Type == abci.CheckTxType_Recheck:
-		mode = runTxModeReCheck
-
-	default:
-		panic(fmt.Sprintf("unknown RequestCheckTx type: %s", req.Type))
-	}
-
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
+	if plan.ShouldExecute(ctx) {
+		// If skip upgrade has been set for current height, we clear the upgrade plan
+		if k.IsSkipHeight(ctx.BlockHeight()) {
+			skipUpgrade(k, ctx, plan)
+			return
+		}
+		// If we don't have an upgrade handler for this upgrade name, then we need to shutdown
+		if !k.HasHandler(plan.Name) {
+			panicUpgradeNeeded(k, ctx, plan)
+		}
+		applyUpgrade(k, ctx, plan)
+		return
 ```
 
-**File:** x/auth/ante/sigverify.go (L269-278)
+**File:** x/upgrade/abci.go (L120-125)
 ```go
-		// Check account sequence number.
-		if sig.Sequence != acc.GetSequence() {
-			params := svd.ak.GetParams(ctx)
-			if !params.GetDisableSeqnoCheck() {
-				return ctx, sdkerrors.Wrapf(
-					sdkerrors.ErrWrongSequence,
-					"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-				)
-			}
-		}
-```
-
-**File:** x/auth/ante/sigverify.go (L352-369)
-```go
-func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
-	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
-	}
-
-	// increment sequence of all signers
-	for _, addr := range sigTx.GetSigners() {
-		acc := isd.ak.GetAccount(ctx, addr)
-		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
-			panic(err)
-		}
-
-		isd.ak.SetAccount(ctx, acc)
-	}
-
-	return next(ctx, tx, simulate)
+// skipUpgrade logs a message that the upgrade has been skipped and clears the upgrade plan.
+func skipUpgrade(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
+	skipUpgradeMsg := fmt.Sprintf("UPGRADE \"%s\" SKIPPED at %d: %s", plan.Name, plan.Height, plan.Info)
+	ctx.Logger().Info(skipUpgradeMsg)
+	k.ClearUpgradePlan(ctx)
 }
 ```
 
-**File:** baseapp/baseapp.go (L168-168)
+**File:** x/upgrade/keeper/keeper.go (L37-45)
 ```go
-	checkTxStateLock *sync.RWMutex
-```
-
-**File:** baseapp/baseapp.go (L834-850)
-```go
-// cacheTxContext returns a new context based off of the provided context with
-// a branched multi-store.
-func (app *BaseApp) cacheTxContext(ctx sdk.Context, checksum [32]byte) (sdk.Context, sdk.CacheMultiStore) {
-	ms := ctx.MultiStore()
-	// TODO: https://github.com/cosmos/cosmos-sdk/issues/2824
-	msCache := ms.CacheMultiStore()
-	if msCache.TracingEnabled() {
-		msCache = msCache.SetTracingContext(
-			sdk.TraceContext(
-				map[string]interface{}{
-					"txHash": fmt.Sprintf("%X", checksum),
-				},
-			),
-		).(sdk.CacheMultiStore)
-	}
-
-	return ctx.WithMultiStore(msCache), msCache
-```
-
-**File:** baseapp/baseapp.go (L927-998)
-```go
-	if app.anteHandler != nil {
-		var anteSpan trace.Span
-		if app.TracingEnabled {
-			// trace AnteHandler
-			_, anteSpan = app.TracingInfo.StartWithContext("AnteHandler", ctx.TraceSpanContext())
-			defer anteSpan.End()
-		}
-		var (
-			anteCtx sdk.Context
-			msCache sdk.CacheMultiStore
-		)
-		// Branch context before AnteHandler call in case it aborts.
-		// This is required for both CheckTx and DeliverTx.
-		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2772
-		//
-		// NOTE: Alternatively, we could require that AnteHandler ensures that
-		// writes do not happen if aborted/failed.  This may have some
-		// performance benefits, but it'll be more difficult to get right.
-		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
-		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
-
-		if !newCtx.IsZero() {
-			// At this point, newCtx.MultiStore() is a store branch, or something else
-			// replaced by the AnteHandler. We want the original multistore.
-			//
-			// Also, in the case of the tx aborting, we need to track gas consumed via
-			// the instantiated gas meter in the AnteHandler, so we update the context
-			// prior to returning.
-			//
-			// This also replaces the GasMeter in the context where GasUsed was initalized 0
-			// and updated with gas consumed in the ante handler runs
-			// The GasMeter is a pointer and its passed to the RunMsg and tracks the consumed
-			// gas there too.
-			ctx = newCtx.WithMultiStore(ms)
-		}
-		defer func() {
-			if newCtx.DeliverTxCallback() != nil {
-				newCtx.DeliverTxCallback()(ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx)))
-			}
-		}()
-
-		events := ctx.EventManager().Events()
-
-		if err != nil {
-			return gInfo, nil, nil, 0, nil, nil, ctx, err
-		}
-		// GasMeter expected to be set in AnteHandler
-		gasWanted = ctx.GasMeter().Limit()
-		gasEstimate = ctx.GasEstimate()
-
-		// Dont need to validate in checkTx mode
-		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
-			storeAccessOpEvents := msCache.GetEvents()
-			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
-
-			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
-			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
-			if len(missingAccessOps) != 0 {
-				for op := range missingAccessOps {
-					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
-					op.EmitValidationFailMetrics()
-				}
-				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
-				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
-			}
-		}
-
-		priority = ctx.Priority()
-		pendingTxChecker = ctx.PendingTxChecker()
-		expireHandler = ctx.ExpireTxHandler()
-		msCache.Write()
-```
-
-**File:** docs/basics/tx-lifecycle.md (L117-127)
-```markdown
-The **mempool** serves the purpose of keeping track of transactions seen by all full-nodes.
-Full-nodes keep a **mempool cache** of the last `mempool.cache_size` transactions they have seen, as a first line of
-defense to prevent replay attacks. Ideally, `mempool.cache_size` is large enough to encompass all
-of the transactions in the full mempool. If the the mempool cache is too small to keep track of all
-the transactions, `CheckTx` is responsible for identifying and rejecting replayed transactions.
-
-Currently existing preventative measures include fees and a `sequence` (nonce) counter to distinguish
-replayed transactions from identical but valid ones. If an attacker tries to spam nodes with many
-copies of a `Tx`, full-nodes keeping a mempool cache will reject identical copies instead of running
-`CheckTx` on all of them. Even if the copies have incremented `sequence` numbers, attackers are
-disincentivized by the need to pay fees.
-```
-
-**File:** baseapp/deliver_tx_test.go (L1513-1576)
-```go
-
-// Test that successive CheckTx can see each others' effects
-// on the store within a block, and that the CheckTx state
-// gets reset to the latest committed state during Commit
-func TestCheckTx(t *testing.T) {
-	// This ante handler reads the key and checks that the value matches the current counter.
-	// This ensures changes to the kvstore persist across successive CheckTx.
-	counterKey := []byte("counter-key")
-
-	anteOpt := func(bapp *BaseApp) { bapp.SetAnteHandler(anteHandlerTxTest(t, capKey1, counterKey)) }
-	routerOpt := func(bapp *BaseApp) {
-		// TODO: can remove this once CheckTx doesnt process msgs.
-		bapp.Router().AddRoute(sdk.NewRoute(routeMsgCounter, func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
-			return &sdk.Result{}, nil
-		}))
-	}
-
-	pchOpt := func(bapp *BaseApp) {
-		bapp.SetPreCommitHandler(func(ctx sdk.Context) error {
-			return nil
-		})
-	}
-
-	app := setupBaseApp(t, anteOpt, routerOpt, pchOpt)
-
-	nTxs := int64(5)
-	app.InitChain(context.Background(), &abci.RequestInitChain{})
-
-	// Create same codec used in txDecoder
-	codec := codec.NewLegacyAmino()
-	registerTestCodec(codec)
-
-	for i := int64(0); i < nTxs; i++ {
-		tx := newTxCounter(i, 0) // no messages
-		txBytes, err := codec.Marshal(tx)
-		require.NoError(t, err)
-		r, _ := app.CheckTx(context.Background(), &abci.RequestCheckTx{Tx: txBytes})
-		require.True(t, r.IsOK(), fmt.Sprintf("%v", r))
-	}
-
-	checkStateStore := app.checkState.ctx.KVStore(capKey1)
-	storedCounter := getIntFromStore(checkStateStore, counterKey)
-
-	// Ensure AnteHandler ran
-	require.Equal(t, nTxs, storedCounter)
-
-	// If a block is committed, CheckTx state should be reset.
-	header := tmproto.Header{Height: 1}
-	app.setDeliverState(header)
-	app.checkState.ctx = app.checkState.ctx.WithHeaderHash([]byte("hash"))
-	app.BeginBlock(app.deliverState.ctx, abci.RequestBeginBlock{Header: header, Hash: []byte("hash")})
-
-	require.NotEmpty(t, app.checkState.ctx.HeaderHash())
-
-	app.EndBlock(app.deliverState.ctx, abci.RequestEndBlock{})
-	require.Empty(t, app.deliverState.ctx.MultiStore().GetEvents())
-
-	app.SetDeliverStateToCommit()
-	app.Commit(context.Background())
-
-	checkStateStore = app.checkState.ctx.KVStore(capKey1)
-	storedBytes := checkStateStore.Get(counterKey)
-	require.Nil(t, storedBytes)
+type Keeper struct {
+	homePath           string                          // root directory of app config
+	skipUpgradeHeights map[int64]bool                  // map of heights to skip for an upgrade
+	storeKey           sdk.StoreKey                    // key to access x/upgrade store
+	cdc                codec.BinaryCodec               // App-wide binary codec
+	upgradeHandlers    map[string]types.UpgradeHandler // map of plan name to upgrade handler
+	versionSetter      xp.ProtocolVersionSetter        // implements setting the protocol version field on BaseApp
+	downgradeVerified  bool                            // tells if we've already sanity checked that this binary version isn't being used against an old state.
 }
 ```
 
-**File:** store/cachekv/store.go (L101-103)
+**File:** x/upgrade/keeper/keeper.go (L320-330)
 ```go
-func (store *Store) Write() {
-	store.mtx.Lock()
-	defer store.mtx.Unlock()
+// ClearUpgradePlan clears any schedule upgrade and associated IBC states.
+func (k Keeper) ClearUpgradePlan(ctx sdk.Context) {
+	// clear IBC states everytime upgrade plan is removed
+	oldPlan, found := k.GetUpgradePlan(ctx)
+	if found {
+		k.ClearIBCState(ctx, oldPlan.Height)
+	}
+
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.PlanKey())
+}
 ```
 
-**File:** baseapp/state.go (L9-13)
+**File:** simapp/simd/cmd/root.go (L262-265)
 ```go
-type state struct {
-	ms  sdk.CacheMultiStore
-	ctx sdk.Context
-	mtx *sync.RWMutex
+	skipUpgradeHeights := make(map[int64]bool)
+	for _, h := range cast.ToIntSlice(appOpts.Get(server.FlagUnsafeSkipUpgrades)) {
+		skipUpgradeHeights[int64(h)] = true
+	}
+```
+
+**File:** x/upgrade/doc.go (L128-134)
+```go
+However, let's assume that we don't realize the upgrade has a bug until shortly before it will occur
+(or while we try it out - hitting some panic in the migration). It would seem the blockchain is stuck,
+but we need to allow an escape for social consensus to overrule the planned upgrade. To do so, there's
+a --unsafe-skip-upgrades flag to the start command, which will cause the node to mark the upgrade
+as done upon hitting the planned upgrade height(s), without halting and without actually performing a migration.
+If over two-thirds run their nodes with this flag on the old binary, it will allow the chain to continue through
+the upgrade with a manual override. (This must be well-documented for anyone syncing from genesis later on).
+```
+
+**File:** x/upgrade/abci_test.go (L288-323)
+```go
+func TestSkipUpgradeSkippingAll(t *testing.T) {
+	var (
+		skipOne int64 = 11
+		skipTwo int64 = 20
+	)
+	s := setupTest(10, map[int64]bool{skipOne: true, skipTwo: true})
+
+	newCtx := s.ctx
+
+	req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
+	err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "test", Height: skipOne}})
+	require.NoError(t, err)
+
+	t.Log("Verify if skip upgrade flag clears upgrade plan in both cases")
+	VerifySet(t, map[int64]bool{skipOne: true, skipTwo: true})
+
+	newCtx = newCtx.WithBlockHeight(skipOne)
+	require.NotPanics(t, func() {
+		s.module.BeginBlock(newCtx, req)
+	})
+
+	t.Log("Verify a second proposal also is being cleared")
+	err = s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop2", Plan: types.Plan{Name: "test2", Height: skipTwo}})
+	require.NoError(t, err)
+
+	newCtx = newCtx.WithBlockHeight(skipTwo)
+	require.NotPanics(t, func() {
+		s.module.BeginBlock(newCtx, req)
+	})
+
+	// To ensure verification is being done only after both upgrades are cleared
+	t.Log("Verify if both proposals are cleared")
+	VerifyCleared(t, s.ctx)
+	VerifyNotDone(t, s.ctx, "test")
+	VerifyNotDone(t, s.ctx, "test2")
+}
+```
+
+**File:** x/upgrade/abci_test.go (L403-416)
+```go
+func TestUpgradeWithoutSkip(t *testing.T) {
+	s := setupTest(10, map[int64]bool{})
+	newCtx := s.ctx.WithBlockHeight(s.ctx.BlockHeight() + 1).WithBlockTime(time.Now())
+	req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
+	err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "test", Height: s.ctx.BlockHeight() + 1}})
+	require.NoError(t, err)
+	t.Log("Verify if upgrade happens without skip upgrade")
+	require.Panics(t, func() {
+		s.module.BeginBlock(newCtx, req)
+	})
+
+	VerifyDoUpgrade(t)
+	VerifyDone(t, s.ctx, "test")
 }
 ```

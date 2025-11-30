@@ -1,243 +1,218 @@
 # Audit Report
 
 ## Title
-Race Condition in CheckTx Allows Duplicate Nonce Transactions to Enter Mempool
+Minor Upgrade Detection Bypass via Malformed JSON Leading to Network Shutdown
 
 ## Summary
-A race condition exists in concurrent CheckTx execution that allows multiple transactions with identical sequence numbers (nonces) from the same account to pass validation and enter the mempool simultaneously. The sequence validation and increment operations lack atomic synchronization across concurrent CheckTx calls.
+The upgrade module fails to validate JSON syntax in the `Plan.Info` field during governance proposal submission. When malformed JSON is present, the `UpgradeDetails()` parsing silently fails at runtime, causing the upgrade to be incorrectly treated as a major release. Validators who update their binaries early (following the documented minor upgrade protocol) will experience node panics, potentially causing network-wide shutdown if ≥30% of validators are affected.
 
 ## Impact
-Low
+Medium
 
 ## Finding Description
 
-**Location:**
-- Primary: `IncrementSequenceDecorator` in [1](#0-0) 
-- Sequence validation: `SigVerificationDecorator` in [2](#0-1) 
-- Cache context creation: [3](#0-2) 
-- CheckTx entry point: [4](#0-3) 
+**Location**: 
+- `x/upgrade/types/plan.go` (ValidateBasic function)
+- `x/upgrade/keeper/keeper.go` (ScheduleUpgrade function)  
+- `x/upgrade/abci.go` (BeginBlocker function)
 
-**Intended Logic:**
-The sequence number system should ensure only one transaction per sequence number from each account can be accepted into the mempool. The `checkState` tracks sequence numbers across CheckTx calls, and `IncrementSequenceDecorator` increments the sequence to prevent replay attacks. The design assumes atomic read-validate-increment-write operations.
+**Intended logic**: When an upgrade plan specifies `{"upgradeType":"minor"}` in the `Info` field, the system should parse this JSON successfully during validation, classify the upgrade as minor, and allow validators to safely update their binaries before the scheduled upgrade height without triggering a panic.
 
-**Actual Logic:**
-When concurrent CheckTx calls execute for the same account, each creates an isolated cached context that reads from the shared checkState. The vulnerability occurs because:
+**Actual logic**: The `Plan.ValidateBasic()` function validates name, height, and deprecated fields but does not validate JSON syntax in the `Info` field. [1](#0-0)  When `BeginBlocker` executes, it calls `plan.UpgradeDetails()` which attempts JSON parsing. [2](#0-1)  If JSON is malformed (e.g., `{upgradeType:minor}` missing quotes), `json.Unmarshal` fails and returns an error with an empty `UpgradeDetails{}` struct. The error is only logged and ignored. [3](#0-2)  The empty struct has `UpgradeType = ""`, causing `IsMinorRelease()` to return false. The code falls through to major upgrade logic, and if a handler exists (validators updated early), the node panics with "BINARY UPDATED BEFORE TRIGGER!". [4](#0-3) 
 
-1. Thread A calls `getContextForTx` which acquires `state.mtx.RLock()` to read the context, then releases it [5](#0-4) 
-2. Thread A calls `cacheTxContext` to create a cache layer on top of checkState [3](#0-2) 
-3. Thread B (concurrently) also reads the context and creates its own cache layer
-4. Both threads read account with sequence=0 from checkState
-5. Both validate signature against sequence=0 (passes for both)
-6. Both increment sequence to 1 in their respective cache layers
-7. Both call `msCache.Write()` to write sequence=1 back to checkState [6](#0-5) 
-8. Result: checkState has sequence=1, but TWO transactions with sequence=0 were accepted
+**Exploitation path**:
+1. A governance proposal is submitted with malformed JSON in the `Info` field (e.g., `{upgradeType:minor}` instead of `{"upgradeType":"minor"}`) - can be accidental human error
+2. The proposal passes `ValidateBasic()` because JSON syntax is not checked [1](#0-0) 
+3. The governance proposal is approved through standard voting
+4. The upgrade plan is scheduled via `ScheduleUpgrade()`, which also doesn't validate JSON [5](#0-4) 
+5. Validators, believing the upgrade is minor (based on proposal description or external communications), update their binaries before the scheduled height
+6. When `BeginBlocker` executes before the scheduled height, JSON parsing fails silently [3](#0-2) 
+7. The upgrade is incorrectly classified as major release
+8. Each validator node with the updated handler panics [4](#0-3) 
+9. If ≥30% of validators are affected, the network experiences severe degradation or halts consensus
 
-The `checkTxStateLock` [7](#0-6)  only protects initialization of checkState, not the CheckTx execution itself. The `state.mtx` lock is released immediately after reading the context, leaving the subsequent operations unprotected.
-
-**Exploitation Path:**
-1. Attacker creates two different transactions (tx1, tx2) with different content (different hashes) but identical sequence=0 from the same account
-2. Submits both transactions concurrently to a node (e.g., via two simultaneous RPC calls)
-3. Both CheckTx calls execute in parallel, race condition occurs during sequence validation
-4. Both pass `SigVerificationDecorator` (both read sequence=0 from checkState)
-5. Both pass `IncrementSequenceDecorator` (non-atomic increment in separate caches)
-6. Both enter mempool because mempool deduplication is hash-based, not nonce-based [8](#0-7) 
-7. During block execution (DeliverTx), only one succeeds; the other fails with sequence mismatch
-
-**Security Guarantee Broken:**
-The invariant that "only one transaction per sequence number per account exists in the mempool at any time" is violated, allowing mempool pollution.
+**Security guarantee broken**: The upgrade type detection mechanism is a critical security feature that allows safe early binary updates for minor releases. The silent failure of JSON parsing violates the documented minor upgrade protocol and creates a vector for network-wide availability attacks.
 
 ## Impact Explanation
 
-This vulnerability allows mempool pollution where multiple transactions with duplicate nonces coexist in the mempool. The consequences include:
+The impact affects network availability and validator node operation:
 
-1. **Resource Waste**: Nodes validate, store, and propagate invalid transactions that will ultimately fail in DeliverTx
-2. **Mempool Space Reduction**: Duplicate-nonce transactions consume mempool slots, reducing space for legitimate transactions  
-3. **Network Bandwidth**: Invalid transactions are propagated across the network unnecessarily
+- **Validator Panics**: All validators who updated their binaries early (following documented minor upgrade best practices) will experience node crashes with the "BINARY UPDATED BEFORE TRIGGER!" panic message
+- **Network Degradation**: If 30-33% of validators are affected, the network continues operating but with degraded consensus quality below the Byzantine fault tolerance threshold
+- **Network Halt**: If >33% of validators are affected, the network cannot reach the 2/3+ consensus threshold and completely halts
+- **Recovery Complexity**: Affected validators must roll back their binaries or coordinate to skip the upgrade height, requiring emergency off-chain coordination
+- **Economic Impact**: Network downtime affects all users, dApps, and economic activity
 
-This directly matches the Low severity impact: "Causing network processing nodes to process transactions from the mempool beyond set parameters" - nodes process and store multiple transactions for the same nonce when design parameters dictate only one should be valid.
+This matches the Medium severity impact: "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network" (for 30-33% affected) or "Network not being able to confirm new transactions (total network shutdown)" (for >33% affected).
 
 ## Likelihood Explanation
 
-**Likelihood: High**
+**Triggering parties**: Any participant who can submit and pass governance proposals (requires governance token holdings and community support - a public democratic process). Can also occur through accidental human error when crafting proposals.
 
-- **Who can trigger**: Any user with an account can exploit this by submitting concurrent transactions
-- **Prerequisites**: Only requires submitting multiple transactions with the same nonce concurrently - no special privileges, no complex setup
-- **Frequency**: Can occur naturally during normal network operation whenever transactions arrive concurrently, which is common in high-throughput scenarios
-- **Cost**: Attacker must pay gas fees for each transaction, but even failed transactions consume network resources during CheckTx and mempool propagation
+**Required conditions**:
+1. Governance proposal containing malformed JSON must be submitted and approved
+2. Validators must believe the upgrade is minor (through proposal description, official communications)
+3. Validators must update their binaries before scheduled height (standard practice for minor upgrades)
+4. BeginBlock must execute with updated handlers present
 
-The vulnerability is exploitable because CheckTx is explicitly designed to handle concurrent requests for throughput, yet no synchronization protects the sequence number validation flow. The codebase has OCC (Optimistic Concurrency Control) for DeliverTx but explicitly does NOT apply it to CheckTx [9](#0-8) .
+**Likelihood assessment**: Moderate to high - JSON syntax errors are common in human-crafted text (missing quotes, trailing commas). Validators rely on external communications to determine upgrade types. The malformed JSON is only detected at runtime, not during proposal validation, providing no early warning. Validators typically update in batches before minor releases, making it likely that multiple validators would be affected simultaneously.
 
 ## Recommendation
 
-Implement per-account locking around sequence number validation and increment operations:
+Add JSON validation to the upgrade plan validation flow to reject malformed JSON early. Enhance `Plan.ValidateBasic()` to include JSON validation:
 
-**Option 1: Per-Account Lock Manager**
-Add a lock manager to `IncrementSequenceDecorator` that acquires per-account locks before reading/incrementing sequence numbers, ensuring atomicity of the read-check-increment-write sequence across concurrent CheckTx calls.
+```go
+func (p Plan) ValidateBasic() error {
+    // ... existing validations ...
+    
+    // Validate JSON syntax in Info field if present
+    if p.Info != "" {
+        if _, err := p.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, 
+                fmt.Sprintf("invalid JSON in Info field: %v", err))
+        }
+    }
+    
+    return nil
+}
+```
 
-**Option 2: Extended CheckTx State Locking**
-Extend the existing `checkTxStateLock` to protect the entire CheckTx execution path per account, or implement per-account synchronization at the CheckTx entry point to serialize CheckTx operations for the same account.
+Or add validation in `ScheduleUpgrade()`:
 
-**Option 3: Sequence Check in Cached Context**
-After `msCache.Write()`, re-read the checkState sequence and verify it matches expectations. If a race occurred (another transaction incremented it), reject the current transaction.
+```go
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+    if err := plan.ValidateBasic(); err != nil {
+        return err
+    }
+    
+    // Validate upgrade details if Info is provided
+    if plan.Info != "" {
+        if _, err := plan.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
+                "invalid upgrade info JSON: %v", err)
+        }
+    }
+    
+    // ... rest of function
+}
+```
 
 ## Proof of Concept
 
-The report provides a conceptual PoC test in `baseapp/deliver_tx_test.go`:
+**File**: `x/upgrade/abci_test.go`
 
-**Setup:**
-1. Initialize test app with an account at sequence=0
-2. Create two different transactions (tx1, tx2) from the same account, both with sequence=0
-3. Ensure different message content so transaction hashes differ
+**Setup**: 
+- Initialize test suite at height 10 with no skip heights
+- Schedule upgrade at height 20 with malformed JSON: `{upgradeType:minor}` (missing quotes)
 
-**Action:**
-Launch two goroutines that simultaneously call `CheckTx` with tx1 and tx2
+**Action**:
+1. Submit governance proposal with malformed JSON upgrade info
+2. Register upgrade handler (simulating validator updating binary early for minor release)
+3. Execute BeginBlock at height 15 (before scheduled height of 20)
 
-**Expected Result:**
-Both CheckTx calls return success (Code=0), demonstrating that both duplicate-nonce transactions were accepted into the mempool. The checkState sequence is only incremented to 1 (not 2), proving the race condition allowed both to read the initial sequence=0 and pass validation.
+**Expected Result (Bug)**:
+- Node panics with "BINARY UPDATED BEFORE TRIGGER!" message
+- This demonstrates that malformed JSON bypasses minor release detection and triggers major upgrade panic logic
+
+**Test Function**:
+```go
+func TestMalformedJSONBypassesMinorUpgradeDetection(t *testing.T) {
+    s := setupTest(10, map[int64]bool{})
+    malformedMinorUpgradeInfo := `{upgradeType:minor}` // Missing quotes
+    
+    err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{
+        Title: "Minor Upgrade Test",
+        Plan: types.Plan{Name: "test_minor", Height: 20, Info: malformedMinorUpgradeInfo},
+    })
+    require.NoError(t, err) // Proposal accepted despite malformed JSON
+    
+    s.keeper.SetUpgradeHandler("test_minor", func(_ sdk.Context, _ types.Plan, vm module.VersionMap) (module.VersionMap, error) {
+        return vm, nil
+    })
+    
+    newCtx := s.ctx.WithBlockHeight(15)
+    req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
+    
+    // PANICS due to malformed JSON bypassing minor release detection
+    require.Panics(t, func() {
+        s.module.BeginBlock(newCtx, req)
+    })
+}
+```
+
+**Comparison**: The same scenario with valid JSON `{"upgradeType":"minor"}` would NOT panic, proving the issue is specifically the malformed JSON handling.
 
 ## Notes
 
-The vulnerability exists because the cache-based state access pattern creates isolated cache branches [10](#0-9)  that don't synchronize sequence reads across concurrent executions. While individual cache write operations use mutex protection [11](#0-10) , this doesn't prevent the TOCTOU (Time-Of-Check-Time-Of-Use) race in the complete read-check-increment-write sequence. The mempool's hash-based deduplication cannot prevent different transactions with identical nonces from coexisting when they have different transaction hashes.
+This vulnerability is particularly dangerous because:
+
+1. **Silent Failure**: The JSON parsing error is only logged, not caught during validation, providing no early warning
+2. **Documented Protocol Violation**: The minor/major upgrade distinction is documented behavior that validators rely on
+3. **Coordination Attack Surface**: Can cause widespread simultaneous panics if multiple validators act on the same malformed proposal
+4. **Human Error Vector**: JSON syntax errors are common and realistic
+5. **Beyond Governance Authority**: Even though governance is a trusted process, the silent failure causes unintended network shutdown beyond the intended authority of a minor upgrade proposal
+
+The fix is straightforward: add JSON syntax validation during the proposal validation phase to reject malformed upgrade plans before they can be scheduled.
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L269-278)
+**File:** x/upgrade/types/plan.go (L21-36)
 ```go
-		// Check account sequence number.
-		if sig.Sequence != acc.GetSequence() {
-			params := svd.ak.GetParams(ctx)
-			if !params.GetDisableSeqnoCheck() {
-				return ctx, sdkerrors.Wrapf(
-					sdkerrors.ErrWrongSequence,
-					"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
-				)
-			}
-		}
-```
-
-**File:** x/auth/ante/sigverify.go (L352-369)
-```go
-func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
-	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
+func (p Plan) ValidateBasic() error {
+	if !p.Time.IsZero() {
+		return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
+	}
+	if p.UpgradedClientState != nil {
+		return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
+	}
+	if len(p.Name) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
+	}
+	if p.Height <= 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
 	}
 
-	// increment sequence of all signers
-	for _, addr := range sigTx.GetSigners() {
-		acc := isd.ak.GetAccount(ctx, addr)
-		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
-			panic(err)
-		}
-
-		isd.ak.SetAccount(ctx, acc)
-	}
-
-	return next(ctx, tx, simulate)
+	return nil
 }
 ```
 
-**File:** baseapp/baseapp.go (L168-168)
+**File:** x/upgrade/types/plan.go (L59-69)
 ```go
-	checkTxStateLock *sync.RWMutex
-```
-
-**File:** baseapp/baseapp.go (L834-850)
-```go
-// cacheTxContext returns a new context based off of the provided context with
-// a branched multi-store.
-func (app *BaseApp) cacheTxContext(ctx sdk.Context, checksum [32]byte) (sdk.Context, sdk.CacheMultiStore) {
-	ms := ctx.MultiStore()
-	// TODO: https://github.com/cosmos/cosmos-sdk/issues/2824
-	msCache := ms.CacheMultiStore()
-	if msCache.TracingEnabled() {
-		msCache = msCache.SetTracingContext(
-			sdk.TraceContext(
-				map[string]interface{}{
-					"txHash": fmt.Sprintf("%X", checksum),
-				},
-			),
-		).(sdk.CacheMultiStore)
+func (p Plan) UpgradeDetails() (UpgradeDetails, error) {
+	if p.Info == "" {
+		return UpgradeDetails{}, nil
 	}
-
-	return ctx.WithMultiStore(msCache), msCache
-```
-
-**File:** baseapp/baseapp.go (L978-979)
-```go
-		// Dont need to validate in checkTx mode
-		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
-```
-
-**File:** baseapp/baseapp.go (L998-998)
-```go
-		msCache.Write()
-```
-
-**File:** baseapp/abci.go (L209-231)
-```go
-func (app *BaseApp) CheckTx(ctx context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTxV2, error) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "check_tx")
-
-	var mode runTxMode
-
-	switch {
-	case req.Type == abci.CheckTxType_New:
-		mode = runTxModeCheck
-
-	case req.Type == abci.CheckTxType_Recheck:
-		mode = runTxModeReCheck
-
-	default:
-		panic(fmt.Sprintf("unknown RequestCheckTx type: %s", req.Type))
+	var details UpgradeDetails
+	if err := json.Unmarshal([]byte(p.Info), &details); err != nil {
+		// invalid json, assume no upgrade details
+		return UpgradeDetails{}, err
 	}
+	return details, nil
+}
+```
 
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
+**File:** x/upgrade/abci.go (L75-78)
+```go
+	details, err := plan.UpgradeDetails()
 	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
+		ctx.Logger().Error("failed to parse upgrade details", "err", err)
 	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
 ```
 
-**File:** baseapp/state.go (L37-41)
+**File:** x/upgrade/abci.go (L92-97)
 ```go
-func (st *state) Context() sdk.Context {
-	st.mtx.RLock()
-	defer st.mtx.RUnlock()
-	return st.ctx
-}
-```
-
-**File:** docs/basics/tx-lifecycle.md (L117-127)
-```markdown
-The **mempool** serves the purpose of keeping track of transactions seen by all full-nodes.
-Full-nodes keep a **mempool cache** of the last `mempool.cache_size` transactions they have seen, as a first line of
-defense to prevent replay attacks. Ideally, `mempool.cache_size` is large enough to encompass all
-of the transactions in the full mempool. If the the mempool cache is too small to keep track of all
-the transactions, `CheckTx` is responsible for identifying and rejecting replayed transactions.
-
-Currently existing preventative measures include fees and a `sequence` (nonce) counter to distinguish
-replayed transactions from identical but valid ones. If an attacker tries to spam nodes with many
-copies of a `Tx`, full-nodes keeping a mempool cache will reject identical copies instead of running
-`CheckTx` on all of them. Even if the copies have incremented `sequence` numbers, attackers are
-disincentivized by the need to pay fees.
-```
-
-**File:** store/cachemulti/store.go (L142-147)
-```go
-func (cms Store) Write() {
-	cms.db.Write()
-	for _, store := range cms.stores {
-		store.Write()
+	// if we have a handler for a non-minor upgrade, that means it updated too early and must stop
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
 	}
-}
 ```
 
-**File:** store/cachekv/store.go (L101-103)
+**File:** x/upgrade/keeper/keeper.go (L177-180)
 ```go
-func (store *Store) Write() {
-	store.mtx.Lock()
-	defer store.mtx.Unlock()
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+	if err := plan.ValidateBasic(); err != nil {
+		return err
+	}
 ```

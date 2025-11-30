@@ -1,219 +1,250 @@
 # Audit Report
 
 ## Title
-Unhandled Missing Route in Governance Proposal Execution Causes Network-Wide Node Crash
+Minor Upgrade Detection Bypass via Malformed JSON Leading to Network Node Shutdown
 
 ## Summary
-The governance module's EndBlocker function calls `GetRoute()` without checking if the route exists when executing passed proposals. Since `GetRoute()` panics on missing routes and EndBlock lacks panic recovery, proposals with routes removed during chain upgrades cause all nodes to crash deterministically at the same block height, resulting in total network shutdown.
+The upgrade module lacks JSON validation in the `Plan.Info` field during governance proposal validation. When malformed JSON is present in an upgrade plan, the system incorrectly treats a minor upgrade as major, causing validators who update their binaries early (standard practice for minor upgrades) to experience node panics affecting ≥30% of network nodes.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- `x/gov/abci.go` line 68 [1](#0-0) 
-- `x/gov/types/router.go` lines 66-72 [2](#0-1) 
+**Location:**
+- `x/upgrade/types/plan.go` (lines 21-36) - ValidateBasic() lacks JSON validation
+- `x/upgrade/keeper/keeper.go` (lines 177-211) - ScheduleUpgrade() lacks JSON validation  
+- `x/upgrade/abci.go` (lines 75-97) - BeginBlocker silent failure handling
 
 **Intended Logic:**
-When a governance proposal passes and enters execution in EndBlocker, the system should safely retrieve and execute the proposal handler. If a route becomes unavailable after proposal submission (e.g., due to chain upgrades), the system should handle this gracefully by failing the proposal rather than crashing.
+When an upgrade plan contains valid JSON `{"upgradeType":"minor"}` in the `Info` field, the system should parse this JSON, detect it as a minor release, and allow validators to update their binaries before the scheduled upgrade height without triggering a panic. [1](#0-0) 
 
 **Actual Logic:**
-The EndBlocker directly calls `GetRoute()` without checking route existence [1](#0-0) . The router's `GetRoute()` function panics if the route doesn't exist [2](#0-1) . This creates a time-of-check-time-of-use (TOCTOU) vulnerability where routes are validated during proposal submission [3](#0-2)  but not during execution.
+When the `Info` field contains malformed JSON (e.g., `{upgradeType:"minor"}` with missing quotes), the `json.Unmarshal()` call in `UpgradeDetails()` fails and returns an empty struct. [1](#0-0)  The error is logged but ignored in BeginBlocker. [2](#0-1)  The `IsMinorRelease()` check returns false for the empty string. [3](#0-2)  If a handler exists (because validators updated early), the node panics. [4](#0-3) 
 
 **Exploitation Path:**
-1. User submits a governance proposal when route "X" exists - submission succeeds because route validation passes
-2. Proposal enters voting period (typically lasting weeks)
-3. Chain upgrade occurs where route "X" is removed from router initialization (legitimate refactoring or module deprecation)
-4. Proposal accumulates sufficient votes and passes
-5. EndBlocker processes the passed proposal and calls `keeper.Router().GetRoute(proposal.ProposalRoute())`
-6. `GetRoute()` panics with "route does not exist" message
-7. Unlike transaction processing which has panic recovery [4](#0-3) , EndBlock has no panic recovery mechanism [5](#0-4) 
-8. Panic propagates and crashes the node
-9. All nodes processing this block crash identically at the same height, causing complete network shutdown
+1. A governance proposal is submitted with malformed JSON in `Plan.Info` (can occur accidentally through human error)
+2. The proposal passes `ValidateBasic()` checks because the Info field JSON format is not validated [5](#0-4) 
+3. The proposal is approved by governance and scheduled via `ScheduleUpgrade()` [6](#0-5) 
+4. Validators receive external communications indicating this is a minor upgrade
+5. Validators update their binaries early and register upgrade handlers (standard minor upgrade protocol)
+6. When `BeginBlocker` executes before the scheduled height, it calls `plan.UpgradeDetails()` which silently fails to parse the malformed JSON
+7. The empty `UpgradeDetails` causes `IsMinorRelease()` to return false
+8. The code reaches the panic condition where `k.HasHandler(plan.Name)` is true for validators who updated early
+9. All affected nodes panic and shut down with message "BINARY UPDATED BEFORE TRIGGER!"
 
 **Security Guarantee Broken:**
-This violates the blockchain's liveness and availability guarantees. The lack of defensive programming in a critical consensus code path (EndBlocker) creates a catastrophic failure mode where normal operational activities (chain upgrades) inadvertently trigger network-wide outages.
+The minor/major upgrade distinction is a critical safety mechanism. The system violates the fail-safe principle by silently failing to parse upgrade metadata and defaulting to unsafe behavior (panic) without explicit validation or rejection during proposal submission.
 
 ## Impact Explanation
 
-**Consequences:**
-- **Total network shutdown**: All validator and full nodes crash when processing the block containing the proposal execution
-- **Consensus failure**: No new blocks can be produced as all nodes halt at the same height
-- **Requires emergency intervention**: Recovery requires either a coordinated hard fork to remove the problematic proposal from state, or an emergency hotfix release adding defensive checks
-- **Cannot self-recover**: This cannot be resolved through normal consensus mechanisms since all nodes crash deterministically at the same block
+**Affected Processes:** Network validator node availability and consensus participation
 
-This directly matches the impact category: "Network not being able to confirm new transactions (total network shutdown)" classified as Medium severity.
+**Consequences:**
+- Validators following minor upgrade best practices experience unexpected node panics
+- If ≥30% of validators coordinate early updates (standard practice for minor upgrades), those nodes shut down simultaneously
+- While the network continues operating (remaining validators > 66.67% threshold needed for consensus), this represents significant availability degradation
+- Requires emergency coordination to roll back binaries or skip the upgrade height
+- Undermines trust in the upgrade mechanism and validator coordination
+
+This matches the defined Medium severity impact: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"**
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- Governance proposals are permissionless (any user can submit)
-- Proposals have voting periods of weeks during which chain upgrades commonly occur
-- Chain upgrades that modify module routes or deprecate modules are routine maintenance operations
-- Routes are hardcoded during application initialization [6](#0-5) 
-- Once triggered, network halt is guaranteed (100% deterministic)
-
-**Frequency Assessment:**
-Medium likelihood during active chain development. The longer a proposal sits in the voting period across upgrade boundaries, the higher the risk. This is not a malicious exploit but a defensive programming gap creating operational risk during normal chain evolution.
-
 **Who Can Trigger:**
-Anyone can submit proposals (creating the precondition). The vulnerability manifests during chain upgrades performed by the development team. However, this is NOT a "privileged misconfiguration" - removing routes during upgrades is legitimate refactoring. The vulnerability is the system's failure to handle this gracefully, causing damage far beyond the intended scope of the upgrade.
+Any governance participant who can submit proposals (requires token holdings and community approval). Critically, this can occur **accidentally** through human error when crafting JSON syntax in upgrade proposals.
+
+**Required Conditions:**
+1. Governance proposal passes with malformed JSON in `Info` field (moderate likelihood - JSON syntax errors are common in manual proposal creation)
+2. Validators coordinate early binary updates based on external communications indicating minor upgrade (high likelihood - this is standard practice for minor version upgrades)
+3. Mismatch between off-chain communications (saying "minor upgrade") and on-chain malformed data (medium likelihood due to lack of validation)
+
+**Likelihood Assessment:**
+Medium to High. JSON syntax errors are common when humans manually craft proposals. Validators regularly coordinate minor upgrades and rely on external communications from the development team. The lack of validation means errors won't be caught during proposal submission, only at runtime when it's too late to prevent the impact.
 
 ## Recommendation
 
-Add a defensive check before calling `GetRoute()` in the EndBlocker execution path:
+Add JSON validation to the `ScheduleUpgrade` function to reject proposals with invalid Info field JSON format:
 
 ```go
-if passes {
-    // Check if route exists before attempting to get it
-    if !keeper.Router().HasRoute(proposal.ProposalRoute()) {
-        // Log error and mark proposal as failed instead of panicking
-        proposal.Status = types.StatusFailed
-        tagValue = types.AttributeValueProposalFailed
-        logMsg = fmt.Sprintf("failed: handler route %s not registered", proposal.ProposalRoute())
-    } else {
-        handler := keeper.Router().GetRoute(proposal.ProposalRoute())
-        // ... rest of execution logic
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+    if err := plan.ValidateBasic(); err != nil {
+        return err
     }
+    
+    // Validate upgrade details if Info is provided
+    if plan.Info != "" {
+        if _, err := plan.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
+                "invalid upgrade info JSON: %v", err)
+        }
+    }
+    
+    // ... rest of function
 }
 ```
 
-This ensures routes becoming unavailable after proposal submission are handled gracefully. The proposal would fail with a clear error message rather than crashing all nodes, maintaining network availability.
-
-**Alternative approach:** Add panic recovery to the EndBlock function similar to how Query [7](#0-6)  and PrepareProposal [8](#0-7)  handle panics, though the defensive check approach is preferable for clearer error semantics.
+This ensures malformed JSON is caught during proposal validation rather than causing runtime failures that panic validator nodes.
 
 ## Proof of Concept
 
-**Test Setup:**
-1. Initialize test application with `simapp.Setup(false)`
-2. Create test accounts and validator
-3. Define a custom proposal content type implementing `types.Content` interface that returns a non-registered route (e.g., "nonexistent-route")
-4. Submit the proposal using the custom content
-5. Deposit sufficient tokens to activate voting
-6. Cast YES votes to ensure proposal passes
-7. Advance block time past the voting period end
+**Test Function:** Add to `x/upgrade/abci_test.go`
 
-**Trigger:**
-Execute `gov.EndBlocker(ctx, app.GovKeeper)` to process the passed proposal
+**Setup:**
+- Initialize test suite at height 10 with no skip heights using `setupTest(10, map[int64]bool{})`
+- Schedule upgrade at height 20 with malformed JSON: `Info: "{upgradeType:minor}"` (missing quotes around key and value)
+- Register upgrade handler using `s.keeper.SetUpgradeHandler("testMalformed", func(...) {...})` to simulate validator updating binary early for minor release
 
-**Expected Result:**
-The system panics with: `panic: route "nonexistent-route" does not exist` originating from the router's `GetRoute()` method. This demonstrates:
-- The panic occurs in the critical consensus code path (EndBlocker)
-- No recovery mechanism exists in EndBlock
-- All nodes would crash when processing this block
-- The network would halt completely
+**Action:**
+- Create context at height 15 (before scheduled height of 20): `newCtx := s.ctx.WithBlockHeight(15)`
+- Execute BeginBlock: `s.module.BeginBlock(newCtx, req)`
 
-The panic recovery middleware only applies to transaction processing via `runTx`, not to EndBlock operations.
+**Result:**
+- Node panics with "BINARY UPDATED BEFORE TRIGGER! UPGRADE \"testMalformed\" - in binary but not executed on chain"
+- This occurs even though the upgrade was intended as minor
+- With valid JSON `{"upgradeType":"minor"}`, the same scenario does NOT panic (verified by existing test at lines 550-568) [7](#0-6) 
+- The existing test confirms that invalid JSON returns an empty struct [8](#0-7) 
+
+The test demonstrates that the JSON parsing failure causes the system to incorrectly treat a minor upgrade as major, triggering panic conditions that should not occur for properly detected minor upgrades.
 
 ## Notes
 
-This vulnerability represents a time-of-check-time-of-use (TOCTOU) issue where the system validates route existence during proposal submission but not during execution. The gap between these operations (potentially weeks) allows for legitimate state changes (chain upgrades) that the system fails to handle gracefully. While other ABCI methods like Query and PrepareProposal have panic recovery, EndBlock notably lacks this protection, making it vulnerable to panics from any module's EndBlocker logic.
+This vulnerability exists because the system makes critical security decisions (panic vs. allow early execution) based on the `Info` field content but doesn't validate the field format during proposal submission. The silent failure mode (logging error but continuing execution with empty struct) violates security best practices and the fail-safe principle.
+
+While this requires governance approval, it qualifies as a valid vulnerability because even trusted governance inadvertently triggering this through human error (JSON syntax mistake) causes an unrecoverable security failure (mass node shutdowns affecting ≥30% of validators) that is beyond their intended authority (they intended a coordinated minor upgrade, not network disruption).
+
+Human operators have no mechanism to detect the malformed JSON until their validator nodes panic at runtime, making this a systemic validation failure at the protocol level.
 
 ### Citations
 
-**File:** x/gov/abci.go (L68-68)
+**File:** x/upgrade/types/plan.go (L21-36)
 ```go
-			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
-```
-
-**File:** x/gov/types/router.go (L66-72)
-```go
-func (rtr *router) GetRoute(path string) Handler {
-	if !rtr.HasRoute(path) {
-		panic(fmt.Sprintf("route \"%s\" does not exist", path))
+func (p Plan) ValidateBasic() error {
+	if !p.Time.IsZero() {
+		return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
+	}
+	if p.UpgradedClientState != nil {
+		return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
+	}
+	if len(p.Name) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
+	}
+	if p.Height <= 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
 	}
 
-	return rtr.routes[path]
+	return nil
 }
 ```
 
-**File:** x/gov/keeper/proposal.go (L19-21)
+**File:** x/upgrade/types/plan.go (L59-69)
 ```go
-	if !keeper.router.HasRoute(content.ProposalRoute()) {
-		return types.Proposal{}, sdkerrors.Wrap(types.ErrNoProposalHandlerExists, content.ProposalRoute())
+func (p Plan) UpgradeDetails() (UpgradeDetails, error) {
+	if p.Info == "" {
+		return UpgradeDetails{}, nil
 	}
-```
-
-**File:** baseapp/baseapp.go (L904-915)
-```go
-	defer func() {
-		if r := recover(); r != nil {
-			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
-			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
-			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
-			err, result = processRecovery(r, recoveryMW), nil
-			if mode != runTxModeDeliver {
-				ctx.MultiStore().ResetEvents()
-			}
-		}
-		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
-	}()
-```
-
-**File:** baseapp/abci.go (L178-201)
-```go
-func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
-	// Clear DeliverTx Events
-	ctx.MultiStore().ResetEvents()
-
-	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
-
-	if app.endBlocker != nil {
-		res = app.endBlocker(ctx, req)
-		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	var details UpgradeDetails
+	if err := json.Unmarshal([]byte(p.Info), &details); err != nil {
+		// invalid json, assume no upgrade details
+		return UpgradeDetails{}, err
 	}
-
-	if cp := app.GetConsensusParams(ctx); cp != nil {
-		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
-	}
-
-	// call the streaming service hooks with the EndBlock messages
-	for _, streamingListener := range app.abciListeners {
-		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
-			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
-		}
-	}
-
-	return res
+	return details, nil
 }
 ```
 
-**File:** baseapp/abci.go (L488-493)
+**File:** x/upgrade/types/plan.go (L72-74)
 ```go
-	defer func() {
-		if r := recover(); r != nil {
-			resp := sdkerrors.QueryResultWithDebug(sdkerrors.Wrapf(sdkerrors.ErrPanic, "%v", r), app.trace)
-			res = &resp
-		}
-	}()
+func (ud UpgradeDetails) IsMinorRelease() bool {
+	return strings.EqualFold(ud.UpgradeType, "minor")
+}
 ```
 
-**File:** baseapp/abci.go (L1037-1052)
+**File:** x/upgrade/abci.go (L75-78)
 ```go
-	defer func() {
-		if err := recover(); err != nil {
-			app.logger.Error(
-				"panic recovered in PrepareProposal",
-				"height", req.Height,
-				"time", req.Time,
-				"panic", err,
-			)
-
-			resp = &abci.ResponsePrepareProposal{
-				TxRecords: utils.Map(req.Txs, func(tx []byte) *abci.TxRecord {
-					return &abci.TxRecord{Action: abci.TxRecord_UNMODIFIED, Tx: tx}
-				}),
-			}
-		}
-	}()
+	details, err := plan.UpgradeDetails()
+	if err != nil {
+		ctx.Logger().Error("failed to parse upgrade details", "err", err)
+	}
 ```
 
-**File:** simapp/app.go (L305-309)
+**File:** x/upgrade/abci.go (L92-97)
 ```go
-	govRouter := govtypes.NewRouter()
-	govRouter.AddRoute(govtypes.RouterKey, govtypes.ProposalHandler).
-		AddRoute(paramproposal.RouterKey, params.NewParamChangeProposalHandler(app.ParamsKeeper)).
-		AddRoute(distrtypes.RouterKey, distr.NewCommunityPoolSpendProposalHandler(app.DistrKeeper)).
-		AddRoute(upgradetypes.RouterKey, upgrade.NewSoftwareUpgradeProposalHandler(app.UpgradeKeeper))
+	// if we have a handler for a non-minor upgrade, that means it updated too early and must stop
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
+	}
+```
+
+**File:** x/upgrade/keeper/keeper.go (L177-211)
+```go
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+	if err := plan.ValidateBasic(); err != nil {
+		return err
+	}
+
+	// NOTE: allow for the possibility of chains to schedule upgrades in begin block of the same block
+	// as a strategy for emergency hard fork recoveries
+	if plan.Height < ctx.BlockHeight() {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "upgrade cannot be scheduled in the past")
+	}
+
+	if k.GetDoneHeight(ctx, plan.Name) != 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "upgrade with name %s has already been completed", plan.Name)
+	}
+
+	store := ctx.KVStore(k.storeKey)
+
+	// clear any old IBC state stored by previous plan
+	oldPlan, found := k.GetUpgradePlan(ctx)
+	if found {
+		k.ClearIBCState(ctx, oldPlan.Height)
+	}
+
+	bz := k.cdc.MustMarshal(&plan)
+	store.Set(types.PlanKey(), bz)
+
+	telemetry.SetGaugeWithLabels(
+		[]string{"cosmos", "upgrade", "plan", "height"},
+		float32(plan.Height),
+		[]metrics.Label{
+			{Name: "name", Value: plan.Name},
+			{Name: "info", Value: plan.Info},
+		},
+	)
+	return nil
+```
+
+**File:** x/upgrade/abci_test.go (L550-568)
+```go
+		{
+			"test not panic: minor upgrade should apply",
+			func() (sdk.Context, abci.RequestBeginBlock) {
+				s.keeper.SetUpgradeHandler("test4", func(_ sdk.Context, _ types.Plan, vm module.VersionMap) (module.VersionMap, error) {
+					return vm, nil
+				})
+
+				err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{
+					Title: "Upgrade test",
+					Plan:  types.Plan{Name: "test4", Height: s.ctx.BlockHeight() + 10, Info: minorUpgradeInfo},
+				})
+				require.NoError(t, err)
+
+				newCtx := s.ctx.WithBlockHeight(12)
+				req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
+				return newCtx, req
+			},
+			false,
+		},
+```
+
+**File:** x/upgrade/types/plan_test.go (L175-180)
+```go
+			name: "invalid json in Info",
+			plan: types.Plan{
+				Info: `{upgradeType:"minor"}`,
+			},
+			want: types.UpgradeDetails{},
+		},
 ```

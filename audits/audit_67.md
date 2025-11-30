@@ -1,199 +1,179 @@
-Based on my investigation of the codebase, I can confirm this is a **valid vulnerability**. Let me provide my analysis:
-
-## Code Verification
-
-I've confirmed the vulnerable code exists at the reported location: [1](#0-0) 
-
-The code performs unsafe operations:
-1. `msgs := genTx.GetMsgs()` retrieves messages without validation
-2. `msg := msgs[0].(*stakingtypes.MsgCreateValidator)` performs both unsafe array access and unsafe type assertion
-
-## Execution Flow Confirmation
-
-The execution path during `collect-gentxs` command is: [2](#0-1) 
-
-This calls into: [3](#0-2) 
-
-Which invokes `CollectTxs` where the unsafe operations occur.
-
-## Validation Gap Confirmed
-
-The proper validation logic exists in `ValidateGenesis`: [4](#0-3) 
-
-However, this validation is **NOT** called during the `collect-gentxs` flow. It only runs as a separate command or during module initialization (after genesis state creation): [5](#0-4) 
-
-The JSON decoder only performs unmarshaling without structural validation: [6](#0-5) 
-
-## Impact Assessment
-
-This vulnerability matches the Medium severity criterion: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"**
-
-During genesis collection, all validators process the same shared set of gentx files. A single malformed file causes all validators to panic simultaneously, blocking network initialization.
-
----
-
 # Audit Report
 
 ## Title
-Missing Transaction Structure Validation in Genesis Collection Leading to Node Panic
+Off-by-One Error in Double-Sign Slashing Causes Incorrect Slashing of Unbonding Delegations
 
 ## Summary
-The `CollectTxs` function performs unsafe array access (`msgs[0]`) and type assertion without validating that messages exist or are of the correct type. A malformed genesis transaction file causes validator nodes to panic during genesis collection, preventing network initialization.
+The evidence handler passes an incorrect infraction height parameter to the slashing function when processing double-sign evidence, causing unbonding delegations that were initiated at the exact block height where the validator set was finalized to be incorrectly slashed, even though their stake did not contribute to the validator's voting power during the infraction.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-- **Location**: [7](#0-6) 
+**Location:** 
+- Primary: [1](#0-0) 
+- Secondary: [2](#0-1) 
 
-- **Intended logic**: Genesis transactions should be validated to ensure they contain exactly one `MsgCreateValidator` message before processing. The comment at line 135 explicitly states "genesis transactions must be single-message".
+**Intended Logic:**
+According to the staking specification [3](#0-2) , only unbonding delegations where "the infraction occurred before the unbonding began" should be slashed. The system should follow the "follow the usei" principle [4](#0-3) , meaning only stake that actively contributed to a validator's voting power at the time of an infraction should be slashed.
 
-- **Actual logic**: After decoding at [8](#0-7) , the code retrieves messages and immediately performs unsafe operations without validation. The decoder [9](#0-8)  only unmarshals JSON without structural validation. While proper validation exists at [4](#0-3) , it is not called during the collection flow [2](#0-1) .
+When a delegator unbonds at block H-1:
+1. During DeliverTx of block H-1, the `Undelegate` function sets `CreationHeight = ctx.BlockHeight() = H-1` [5](#0-4) 
+2. Validator tokens are immediately reduced [6](#0-5) 
+3. At EndBlock(H-1), the validator set for block H is calculated with the reduced power
+4. At block H, the validator signs with reduced power (unbonded stake is NOT part of voting power)
 
-- **Exploitation path**:
-  1. Create malformed genesis transaction JSON with empty messages array or non-`MsgCreateValidator` message
-  2. Place file in gentx directory (`~/.sei/config/gentx/`)
-  3. Validator runs standard `collect-gentxs` command
-  4. `CollectTxs` processes the malformed file
-  5. Code panics at line 139 with "index out of range" or "interface conversion" error
+**Actual Logic:**
+The evidence handler calculates `distributionHeight = infractionHeight - ValidatorUpdateDelay` (where `ValidatorUpdateDelay = 1` [7](#0-6) ) and passes `distributionHeight` as the infraction height parameter to the Slash function. For a double-sign at block H, this becomes H-1.
 
-- **Security guarantee broken**: Availability guarantee during genesis initialization is violated. A single malformed gentx file prevents all validators from completing genesis collection.
+The slashing check uses `entry.CreationHeight < infractionHeight` to determine which delegations to skip. For an unbonding with CreationHeight = H-1 and infractionHeight parameter = H-1:
+- Check evaluates: `H-1 < H-1` → false  
+- The entry is NOT skipped, so it IS slashed (incorrectly)
+
+**Exploitation Path:**
+1. Delegator submits unbonding transaction at block H-1 (normal operation)
+2. Transaction is processed with CreationHeight = H-1
+3. Validator's power is reduced immediately
+4. EndBlock(H-1) calculates validator set for block H with reduced power
+5. Validator double-signs at block H (with reduced power that doesn't include unbonded stake)
+6. Evidence handler calculates distributionHeight = H-1 and passes it as infraction height
+7. Slash function incorrectly slashes the unbonding because `H-1 < H-1` evaluates to false
+8. Delegator loses SlashFractionDoubleSign (typically 5%) of their unbonding amount
+
+**Security Guarantee Broken:**
+This violates the documented invariant that only stake contributing to an infraction should be penalized. The unbonded stake was removed from the validator's power before the validator set for block H was finalized, so it did not contribute to the validator's voting power when the double-sign occurred at block H.
 
 ## Impact Explanation
 
-During coordinated network launches, validators share and collect genesis transactions from all participants. Each validator runs `collect-gentxs` to process ALL gentx files. If any single gentx file is malformed, every validator's node will panic when processing it, blocking the genesis collection phase and preventing network initialization. This affects ≥30% of validator nodes simultaneously as they all process the same shared set of gentx files.
+Delegators who unbond from a validator at the exact block height where the validator set is finalized (distributionHeight) suffer direct loss of funds when that validator subsequently double-signs at the next block. The typical SlashFractionDoubleSign is 5%, representing a permanent loss of the delegators' unbonding funds. This directly violates the core security principle that penalties should only apply to stake that actively contributed to the misbehavior.
 
 ## Likelihood Explanation
 
-**Likelihood: High**
-- Occurs during standard `collect-gentxs` command execution (required for network initialization)
-- Can be triggered accidentally through buggy tooling or file corruption
-- Can be triggered maliciously by compromised validator infrastructure
-- Amplification effect: one malformed file from any validator affects ALL validators during genesis
-- Deterministic: every validator processing the malformed file will panic
-- Affects the most critical phase of network operation
+This issue occurs when:
+1. A delegator unbonds from a validator at block height H-1 (routine operation)
+2. The same validator commits a double-sign infraction at block height H (rare but significant event)
+
+While double-sign events are relatively rare, unbonding is a routine operation in any active Proof-of-Stake network. When a double-sign does occur, any delegators who happened to unbond at the specific height (distributionHeight) will be incorrectly slashed. This occurs in normal network operation without requiring any special conditions or privileged access.
 
 ## Recommendation
 
-Add validation checks in `CollectTxs` before the unsafe operations, mirroring the existing validation in `ValidateGenesis`:
+Modify the evidence handler to pass `distributionHeight + 1` instead of `distributionHeight` to the Slash function:
 
 ```go
-// After line 136: msgs := genTx.GetMsgs()
-if len(msgs) != 1 {
-    return appGenTxs, persistentPeers, fmt.Errorf(
-        "genesis transaction in %s must contain exactly 1 message, got %d", 
-        fo.Name(), len(msgs))
-}
-
-// Replace line 139 with safe type assertion:
-msg, ok := msgs[0].(*stakingtypes.MsgCreateValidator)
-if !ok {
-    return appGenTxs, persistentPeers, fmt.Errorf(
-        "genesis transaction in %s does not contain a MsgCreateValidator, got %T", 
-        fo.Name(), msgs[0])
-}
+k.slashingKeeper.Slash(
+    ctx,
+    consAddr,
+    k.slashingKeeper.SlashFractionDoubleSign(ctx),
+    evidence.GetValidatorPower(), 
+    distributionHeight + 1,  // Changed from distributionHeight
+)
 ```
+
+This ensures the infraction height parameter correctly represents the actual block where the infraction occurred (H), not where the validator set was determined (H-1). The slashing check will then correctly evaluate to `H-1 < H` → true, skipping unbonding delegations whose stake was removed before the validator set for the infraction block was finalized.
 
 ## Proof of Concept
 
-**File**: `x/genutil/collect_test.go`
+**Setup:**
+1. Initialize a validator with delegated stake at block 100
+2. Execute EndBlock(100) to finalize validator set for block 101
 
-**Setup**:
-1. Create temporary directory for gentx files
-2. Write malformed transaction JSON with empty messages array to file
-3. Initialize codec and decoder
+**Action:**
+1. At block 101 during DeliverTx:
+   - Delegator submits unbonding transaction
+   - `Undelegate` function sets CreationHeight = 101 via `ctx.BlockHeight()`
+   - Validator's tokens are immediately reduced via `bondedTokensToNotBonded`
+2. At EndBlock(101):
+   - Validator set for block 102 is calculated with reduced power
+3. At block 102:
+   - Validator double-signs using the reduced power
+4. Evidence processing:
+   - `distributionHeight = 102 - 1 = 101`
+   - `SlashUnbondingDelegation` is called with `infractionHeight = 101`
+5. Slashing check:
+   - Check evaluates: `101 < 101` → false
+   - Unbonding delegation IS slashed
 
-**Action**:
-Call `CollectTxs` with directory containing malformed gentx file
+**Result:**
+- Expected: Slash amount = 0 (stake didn't contribute to infraction)
+- Actual: Slash amount = 5% of unbonding amount
+- This demonstrates stake that did not contribute to the validator's power at the infraction is incorrectly slashed
 
-**Result**:
-Function panics at line 139 when accessing `msgs[0]` on empty slice or performing invalid type assertion. Fixed implementation would return descriptive error instead.
-
-## Notes
-
-This vulnerability qualifies as Medium severity under the impact criterion: "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network." The amplification effect of one malformed file affecting all validators during genesis collection elevates this beyond an individual node issue to a network-wide initialization failure.
+**Note:** The existing test [8](#0-7)  tests the case where CreationHeight = 0 and infractionHeight = 1 (clearly before), but does not test the boundary case where CreationHeight equals distributionHeight, which is where the off-by-one error manifests.
 
 ### Citations
 
-**File:** x/genutil/collect.go (L32-38)
+**File:** x/evidence/keeper/infraction.go (L101-112)
 ```go
-	// process genesis transactions, else create default genesis.json
-	appGenTxs, persistentPeers, err := CollectTxs(
-		cdc, txEncodingConfig.TxJSONDecoder(), config.Moniker, initCfg.GenTxsDir, genDoc, genBalIterator,
+	distributionHeight := infractionHeight - sdk.ValidatorUpdateDelay
+
+	// Slash validator. The `power` is the int64 power of the validator as provided
+	// to/by Tendermint. This value is validator.Tokens as sent to Tendermint via
+	// ABCI, and now received as evidence. The fraction is passed in to separately
+	// to slash unbonding and rebonding delegations.
+	k.slashingKeeper.Slash(
+		ctx,
+		consAddr,
+		k.slashingKeeper.SlashFractionDoubleSign(ctx),
+		evidence.GetValidatorPower(), distributionHeight,
 	)
-	if err != nil {
-		return appState, err
+```
+
+**File:** x/staking/keeper/slash.go (L174-177)
+```go
+		// If unbonding started before this height, stake didn't contribute to infraction
+		if entry.CreationHeight < infractionHeight {
+			continue
+		}
+```
+
+**File:** x/staking/spec/02_state_transitions.md (L133-134)
+```markdown
+- Every unbonding delegation and pseudo-unbonding redelegation such that the infraction occured before the unbonding or
+  redelegation began from the validator are slashed by the `slashFactor` percentage of the initialBalance.
+```
+
+**File:** x/evidence/spec/06_begin_block.md (L40-44)
+```markdown
+If valid `Equivocation` evidence is included in a block, the validator's stake is
+reduced (slashed) by `SlashFractionDoubleSign` as defined by the `x/slashing` module
+of what their stake was when the infraction occurred, rather than when the evidence was discovered.
+We want to "follow the usei", i.e., the stake that contributed to the infraction
+should be slashed, even if it has since been redelegated or started unbonding.
+```
+
+**File:** x/staking/keeper/delegation.go (L848-850)
+```go
+	if validator.IsBonded() {
+		k.bondedTokensToNotBonded(ctx, returnAmount)
 	}
 ```
 
-**File:** x/genutil/collect.go (L116-118)
+**File:** x/staking/keeper/delegation.go (L853-853)
 ```go
-		if genTx, err = txJSONDecoder(jsonRawTx); err != nil {
-			return appGenTxs, persistentPeers, err
-		}
+	ubd := k.SetUnbondingDelegationEntry(ctx, delAddr, valAddr, ctx.BlockHeight(), completionTime, returnAmount)
 ```
 
-**File:** x/genutil/collect.go (L135-139)
+**File:** types/staking.go (L26-26)
 ```go
-		// genesis transactions must be single-message
-		msgs := genTx.GetMsgs()
-
-		// TODO abstract out staking message validation back to staking
-		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
+	ValidatorUpdateDelay int64 = 1
 ```
 
-**File:** x/genutil/client/cli/collect.go (L53-58)
+**File:** x/staking/keeper/slash_test.go (L75-89)
 ```go
-			appMessage, err := genutil.GenAppStateFromConfig(cdc,
-				clientCtx.TxConfig,
-				config, initCfg, *genDoc, genBalIterator)
-			if err != nil {
-				return errors.Wrap(err, "failed to get genesis app state from config")
-			}
-```
+func TestSlashUnbondingDelegation(t *testing.T) {
+	app, ctx, addrDels, addrVals := bootstrapSlashTest(t, 10)
 
-**File:** x/genutil/types/genesis_state.go (L107-117)
-```go
-		msgs := tx.GetMsgs()
-		if len(msgs) != 1 {
-			return errors.New(
-				"must provide genesis Tx with exactly 1 CreateValidator message")
-		}
+	fraction := sdk.NewDecWithPrec(5, 1)
 
-		// TODO: abstract back to staking
-		if _, ok := msgs[0].(*stakingtypes.MsgCreateValidator); !ok {
-			return fmt.Errorf(
-				"genesis transaction %v does not contain a MsgCreateValidator", i)
-		}
-```
+	// set an unbonding delegation with expiration timestamp (beyond which the
+	// unbonding delegation shouldn't be slashed)
+	ubd := types.NewUnbondingDelegation(addrDels[0], addrVals[0], 0,
+		time.Unix(5, 0), sdk.NewInt(10))
 
-**File:** x/genutil/module.go (L46-54)
-```go
-// ValidateGenesis performs genesis state validation for the genutil module.
-func (b AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, txEncodingConfig client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
-	}
+	app.StakingKeeper.SetUnbondingDelegation(ctx, ubd)
 
-	return types.ValidateGenesis(&data, txEncodingConfig.TxJSONDecoder())
-}
-```
-
-**File:** x/auth/tx/decoder.go (L78-90)
-```go
-// DefaultJSONTxDecoder returns a default protobuf JSON TxDecoder using the provided Marshaler.
-func DefaultJSONTxDecoder(cdc codec.ProtoCodecMarshaler) sdk.TxDecoder {
-	return func(txBytes []byte) (sdk.Tx, error) {
-		var theTx tx.Tx
-		err := cdc.UnmarshalJSON(txBytes, &theTx)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
-		}
-
-		return &wrapper{
-			tx: &theTx,
-		}, nil
-	}
+	// unbonding started prior to the infraction height, stakw didn't contribute
+	slashAmount := app.StakingKeeper.SlashUnbondingDelegation(ctx, ubd, 1, fraction)
+	require.True(t, slashAmount.Equal(sdk.NewInt(0)))
 ```

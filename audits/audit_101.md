@@ -1,200 +1,253 @@
 # Audit Report
 
 ## Title
-Unvalidated Pagination Limit Causing Resource Exhaustion in GranteeGrants Query
+ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
 
 ## Summary
-The `GranteeGrants` gRPC query in the authz module allows unprivileged attackers to cause significant resource exhaustion by exploiting inefficient store iteration combined with unbounded pagination limits. The query iterates over ALL grants in the system with expensive unmarshaling operations occurring before filtering, and no upper bound validation prevents arbitrarily large pagination limits.
+The `ClaimCapability` function in the Cosmos SDK capability module fails to prevent a single module from claiming the same capability multiple times under different names. This causes forward-map corruption that breaks authentication and creates permanent orphaned state in the capability tracking system. [1](#0-0) 
 
 ## Impact
 **Medium**
 
 ## Finding Description
 
-**Location:** `x/authz/keeper/grpc_query.go` lines 132-178 (GranteeGrants function) and `types/query/filtered_pagination.go` lines 130-254 (GenericFilteredPaginate function)
+**Location:** `x/capability/keeper/keeper.go`, function `ClaimCapability` (lines 287-314)
 
-**Intended Logic:** The pagination mechanism should efficiently query only grants relevant to the specified grantee with reasonable resource limits. Queries should process only the minimum necessary data and enforce bounds to prevent abuse.
+**Intended Logic:** The ClaimCapability function should prevent a module from claiming the same capability object more than once. Each (module, capability) pair should have exactly one forward mapping to maintain authentication consistency. The forward mapping structure, keyed by (module, capability), inherently supports only one name per pair. [2](#0-1) 
 
-**Actual Logic:** 
+**Actual Logic:** ClaimCapability only validates whether the exact (module, name) pair exists as an owner. The owner key is "module/name", so Owner("module", "name1") and Owner("module", "name2") are treated as different entries and both succeed. [3](#0-2) 
 
-The `GranteeGrants` function creates a prefix store using only `GrantKey` (0x01) which includes ALL grants in the system, not just grantee-specific grants. [1](#0-0) 
-
-This occurs because the grant key structure places granter before grantee, making grantee-specific prefixes impossible. [2](#0-1) [3](#0-2) 
-
-The `GenericFilteredPaginate` function unmarshals every grant entry BEFORE applying the grantee filter. [4](#0-3) 
-
-The filtering happens in the `onResult` callback, which returns nil for non-matching entries, but the expensive unmarshal has already occurred. [5](#0-4) 
-
-While `MaxLimit = math.MaxUint64` is defined, there is no enforcement preventing users from requesting arbitrarily large limits. [6](#0-5) 
-
-The pagination logic only sets a default when limit is 0, but accepts any non-zero value without validation. [7](#0-6) 
-
-Query contexts are created with infinite gas meters, providing no resource protection. [8](#0-7) 
+However, the forward mapping key `FwdCapabilityKey` is based solely on (module, capability), meaning there can only be ONE forward mapping per (module, capability) pair. When the same module claims the same capability with a different name, the forward mapping gets overwritten while the owners list and reverse mappings accumulate multiple entries.
 
 **Exploitation Path:**
-1. Attacker calls the publicly accessible `GranteeGrants` gRPC endpoint with any address (including one with zero grants)
-2. Attacker sets pagination `Limit` to a very large value (e.g., 10,000,000)
-3. Node creates prefix store that includes entire grant store (all grants with prefix 0x01)
-4. Pagination iterates through the store, unmarshaling each grant via expensive protobuf deserialization
-5. After unmarshaling, the filter checks if grantee matches and returns nil for non-matching entries
-6. Loop continues trying to find `limit` matching entries, processing the entire store when insufficient matches exist [9](#0-8) 
-7. Attacker repeats with multiple concurrent queries to amplify impact
+1. Module claims capability with name "channel-1"
+   - Forward map: `module/fwd/0xCAP` → "channel-1"
+   - Reverse map: `module/rev/channel-1` → index
+   - Owners: [("module", "channel-1")]
 
-**Security Guarantee Broken:** Resource limitation and DoS protection. The system fails to enforce reasonable bounds on query resource consumption, allowing unprivileged users to exhaust node resources.
+2. Module claims same capability with name "channel-2"
+   - Owner check passes (different key "module/channel-2" vs "module/channel-1")
+   - Forward map OVERWRITES: `module/fwd/0xCAP` → "channel-2"
+   - New reverse map: `module/rev/channel-2` → index
+   - Owners: [("module", "channel-1"), ("module", "channel-2")]
+
+3. Authentication fails for "channel-1": `AuthenticateCapability` checks if `GetCapabilityName` returns "channel-1", but it returns "channel-2" (the overwritten value) [4](#0-3) 
+
+4. `ReleaseCapability` only cleans up the last claimed name based on `GetCapabilityName`, leaving the "channel-1" reverse mapping and owner entry permanently orphaned [5](#0-4) 
+
+**Security Guarantee Broken:** The capability authentication invariant is violated - modules cannot authenticate capabilities they legitimately own, and the cleanup mechanism creates permanent state corruption that cannot be recovered without a chain upgrade.
 
 ## Impact Explanation
 
-On a mature blockchain with substantial authz usage (thousands to millions of grants), this vulnerability allows attackers to force nodes to:
-- Perform expensive protobuf unmarshaling operations on every grant in the system
-- Allocate memory for each unmarshaled grant object
-- Consume significant CPU and memory resources per query
+This vulnerability affects the core capability authentication mechanism used throughout the Cosmos SDK, particularly in IBC:
 
-Multiple concurrent malicious queries amplify the effect. Nodes experience degraded performance and become unable to process legitimate transactions promptly. This meets the Medium severity threshold of "Increasing network processing node resource consumption by at least 30% without brute force actions" because:
-- A single query with a large limit can force processing of the entire grant store
-- No brute force is required (legitimate gRPC call with large pagination limit)
-- Public RPC nodes are accessible to any network participant
-- Impact scales with the number of grants in the system
+1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it, potentially blocking IBC channel operations or other capability-protected actions.
+
+2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last name's mappings get cleaned up. Previous names' reverse mappings and owner entries remain permanently orphaned in storage, creating inconsistent state that cannot be recovered without a hard fork or chain upgrade.
+
+3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate in memory and persistent storage, consuming resources that can never be reclaimed through normal operations.
+
+This qualifies as **Medium** severity under the impact criteria: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - the capability module is core Cosmos SDK infrastructure that causes module misbehavior without directly risking funds.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any network participant with gRPC endpoint access (standard for public RPC nodes)
-- No authentication, authorization, or on-chain resources required
-- Authz module contains grants (normal operational state for active chains)
-- No special timing or race conditions needed
+**Likelihood: Medium**
 
-**Frequency:** Can be exploited continuously with multiple concurrent queries. The attack is trivial (single gRPC call with large limit parameter) and works against any public RPC endpoint. Likelihood is high in production environments where chains accumulate grants over time through normal authz usage.
+While the capability module is used by trusted on-chain modules, this vulnerability can be inadvertently triggered during normal operation when:
+- Module code has bugs in capability tracking logic
+- Retry or error recovery logic attempts to re-claim an already-claimed capability
+- Complex state transitions in IBC handshakes (e.g., crossing hellos scenarios) cause confusion about which capabilities are already owned
+- A module implementation doesn't check ownership before claiming
+
+The IBC module documentation explicitly shows defensive code checking `AuthenticateCapability` before claiming, indicating this is a known concern that module developers must guard against. [6](#0-5) 
+
+However, the capability module itself should enforce this invariant rather than relying on all callers to implement defensive checks. Once triggered, the corruption is permanent and cannot self-heal, requiring a chain upgrade to fix the corrupted state.
 
 ## Recommendation
 
-**Immediate Fixes:**
+Add a check in `ClaimCapability` to verify the calling module hasn't already claimed the capability under any name:
 
-1. Add upper bound validation for pagination limits:
 ```go
-const MaxQueryLimit = 1000
-
-if req.Pagination != nil && req.Pagination.Limit > MaxQueryLimit {
-    req.Pagination.Limit = MaxQueryLimit
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+    // ... existing validation ...
+    
+    // Check if this module already owns this capability under any name
+    existingName := sk.GetCapabilityName(ctx, cap)
+    if existingName != "" {
+        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
+            "module %s already owns capability under name %s", sk.module, existingName)
+    }
+    
+    // ... rest of function ...
 }
 ```
 
-2. Optimize store iteration by restructuring the grant key schema to enable efficient grantee-based lookups, or implement a secondary index for grantee queries.
-
-**Long-term Improvements:**
-- Implement rate limiting on expensive query endpoints
-- Add query gas metering for read operations to limit resource consumption
-- Consider caching mechanisms for frequently accessed grant data
-- Add monitoring and alerting for excessive query resource consumption
+This ensures each module can only claim a given capability once, preventing forward-map corruption and maintaining the authentication invariant.
 
 ## Proof of Concept
 
-**Setup:** In `x/authz/keeper/grpc_query_test.go`, create a test with 10,000 grants between various granter-grantee pairs to simulate a populated authz store on a production chain.
+**Test File:** `x/capability/keeper/keeper_test.go`
 
-**Action:** Call `GranteeGrants` with an address that has zero grants and a pagination limit of 1,000,000:
-```go
-queryClient.GranteeGrants(context.Background(), &authz.QueryGranteeGrantsRequest{
-    Grantee: victimAddr.String(),
-    Pagination: &query.PageRequest{Limit: 1000000},
-})
-```
+**Setup:**
+- Create a scoped keeper for a test module
+- Create a new capability with name "original" using `NewCapability`
+- Verify initial authentication works
 
-**Result:** Despite returning zero grants (no matches), the query iterates through and unmarshals all 10,000 grants in the store. Profiling would show significant CPU time spent in protobuf unmarshaling. The elapsed time and resource consumption demonstrate the vulnerability. In production with millions of grants, this causes severe resource exhaustion that can affect 30% or more of network processing nodes.
+**Action:**
+1. Call `ClaimCapability(ctx, cap, "duplicate")` with the same capability but different name
+2. Attempt `AuthenticateCapability(ctx, cap, "original")`
+3. Call `ReleaseCapability(ctx, cap)`
+4. Check for orphaned state in reverse mappings
+
+**Result:**
+1. The second `ClaimCapability` succeeds (demonstrates the bug allows duplicate claims)
+2. `AuthenticateCapability(cap, "original")` returns false (proves forward map was overwritten and authentication is broken)
+3. After `ReleaseCapability`, the reverse mapping for "original" still exists while "duplicate" was cleaned up (confirms orphaned state)
+4. The owners list still contains the "original" owner entry (proves permanent state corruption)
+
+The existing test suite confirms this scenario is not covered: [7](#0-6) 
+
+`TestClaimCapability` only tests claiming with the same name (correctly fails) and different modules claiming (correctly succeeds), but not the same module claiming with different names.
 
 ## Notes
 
-The comparison with `GranterGrants` is instructive - it uses `grantStoreKey(nil, granter, "")` which creates an efficient granter-specific prefix. [10](#0-9) 
-
-In contrast, `GranteeGrants` cannot use a grantee-specific prefix due to the key structure placing granter before grantee in the composite key. This architectural limitation makes grantee queries inherently inefficient, which when combined with unbounded pagination limits and infinite gas meters for queries, creates a significant DoS vector for unprivileged attackers targeting public RPC infrastructure.
+This is a defensive programming issue in core Cosmos SDK infrastructure. While it requires a module to inadvertently call `ClaimCapability` twice with different names, the consequences are severe and permanent: broken authentication and unrecoverable state corruption. The capability module should enforce its own invariants rather than relying on all calling modules to implement defensive checks, as evidenced by the IBC module's explicit protection against this scenario. The vulnerability matches the Medium impact criteria as "a bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ### Citations
 
-**File:** x/authz/keeper/grpc_query.go (L96-96)
+**File:** x/capability/keeper/keeper.go (L275-280)
 ```go
-	authzStore := prefix.NewStore(store, grantStoreKey(nil, granter, ""))
-```
-
-**File:** x/authz/keeper/grpc_query.go (L143-143)
-```go
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
-```
-
-**File:** x/authz/keeper/grpc_query.go (L151-154)
-```go
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
-		}
-```
-
-**File:** x/authz/keeper/keys.go (L22-22)
-```go
-// - 0x01<granterAddressLen (1 Byte)><granterAddress_Bytes><granteeAddressLen (1 Byte)><granteeAddress_Bytes><msgType_Bytes>: Grant
-```
-
-**File:** x/authz/keeper/keys.go (L30-32)
-```go
-	copy(key, GrantKey)
-	copy(key[1:], granter)
-	copy(key[1+len(granter):], grantee)
-```
-
-**File:** types/query/filtered_pagination.go (L153-158)
-```go
-	if limit == 0 {
-		limit = DefaultLimit
-
-		// count total results when the limit is zero/not supplied
-		countTotal = true
+func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
+	if strings.TrimSpace(name) == "" || cap == nil {
+		return false
 	}
+	return sk.GetCapabilityName(ctx, cap) == name
+}
 ```
 
-**File:** types/query/filtered_pagination.go (L212-246)
+**File:** x/capability/keeper/keeper.go (L287-314)
 ```go
-	for ; iterator.Valid(); iterator.Next() {
-		if iterator.Error() != nil {
-			return nil, nil, iterator.Error()
-		}
-
-		protoMsg := constructor()
-
-		err := cdc.Unmarshal(iterator.Value(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		val, err := onResult(iterator.Key(), protoMsg)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if val.Size() != 0 {
-			// Previously this was the "accumulate" flag
-			if numHits >= offset && numHits < end {
-				results = append(results, val)
-			}
-			numHits++
-		}
-
-		if numHits == end+1 {
-			if nextKey == nil {
-				nextKey = iterator.Key()
-			}
-
-			if !countTotal {
-				break
-			}
-		}
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
 	}
+	if strings.TrimSpace(name) == "" {
+		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
+	}
+	// update capability owner set
+	if err := sk.addOwner(ctx, cap, name); err != nil {
+		return err
+	}
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Set the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
+
+	// Set the reverse mapping between the module and capability name and the
+	// index in the in-memory store. Since marshalling and unmarshalling into a store
+	// will change memory address of capability, we simply store index as value here
+	// and retrieve the in-memory pointer to the capability from our map
+	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
+
+	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
+
+	return nil
+}
 ```
 
-**File:** types/query/pagination.go (L18-20)
+**File:** x/capability/keeper/keeper.go (L323-340)
 ```go
-// MaxLimit is the maximum limit the paginate function can handle
-// which equals the maximum value that can be stored in uint64
-const MaxLimit = math.MaxUint64
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	}
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
 ```
 
-**File:** types/context.go (L272-272)
+**File:** x/capability/types/keys.go (L41-50)
 ```go
-		gasMeter:        NewInfiniteGasMeter(1, 1),
+func FwdCapabilityKey(module string, cap *Capability) []byte {
+	// encode the key to a fixed length to avoid breaking consensus state machine
+	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
+	// the length 10 is picked so it's backward compatible on common architectures.
+	key := fmt.Sprintf("%#010p", cap)
+	if len(key) > 10 {
+		key = key[len(key)-10:]
+	}
+	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
+}
+```
+
+**File:** x/capability/types/types.go (L46-59)
+```go
+func (co *CapabilityOwners) Set(owner Owner) error {
+	i, ok := co.Get(owner)
+	if ok {
+		// owner already exists at co.Owners[i]
+		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
+	}
+
+	// owner does not exist in the set of owners, so we insert at position i
+	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
+	copy(co.Owners[i+1:], co.Owners[i:])
+	co.Owners[i] = owner
+
+	return nil
+}
+```
+
+**File:** docs/ibc/custom.md (L77-86)
+```markdown
+    // Module may have already claimed capability in OnChanOpenInit in the case of crossing hellos
+    // (ie chainA and chainB both call ChanOpenInit before one of them calls ChanOpenTry)
+    // If the module can already authenticate the capability then the module already owns it so we don't need to claim
+    // Otherwise, module does not have channel capability and we must claim it from IBC
+    if !k.AuthenticateCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)) {
+        // Only claim channel capability passed back by IBC module if we do not already own it
+        if err := k.scopedKeeper.ClaimCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)); err != nil {
+            return err
+        }
+    }
+```
+
+**File:** x/capability/keeper/keeper_test.go (L156-178)
+```go
+func (suite *KeeperTestSuite) TestClaimCapability() {
+	sk1 := suite.keeper.ScopeToModule(banktypes.ModuleName)
+	sk2 := suite.keeper.ScopeToModule(stakingtypes.ModuleName)
+	sk3 := suite.keeper.ScopeToModule("foo")
+
+	cap, err := sk1.NewCapability(suite.ctx, "transfer")
+	suite.Require().NoError(err)
+	suite.Require().NotNil(cap)
+
+	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
+	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
+
+	got, ok := sk1.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
+
+	got, ok = sk2.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
+
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, cap, "  "))
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, nil, "transfer"))
+}
 ```

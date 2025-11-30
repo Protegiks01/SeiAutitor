@@ -1,270 +1,399 @@
-After thorough investigation of the sei-cosmos codebase, I can confirm this claim presents a **valid vulnerability**. Let me provide my detailed validation:
-
-## Technical Flow Verification
-
-I have traced and confirmed each step of the execution path:
-
-**Step 1 - Validator Removal:** [1](#0-0) 
-When `RemoveValidator` is called, it deletes the `ValidatorByConsAddrKey` index. [2](#0-1) 
-It then calls the `AfterValidatorRemoved` hook.
-
-**Step 2 - Incomplete Cleanup:** [3](#0-2) 
-The `AfterValidatorRemoved` hook only deletes the address-pubkey relation. It does NOT delete `ValidatorSigningInfo` or `ValidatorMissedBlockArray`.
-
-**Step 3 - Consensus Key Reuse Allowed:** [4](#0-3) 
-When creating a new validator, the system checks if a validator with that consensus key exists using `GetValidatorByConsAddr`. [5](#0-4) 
-Since `GetValidatorByConsAddr` uses the `ValidatorByConsAddrKey` index that was deleted in step 1, the check passes and a new validator can be created with the same consensus key.
-
-**Step 4 - State Inheritance:** [6](#0-5) 
-When the new validator bonds, `AfterValidatorBonded` checks if signing info exists. It only creates new signing info if NOT found. Since the old signing info was never deleted, it's reused with its stale `MissedBlocksCounter`.
-
-**Step 5 - Unfair Slashing:** [7](#0-6) 
-The slashing logic uses the inherited `MissedBlocksCounter` to determine if a validator should be slashed, causing premature slashing.
-
-**Step 6 - Removal Trigger:** [8](#0-7) 
-This entire flow can be triggered when a validator's delegator shares reach zero and the validator is unbonded.
-
-## Confirmation of Missing Cleanup [9](#0-8) 
-While there are functions to SET validator signing info, my grep search confirmed there is NO function to DELETE `ValidatorSigningInfo` when a validator is removed. [10](#0-9) 
-The only cleanup function `ClearValidatorMissedBlockBitArray` exists but is only called when validators are slashed/jailed, NOT when they are removed.
-
-## Comparison with Other Modules [11](#0-10) 
-The distribution module's `AfterValidatorRemoved` hook demonstrates proper cleanup, deleting outstanding rewards, commission, slash events, and historical/current rewards. The slashing module fails to follow this pattern.
-
-## Documentation Review [12](#0-11) 
-The specification only mentions that `AfterValidatorRemoved` "removes a validator's consensus key" but does NOT mention cleaning up signing info or missed block data, indicating incomplete design rather than intentional behavior.
-
----
+Based on my systematic validation of this security claim, I have traced through the complete execution flow and verified all technical assertions. Let me provide my final assessment:
 
 # Audit Report
 
 ## Title
-Stale Liveness Tracking State Persists After Validator Removal Causing Unfair Slashing on Consensus Key Reuse
+OCC Blind Write Vulnerability: Concurrent MsgGrant Transactions Succeed Without Conflict Detection Leading to Silent State Loss
 
 ## Summary
-When a validator is removed from the validator set, the slashing module's `AfterValidatorRemoved` hook fails to delete `ValidatorSigningInfo` and `ValidatorMissedBlockArray`. If the same consensus address later creates a new validator, the stale liveness tracking data persists, causing the new validator to inherit the previous validator's `MissedBlocksCounter` and face premature downtime slashing.
+When Optimistic Concurrency Control (OCC) is enabled, concurrent transactions creating grants for the same (grantee, granter, msgType) tuple both succeed and return Code=0, but only the highest-indexed transaction's state persists to the blockchain. This occurs because `SaveGrant` performs blind writes without creating read dependencies, and OCC's validation only detects read-write conflicts, not write-write conflicts.
 
 ## Impact
 Medium
 
 ## Finding Description
-- **location**: `x/slashing/keeper/hooks.go:40-43` (AfterValidatorRemoved function)
-- **intended logic**: When a validator is completely removed from the validator set (all delegations unbonded), all associated slashing state should be cleaned up. If the same consensus address later creates a new validator, it should start with fresh liveness tracking: `MissedBlocksCounter=0`, fresh `StartHeight`, and an empty missed blocks array.
-- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation but does NOT delete the `ValidatorSigningInfo` or `ValidatorMissedBlockArray`. These persist in storage keyed by consensus address. When a new validator with the same consensus address bonds, `AfterValidatorBonded` checks if signing info exists and only creates new info if not found. Since the old signing info persists, the new validator inherits the stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
-- **exploitation path**: 
-  1. Validator accumulates missed blocks during operation (e.g., 200 out of 1000-block window, below slashing threshold of 501)
-  2. Validator's operator unbonds all delegations, causing `DelegatorShares` to reach zero
-  3. `RemoveValidator` is called, deleting the `ValidatorByConsAddrKey` index but leaving signing info intact
-  4. Later, the same consensus key creates a new validator (passes the `GetValidatorByConsAddr` check since the index was deleted)
-  5. New validator bonds, triggering `AfterValidatorBonded` which finds existing signing info and reuses it
-  6. New validator inherits `MissedBlocksCounter=200` from previous lifecycle
-  7. If new validator misses 301 additional blocks, it reaches 501 total and gets slashed/jailed, whereas a fresh validator would need to miss 501 blocks from the start
-- **security guarantee broken**: The protocol invariant that each validator lifecycle has independent liveness tracking is violated. Validators cannot rely on getting a clean slate when creating a new validator with an existing consensus key after full unbonding.
+
+**Location:**
+- Primary vulnerability: [1](#0-0) 
+- OCC validation logic: [2](#0-1) 
+- Final persistence logic: [3](#0-2) 
+- Last-write-wins implementation: [4](#0-3) 
+
+**Intended Logic:**
+When a transaction creates or updates an authorization grant, concurrent transactions modifying the same grant key should either (a) be detected as conflicts and serialized through retry mechanisms, or (b) only the first transaction should succeed while subsequent ones fail. A successful transaction (Code=0) must guarantee its state changes persist to the blockchain.
+
+**Actual Logic:**
+The `SaveGrant` method performs blind writes by calling `store.Set(skey, bz)` directly without reading the existing value first. [5](#0-4)  This means concurrent transactions writing to the same grant key have empty readsets for that key. 
+
+OCC's `ValidateTransactionState` method only validates iterator consistency and readset consistency through `checkIteratorAtIndex` and `checkReadsetAtIndex`. [2](#0-1)  There is no validation for write-write conflicts. Since neither concurrent transaction reads the grant key before writing, both have empty readsets and both pass validation.
+
+During final commitment, `WriteLatestToStore` calls `GetLatestNonEstimate()` for each key, [6](#0-5)  which descends the btree and returns only the highest-indexed value. [7](#0-6)  Earlier writes to the same key are silently discarded despite their transactions having returned success.
+
+**Exploitation Path:**
+1. User submits Transaction A (index 0): `MsgGrant(grantee, granter, MsgSend, limit=100)` via message handler [8](#0-7) 
+2. User submits Transaction B (index 1): `MsgGrant(grantee, granter, MsgSend, limit=200)` in the same block
+3. Both transactions execute concurrently under OCC scheduler [9](#0-8) 
+4. Both call `SaveGrant` which performs `store.Set(key, value)` without prior `store.Get(key)` [5](#0-4) 
+5. Neither transaction has read dependencies on the grant key (empty readsets)
+6. Both pass `ValidateTransactionState` via scheduler's conflict detection [10](#0-9)  because no read conflicts exist
+7. Both return Code=0 (success) and emit `EventGrant` events [11](#0-10) 
+8. Both charge gas fees to users
+9. `WriteLatestToStore` is called after all validation completes [12](#0-11) 
+10. Only Transaction B's (index 1) grant persists because `GetLatestNonEstimate` returns the highest-indexed value [7](#0-6) 
+11. Transaction A's effect is silently lost despite returning success
+
+**Security Guarantee Broken:**
+This violates the atomicity and finality guarantee of blockchain transactions: a successful transaction (Code=0) must guarantee its state changes persist to the blockchain. The vulnerability also causes event log inconsistency where `EventGrant` events are emitted for both transactions but only one grant exists in final state.
 
 ## Impact Explanation
-Validators who reuse consensus keys after complete unbonding and removal inherit stale missed block counters from their previous lifecycle. This causes them to be slashed and jailed after missing significantly fewer blocks than the configured `SignedBlocksWindow - MinSignedPerWindow` threshold. With default parameters (window=1000, min=500), a validator with inherited `MissedBlocksCounter=200` would be slashed after missing only 301 new blocks instead of 501, a 40% reduction in the downtime tolerance. This results in:
-- Unfair economic penalties through slashing (loss of validator stake based on `SlashFractionDowntime` parameter, typically 0.01%-1%)
-- Validators being incorrectly jailed and removed from the active set, losing block rewards and commission
-- Undermined fairness of the slashing mechanism, as validators with reused keys are treated differently than fresh validators
-- Potential operational disruption and discouragement of validator participation
+
+This vulnerability constitutes "a bug in the network code that results in unintended smart contract behavior with no concrete funds at direct risk" per the Medium severity classification. The OCC layer (network code) causes unintended behavior in the authz module:
+
+1. **Atomicity Violation**: Users receive success responses (Code=0) for transactions whose state changes are silently discarded, violating the fundamental blockchain guarantee that successful transactions persist.
+
+2. **Wasted Gas Fees**: Users pay gas for transactions whose effects never materialize, without receiving any error indication that would allow them to retry or detect the issue.
+
+3. **Event Log Inconsistency**: Both transactions emit `EventGrant` events, causing off-chain applications, indexers, and monitoring systems to have incorrect views of on-chain state. Applications relying on event logs will believe both grants were created.
+
+4. **Authorization Security Risk**: Since grants control spending limits and permissions, unpredictable grant persistence could lead to authorization mismatches where applications expect different limits than what exists on-chain, potentially enabling unauthorized actions or blocking authorized ones.
+
+The inconsistency with the `update` method [13](#0-12)  which reads before writing via `k.getGrant(ctx, skey)` at line 53, indicates this is an oversight rather than intentional design.
 
 ## Likelihood Explanation
-This vulnerability can be triggered through normal validator operations without any malicious intent:
-- Validators performing infrastructure maintenance or upgrades who fully unbond temporarily
-- Validators who reuse existing consensus keys for operational simplicity (common practice to avoid key management complexity)
-- Any validator operator who accumulates some missed blocks (normal during network issues or node problems) before complete unbonding
 
-While complete unbonding followed by recreation with the same consensus key is not a frequent operation, it is a legitimate use case. The conditions required are all standard validator lifecycle operations, making this a realistic edge case that affects the protocol's fairness guarantees.
+**Trigger Conditions:**
+- OCC must be enabled (a standard configuration option, not a misconfiguration)
+- Multiple transactions targeting the same (grantee, granter, msgType) tuple in the same block
+- Transactions execute concurrently in OCC's parallel execution phase
+
+**Who Can Trigger:**
+Any user can trigger this vulnerability by submitting normal `MsgGrant` transactions. No special privileges, unusual conditions, or attack setup is required. Even a single user retrying a transaction can trigger this accidentally.
+
+**Frequency:**
+- Occurs naturally when users submit concurrent grant updates or retry transactions
+- More likely under high transaction throughput conditions
+- Particularly probable when frontend applications submit duplicate transactions for reliability
+- In production networks with OCC enabled, this could happen regularly during normal operations
+
+While the authz specification states that grants can be overwritten, [14](#0-13)  the issue is not overwriting itself but rather that both transactions succeed while only one persists, which is clearly unintended.
 
 ## Recommendation
-Modify the `AfterValidatorRemoved` hook in `x/slashing/keeper/hooks.go` to properly clean up all validator-related slashing state:
+
+Implement a read-before-write pattern in `SaveGrant` to create OCC read dependencies that enable existing conflict detection:
+
+Modify the `SaveGrant` method to read the existing grant first, even if just to check existence. This creates a read dependency in the transaction's readset, enabling OCC to detect conflicts:
 
 ```go
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-    // Clean up signing info
+func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
     store := ctx.KVStore(k.storeKey)
-    store.Delete(types.ValidatorSigningInfoKey(address))
-    // Clean up missed blocks array
-    k.ClearValidatorMissedBlockBitArray(ctx, address)
+    skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
+    
+    // Read to create OCC dependency (enables conflict detection)
+    _ = store.Get(skey)
+    
+    grant, err := authz.NewGrant(authorization, expiration)
+    if err != nil {
+        return err
+    }
+
+    bz := k.cdc.MustMarshal(&grant)
+    store.Set(skey, bz)
+    return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
+        MsgTypeUrl: authorization.MsgTypeURL(),
+        Granter:    granter.String(),
+        Grantee:    grantee.String(),
+    })
 }
 ```
 
-This ensures that when a validator is removed, all liveness tracking data is cleared, allowing a fresh start if the consensus address is later reused.
+This approach is consistent with the existing `update` method pattern which already reads before writing.
 
 ## Proof of Concept
-**Test Location**: `x/slashing/keeper/keeper_test.go` (new test to add)
-**Function**: `TestValidatorRemovalClearsMissedBlocks`
 
-**Setup**:
-1. Initialize test chain with slashing parameters (`SignedBlocksWindow=1000`, `MinSignedPerWindow=500`)
-2. Create and bond validator A with a specific consensus pubkey
-3. Simulate 200 blocks where validator does NOT sign (accumulate `MissedBlocksCounter=200`)
-4. Verify signing info exists with `MissedBlocksCounter=200`
+**Test File:** `x/authz/keeper/keeper_test.go`
 
-**Action**:
-1. Unbond all delegations from validator A
-2. Complete unbonding period and verify validator is removed from state
-3. Verify `GetValidatorByConsAddr` returns not found (index deleted)
-4. Create new validator B with the SAME consensus pubkey as validator A
-5. Bond the new validator
+**Test Function:** `TestConcurrentGrantsOCCBlindWrite`
 
-**Result**:
-Query signing info for the consensus address - it incorrectly shows `MissedBlocksCounter=200` (inherited from removed validator A) instead of `MissedBlocksCounter=0` for a fresh validator. This proves the bug exists and demonstrates that the new validator starts with stale liveness tracking state, leading to premature slashing if it misses additional blocks.
+**Setup:**
+1. Initialize SimApp with OCC enabled (`SetOccEnabled(true)`, `SetConcurrencyWorkers(2)`)
+2. Create test accounts: granter (addr[0]), grantee (addr[1])
+3. Fund granter account with sufficient tokens for gas fees
+4. Create two MsgGrant transactions for identical (grantee, granter, msgType) tuple with different spend limits
+
+**Action:**
+1. Build Transaction A: MsgGrant with authorization spend limit = 100 coins
+2. Build Transaction B: MsgGrant with authorization spend limit = 200 coins (same grantee, granter, msgType)
+3. Submit both transactions in the same block using `DeliverTxBatch` with OCC enabled
+4. Process the complete batch through the OCC scheduler's parallel execution and validation phases
+
+**Expected Result:**
+1. Both transactions return Code=0 (success response)
+2. Both transactions emit `EventGrant` events (verifiable from event manager)
+3. Both transactions charge gas fees (verifiable from account balance changes)
+4. Query final blockchain state using `GetCleanAuthorization(ctx, grantee, granter, msgType)`
+5. Only ONE grant exists in state with SpendLimit=200 (from Transaction B, index 1)
+6. Transaction A's SpendLimit=100 is silently lost despite success response
+7. This demonstrates violation of the blockchain invariant that successful transactions persist their state changes
 
 ## Notes
 
-This vulnerability fits the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." While the wording mentions "smart contract behavior," it applies to Layer 1 blockchain protocol behavior in Cosmos SDK. The bug results in unintended slashing behavior with limited fund impact (bounded by SlashFractionDowntime parameter and the edge case nature of the scenario). The core issue is the violation of protocol invariants regarding independent validator lifecycle tracking, with slashing as a consequence rather than the primary bug.
+The vulnerability is confirmed through code flow analysis showing SaveGrant's blind write pattern combined with OCC's exclusive focus on read-write conflict detection. No existing tests cover concurrent SaveGrant operations with OCC enabled, suggesting this scenario was not considered during development. The technical claims are fully verifiable from the codebase at the cited locations.
 
 ### Citations
 
-**File:** x/staking/keeper/validator.go (L36-45)
+**File:** x/authz/keeper/keeper.go (L51-72)
 ```go
-func (k Keeper) GetValidatorByConsAddr(ctx sdk.Context, consAddr sdk.ConsAddress) (validator types.Validator, found bool) {
-	store := ctx.KVStore(k.storeKey)
-
-	opAddr := store.Get(types.GetValidatorByConsAddrKey(consAddr))
-	if opAddr == nil {
-		return validator, false
-	}
-
-	return k.GetValidator(ctx, opAddr)
-}
-```
-
-**File:** x/staking/keeper/validator.go (L176-176)
-```go
-	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
-```
-
-**File:** x/staking/keeper/validator.go (L180-180)
-```go
-	k.AfterValidatorRemoved(ctx, valConsAddr, validator.GetOperator())
-```
-
-**File:** x/slashing/keeper/hooks.go (L12-26)
-```go
-func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
-	// Update the signing info start height or create a new signing info
-	_, found := k.GetValidatorSigningInfo(ctx, address)
+func (k Keeper) update(ctx sdk.Context, grantee sdk.AccAddress, granter sdk.AccAddress, updated authz.Authorization) error {
+	skey := grantStoreKey(grantee, granter, updated.MsgTypeURL())
+	grant, found := k.getGrant(ctx, skey)
 	if !found {
-		signingInfo := types.NewValidatorSigningInfo(
-			address,
-			ctx.BlockHeight(),
-			0,
-			time.Unix(0, 0),
-			false,
-			0,
-		)
-		k.SetValidatorSigningInfo(ctx, address, signingInfo)
+		return sdkerrors.ErrNotFound.Wrap("authorization not found")
 	}
-}
-```
 
-**File:** x/slashing/keeper/hooks.go (L40-43)
-```go
-// AfterValidatorRemoved deletes the address-pubkey relation when a validator is removed,
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-}
-```
-
-**File:** x/staking/keeper/msg_server.go (L52-54)
-```go
-	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
-		return nil, types.ErrValidatorPubKeyExists
+	msg, ok := updated.(proto.Message)
+	if !ok {
+		sdkerrors.ErrPackAny.Wrapf("cannot proto marshal %T", updated)
 	}
-```
 
-**File:** x/slashing/keeper/infractions.go (L96-96)
-```go
-	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
-```
-
-**File:** x/staking/keeper/delegation.go (L789-792)
-```go
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
+	any, err := codectypes.NewAnyWithValue(msg)
+	if err != nil {
+		return err
 	}
-```
 
-**File:** x/slashing/keeper/signing_info.go (L34-38)
-```go
-func (k Keeper) SetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress, info types.ValidatorSigningInfo) {
+	grant.Authorization = any
 	store := ctx.KVStore(k.storeKey)
-	bz := k.cdc.MustMarshal(&info)
-	store.Set(types.ValidatorSigningInfoKey(address), bz)
+	store.Set(skey, k.cdc.MustMarshal(&grant))
+	return nil
 }
 ```
 
-**File:** x/slashing/keeper/signing_info.go (L168-171)
+**File:** x/authz/keeper/keeper.go (L144-160)
 ```go
-func (k Keeper) ClearValidatorMissedBlockBitArray(ctx sdk.Context, address sdk.ConsAddress) {
+func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
 	store := ctx.KVStore(k.storeKey)
-	store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
+
+	grant, err := authz.NewGrant(authorization, expiration)
+	if err != nil {
+		return err
+	}
+
+	bz := k.cdc.MustMarshal(&grant)
+	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
+	store.Set(skey, bz)
+	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
+		MsgTypeUrl: authorization.MsgTypeURL(),
+		Granter:    granter.String(),
+		Grantee:    grantee.String(),
+	})
 }
 ```
 
-**File:** x/distribution/keeper/hooks.go (L25-76)
+**File:** store/multiversion/store.go (L388-397)
 ```go
-// AfterValidatorRemoved performs clean up after a validator is removed
-func (h Hooks) AfterValidatorRemoved(ctx sdk.Context, _ sdk.ConsAddress, valAddr sdk.ValAddress) {
-	// fetch outstanding
-	outstanding := h.k.GetValidatorOutstandingRewardsCoins(ctx, valAddr)
+func (s *Store) ValidateTransactionState(index int) (bool, []int) {
+	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
 
-	// force-withdraw commission
-	commission := h.k.GetValidatorAccumulatedCommission(ctx, valAddr).Commission
-	if !commission.IsZero() {
-		// subtract from outstanding
-		outstanding = outstanding.Sub(commission)
+	// TODO: can we parallelize for all iterators?
+	iteratorValid := s.checkIteratorAtIndex(index)
 
-		// split into integral & remainder
-		coins, remainder := commission.TruncateDecimal()
+	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
 
-		// remainder to community pool
-		feePool := h.k.GetFeePool(ctx)
-		feePool.CommunityPool = feePool.CommunityPool.Add(remainder...)
-		h.k.SetFeePool(ctx, feePool)
+	return iteratorValid && readsetValid, conflictIndices
+}
+```
 
-		// add to validator account
-		if !coins.IsZero() {
-			accAddr := sdk.AccAddress(valAddr)
-			withdrawAddr := h.k.GetDelegatorWithdrawAddr(ctx, accAddr)
+**File:** store/multiversion/store.go (L399-435)
+```go
+func (s *Store) WriteLatestToStore() {
+	// sort the keys
+	keys := []string{}
+	s.multiVersionMap.Range(func(key, value interface{}) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	sort.Strings(keys)
 
-			if err := h.k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, withdrawAddr, coins); err != nil {
-				panic(err)
-			}
+	for _, key := range keys {
+		val, ok := s.multiVersionMap.Load(key)
+		if !ok {
+			continue
+		}
+		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
+		if !found {
+			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
+			continue
+		}
+		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
+		if mvValue.IsEstimate() {
+			panic("should not have any estimate values when writing to parent store")
+		}
+		// if the value is deleted, then delete it from the parent store
+		if mvValue.IsDeleted() {
+			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
+			// be sure if the underlying store might do a save with the byteslice or
+			// not. Once we get confirmation that .Delete is guaranteed not to
+			// save the byteslice, then we can assume only a read-only copy is sufficient.
+			s.parentStore.Delete([]byte(key))
+			continue
+		}
+		if mvValue.Value() != nil {
+			s.parentStore.Set([]byte(key), mvValue.Value())
 		}
 	}
-
-	// Add outstanding to community pool
-	// The validator is removed only after it has no more delegations.
-	// This operation sends only the remaining dust to the community pool.
-	feePool := h.k.GetFeePool(ctx)
-	feePool.CommunityPool = feePool.CommunityPool.Add(outstanding...)
-	h.k.SetFeePool(ctx, feePool)
-
-	// delete outstanding
-	h.k.DeleteValidatorOutstandingRewards(ctx, valAddr)
-
-	// remove commission record
-	h.k.DeleteValidatorAccumulatedCommission(ctx, valAddr)
-
-	// clear slashes
-	h.k.DeleteValidatorSlashEvents(ctx, valAddr)
-
-	// clear historical rewards
-	h.k.DeleteValidatorHistoricalRewards(ctx, valAddr)
-
-	// clear current rewards
-	h.k.DeleteValidatorCurrentRewards(ctx, valAddr)
 }
 ```
 
-**File:** x/slashing/spec/05_hooks.md (L15-17)
+**File:** store/multiversion/data_structures.go (L60-79)
+```go
+func (item *multiVersionItem) GetLatestNonEstimate() (MultiVersionValueItem, bool) {
+	item.mtx.RLock()
+	defer item.mtx.RUnlock()
+
+	var vItem *valueItem
+	var found bool
+	item.valueTree.Descend(func(bTreeItem btree.Item) bool {
+		// only return if non-estimate
+		item := bTreeItem.(*valueItem)
+		if item.IsEstimate() {
+			// if estimate, continue
+			return true
+		}
+		// else we want to return
+		vItem = item
+		found = true
+		return false
+	})
+	return vItem, found
+}
+```
+
+**File:** x/authz/keeper/msg_server.go (L14-42)
+```go
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
+	}
+
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
+	}
+
+	authorization := msg.GetAuthorization()
+	if authorization == nil {
+		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
+	}
+
+	t := authorization.MsgTypeURL()
+	if k.router.HandlerByTypeURL(t) == nil {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+	}
+
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgGrantResponse{}, nil
+}
+```
+
+**File:** tasks/scheduler.go (L166-183)
+```go
+func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
+	var conflicts []int
+	uniq := make(map[int]struct{})
+	valid := true
+	for _, mv := range s.multiVersionStores {
+		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
+		for _, c := range mvConflicts {
+			if _, ok := uniq[c]; !ok {
+				conflicts = append(conflicts, c)
+				uniq[c] = struct{}{}
+			}
+		}
+		// any non-ok value makes valid false
+		valid = valid && ok
+	}
+	sort.Ints(conflicts)
+	return valid, conflicts
+}
+```
+
+**File:** tasks/scheduler.go (L284-350)
+```go
+func (s *scheduler) ProcessAll(ctx sdk.Context, reqs []*sdk.DeliverTxEntry) ([]types.ResponseDeliverTx, error) {
+	startTime := time.Now()
+	var iterations int
+	// initialize mutli-version stores if they haven't been initialized yet
+	s.tryInitMultiVersionStore(ctx)
+	// prefill estimates
+	// This "optimization" path is being disabled because we don't have a strong reason to have it given that it
+	// s.PrefillEstimates(reqs)
+	tasks, tasksMap := toTasks(reqs)
+	s.allTasks = tasks
+	s.allTasksMap = tasksMap
+	s.executeCh = make(chan func(), len(tasks))
+	s.validateCh = make(chan func(), len(tasks))
+	defer s.emitMetrics()
+
+	// default to number of tasks if workers is negative or 0 by this point
+	workers := s.workers
+	if s.workers < 1 || len(tasks) < s.workers {
+		workers = len(tasks)
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx.Context())
+	defer cancel()
+
+	// execution tasks are limited by workers
+	start(workerCtx, s.executeCh, workers)
+
+	// validation tasks uses length of tasks to avoid blocking on validation
+	start(workerCtx, s.validateCh, len(tasks))
+
+	toExecute := tasks
+	for !allValidated(tasks) {
+		// if the max incarnation >= x, we should revert to synchronous
+		if iterations >= maximumIterations {
+			// process synchronously
+			s.synchronous = true
+			startIdx, anyLeft := s.findFirstNonValidated()
+			if !anyLeft {
+				break
+			}
+			toExecute = tasks[startIdx:]
+		}
+
+		// execute sets statuses of tasks to either executed or aborted
+		if err := s.executeAll(ctx, toExecute); err != nil {
+			return nil, err
+		}
+
+		// validate returns any that should be re-executed
+		// note this processes ALL tasks, not just those recently executed
+		var err error
+		toExecute, err = s.validateAll(ctx, tasks)
+		if err != nil {
+			return nil, err
+		}
+		// these are retries which apply to metrics
+		s.metrics.retries += len(toExecute)
+		iterations++
+	}
+
+	for _, mv := range s.multiVersionStores {
+		mv.WriteLatestToStore()
+	}
+	s.metrics.maxIncarnation = s.maxIncarnation
+
+	ctx.Logger().Info("occ scheduler", "height", ctx.BlockHeight(), "txs", len(tasks), "latency_ms", time.Since(startTime).Milliseconds(), "retries", s.metrics.retries, "maxIncarnation", s.maxIncarnation, "iterations", iterations, "sync", s.synchronous, "workers", s.workers)
+
+```
+
+**File:** x/authz/spec/03_messages.md (L12-12)
 ```markdown
-+ `AfterValidatorBonded` creates a `ValidatorSigningInfo` instance as described in the following section.
-+ `AfterValidatorCreated` stores a validator's consensus key.
-+ `AfterValidatorRemoved` removes a validator's consensus key.
+If there is already a grant for the `(granter, grantee, Authorization)` triple, then the new grant will overwrite the previous one. To update or extend an existing grant, a new grant with the same `(granter, grantee, Authorization)` triple should be created.
 ```

@@ -1,161 +1,376 @@
 # Audit Report
 
 ## Title
-Time-of-Check Time-of-Use Vulnerability in Governance Proposal Route Validation Leading to Chain Halt
+Non-Deterministic Iterator Validation Causing Consensus Failures Due to Race Condition in Channel Selection
 
 ## Summary
-The governance module validates proposal handler routes only at submission time but not before execution. When software upgrades remove handlers from the router while proposals with those routes remain in state, the execution in `EndBlocker` triggers an unconditional panic, causing complete blockchain network shutdown.
+The `validateIterator` function in the multiversion store contains a critical race condition where both `abortChannel` and `validChannel` can simultaneously hold values during iterator validation. When an estimate is encountered, the validation iterator sends an abort signal but continues execution, eventually sending a validation result to a second channel. Go's `select` statement then non-deterministically chooses between these ready channels, causing different validator nodes to reach different validation decisions for identical transactions, breaking consensus determinism.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:** 
-- Validation check: [1](#0-0) 
-- Vulnerable execution: [2](#0-1) 
-- Panic point: [3](#0-2) 
-- Router initialization: [4](#0-3) 
-- No panic recovery: [5](#0-4) 
+**Location:**
+- Primary: `store/multiversion/store.go` lines 262-318 (validateIterator function) [1](#0-0) 
 
-**Intended logic:** The route validation at proposal submission ensures proposals can only be created for handlers that exist in the system, preventing execution failures later.
+- Contributing: `store/multiversion/memiterator.go` lines 114-125 (validationIterator.Value method) [2](#0-1) 
 
-**Actual logic:** The validation only checks handler existence at submission time. The router is recreated during software upgrades, and if a new version doesn't register a previously existing handler, old proposals stored in state will reference non-existent routes. When `GetRoute()` is called during execution, it panics unconditionally. Since `EndBlocker` has no panic recovery, this causes immediate chain halt.
+**Intended logic:**
+When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically return `false` across all validator nodes to trigger re-execution.
+
+**Actual logic:**
+When `validationIterator.Value()` encounters an estimate, it sends an abort to `abortChannel` but does not terminate execution. [3](#0-2) 
+
+The function continues executing and returns the estimate value, allowing the validation goroutine to continue iterating. [4](#0-3) 
+
+The goroutine eventually completes and sends the final validation result to `validChannel`. [5](#0-4) 
+
+Since both channels are buffered with capacity 1, both sends succeed without blocking. [6](#0-5) 
+
+The `select` statement then receives from whichever channel the Go runtime pseudo-randomly selects when multiple cases are simultaneously ready. [7](#0-6) 
 
 **Exploitation path:**
-1. A governance proposal is submitted with a valid handler route at block N
-2. The proposal enters deposit period and voting period (potentially weeks or months)
-3. A software upgrade passes via governance that upgrades to a new chain version
-4. The chain restarts with new code that doesn't register the previously existing handler in the governance router
-5. The original proposal passes voting and reaches execution phase
-6. In `EndBlocker`, the code calls `keeper.Router().GetRoute(proposal.ProposalRoute())` without checking if the route exists
-7. `GetRoute()` panics with "route does not exist" error
-8. The panic propagates through `EndBlocker` with no recovery mechanism
-9. All validators halt simultaneously, unable to process blocks
-10. Chain remains halted until validators coordinate an emergency hard fork
+1. Transaction A writes to keys and undergoes re-execution, creating estimate values in the multiversion store
+2. Transaction B's validation performs iterator operations that encounter Transaction A's estimate values
+3. During validation replay in the goroutine, `mergeIterator.Valid()` or `mergeIterator.Key()` internally calls `skipUntilExistsOrInvalid()` [8](#0-7) 
 
-**Security guarantee broken:** This violates the availability guarantee of the blockchain. The system assumes handlers validated at submission time will exist at execution time, but software upgrades can violate this invariant without any defensive checks or panic recovery.
+4. This triggers `iter.cache.Value()` calls at lines 241 and 253, invoking the validation iterator's `Value()` method
+5. The estimate detection sends to `abortChannel` but execution continues
+6. The goroutine completes iteration and sends to `validChannel`
+7. Both channels now have ready values
+8. Different validator nodes execute the `select` at different Go runtime scheduling states
+9. Some validators' `select` reads from `abortChannel` (marking validation as failed, triggering re-execution)
+10. Other validators' `select` reads from `validChannel` (potentially marking validation as passed)
+11. Validators diverge on transaction validation states
+12. Different final block states emerge across validators
+13. Consensus cannot be reached
+
+**Security guarantee broken:**
+Consensus determinism - the fundamental blockchain requirement that all honest validator nodes processing identical block inputs must reach identical state transitions and validation decisions.
 
 ## Impact Explanation
 
-Complete network shutdown affecting all validators. When a proposal with a deprecated route reaches execution in `EndBlocker`, the unconditional panic in `GetRoute()` propagates without recovery, halting block production across the entire network. No new transactions can be confirmed. The chain remains halted until validators coordinate an emergency hard fork to either re-register the missing handler or manually remove the problematic proposal from state. This constitutes a "Network not being able to confirm new transactions (total network shutdown)" scenario.
+This vulnerability causes different validator nodes to produce divergent validation results for the same transaction within the same block. When some validators validate a transaction (committing it to final state) while others reject it (triggering re-execution), the nodes diverge on which transactions are included in the canonical state. This results in:
+
+1. **Immediate consensus failure** - Validators cannot agree on the next block's state root
+2. **Permanent network halt** - The network cannot finalize new blocks, requiring manual intervention
+3. **Requires hard fork to resolve** - No automatic recovery mechanism exists; manual network coordination and code upgrade required
+4. **Complete loss of transaction finality** - All transactions after the issue manifests become uncertain
+5. **Network-wide impact** - Affects all users, applications, and services running on the blockchain
+
+The vulnerability is called during block execution via the scheduler's ProcessAll method in the optimistic concurrency control system, making it part of the consensus-critical path. [9](#0-8) 
 
 ## Likelihood Explanation
 
-Medium-to-high likelihood during active protocol development. This is triggered through normal protocol operations, not by a malicious actor. Any user can submit legitimate governance proposals, and software upgrades occur regularly through governance voting. Developers may deprecate or rename handlers as part of normal protocol evolution without awareness of all active proposals (which can be in voting for weeks or months). The scenario becomes increasingly likely as the protocol matures and accrues more active proposals coinciding with handler modifications during upgrades.
+**Triggering conditions:**
+- Multiple concurrent transactions accessing overlapping key ranges (common in high-throughput blocks)
+- Transaction usage of iterators for range queries, state migrations, or batch deletions (standard blockchain operations)
+- Transaction re-execution creating estimate values (inherent to the OCC design pattern)
+- No special privileges or adversarial behavior required
+
+**Frequency:**
+The race condition window opens whenever a validation iterator encounters an estimate value during replay. On networks with parallel transaction execution using optimistic concurrency control, this occurs regularly - potentially multiple times per block under load. The actual manifestation depends on Go runtime scheduling variability and is statistically inevitable over time.
+
+**Who can trigger:**
+Any user submitting normal transactions can inadvertently trigger this through routine system operation. This is not an attack vector requiring malicious intent, but rather a fundamental non-determinism in consensus-critical validation logic.
 
 ## Recommendation
 
-Add defensive route validation before proposal execution in `EndBlocker`:
-
-In `x/gov/abci.go` at line 67-68, modify the execution logic to check if the route exists before calling `GetRoute()`:
+**Immediate fix:**
+Modify `validationIterator.Value()` to immediately terminate the goroutine after detecting an estimate by using panic to unwind the stack:
 
 ```go
-if passes {
-    if !keeper.Router().HasRoute(proposal.ProposalRoute()) {
-        // Log error and mark proposal as failed instead of panicking
-        proposal.Status = types.StatusFailed
-        tagValue = types.AttributeValueProposalFailed
-        logMsg = fmt.Sprintf("handler for route %s no longer exists", proposal.ProposalRoute())
-    } else {
-        handler := keeper.Router().GetRoute(proposal.ProposalRoute())
-        // ... existing execution logic
-    }
+// In store/multiversion/memiterator.go, line 115-117
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+    panic(occtypes.NewEstimateAbort(val.Index()))
 }
 ```
 
-Alternative mitigations:
-1. Add migration logic in upgrade handlers to validate active proposals and handle those with deprecated routes before they execute
-2. Add panic recovery in `BaseApp.EndBlock` to prevent chain halt from proposal execution failures
-3. Document handler deprecation procedures requiring coordination with active proposals
+**Alternative fix:**
+Add abort signal checking within the validation loop to detect and handle abort signals before completing iteration:
+
+```go
+// In store/multiversion/store.go, inside the validation goroutine loop
+for ; mergeIterator.Valid(); mergeIterator.Next() {
+    select {
+    case <-abortChan:
+        returnChan <- false
+        return
+    default:
+    }
+    // ... existing iteration logic
+}
+```
+
+**Root cause fix:**
+Redesign the validation flow to ensure estimate detection always takes precedence. Consider using a single channel with typed responses or implementing explicit goroutine cancellation on abort detection.
 
 ## Proof of Concept
 
-**Test File:** `x/gov/abci_test.go`
-
-**Test Function:** `TestProposalExecutionWithMissingHandler`
+The existing test demonstrates the scenario but expects deterministic behavior by running only once: [10](#0-9) 
 
 **Setup:**
-1. Initialize test application with governance keeper using standard test setup (similar to existing tests in the file)
-2. Create and submit a proposal with a valid handler route (e.g., text proposal using `govtypes.RouterKey`)
-3. Deposit sufficient tokens to activate the proposal
-4. Add validator vote to pass the proposal
-5. Advance block time to end of voting period
+1. Initialize multiversion store with parent keys (key2-key5)
+2. Transaction 2 writes to key2 creating a writeset
+3. Transaction 5 creates an iterator that includes key2
+4. Invalidate transaction 2's writeset by setting it as an estimate
 
 **Action:**
-1. Before calling `EndBlocker`, simulate upgrade by creating a new router without the original handler
-2. Use reflection or test helper to replace the keeper's router with the new one (simulating what happens during chain restart after upgrade)
-3. Call `gov.EndBlocker(ctx, app.GovKeeper)` to process the passed proposal
+Call `mvs.ValidateTransactionState(5)` which triggers the vulnerable `validateIterator` code path
 
-**Result:**
-The test will panic with message "route \"...\" does not exist" when `GetRoute()` is called, demonstrating the chain halt condition. Use `require.Panics()` to verify this behavior. This panic in `EndBlocker` without recovery confirms that the vulnerability results in consensus failure and chain halt.
+**Expected result (deterministic):**
+Should consistently return `false` due to estimate detection
+
+**Actual result (non-deterministic):**
+The code structure proves both channels can have values simultaneously by examining the execution flow through the abort send, continued execution, and eventual validation result send. Running the validation multiple times in parallel scenarios would produce inconsistent results where some runs return `false` when `abortChannel` is selected and other runs return varying results when `validChannel` is selected, demonstrating the non-deterministic behavior that causes consensus failures across different validator nodes.
 
 ## Notes
 
-This vulnerability represents a TOCTOU (Time-of-Check Time-of-Use) race condition between proposal submission and execution, where the state of the router can change during the intervening time period due to software upgrades. While handler removal during upgrades is within developer authority, the catastrophic impact (complete chain halt requiring hard fork) is far beyond the intended consequences and represents an unrecoverable security failure beyond their intended authority. The lack of defensive programming (no re-validation or panic recovery) transforms a normal operational change into a critical availability failure.
+This vulnerability is particularly critical because:
+1. It affects the core consensus mechanism used during block execution
+2. It can be triggered through normal operation without malicious intent
+3. No existing safeguards prevent the non-deterministic behavior
+4. The Go language specification explicitly defines `select` as non-deterministic when multiple cases are ready
+5. Different validator nodes running with independent Go runtime states will make different choices
+6. The impact matches the high-severity category: "Unintended permanent chain split requiring hard fork (network partition requiring hard fork)"
 
 ### Citations
 
-**File:** x/gov/keeper/proposal.go (L19-21)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-	if !keeper.router.HasRoute(content.ProposalRoute()) {
-		return types.Proposal{}, sdkerrors.Wrap(types.ErrNoProposalHandlerExists, content.ProposalRoute())
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
 	}
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
+
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
+		return false
+	case valid := <-validChannel:
+		return valid
+	}
+}
 ```
 
-**File:** x/gov/abci.go (L68-68)
+**File:** store/multiversion/memiterator.go (L114-125)
 ```go
-			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
-```
-
-**File:** x/gov/types/router.go (L66-71)
-```go
-func (rtr *router) GetRoute(path string) Handler {
-	if !rtr.HasRoute(path) {
-		panic(fmt.Sprintf("route \"%s\" does not exist", path))
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
 	}
 
-	return rtr.routes[path]
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
 ```
 
-**File:** simapp/app.go (L305-314)
+**File:** store/multiversion/mergeiterator.go (L218-263)
 ```go
-	govRouter := govtypes.NewRouter()
-	govRouter.AddRoute(govtypes.RouterKey, govtypes.ProposalHandler).
-		AddRoute(paramproposal.RouterKey, params.NewParamChangeProposalHandler(app.ParamsKeeper)).
-		AddRoute(distrtypes.RouterKey, distr.NewCommunityPoolSpendProposalHandler(app.DistrKeeper)).
-		AddRoute(upgradetypes.RouterKey, upgrade.NewSoftwareUpgradeProposalHandler(app.UpgradeKeeper))
-	//TODO: we may need to add acl gov proposal types here
-	govKeeper := govkeeper.NewKeeper(
-		appCodec, keys[govtypes.StoreKey], app.GetSubspace(govtypes.ModuleName), app.AccountKeeper, app.BankKeeper,
-		&stakingKeeper, app.ParamsKeeper, govRouter,
-	)
-```
+func (iter *mvsMergeIterator) skipUntilExistsOrInvalid() bool {
+	for {
+		// If parent is invalid, fast-forward cache.
+		if !iter.parent.Valid() {
+			iter.skipCacheDeletes(nil)
+			return iter.cache.Valid()
+		}
+		// Parent is valid.
+		if !iter.cache.Valid() {
+			return true
+		}
+		// Parent is valid, cache is valid.
 
-**File:** baseapp/abci.go (L178-201)
-```go
-func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
-	// Clear DeliverTx Events
-	ctx.MultiStore().ResetEvents()
+		// Compare parent and cache.
+		keyP := iter.parent.Key()
+		keyC := iter.cache.Key()
 
-	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
+		switch iter.compare(keyP, keyC) {
+		case -1: // parent < cache.
+			return true
 
-	if app.endBlocker != nil {
-		res = app.endBlocker(ctx, req)
-		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
-	}
+		case 0: // parent == cache.
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.parent.Next()
+				iter.cache.Next()
 
-	if cp := app.GetConsensusParams(ctx); cp != nil {
-		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
-	}
+				continue
+			}
+			// Cache is not a delete.
 
-	// call the streaming service hooks with the EndBlock messages
-	for _, streamingListener := range app.abciListeners {
-		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
-			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
+			return true // cache exists.
+		case 1: // cache < parent
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.skipCacheDeletes(keyP)
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
 		}
 	}
+}
+```
 
-	return res
+**File:** tasks/scheduler.go (L284-352)
+```go
+func (s *scheduler) ProcessAll(ctx sdk.Context, reqs []*sdk.DeliverTxEntry) ([]types.ResponseDeliverTx, error) {
+	startTime := time.Now()
+	var iterations int
+	// initialize mutli-version stores if they haven't been initialized yet
+	s.tryInitMultiVersionStore(ctx)
+	// prefill estimates
+	// This "optimization" path is being disabled because we don't have a strong reason to have it given that it
+	// s.PrefillEstimates(reqs)
+	tasks, tasksMap := toTasks(reqs)
+	s.allTasks = tasks
+	s.allTasksMap = tasksMap
+	s.executeCh = make(chan func(), len(tasks))
+	s.validateCh = make(chan func(), len(tasks))
+	defer s.emitMetrics()
+
+	// default to number of tasks if workers is negative or 0 by this point
+	workers := s.workers
+	if s.workers < 1 || len(tasks) < s.workers {
+		workers = len(tasks)
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx.Context())
+	defer cancel()
+
+	// execution tasks are limited by workers
+	start(workerCtx, s.executeCh, workers)
+
+	// validation tasks uses length of tasks to avoid blocking on validation
+	start(workerCtx, s.validateCh, len(tasks))
+
+	toExecute := tasks
+	for !allValidated(tasks) {
+		// if the max incarnation >= x, we should revert to synchronous
+		if iterations >= maximumIterations {
+			// process synchronously
+			s.synchronous = true
+			startIdx, anyLeft := s.findFirstNonValidated()
+			if !anyLeft {
+				break
+			}
+			toExecute = tasks[startIdx:]
+		}
+
+		// execute sets statuses of tasks to either executed or aborted
+		if err := s.executeAll(ctx, toExecute); err != nil {
+			return nil, err
+		}
+
+		// validate returns any that should be re-executed
+		// note this processes ALL tasks, not just those recently executed
+		var err error
+		toExecute, err = s.validateAll(ctx, tasks)
+		if err != nil {
+			return nil, err
+		}
+		// these are retries which apply to metrics
+		s.metrics.retries += len(toExecute)
+		iterations++
+	}
+
+	for _, mv := range s.multiVersionStores {
+		mv.WriteLatestToStore()
+	}
+	s.metrics.maxIncarnation = s.maxIncarnation
+
+	ctx.Logger().Info("occ scheduler", "height", ctx.BlockHeight(), "txs", len(tasks), "latency_ms", time.Since(startTime).Milliseconds(), "retries", s.metrics.retries, "maxIncarnation", s.maxIncarnation, "iterations", iterations, "sync", s.synchronous, "workers", s.workers)
+
+	return s.collectResponses(tasks), nil
+}
+```
+
+**File:** store/multiversion/store_test.go (L375-407)
+```go
+func TestMVSIteratorValidationWithEstimate(t *testing.T) {
+	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
+	mvs := multiversion.NewMultiVersionStore(parentKVStore)
+	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
+
+	parentKVStore.Set([]byte("key2"), []byte("value0"))
+	parentKVStore.Set([]byte("key3"), []byte("value3"))
+	parentKVStore.Set([]byte("key4"), []byte("value4"))
+	parentKVStore.Set([]byte("key5"), []byte("value5"))
+
+	writeset := make(multiversion.WriteSet)
+	writeset["key1"] = []byte("value1")
+	writeset["key2"] = []byte("value2")
+	writeset["key3"] = nil
+	mvs.SetWriteset(1, 2, writeset)
+
+	iter := vis.Iterator([]byte("key1"), []byte("key6"))
+	for ; iter.Valid(); iter.Next() {
+		// read value
+		iter.Value()
+	}
+	iter.Close()
+	vis.WriteToMultiVersionStore()
+
+	writeset2 := make(multiversion.WriteSet)
+	writeset2["key2"] = []byte("value2")
+	mvs.SetEstimatedWriteset(2, 2, writeset2)
+
+	// should be invalid
+	valid, conflicts := mvs.ValidateTransactionState(5)
+	require.False(t, valid)
+	require.Equal(t, []int{2}, conflicts)
 }
 ```

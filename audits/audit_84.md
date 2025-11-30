@@ -1,350 +1,234 @@
 # Audit Report
 
 ## Title
-Privilege Escalation Through Unrestricted MsgExec Authorization Enabling Unauthorized Transitive Delegation
+Concurrent Capability Creation Race Condition Causes Non-Deterministic Consensus Failure
 
 ## Summary
-The authz module's `Grant` method lacks validation to prevent granting authorization for `MsgExec` message types, enabling privilege escalation through delegation chains. When combined with `GenericAuthorization` and the recursive nature of `MsgExec` execution, this allows grantees to re-delegate authorizations to unauthorized third parties, resulting in direct loss of funds.
+The capability module's `NewCapability` function writes to a shared `capMap` without synchronization during concurrent transaction execution in the OCC scheduler. This creates a data race where different validators end up with different capability objects mapped to the same index, causing non-deterministic authentication results and consensus failure.
 
 ## Impact
 High
 
 ## Finding Description
 
-- **location**: [1](#0-0)  (Grant method) and [2](#0-1)  (DispatchActions method)
+**Location**: `x/capability/keeper/keeper.go` line 260 in the `NewCapability` function [1](#0-0) 
 
-- **intended logic**: Authorizations should be explicit and non-transitive. When Alice grants Bob authorization to perform actions on her behalf, only Bob should be able to execute those actions, not arbitrary third parties that Bob chooses to delegate to. The authorization model assumes a direct trust relationship between granter and grantee.
+**Intended Logic**: The capability module should provide deterministic capability creation and authentication across all validators. Each capability index should map to exactly one capability object, ensuring consistent authentication results across all nodes. The design assumes that when a transaction is aborted, all its state changes are rolled back, maintaining consistency.
 
-- **actual logic**: The `Grant` method only validates that an authorization is present and a handler exists for the message type [3](#0-2) . There is no check preventing authorization of `MsgExec` itself. The `GenericAuthorization.Accept()` method accepts any message without validation [4](#0-3) . The `MsgExec.GetSigners()` returns the grantee field [5](#0-4) , which when combined with `DispatchActions` creates a recursive execution path that enables transitive delegation chains.
+**Actual Logic**: 
+The sei-cosmos blockchain executes transactions concurrently using an OCC scheduler with 20 workers by default [2](#0-1) , spawning multiple worker goroutines [3](#0-2) .
 
-- **exploitation path**: 
-  1. Alice grants Bob a `SendAuthorization` for 100 tokens
-  2. Bob grants Charlie a `GenericAuthorization` for `MsgExec` type URL
-  3. Charlie constructs nested `MsgExec` messages: outer `MsgExec` with grantee=Charlie containing inner `MsgExec` with grantee=Bob containing `MsgSend` from Alice
-  4. When the outer `MsgExec` is processed by the `Exec` handler [6](#0-5) , it calls `DispatchActions` with grantee=Charlie
-  5. `DispatchActions` extracts the signer from the inner `MsgExec` (which returns Bob via `GetSigners()`) and validates Charlie's authorization from Bob for `MsgExec` type
-  6. The handler recursively calls `Exec` for the inner `MsgExec`, which then calls `DispatchActions` with grantee=Bob
-  7. This validates Bob's authorization from Alice for `MsgSend` and executes the transfer
-  8. Alice's funds are transferred without Alice ever authorizing Charlie
+All `ScopedKeeper` instances share the same `capMap` reference [4](#0-3) , which is defined as a plain Go map without synchronization [5](#0-4) .
 
-- **security guarantee broken**: The principle that authorizations are personal and non-transferable is violated. The authz module design in ADR-030 [7](#0-6)  describes granting privileges "from one account (the _granter_) to another account (the _grantee_)" with no mention of transitive delegation capabilities.
+When multiple transactions concurrently execute `NewCapability`, they perform unsynchronized writes to `capMap[index]` [1](#0-0) . The OCC scheduler only tracks KVStore operations via multiversion stores [6](#0-5) , not plain Go maps. When a transaction is aborted, its KVStore writes are rolled back, but the `capMap[index]` write persists.
+
+**Exploitation Path**:
+1. User submits IBC transactions that call `NewCapability` (e.g., channel creation, port binding)
+2. Scheduler executes transactions concurrently in worker goroutines [7](#0-6) 
+3. Two transactions (Tx1, Tx2) read the same index value from KVStore [8](#0-7) 
+4. Both create different capability objects (`capA`, `capB`) with that index [9](#0-8) 
+5. Both race on writing to `capMap[index]` without synchronization [1](#0-0) 
+6. Both write to KVStore, creating a conflict [10](#0-9) 
+7. OCC scheduler detects the conflict and aborts one transaction
+8. The aborted transaction's KVStore and memStore writes are rolled back, but `capMap[index]` may contain either `capA` or `capB` depending on race timing
+9. Different validators have different goroutine scheduling → different race outcomes → different `capMap` contents
+10. Later `GetCapability` calls [11](#0-10)  return different capability objects on different validators
+11. `AuthenticateCapability` uses `FwdCapabilityKey` which encodes the capability's memory address [12](#0-11) 
+12. For the wrong capability object, authentication fails because the memStore key was rolled back
+13. Different validators produce different authentication results → different transaction outcomes → different state roots → consensus failure
+
+**Security Guarantee Broken**: Deterministic consensus - identical transaction sequences must produce identical state across all validators.
 
 ## Impact Explanation
-This vulnerability results in **direct loss of funds**. Unauthorized parties can gain access to and steal funds from accounts they were never authorized to access. The trust relationship between granter and grantee is fundamentally broken as grantees can re-delegate to arbitrary third parties without the original granter's knowledge or consent. This affects all assets that can be controlled through authorizations including tokens, staking positions, and governance votes. In the described scenario, Charlie can drain Alice's account despite Alice only trusting Bob.
+
+This vulnerability affects the fundamental consensus mechanism of the blockchain:
+
+- **Scope**: All capability-based operations (IBC channels, ports, module authorizations) become non-deterministic
+- **Consequence**: Validators disagree on capability authentication results, computing different state roots for identical transaction sequences
+- **Network Effect**: The blockchain will halt or permanently split when validators cannot reach consensus on block validity
+- **Recovery**: Requires a hard fork to add synchronization to the capability module and resync the network
+
+The codebase already acknowledges that `capMap` doesn't revert properly [13](#0-12) , but this TODO doesn't address the concurrent race condition scenario.
 
 ## Likelihood Explanation
-Any user who receives any authorization grant can exploit this vulnerability. The only conditions required are: (1) an initial authorization grant exists between Alice and Bob, and (2) Bob creates a grant for `MsgExec` to Charlie using `GenericAuthorization`. This is trivially achievable through normal transaction submission with no special conditions, race conditions, or timing requirements. No administrative privileges or special access is needed. The vulnerability is persistent and can be exploited at any time after the authorization chain is established.
+
+**Triggering Actors**: Any user submitting transactions that create capabilities (IBC operations, module initialization)
+
+**Required Conditions**:
+- Concurrent transaction execution (enabled by default with 20 workers)
+- At least two transactions in the same block calling `NewCapability`
+- Transactions executing concurrently and reading the same capability index
+
+**Frequency Assessment**:
+- **High likelihood** during normal operations with IBC activity
+- Default configuration uses 20 concurrent workers, maximizing the race window
+- Probability increases with block size and transaction throughput
+- The race is probabilistic but inevitable under sustained IBC traffic
+- Once triggered, all subsequent authentications for that capability index are affected until a hard fork
 
 ## Recommendation
-Add validation in the `Grant` method to explicitly reject authorization grants for `MsgExec` and `MsgGrant` message types:
 
-```go
-func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
-    // ... existing code ...
-    
-    t := authorization.MsgTypeURL()
-    
-    // Prevent recursive delegation chains
-    if t == sdk.MsgTypeURL(&authz.MsgExec{}) || t == sdk.MsgTypeURL(&authz.MsgGrant{}) {
-        return nil, sdkerrors.ErrUnauthorized.Wrap("cannot grant authorization for MsgExec or MsgGrant to prevent delegation chains")
-    }
-    
-    if k.router.HandlerByTypeURL(t) == nil {
-        return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
-    }
-    
-    // ... rest of existing code ...
-}
-```
+Replace the plain `map[uint64]*types.Capability` with thread-safe concurrent access patterns:
 
-Alternatively, the validation could be added in `MsgGrant.ValidateBasic()` [8](#0-7)  to reject such grants earlier in the transaction processing pipeline.
+**Option 1**: Use `sync.Map` for built-in concurrency safety
+**Option 2**: Add `sync.RWMutex` protection around all `capMap` access
+
+All reads must use `RLock()`/`RUnlock()` and all writes must use `Lock()`/`Unlock()` to ensure atomicity during concurrent execution. The codebase already uses these patterns elsewhere [6](#0-5)  and [14](#0-13) , confirming their suitability for this scenario.
 
 ## Proof of Concept
 
-Following the pattern in `TestKeeperFees` [9](#0-8) , a test can be constructed:
+While the report describes a test function `TestConcurrentCapabilityRaceCondition`, the actual test implementation is not provided in the codebase. However, the vulnerability is evident from code inspection:
 
-**Setup**:
-- Initialize three accounts: Alice (addrs[0]), Bob (addrs[1]), Charlie (addrs[2])
-- Fund Alice with 10,000 steak tokens using `simapp.FundAccount`
-- Set expiration time from `ctx.BlockHeader().Time`
+**Setup**: Initialize capability keeper with concurrent transaction execution enabled (default configuration)
 
-**Action**:
-```go
-// 1. Alice grants Bob SendAuthorization with 100 token limit
-app.AuthzKeeper.SaveGrant(ctx, Bob, Alice, 
-    &banktypes.SendAuthorization{SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("steak", 100))}, 
-    expiration)
+**Action**: 
+1. Submit two transactions in the same block that call `NewCapability` with different names
+2. Both transactions execute concurrently in the OCC scheduler
+3. Both read the same index and create different capability objects
+4. Both race on writing to `capMap[index]`
+5. OCC detects KVStore conflict and aborts one transaction
 
-// 2. Bob grants Charlie GenericAuthorization for MsgExec
-app.AuthzKeeper.SaveGrant(ctx, Charlie, Bob,
-    &authz.GenericAuthorization{Msg: sdk.MsgTypeURL(&authz.MsgExec{})},
-    expiration)
+**Expected Result**: Running with `go test -race` would detect a data race on `capMap[index]`. Different validators would observe different authentication outcomes depending on race timing, demonstrating non-deterministic consensus behavior.
 
-// 3. Charlie constructs nested MsgExec
-innerMsgExec := authz.NewMsgExec(Bob, []sdk.Msg{
-    &banktypes.MsgSend{
-        Amount:      sdk.NewCoins(sdk.NewInt64Coin("steak", 100)),
-        FromAddress: Alice.String(),
-        ToAddress:   Recipient.String(),
-    },
-})
+## Notes
 
-outerMsgExec := authz.NewMsgExec(Charlie, []sdk.Msg{&innerMsgExec})
-
-// 4. Execute the nested MsgExec
-msgs, _ := outerMsgExec.GetMessages()
-result, err := app.AuthzKeeper.DispatchActions(ctx, Charlie, msgs)
-```
-
-**Result**:
-- Transaction succeeds (`err == nil`, `result != nil`)
-- 100 steak tokens are transferred from Alice to Recipient
-- Alice never authorized Charlie, only Bob
-- This demonstrates unauthorized transitive delegation
+This vulnerability exists in production code and affects consensus determinism under the default concurrent execution configuration. The ADR-003 design document [15](#0-14)  explicitly describes the intended behavior of reverting capability creation on transaction failure, but this design assumes sequential execution or proper synchronization, which is broken by the concurrent OCC scheduler. The issue represents a critical mismatch between the capability module's sequential design and the concurrent execution model introduced by the OCC scheduler.
 
 ### Citations
 
-**File:** x/authz/keeper/msg_server.go (L14-42)
+**File:** x/capability/keeper/keeper.go (L33-33)
 ```go
-func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
+		capMap        map[uint64]*types.Capability
+```
+
+**File:** x/capability/keeper/keeper.go (L83-89)
+```go
+	return ScopedKeeper{
+		cdc:      k.cdc,
+		storeKey: k.storeKey,
+		memKey:   k.memKey,
+		capMap:   k.capMap,
+		module:   moduleName,
+	}
+```
+
+**File:** x/capability/keeper/keeper.go (L236-236)
+```go
+	index := types.IndexFromKey(store.Get(types.KeyIndex))
+```
+
+**File:** x/capability/keeper/keeper.go (L237-237)
+```go
+	cap := types.NewCapability(index)
+```
+
+**File:** x/capability/keeper/keeper.go (L245-245)
+```go
+	store.Set(types.KeyIndex, types.IndexToKey(index+1))
+```
+
+**File:** x/capability/keeper/keeper.go (L260-260)
+```go
+	sk.capMap[index] = cap
+```
+
+**File:** x/capability/keeper/keeper.go (L361-388)
+```go
+func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
+	if strings.TrimSpace(name) == "" {
+		return nil, false
+	}
+	memStore := ctx.KVStore(sk.memKey)
+
+	key := types.RevCapabilityKey(sk.module, name)
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
+
+	if len(indexBytes) == 0 {
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+
+		return nil, false
 	}
 
-	granter, err := sdk.AccAddressFromBech32(msg.Granter)
-	if err != nil {
-		return nil, err
+	cap := sk.capMap[index]
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
 	}
 
-	authorization := msg.GetAuthorization()
-	if authorization == nil {
-		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
-	}
-
-	t := authorization.MsgTypeURL()
-	if k.router.HandlerByTypeURL(t) == nil {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
-	}
-
-	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgGrantResponse{}, nil
+	return cap, true
 }
 ```
 
-**File:** x/authz/keeper/msg_server.go (L65-82)
+**File:** server/config/config.go (L25-26)
 ```go
-func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
-	}
-
-	msgs, err := msg.GetMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	results, err := k.DispatchActions(ctx, grantee, msgs)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgExecResponse{Results: results}, nil
+	// DefaultConcurrencyWorkers defines the default workers to use for concurrent transactions
+	DefaultConcurrencyWorkers = 20
 ```
 
-**File:** x/authz/keeper/keeper.go (L76-139)
+**File:** tasks/scheduler.go (L47-47)
 ```go
-func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
-	results := make([][]byte, len(msgs))
+	mx            sync.RWMutex
+```
 
-	for i, msg := range msgs {
-		signers := msg.GetSigners()
-		if len(signers) != 1 {
-			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
-		}
-
-		granter := signers[0]
-
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+**File:** tasks/scheduler.go (L135-148)
+```go
+func start(ctx context.Context, ch chan func(), workers int) {
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case work := <-ch:
+					work()
+				}
 			}
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
-
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
-		}
-
-		handler := k.router.Handler(msg)
-		if handler == nil {
-			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
-		}
-
-		msgResp, err := handler(ctx, msg)
-		if err != nil {
-			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
-		}
-
-		results[i] = msgResp.Data
-
-		// emit the events from the dispatched actions
-		events := msgResp.Events
-		sdkEvents := make([]sdk.Event, 0, len(events))
-		for _, event := range events {
-			e := event
-			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
-
-			sdkEvents = append(sdkEvents, sdk.Event(e))
-		}
-
-		ctx.EventManager().EmitEvents(sdkEvents)
+		}()
 	}
-
-	return results, nil
 }
 ```
 
-**File:** x/authz/generic_authorization.go (L23-26)
+**File:** store/multiversion/store.go (L40-50)
 ```go
-// Accept implements Authorization.Accept.
-func (a GenericAuthorization) Accept(ctx sdk.Context, msg sdk.Msg) (AcceptResponse, error) {
-	return AcceptResponse{Accept: true}, nil
+type Store struct {
+	// map that stores the key string -> MultiVersionValue mapping for accessing from a given key
+	multiVersionMap *sync.Map
+	// TODO: do we need to support iterators as well similar to how cachekv does it - yes
+
+	txWritesetKeys *sync.Map // map of tx index -> writeset keys []string
+	txReadSets     *sync.Map // map of tx index -> readset ReadSet
+	txIterateSets  *sync.Map // map of tx index -> iterateset Iterateset
+
+	parentStore types.KVStore
 }
 ```
 
-**File:** x/authz/msgs.go (L54-68)
+**File:** baseapp/abci.go (L266-266)
 ```go
-func (msg MsgGrant) ValidateBasic() error {
-	granter, err := sdk.AccAddressFromBech32(msg.Granter)
-	if err != nil {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
-	}
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
-	}
+	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
+```
 
-	if granter.Equals(grantee) {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be same")
+**File:** x/capability/types/keys.go (L41-50)
+```go
+func FwdCapabilityKey(module string, cap *Capability) []byte {
+	// encode the key to a fixed length to avoid breaking consensus state machine
+	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
+	// the length 10 is picked so it's backward compatible on common architectures.
+	key := fmt.Sprintf("%#010p", cap)
+	if len(key) > 10 {
+		key = key[len(key)-10:]
 	}
-	return msg.Grant.ValidateBasic()
+	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
 }
 ```
 
-**File:** x/authz/msgs.go (L212-218)
-```go
-func (msg MsgExec) GetSigners() []sdk.AccAddress {
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		panic(err)
-	}
-	return []sdk.AccAddress{grantee}
-}
-```
-
-**File:** docs/architecture/adr-030-authz-module.md (L40-43)
+**File:** docs/architecture/adr-003-dynamic-capability-store.md (L329-330)
 ```markdown
-We will create a module named `authz` which provides functionality for
-granting arbitrary privileges from one account (the _granter_) to another account (the _grantee_). Authorizations
-must be granted for a particular `Msg` service methods one by one using an implementation
-of `Authorization` interface.
-```
-
-**File:** x/authz/keeper/keeper_test.go (L126-197)
-```go
-func (s *TestSuite) TestKeeperFees() {
-	app, addrs := s.app, s.addrs
-
-	granterAddr := addrs[0]
-	granteeAddr := addrs[1]
-	recipientAddr := addrs[2]
-	s.Require().NoError(simapp.FundAccount(app.BankKeeper, s.ctx, granterAddr, sdk.NewCoins(sdk.NewInt64Coin("steak", 10000))))
-	now := s.ctx.BlockHeader().Time
-	s.Require().NotNil(now)
-
-	smallCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 20))
-	someCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 123))
-
-	msgs := authz.NewMsgExec(granteeAddr, []sdk.Msg{
-		&banktypes.MsgSend{
-			Amount:      sdk.NewCoins(sdk.NewInt64Coin("steak", 2)),
-			FromAddress: granterAddr.String(),
-			ToAddress:   recipientAddr.String(),
-		},
-	})
-
-	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
-
-	s.T().Log("verify dispatch fails with invalid authorization")
-	executeMsgs, err := msgs.GetMessages()
-	s.Require().NoError(err)
-	result, err := app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
-
-	s.Require().Nil(result)
-	s.Require().NotNil(err)
-
-	s.T().Log("verify dispatch executes with correct information")
-	// grant authorization
-	err = app.AuthzKeeper.SaveGrant(s.ctx, granteeAddr, granterAddr, &banktypes.SendAuthorization{SpendLimit: smallCoin}, now)
-	s.Require().NoError(err)
-	authorization, _ := app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
-	s.Require().NotNil(authorization)
-
-	s.Require().Equal(authorization.MsgTypeURL(), bankSendAuthMsgType)
-
-	executeMsgs, err = msgs.GetMessages()
-	s.Require().NoError(err)
-
-	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
-	s.Require().NoError(err)
-	s.Require().NotNil(result)
-
-	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
-	s.Require().NotNil(authorization)
-
-	s.T().Log("verify dispatch fails with overlimit")
-	// grant authorization
-
-	msgs = authz.NewMsgExec(granteeAddr, []sdk.Msg{
-		&banktypes.MsgSend{
-			Amount:      someCoin,
-			FromAddress: granterAddr.String(),
-			ToAddress:   recipientAddr.String(),
-		},
-	})
-
-	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
-	executeMsgs, err = msgs.GetMessages()
-	s.Require().NoError(err)
-
-	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
-	s.Require().Nil(result)
-	s.Require().NotNil(err)
-
-	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
-	s.Require().NotNil(authorization)
-}
+- Dynamic capability support.
+- Allows CapabilityKeeper to return same capability pointer from go-map while reverting any writes to the persistent `KVStore` and in-memory `MemoryStore` on tx failure.
 ```

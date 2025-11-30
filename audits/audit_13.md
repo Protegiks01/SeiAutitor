@@ -1,216 +1,258 @@
-After thorough investigation of the codebase, I confirm this is a **VALID HIGH SEVERITY VULNERABILITY**.
+# Audit Report Validation
 
-## Technical Validation Summary
+After thorough analysis of the codebase and tracing the execution flow, I can confirm this is a **valid vulnerability**.
 
-I traced through the complete execution paths and confirmed:
+## Audit Report
 
-**State Divergence is Real:**
-- `skipUpgrade()` only clears the upgrade plan [1](#0-0) 
-- `ApplyUpgrade()` modifies three distinct state key spaces: module versions (VersionMapByte), protocol version (ProtocolVersionByte), and done markers (DoneByte) [2](#0-1) 
-- These use different prefixes defined in the state key constants [3](#0-2) 
+### Title
+Scheduler Commits State Changes from Failed Transactions Due to Missing Response Code Validation
 
-**Per-Node Configuration Confirmed:**
-The skipUpgradeHeights is populated from command-line flags with no consensus validation [4](#0-3) 
+### Summary
+The concurrent transaction scheduler in `tasks/scheduler.go` validates transactions only for Optimistic Concurrency Control (OCC) conflicts but fails to check transaction response codes. This allows transactions that fail access operation validation to have their state changes permanently committed to the blockchain, violating the fundamental invariant that failed transactions should not modify state. [1](#0-0) 
 
-**Documentation Mismatch:**
-The documentation claims the flag "will cause the node to mark the upgrade as done" but the implementation does NOT call `SetDone()` [5](#0-4) 
+### Impact
+Medium
 
-**Test Evidence:**
-The test suite explicitly verifies that skipped upgrades are NOT marked as done, while applied upgrades ARE marked as done [6](#0-5) 
+### Finding Description
 
----
+**Location:**
+- Primary vulnerability: `tasks/scheduler.go`, `shouldRerun` method (lines 354-390)
+- Unconditional write: `tasks/scheduler.go`, line 576
+- Final commitment: `tasks/scheduler.go`, line 345
 
-# Audit Report
+**Intended logic:**
+Only transactions that complete successfully should have their state changes committed to the blockchain. In normal sequential execution, when a transaction fails validation and returns an error, the cached state changes are not written to the parent store. [2](#0-1) 
 
-## Title
-Unintended Permanent Chain Split Due to Per-Node skipUpgradeHeights Configuration Causing State Divergence
+**Actual logic:**
+In the OCC concurrent execution path:
+1. Transactions execute and can fail access operation validation, returning an error [3](#0-2) 
+2. Errors are converted to ResponseDeliverTx with non-zero code [4](#0-3) 
+3. `WriteToMultiVersionStore()` is called unconditionally after execution, persisting all writes regardless of response code [5](#0-4) 
+4. The `shouldRerun` method only checks for OCC conflicts via `findConflicts` and never examines `task.Response.Code`
+5. If no OCC conflicts are detected, the transaction is marked as "validated"
+6. `WriteLatestToStore()` commits all "validated" transactions' writes to the blockchain state [6](#0-5) 
 
-## Summary
-The `--unsafe-skip-upgrades` flag allows validators to bypass scheduled upgrades through per-node configuration. When validators use different skip configurations, they execute divergent state transitions that modify different state keys, producing different AppHashes and breaking Tendermint consensus, resulting in a permanent chain split requiring a hard fork.
+**Exploitation path:**
+1. User submits transaction T1 with incorrect access operation declarations (due to bugs in mappings or malicious WASM contracts)
+2. T1 executes and makes state modifications via VersionIndexedStore
+3. Access operation validation fails during execution, returning error
+4. `WriteToMultiVersionStore()` persists T1's writes to multiversion store unconditionally
+5. Scheduler's `shouldRerun(T1)` checks only for OCC conflicts, not response codes
+6. If no OCC conflicts detected, T1 marked as "validated"
+7. `WriteLatestToStore()` commits T1's writes to blockchain state despite validation failure
+8. Subsequent transactions read corrupted state
 
-## Impact
-High
+**Security guarantee broken:**
+The fundamental blockchain invariant stated in the code that "State only gets persisted if all messages are valid and get executed successfully" is violated. [7](#0-6) 
 
-## Finding Description
+### Impact Explanation
 
-- **location**: `x/upgrade/abci.go` lines 61-66, 120-125; `x/upgrade/keeper/keeper.go` lines 364-391; `x/upgrade/types/keys.go` lines 19-30
-- **intended logic**: All validators should coordinate to use identical skip configurations, ensuring uniform state transitions. The documentation suggests "over two-thirds" coordination for social consensus override.
-- **actual logic**: The `skipUpgradeHeights` map is independently configured per node via command-line flag with zero consensus-level validation. At upgrade height: (1) Nodes WITH skip configured call `skipUpgrade()` which only clears the upgrade plan. (2) Nodes WITHOUT skip call `ApplyUpgrade()` which updates module versions (VersionMapByte prefix 0x2), increments protocol version (ProtocolVersionByte prefix 0x3), sets done marker (DoneByte prefix 0x1), and clears the plan. These operations write to different state keys, producing different merkle roots.
-- **exploitation path**: (1) Blockchain schedules upgrade at height H via governance. (2) Emergency discovered before H. (3) Some validators restart with `--unsafe-skip-upgrades=H` on old binary. (4) Other validators use new binary with upgrade handler, no skip flag. (5) At height H, validators compute different AppHashes due to divergent state modifications. (6) Tendermint consensus cannot achieve 2/3+ supermajority agreement on AppHash. (7) Consensus permanently fails, network splits into incompatible chains.
-- **security guarantee broken**: Violates the fundamental consensus invariant requiring all honest validators to agree on application state hash. Per-node configuration of consensus-critical state transitions enables state divergence without any detection or prevention mechanism.
+This vulnerability results in permanent state corruption with cascading effects:
 
-## Impact Explanation
-This causes a permanent chain split—the most catastrophic blockchain failure. The network fragments into incompatible chains computing different state roots. Consequences: (1) consensus failure preventing new blocks, (2) transaction finality destroyed, (3) requires emergency hard fork with social coordination to resolve, (4) all pending transactions stalled, (5) potential double-spend risks if different network segments continue on different chains. Chain splits destroy the single source of truth that defines blockchain integrity.
+1. **State Corruption**: Transactions that fail access operation validation have writes permanently committed despite returning error codes
+2. **Cascading Effects**: Valid transactions reading corrupted state execute with incorrect data
+3. **Smart Contract Integrity**: Smart contracts relying on accurate state produce incorrect results
+4. **Detection Difficulty**: Failed transactions appear "validated" by scheduler, making corruption subtle
 
-## Likelihood Explanation
-Moderate to high likelihood during upgrade events. Triggerable through inadvertent validator misconfiguration requiring no malicious intent. The documentation explicitly presents this as an emergency mechanism for bugs discovered "shortly before" upgrades—precisely when miscommunication and rushed decisions occur. Required conditions: (1) scheduled upgrade exists, (2) validators configure different skip heights due to miscommunication, (3) upgrade height reached. This scenario is realistic during the exact crisis situations when this mechanism would be deployed. The absence of any coordination validation or divergence detection makes this particularly dangerous.
+This matches the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
-## Recommendation
+### Likelihood Explanation
 
-**Immediate**: Deprecate `--unsafe-skip-upgrades` functionality. The current design is fundamentally incompatible with consensus safety guarantees.
+**Who can trigger:**
+Any user submitting transactions when:
+- Access operation dependency mappings contain bugs
+- WASM contracts have incorrect dependency declarations
+- Dynamic dependency generator has bugs
 
-**Proper Alternative**: Implement consensus-level skip mechanism:
-1. Require governance proposal to schedule upgrade skip, recorded in consensus state
-2. All validators read this on-chain decision deterministically
-3. Ensure all nodes execute identical logic based on same consensus state
+**Conditions required:**
+- Transaction must have incomplete/incorrect access operation declarations
+- Transaction must fail `ValidateAccessOperations` during execution [8](#0-7) 
+- The multiversion store OCC validation must not detect a conflict
+- Concurrent transaction execution must be enabled (OCC mode)
 
-**Additional Safeguards**:
-- Add explicit documentation warning that mismatched skip configurations cause permanent chain splits
-- Implement AppHash divergence detection that halts node with clear error message
-- Add consensus parameter tracking which upgrades to skip
-- Require validators to signal skip intention through consensus mechanism before execution
+**Frequency:**
+Can occur during normal block production if access operation mappings have bugs. More likely with complex WASM contracts where dependency tracking is difficult. Given the complexity of maintaining accurate access operation declarations, bugs are reasonably probable.
 
-## Proof of Concept
+### Recommendation
 
-The existing test suite demonstrates the vulnerability conceptually. From the test file, we can construct:
+Modify the `shouldRerun` method in `tasks/scheduler.go` to check transaction response code before marking as validated:
 
-**Setup**: 
-- Initialize two nodes with different skipUpgradeHeights configurations
-- nodeA: `map[int64]bool{15: true}` (will skip)
-- nodeB: `map[int64]bool{}` (will apply)
-- Both schedule identical upgrade at height 15
+```go
+case statusExecuted, statusValidated:
+    // Check if response has an error code
+    if task.Response != nil && task.Response.Code != 0 {
+        s.invalidateTask(task)
+        task.Reset()
+        task.Increment()
+        return true
+    }
+    
+    // Existing OCC conflict check
+    if valid, conflicts := s.findConflicts(task); !valid {
+        // ... existing logic
+    }
+```
 
-**Action**: 
-- nodeB registers upgrade handler
-- Both execute BeginBlock at height 15
-- nodeA executes `skipUpgrade()` path
-- nodeB executes `ApplyUpgrade()` path
+Alternatively, modify `executeTask` to conditionally call `WriteToMultiVersionStore()` only for successful transactions:
 
-**Result** (verified by tests):
-- Protocol versions diverge (GetProtocolVersion returns different values)
-- Done markers diverge (GetDoneHeight returns 0 vs non-zero) 
-- Module version maps diverge (handler only executed on nodeB)
-- These produce different state merkle roots → different AppHashes → consensus failure
+```go
+if resp.Code == 0 {
+    for _, v := range task.VersionStores {
+        v.WriteToMultiVersionStore()
+    }
+} else {
+    for _, v := range task.VersionStores {
+        v.WriteEstimatesToMultiVersionStore()
+    }
+}
+```
 
-This conceptual proof demonstrates that nodes with different skip configurations compute different state roots, which breaks consensus and causes chain split in production deployment.
+### Proof of Concept
 
-## Notes
+The vulnerability is demonstrable through code analysis:
 
-This vulnerability qualifies despite requiring validator misconfiguration because:
+**Setup:**
+- Normal execution path: Cache writes only committed if `err == nil` [2](#0-1) 
 
-1. **Matches Required Impact**: "Unintended permanent chain split requiring hard fork" is explicitly listed as High severity in the acceptance criteria.
+**Action:**
+- OCC execution path: Writes committed unconditionally [9](#0-8) 
+- Validation only checks OCC conflicts, not response codes [10](#0-9) 
 
-2. **Exception Applies**: The acceptance rule states misconfiguration issues are invalid "unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." Permanent chain splits requiring hard forks exceed what validator misconfiguration should be able to cause. Validators can temporarily halt chains by going offline, but creating PERMANENT divergent state histories exceeds their intended authority.
+**Result:**
+- Failed transactions (response code != 0) have writes committed via `WriteLatestToStore()` because scheduler marks them "validated" based solely on absence of OCC conflicts
+- This breaks the documented invariant that state only persists for successful transactions
 
-3. **Realistic Scenario**: This occurs during emergency situations when the feature is designed to be used—exactly when miscommunication is most likely.
+### Notes
 
-4. **System Design Flaw**: The blockchain should be resilient to operational errors at the consensus level, not depend on perfect coordination of per-node command-line flags with zero validation mechanisms.
+The vulnerability is validated through comprehensive code analysis showing the scheduler bypasses response code validation that exists in normal sequential execution. The comment at line 162 in baseapp.go indicates this OCC validation system is still under development, suggesting this gap was likely unintentional. [11](#0-10)
 
 ### Citations
 
-**File:** x/upgrade/abci.go (L120-125)
+**File:** tasks/scheduler.go (L344-346)
 ```go
-// skipUpgrade logs a message that the upgrade has been skipped and clears the upgrade plan.
-func skipUpgrade(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
-	skipUpgradeMsg := fmt.Sprintf("UPGRADE \"%s\" SKIPPED at %d: %s", plan.Name, plan.Height, plan.Info)
-	ctx.Logger().Info(skipUpgradeMsg)
-	k.ClearUpgradePlan(ctx)
+	for _, mv := range s.multiVersionStores {
+		mv.WriteLatestToStore()
+	}
+```
+
+**File:** tasks/scheduler.go (L354-390)
+```go
+func (s *scheduler) shouldRerun(task *deliverTxTask) bool {
+	switch task.Status {
+
+	case statusAborted, statusPending:
+		return true
+
+	// validated tasks can become unvalidated if an earlier re-run task now conflicts
+	case statusExecuted, statusValidated:
+		// With the current scheduler, we won't actually get to this step if a previous task has already been determined to be invalid,
+		// since we choose to fail fast and mark the subsequent tasks as invalid as well.
+		// TODO: in a future async scheduler that no longer exhaustively validates in order, we may need to carefully handle the `valid=true` with conflicts case
+		if valid, conflicts := s.findConflicts(task); !valid {
+			s.invalidateTask(task)
+			task.AppendDependencies(conflicts)
+
+			// if the conflicts are now validated, then rerun this task
+			if dependenciesValidated(s.allTasksMap, task.Dependencies) {
+				return true
+			} else {
+				// otherwise, wait for completion
+				task.SetStatus(statusWaiting)
+				return false
+			}
+		} else if len(conflicts) == 0 {
+			// mark as validated, which will avoid re-validating unless a lower-index re-validates
+			task.SetStatus(statusValidated)
+			return false
+		}
+		// conflicts and valid, so it'll validate next time
+		return false
+
+	case statusWaiting:
+		// if conflicts are done, then this task is ready to run again
+		return dependenciesValidated(s.allTasksMap, task.Dependencies)
+	}
+	panic("unexpected status: " + task.Status)
 }
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L364-391)
+**File:** tasks/scheduler.go (L571-577)
 ```go
-// ApplyUpgrade will execute the handler associated with the Plan and mark the plan as done.
-func (k Keeper) ApplyUpgrade(ctx sdk.Context, plan types.Plan) {
-	handler := k.upgradeHandlers[plan.Name]
-	if handler == nil {
-		panic("ApplyUpgrade should never be called without first checking HasHandler")
-	}
+	task.SetStatus(statusExecuted)
+	task.Response = &resp
 
-	updatedVM, err := handler(ctx, plan, k.GetModuleVersionMap(ctx))
+	// write from version store to multiversion stores
+	for _, v := range task.VersionStores {
+		v.WriteToMultiVersionStore()
+	}
+```
+
+**File:** baseapp/baseapp.go (L978-992)
+```go
+		// Dont need to validate in checkTx mode
+		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
+			storeAccessOpEvents := msCache.GetEvents()
+			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
+
+			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
+			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+			if len(missingAccessOps) != 0 {
+				for op := range missingAccessOps {
+					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
+					op.EmitValidationFailMetrics()
+				}
+				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
+				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
+			}
+```
+
+**File:** baseapp/baseapp.go (L1015-1017)
+```go
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
+	}
+```
+
+**File:** baseapp/baseapp.go (L1155-1174)
+```go
+		if ctx.MsgValidator() == nil {
+			continue
+		}
+		storeAccessOpEvents := msgMsCache.GetEvents()
+		accessOps := ctx.TxMsgAccessOps()[i]
+		missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+		// TODO: (occ) This is where we are currently validating our per message dependencies,
+		// whereas validation will be done holistically based on the mvkv for OCC approach
+		if len(missingAccessOps) != 0 {
+			for op := range missingAccessOps {
+				ctx.Logger().Info((fmt.Sprintf("eventMsgName=%s Missing Access Operation:%s ", eventMsgName, op.String())))
+				op.EmitValidationFailMetrics()
+			}
+			errMessage := fmt.Sprintf("Invalid Concurrent Execution messageIndex=%d, missing %d access operations", i, len(missingAccessOps))
+			// we need to bubble up the events for inspection
+			return &sdk.Result{
+				Log:    strings.TrimSpace(msgLogs.String()),
+				Events: events.ToABCIEvents(),
+			}, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
+		}
+```
+
+**File:** baseapp/abci.go (L280-283)
+```go
+// State only gets persisted if all messages are valid and get executed successfully.
+// Otherwise, the ResponseDeliverTx will contain relevant error information.
+// Regardless of tx execution outcome, the ResponseDeliverTx will contain relevant
+// gas execution context.
+```
+
+**File:** baseapp/abci.go (L304-311)
+```go
+	gInfo, result, anteEvents, _, _, _, resCtx, err := app.runTx(ctx.WithTxBytes(req.Tx).WithTxSum(checksum).WithVoteInfos(app.voteInfos), runTxModeDeliver, tx, checksum)
 	if err != nil {
-		panic(err)
-	}
-
-	k.SetModuleVersionMap(ctx, updatedVM)
-
-	// incremement the protocol version and set it in state and baseapp
-	nextProtocolVersion := k.getProtocolVersion(ctx) + 1
-	k.setProtocolVersion(ctx, nextProtocolVersion)
-	if k.versionSetter != nil {
-		// set protocol version on BaseApp
-		k.versionSetter.SetProtocolVersion(nextProtocolVersion)
-	}
-
-	// Must clear IBC state after upgrade is applied as it is stored separately from the upgrade plan.
-	// This will prevent resubmission of upgrade msg after upgrade is already completed.
-	k.ClearIBCState(ctx, plan.Height)
-	k.ClearUpgradePlan(ctx)
-	k.SetDone(ctx, plan.Name)
-}
-```
-
-**File:** x/upgrade/types/keys.go (L19-30)
-```go
-const (
-	// PlanByte specifies the Byte under which a pending upgrade plan is stored in the store
-	PlanByte = 0x0
-	// DoneByte is a prefix for to look up completed upgrade plan by name
-	DoneByte = 0x1
-
-	// VersionMapByte is a prefix to look up module names (key) and versions (value)
-	VersionMapByte = 0x2
-
-	// ProtocolVersionByte is a prefix to look up Protocol Version
-	ProtocolVersionByte = 0x3
-
-```
-
-**File:** simapp/simd/cmd/root.go (L262-265)
-```go
-	skipUpgradeHeights := make(map[int64]bool)
-	for _, h := range cast.ToIntSlice(appOpts.Get(server.FlagUnsafeSkipUpgrades)) {
-		skipUpgradeHeights[int64(h)] = true
-	}
-```
-
-**File:** x/upgrade/doc.go (L128-134)
-```go
-However, let's assume that we don't realize the upgrade has a bug until shortly before it will occur
-(or while we try it out - hitting some panic in the migration). It would seem the blockchain is stuck,
-but we need to allow an escape for social consensus to overrule the planned upgrade. To do so, there's
-a --unsafe-skip-upgrades flag to the start command, which will cause the node to mark the upgrade
-as done upon hitting the planned upgrade height(s), without halting and without actually performing a migration.
-If over two-thirds run their nodes with this flag on the old binary, it will allow the chain to continue through
-the upgrade with a manual override. (This must be well-documented for anyone syncing from genesis later on).
-```
-
-**File:** x/upgrade/abci_test.go (L288-323)
-```go
-func TestSkipUpgradeSkippingAll(t *testing.T) {
-	var (
-		skipOne int64 = 11
-		skipTwo int64 = 20
-	)
-	s := setupTest(10, map[int64]bool{skipOne: true, skipTwo: true})
-
-	newCtx := s.ctx
-
-	req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
-	err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "test", Height: skipOne}})
-	require.NoError(t, err)
-
-	t.Log("Verify if skip upgrade flag clears upgrade plan in both cases")
-	VerifySet(t, map[int64]bool{skipOne: true, skipTwo: true})
-
-	newCtx = newCtx.WithBlockHeight(skipOne)
-	require.NotPanics(t, func() {
-		s.module.BeginBlock(newCtx, req)
-	})
-
-	t.Log("Verify a second proposal also is being cleared")
-	err = s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop2", Plan: types.Plan{Name: "test2", Height: skipTwo}})
-	require.NoError(t, err)
-
-	newCtx = newCtx.WithBlockHeight(skipTwo)
-	require.NotPanics(t, func() {
-		s.module.BeginBlock(newCtx, req)
-	})
-
-	// To ensure verification is being done only after both upgrades are cleared
-	t.Log("Verify if both proposals are cleared")
-	VerifyCleared(t, s.ctx)
-	VerifyNotDone(t, s.ctx, "test")
-	VerifyNotDone(t, s.ctx, "test2")
-}
+		resultStr = "failed"
+		// if we have a result, use those events instead of just the anteEvents
+		if result != nil {
+			return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(result.Events, app.indexEvents), app.trace)
+		}
+		return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(anteEvents, app.indexEvents), app.trace)
 ```

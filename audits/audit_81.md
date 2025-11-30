@@ -1,322 +1,309 @@
+Based on my thorough investigation of the codebase, I can confirm this **IS a valid vulnerability**. Here is my validation:
+
 # Audit Report
 
 ## Title
-Lack of Zero Voting Power Validation in Validator Set Updates Allows Complete Network Halt
+Unrecovered Panic in Governance Proposal Handler Causes Complete Network Halt
 
 ## Summary
-The `ApplyAndReturnValidatorSetUpdates` function in the staking module fails to validate that total voting power remains above zero before setting it. When all validators are simultaneously jailed due to mass downtime, the function sets total power to zero without validation, resulting in complete network shutdown as Tendermint/CometBFT cannot reach consensus with zero voting power. [1](#0-0) 
+The governance module's `EndBlocker` function executes proposal handlers without panic recovery. When a proposal handler panics during execution, the panic propagates uncaught through the entire call chain, causing all validator nodes to crash simultaneously at the same block height, resulting in a complete network shutdown. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** `x/staking/keeper/val_state_change.go`, lines 217-219 where total power is set without validation
+**Location:**
+- Primary: `x/gov/abci.go`, line 74 where the handler is invoked without panic recovery
+- Secondary: `baseapp/abci.go`, lines 178-201 where EndBlock lacks panic recovery [2](#0-1) 
 
-**Intended Logic:** The validator set update mechanism should maintain at least one validator with positive voting power to ensure the network can continue producing blocks and reaching consensus. The system should prevent scenarios where the entire validator set becomes powerless.
+**Intended logic:** 
+The governance EndBlocker should execute passed proposal handlers safely. If a handler fails, the proposal should be marked as failed and the chain should continue processing blocks. The cached context isolates state changes for rollback on error.
 
-**Actual Logic:** The function initializes `totalPower` to zero and only accumulates power from validators found in the power store iterator. When validators are jailed, they are removed from the power store via `DeleteValidatorByPowerIndex`. [2](#0-1)  If all validators are jailed simultaneously, the power store becomes empty, the iterator yields no validators, and `totalPower` remains at zero. The function then sets `totalPower` to zero without any validation check.
+**Actual logic:**
+The code only handles errors returned by the handler (`if err == nil` check), but provides no protection against panics. When a handler panics, it propagates uncaught through `gov.EndBlocker` → module manager's `EndBlock` → `BaseApp.EndBlock` → validator node crash. [3](#0-2) 
 
-**Exploitation Path:**
-1. Network-wide outage or mass validator downtime occurs (e.g., cloud provider failure, software bug, network partition)
-2. All validators miss blocks beyond the `maxMissed` threshold [3](#0-2) 
-3. All validators are jailed via `k.sk.Jail(ctx, consAddr)` [4](#0-3) 
-4. Each jailed validator is removed from the power store
-5. In the next EndBlock, `ApplyAndReturnValidatorSetUpdates` is called
-6. The power store iterator finds no validators (all removed when jailed)
-7. The loop doesn't accumulate any power, leaving `totalPower` at zero
-8. Previously bonded validators receive zero-power updates
-9. The function sets `totalPower` to zero and returns zero-power validator set to Tendermint
-10. Tendermint cannot reach consensus with zero total voting power (requires >2/3)
-11. Network halts completely - no new blocks can be produced
+**Exploitation path:**
+1. A module registers a governance proposal handler containing code that can panic (e.g., nil pointer dereference, array out of bounds, type assertion failure, or panic-inducing functions)
+2. A governance proposal of that type is submitted and passes through normal voting
+3. When the voting period ends, `gov.EndBlocker` executes during block finalization
+4. The handler is invoked and panics at line 74 of `x/gov/abci.go`
+5. No defer/recover exists in the call stack to catch the panic
+6. All validator nodes crash at the same block height due to deterministic execution
+7. Network completely halts - cannot produce new blocks
 
-**Security Guarantee Broken:** The fundamental consensus availability invariant is violated. A Proof-of-Stake blockchain must maintain at least one active validator with positive voting power to function.
+**Security guarantee broken:**
+Availability and fault tolerance. The chain should gracefully handle proposal handler failures without causing network-wide consensus failure. The SDK provides panic recovery in other critical paths (ProcessProposal, PrepareProposal, Query, runTx) but not in EndBlock. [4](#0-3) 
 
 ## Impact Explanation
 
-This vulnerability results in complete network shutdown with the following consequences:
+This vulnerability results in:
+- All validator nodes crashing simultaneously at the same block height
+- Complete network shutdown - no new blocks can be produced
+- All transaction processing halts
+- Network cannot reach consensus
+- Requires coordinated hard fork with patched binary to recover
+- Economic impact: trading halts, DeFi protocols freeze, funds temporarily inaccessible
 
-1. **No Block Production**: With zero total voting power, Tendermint/CometBFT cannot select a proposer or reach consensus on new blocks
-2. **Transaction Halt**: All pending and new transactions cannot be confirmed or executed  
-3. **State Freeze**: The blockchain state becomes permanently frozen at the last successfully committed block
-4. **Unrecoverable Without Hard Fork**: Since no transactions can execute (including unjail transactions), validators cannot recover themselves. Recovery requires coordinated manual intervention such as a hard fork with validator set restoration
-5. **Economic Damage**: Extended downtime causes loss of user confidence, potential loss of network value, and damage to ecosystem projects
-
-The impact matches the accepted category: "Network not being able to confirm new transactions (total network shutdown)" - Medium severity.
+This matches the approved impact: "Network not being able to confirm new transactions (total network shutdown)" classified as **Medium** severity.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** This is triggered by operational conditions affecting all validators simultaneously:
-- Infrastructure failures: Cloud provider outages, ISP failures
-- Software issues: Bugs in validator software affecting all nodes running the same version
-- Network conditions: Widespread DDoS attacks, network partitions
-- Operational errors: Misconfigured chain upgrades
+**Trigger requirements:**
+- Governance proposal must pass (requires majority token holder support)
+- Handler must contain code that can panic
 
-**Conditions Required:**
-- All validators must simultaneously exceed the downtime slashing threshold
-- Can realistically occur during network-wide infrastructure failures or software bugs
-- No privileged access or malicious intent required
+**Likelihood: Medium**
 
-**Frequency:**
-- Low probability under normal operations with geographically distributed, diverse validator infrastructure
-- Higher probability during major cloud provider outages, chain upgrades with bugs, or network-level attacks
+The likelihood is realistic because:
+1. Third-party modules commonly integrate custom proposal handlers
+2. Handlers can have implementation bugs: nil pointer dereferences, array bounds violations, type assertions, division by zero
+3. Real production code demonstrates panic-inducing patterns (e.g., `MustMarshal` in upgrade keeper) [5](#0-4) [6](#0-5) [7](#0-6) 
 
-While the likelihood is low, the catastrophic impact (complete network halt requiring hard fork) makes this a critical vulnerability. Defense-in-depth principles dictate that the application layer should validate its own invariants rather than relying solely on operational best practices.
+**Key justification:** This doesn't require malicious governance. A buggy handler from a legitimate module suffices. The exception clause applies: "unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." Governance's intended authority is to pass/fail proposals, not to halt the entire network.
 
 ## Recommendation
 
-Add validation in `ApplyAndReturnValidatorSetUpdates` to prevent zero total voting power:
+Add panic recovery to the governance EndBlocker or BaseApp's EndBlock, mirroring the pattern used in `ProcessProposal`: [8](#0-7) 
 
-```go
-// set total power on lookup index if there are any updates
-if len(updates) > 0 {
-    if totalPower.IsZero() {
-        return nil, fmt.Errorf("total voting power cannot be zero: this would halt the network")
-    }
-    k.SetLastTotalPower(ctx, totalPower)
-}
-```
+Specifically:
+1. Wrap the handler execution (around lines 67-92 in `x/gov/abci.go`) with a defer/recover block
+2. In the recovery handler:
+   - Log the panic details (proposal ID, type, stack trace)
+   - Mark the proposal as failed (`proposal.Status = types.StatusFailed`)
+   - Continue processing remaining proposals
+   - Return normally to prevent node crash
 
-Additional recommendations:
-1. **Genesis Validation**: Add checks during chain initialization to ensure at least one validator with positive power exists
-2. **Minimum Validator Check**: Consider adding a configurable minimum number of active validators required
-3. **Emergency Recovery Mechanism**: Document and implement emergency validator set recovery procedures
-4. **Monitoring and Alerting**: Implement alerts when total voting power drops below critical thresholds
+This provides defense-in-depth: even if a handler panics, the chain continues operating and the proposal is safely marked as failed.
 
 ## Proof of Concept
 
+While no executable PoC is provided, the vulnerability is evident from code inspection:
+
 **Setup:**
-1. Initialize test application with multiple validators having bonded status and positive voting power
-2. Apply initial validator set updates to establish the bonded validator set
-3. Verify the network has positive total voting power
+- Standard Cosmos SDK chain with governance module enabled
+- Custom proposal handler containing panic-inducing code (e.g., nil dereference, array out of bounds, type assertion failure)
 
 **Action:**
-1. Simulate mass jailing by setting all validators' `Jailed` flag to true
-2. Remove all validators from the power index via `DeleteValidatorByPowerIndex`
-3. Call `ApplyAndReturnValidatorSetUpdates` to process validator set changes
+- Submit and pass governance proposal
+- Advance to voting period end
+- `gov.EndBlocker` executes and calls the panicking handler
 
 **Result:**
-1. The function returns successfully without error
-2. All validator updates have zero power
-3. `GetLastTotalPower` returns zero
-4. This zero-power validator set would be sent to Tendermint, causing network halt
+- Panic propagates through call chain: handler → `gov.EndBlocker` → module manager → `BaseApp.EndBlock`
+- Validator node crashes
+- All validators crash at same height (deterministic execution)
+- Network halts
 
-The test would follow patterns in `x/staking/keeper/validator_test.go` using the `applyValidatorSetUpdates` helper function. [5](#0-4) 
+The existing test `TestEndBlockerProposalHandlerFailed` tests error handling but not panic scenarios, confirming this gap in defensive programming. [9](#0-8) 
 
 ## Notes
 
-This vulnerability has been validated through code analysis:
-- No validation exists in `SetLastTotalPower` [6](#0-5) 
-- No minimum validator checks in genesis validation [7](#0-6) 
-- The panic at line 133 ("should never retrieve a jailed validator from the power store") confirms jailed validators are removed from power store, but there's no safeguard for when ALL validators are jailed simultaneously
+This vulnerability is valid because:
+1. It matches an approved Medium severity impact ("network shutdown")
+2. The technical deficiency is objectively present (no panic recovery in EndBlock while other ABCI methods have it)
+3. ProcessProposal's panic recovery proves this is a known concern and expected defensive programming pattern
+4. Handler bugs are realistic in production systems
+5. The exception clause for privileged roles applies - governance inadvertently triggering network halt exceeds their intended authority
+6. The inconsistency with other handler execution paths (Query, ProcessProposal, PrepareProposal, runTx all have panic recovery) indicates an oversight, not intentional design
+7. Defense-in-depth is a reasonable expectation for critical blockchain infrastructure
 
 ### Citations
 
-**File:** x/staking/keeper/val_state_change.go (L108-222)
+**File:** x/gov/abci.go (L67-92)
 ```go
-func (k Keeper) ApplyAndReturnValidatorSetUpdates(ctx sdk.Context) (updates []abci.ValidatorUpdate, err error) {
-	params := k.GetParams(ctx)
-	maxValidators := params.MaxValidators
-	powerReduction := k.PowerReduction(ctx)
-	totalPower := sdk.ZeroInt()
-	amtFromBondedToNotBonded, amtFromNotBondedToBonded := sdk.ZeroInt(), sdk.ZeroInt()
+		if passes {
+			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
+			cacheCtx, writeCache := ctx.CacheContext()
 
-	// Retrieve the last validator set.
-	// The persistent set is updated later in this function.
-	// (see LastValidatorPowerKey).
-	last, err := k.getLastValidatorsByAddr(ctx)
-	if err != nil {
-		return nil, err
-	}
+			// The proposal handler may execute state mutating logic depending
+			// on the proposal content. If the handler fails, no state mutation
+			// is written and the error message is logged.
+			err := handler(cacheCtx, proposal.GetContent())
+			if err == nil {
+				proposal.Status = types.StatusPassed
+				tagValue = types.AttributeValueProposalPassed
+				logMsg = "passed"
 
-	// Iterate over validators, highest power to lowest.
-	iterator := k.ValidatorsPowerStoreIterator(ctx)
-	defer iterator.Close()
+				// The cached context is created with a new EventManager. However, since
+				// the proposal handler execution was successful, we want to track/keep
+				// any events emitted, so we re-emit to "merge" the events into the
+				// original Context's EventManager.
+				ctx.EventManager().EmitEvents(cacheCtx.EventManager().Events())
 
-	for count := 0; iterator.Valid() && count < int(maxValidators); iterator.Next() {
-		// everything that is iterated in this loop is becoming or already a
-		// part of the bonded validator set
-		valAddr := sdk.ValAddress(iterator.Value())
-		validator := k.mustGetValidator(ctx, valAddr)
-
-		if validator.Jailed {
-			panic("should never retrieve a jailed validator from the power store")
-		}
-
-		// if we get to a zero-power validator (which we don't bond),
-		// there are no more possible bonded validators
-		if validator.PotentialConsensusPower(k.PowerReduction(ctx)) == 0 {
-			break
-		}
-
-		// apply the appropriate state change if necessary
-		switch {
-		case validator.IsUnbonded():
-			validator, err = k.unbondedToBonded(ctx, validator)
-			if err != nil {
-				return
+				// write state to the underlying multi-store
+				writeCache()
+			} else {
+				proposal.Status = types.StatusFailed
+				tagValue = types.AttributeValueProposalFailed
+				logMsg = fmt.Sprintf("passed, but failed on execution: %s", err)
 			}
-			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
-		case validator.IsUnbonding():
-			validator, err = k.unbondingToBonded(ctx, validator)
-			if err != nil {
-				return
-			}
-			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
-		case validator.IsBonded():
-			// no state change
-		default:
-			panic("unexpected validator status")
+```
+
+**File:** baseapp/abci.go (L178-201)
+```go
+func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
+	// Clear DeliverTx Events
+	ctx.MultiStore().ResetEvents()
+
+	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
+
+	if app.endBlocker != nil {
+		res = app.endBlocker(ctx, req)
+		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	}
+
+	if cp := app.GetConsensusParams(ctx); cp != nil {
+		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
+	}
+
+	// call the streaming service hooks with the EndBlock messages
+	for _, streamingListener := range app.abciListeners {
+		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
+			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
 		}
-
-		// fetch the old power bytes
-		valAddrStr, err := sdk.Bech32ifyAddressBytes(sdk.GetConfig().GetBech32ValidatorAddrPrefix(), valAddr)
-		if err != nil {
-			return nil, err
-		}
-		oldPowerBytes, found := last[valAddrStr]
-		newPower := validator.ConsensusPower(powerReduction)
-		newPowerBytes := k.cdc.MustMarshal(&gogotypes.Int64Value{Value: newPower})
-
-		// update the validator set if power has changed
-		if !found || !bytes.Equal(oldPowerBytes, newPowerBytes) {
-			updates = append(updates, validator.ABCIValidatorUpdate(powerReduction))
-
-			k.SetLastValidatorPower(ctx, valAddr, newPower)
-		}
-
-		delete(last, valAddrStr)
-		count++
-
-		totalPower = totalPower.Add(sdk.NewInt(newPower))
 	}
 
-	noLongerBonded, err := sortNoLongerBonded(last)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, valAddrBytes := range noLongerBonded {
-		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
-		validator, err = k.bondedToUnbonding(ctx, validator)
-		if err != nil {
-			return
-		}
-		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
-		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
-		updates = append(updates, validator.ABCIValidatorUpdateZero())
-	}
-
-	// Update the pools based on the recent updates in the validator set:
-	// - The tokens from the non-bonded candidates that enter the new validator set need to be transferred
-	// to the Bonded pool.
-	// - The tokens from the bonded validators that are being kicked out from the validator set
-	// need to be transferred to the NotBonded pool.
-	switch {
-	// Compare and subtract the respective amounts to only perform one transfer.
-	// This is done in order to avoid doing multiple updates inside each iterator/loop.
-	case amtFromNotBondedToBonded.GT(amtFromBondedToNotBonded):
-		k.notBondedTokensToBonded(ctx, amtFromNotBondedToBonded.Sub(amtFromBondedToNotBonded))
-	case amtFromNotBondedToBonded.LT(amtFromBondedToNotBonded):
-		k.bondedTokensToNotBonded(ctx, amtFromBondedToNotBonded.Sub(amtFromNotBondedToBonded))
-	default: // equal amounts of tokens; no update required
-	}
-
-	// set total power on lookup index if there are any updates
-	if len(updates) > 0 {
-		k.SetLastTotalPower(ctx, totalPower)
-	}
-
-	return updates, err
+	return res
 }
 ```
 
-**File:** x/staking/keeper/val_state_change.go (L260-268)
+**File:** baseapp/abci.go (L1037-1052)
 ```go
-func (k Keeper) jailValidator(ctx sdk.Context, validator types.Validator) {
-	if validator.Jailed {
-		panic(fmt.Sprintf("cannot jail already jailed validator, validator: %v\n", validator))
-	}
-
-	validator.Jailed = true
-	k.SetValidator(ctx, validator)
-	k.DeleteValidatorByPowerIndex(ctx, validator)
-}
-```
-
-**File:** x/slashing/keeper/infractions.go (L96-122)
-```go
-	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
-		validator := k.sk.ValidatorByConsAddr(ctx, consAddr)
-		if validator != nil && !validator.IsJailed() {
-			// Downtime confirmed: slash and jail the validator
-			// We need to retrieve the stake distribution which signed the block, so we subtract ValidatorUpdateDelay from the evidence height,
-			// and subtract an additional 1 since this is the LastCommit.
-			// Note that this *can* result in a negative "distributionHeight" up to -ValidatorUpdateDelay-1,
-			// i.e. at the end of the pre-genesis block (none) = at the beginning of the genesis block.
-			// That's fine since this is just used to filter unbonding delegations & redelegations.
-			shouldSlash = true
-			distributionHeight := height - sdk.ValidatorUpdateDelay - 1
-			slashInfo = SlashInfo{
-				height:             height,
-				power:              power,
-				distributionHeight: distributionHeight,
-				minHeight:          minHeight,
-				minSignedPerWindow: minSignedPerWindow,
-			}
-			// This value is passed back and the validator is slashed and jailed appropriately
-		} else {
-			// validator was (a) not found or (b) already jailed so we do not slash
-			logger.Info(
-				"validator would have been slashed for downtime, but was either not found in store or already jailed",
-				"validator", consAddr.String(),
+	defer func() {
+		if err := recover(); err != nil {
+			app.logger.Error(
+				"panic recovered in PrepareProposal",
+				"height", req.Height,
+				"time", req.Time,
+				"panic", err,
 			)
+
+			resp = &abci.ResponsePrepareProposal{
+				TxRecords: utils.Map(req.Txs, func(tx []byte) *abci.TxRecord {
+					return &abci.TxRecord{Action: abci.TxRecord_UNMODIFIED, Tx: tx}
+				}),
+			}
 		}
-	}
+	}()
 ```
 
-**File:** x/staking/keeper/slash.go (L145-151)
+**File:** baseapp/abci.go (L1106-1118)
 ```go
-// jail a validator
-func (k Keeper) Jail(ctx sdk.Context, consAddr sdk.ConsAddress) {
-	validator := k.mustGetValidatorByConsAddr(ctx, consAddr)
-	k.jailValidator(ctx, validator)
-	logger := k.Logger(ctx)
-	logger.Info("validator jailed", "validator", consAddr)
+	defer func() {
+		if err := recover(); err != nil {
+			app.logger.Error(
+				"panic recovered in ProcessProposal",
+				"height", req.Height,
+				"time", req.Time,
+				"hash", fmt.Sprintf("%X", req.Hash),
+				"panic", err,
+			)
+
+			resp = &abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_REJECT}
+		}
+	}()
+```
+
+**File:** types/module/module.go (L642-670)
+```go
+func (m *Manager) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) abci.ResponseEndBlock {
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+	validatorUpdates := []abci.ValidatorUpdate{}
+	defer telemetry.MeasureSince(time.Now(), "module", "total_end_block")
+	for _, moduleName := range m.OrderEndBlockers {
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
+			continue
+		}
+		moduleStartTime := time.Now()
+		moduleValUpdates := module.EndBlock(ctx, req)
+		telemetry.ModuleMeasureSince(moduleName, moduleStartTime, "module", "end_block")
+		// use these validator updates if provided, the module manager assumes
+		// only one module will update the validator set
+		if len(moduleValUpdates) > 0 {
+			if len(validatorUpdates) > 0 {
+				panic("validator EndBlock updates already set by a previous module")
+			}
+
+			validatorUpdates = moduleValUpdates
+		}
+
+	}
+
+	return abci.ResponseEndBlock{
+		ValidatorUpdates: validatorUpdates,
+		Events:           ctx.EventManager().ABCIEvents(),
+	}
 }
 ```
 
-**File:** x/staking/keeper/validator_test.go (L1108-1120)
+**File:** x/upgrade/keeper/keeper.go (L200-201)
 ```go
-func applyValidatorSetUpdates(t *testing.T, ctx sdk.Context, k keeper.Keeper, expectedUpdatesLen int) []abci.ValidatorUpdate {
-	updates, err := k.ApplyAndReturnValidatorSetUpdates(ctx)
+	bz := k.cdc.MustMarshal(&plan)
+	store.Set(types.PlanKey(), bz)
+```
+
+**File:** codec/proto_codec.go (L46-53)
+```go
+func (pc *ProtoCodec) MustMarshal(o ProtoMarshaler) []byte {
+	bz, err := pc.Marshal(o)
+	if err != nil {
+		panic(err)
+	}
+
+	return bz
+}
+```
+
+**File:** simapp/app.go (L309-309)
+```go
+		AddRoute(upgradetypes.RouterKey, upgrade.NewSoftwareUpgradeProposalHandler(app.UpgradeKeeper))
+```
+
+**File:** x/gov/abci_test.go (L564-606)
+```go
+func TestEndBlockerProposalHandlerFailed(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+	addrs := simapp.AddTestAddrs(app, ctx, 1, valTokens)
+	params := app.StakingKeeper.GetParams(ctx)
+	params.MinCommissionRate = sdk.NewDec(0)
+	app.StakingKeeper.SetParams(ctx, params)
+
+	SortAddresses(addrs)
+
+	stakingHandler := staking.NewHandler(app.StakingKeeper)
+	app.FinalizeBlock(context.Background(), &abci.RequestFinalizeBlock{Height: app.LastBlockHeight() + 1})
+
+	valAddr := sdk.ValAddress(addrs[0])
+
+	createValidators(t, stakingHandler, ctx, []sdk.ValAddress{valAddr}, []int64{10})
+	staking.EndBlocker(ctx, app.StakingKeeper)
+
+	// Create a proposal where the handler will pass for the test proposal
+	// because the value of contextKeyBadProposal is true.
+	ctx = ctx.WithValue(contextKeyBadProposal, true)
+	proposal, err := app.GovKeeper.SubmitProposal(ctx, TestProposal)
 	require.NoError(t, err)
-	if expectedUpdatesLen >= 0 {
-		require.Equal(t, expectedUpdatesLen, len(updates), "%v", updates)
-	}
-	return utils.Map(updates, func(v abci.ValidatorUpdate) abci.ValidatorUpdate {
-		return abci.ValidatorUpdate{
-			PubKey: v.PubKey,
-			Power:  v.Power,
-		}
-	})
+
+	proposalCoins := sdk.NewCoins(sdk.NewCoin(sdk.DefaultBondDenom, app.StakingKeeper.TokensFromConsensusPower(ctx, 10)))
+	newDepositMsg := types.NewMsgDeposit(addrs[0], proposal.ProposalId, proposalCoins)
+
+	handleAndCheck(t, gov.NewHandler(app.GovKeeper), ctx, newDepositMsg)
+
+	err = app.GovKeeper.AddVote(ctx, proposal.ProposalId, addrs[0], types.NewNonSplitVoteOption(types.OptionYes))
+	require.NoError(t, err)
+
+	newHeader := ctx.BlockHeader()
+	newHeader.Time = ctx.BlockHeader().Time.Add(app.GovKeeper.GetDepositParams(ctx).MaxDepositPeriod).Add(app.GovKeeper.GetVotingParams(ctx).VotingPeriod)
+	ctx = ctx.WithBlockHeader(newHeader)
+
+	// Set the contextKeyBadProposal value to false so that the handler will fail
+	// during the processing of the proposal in the EndBlocker.
+	ctx = ctx.WithValue(contextKeyBadProposal, false)
+
+	// validate that the proposal fails/has been rejected
+	gov.EndBlocker(ctx, app.GovKeeper)
 }
-```
-
-**File:** x/staking/keeper/keeper.go (L95-98)
-```go
-func (k Keeper) SetLastTotalPower(ctx sdk.Context, power sdk.Int) {
-	store := ctx.KVStore(k.storeKey)
-	bz := k.cdc.MustMarshal(&sdk.IntProto{Int: power})
-	store.Set(types.LastTotalPowerKey, bz)
-```
-
-**File:** x/staking/genesis.go (L230-235)
-```go
-func ValidateGenesis(data *types.GenesisState) error {
-	if err := validateGenesisStateValidators(data.Validators); err != nil {
-		return err
-	}
-
-	return data.Params.Validate()
 ```

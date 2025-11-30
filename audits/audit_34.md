@@ -1,246 +1,240 @@
 # Audit Report
 
 ## Title
-Nil Pointer Dereference in Iterator Validation Causing Node Crash During Concurrent Transaction Processing
+Incorrect Slash Accounting for Redelegations When Destination Validator Has Been Slashed
 
 ## Summary
-A missing nil check in `validationIterator.Value()` causes a nil pointer dereference panic when `GetLatestBeforeIndex()` returns nil during iterator validation in the multiversion store. This causes validator nodes to crash when processing blocks with concurrent transactions that trigger iterator validation. [1](#0-0) 
+The `SlashRedelegation` function contains an accounting mismatch where it returns a theoretical slash amount based on `InitialBalance` but actually burns fewer tokens when the destination validator's exchange rate has decreased due to prior slashing. This causes systematic under-slashing that violates the protocol's core slashing invariant.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location**: `store/multiversion/memiterator.go`, lines 112-115
+**Location:** [1](#0-0)  and its interaction with the main Slash function at [2](#0-1) 
 
-**Intended logic**: The validation iterator should safely retrieve values from the multiversion store during transaction validation, handling cases where keys may have been modified or removed by concurrent transactions. When a key doesn't exist before a given index, the function should handle the nil return gracefully.
+**Intended Logic:** According to the protocol specification [3](#0-2) , when a validator is slashed, the total amount slashed must equal `slashFactor * power` at the infraction height. Each actual amount slashed from redelegations and unbonding delegations should be subtracted from the total slash amount, with the remaining amount slashed from the validator's bonded tokens.
 
-**Actual logic**: The code calls `GetLatestBeforeIndex()` at line 112 and immediately invokes `.IsEstimate()` at line 115 without checking if the returned value is nil. In Go, calling a method on a nil interface causes a panic, which is unrecoverable and terminates the process. [2](#0-1) 
+**Actual Logic:** The `SlashRedelegation` function calculates a theoretical slash amount as `slashFactor * entry.InitialBalance` and accumulates this in `totalSlashAmount`. However, the actual tokens burned are obtained by calling `Unbond()` which converts shares to tokens using the destination validator's current exchange rate via `TokensFromShares()` [4](#0-3) . When a destination validator has been slashed, its exchange rate decreases because slashing reduces `Tokens` without reducing `DelegatorShares` [5](#0-4) . This causes `tokensToBurn < slashAmount`, but the function returns `totalSlashAmount` (theoretical) not the actual burned amount. The main `Slash` function then subtracts this theoretical amount from `remainingSlashAmount`, resulting in total actual tokens burned being less than the protocol-specified amount.
 
-**Exploitation path**:
-1. User submits Transaction A which writes keys to the multiversion store
-2. User submits Transaction B which creates an iterator over a range including Transaction A's keys  
-3. Transaction A is re-executed with a new incarnation due to conflicts, writing a different set of keys
-4. The `removeOldWriteset()` function removes old keys from the multiversion store [3](#0-2) 
-5. During validation of Transaction B's iterator via `ValidateTransactionState()`, a validation iterator is created [4](#0-3) 
-6. The merge iterator calls `Value()` on the validation iterator for keys in the iteration range
-7. For a removed key, `GetLatestBeforeIndex()` returns nil (as documented in lines 87-88 and 92-93 of store.go)
-8. Calling `.IsEstimate()` on nil at line 115 triggers a panic, crashing the validator node
+**Exploitation Path:**
+1. Validator A commits a slashable infraction at height H1
+2. After H1, tokens are redelegated from A to B (creating redelegation entry with `InitialBalance` and `SharesDst`)
+3. Validator B is slashed for its own independent infraction, reducing its exchange rate (e.g., from 1.0 to 0.5)
+4. Validator A is slashed for the H1 infraction:
+   - `SlashRedelegation` calculates theoretical = `slashFactor * InitialBalance`
+   - Actual burn via `Unbond` = `slashFactor * SharesDst * currentExchangeRate`
+   - Since B was slashed: currentExchangeRate < 1.0, so actual burn < theoretical
+   - Function returns theoretical amount
+   - Main `Slash` subtracts theoretical from `remainingSlashAmount`
+   - Validator A's bonded tokens are slashed by the remaining amount
+   - Total actual burn < `slashFactor * power` (protocol violation)
 
-**Security guarantee broken**: Memory safety and node availability. The code violates Go's requirement to check interface values for nil before dereferencing, causing unrecoverable panics that terminate validator processes.
+**Security Guarantee Broken:** The protocol invariant that validators must be slashed by exactly `slashFactor * power` at the infraction height is violated. This allows validators to escape proportional punishment through redelegations to subsequently-slashed validators.
 
 ## Impact Explanation
 
-This vulnerability causes validator nodes to crash during block processing when specific transaction patterns occur:
+This vulnerability weakens the economic security model by enabling systematic under-slashing of misbehaving validators. During cascading slashing events (multiple validators slashed in sequence), the source validator escapes proportional punishment when their redelegations point to validators that get slashed first.
 
-- **Node Crashes**: When the panic occurs, the validator process terminates immediately
-- **Network Disruption**: Multiple validators processing the same block with conflicting transactions will crash simultaneously, as they all execute the same validation logic
-- **Denial of Service**: Attackers can craft transaction sequences to reliably trigger this condition and crash validators
-- **Consensus Delays**: If sufficient validators crash (>= 30%), block finalization is delayed until nodes restart
-
-The vulnerability affects the core optimistic concurrency control mechanism used for parallel transaction execution, which is specifically designed to handle high-conflict scenarios.
+For example, with a validator having 1000 tokens at infraction height, 400 tokens redelegated to a validator that subsequently gets slashed 50%, and then the source validator slashed 50%: the shortfall is 100 tokens (20% of the intended 500-token punishment). This accumulates across multiple redelegations and slashing events, reducing the effectiveness of the slashing mechanism in deterring validator misbehavior. Fewer tokens are burned than the protocol specifies, affecting both token supply accounting and the security guarantee that validators face full financial consequences for infractions.
 
 ## Likelihood Explanation
 
-**Medium-to-High likelihood**:
+**Who Can Trigger:** Any network participant through normal operations—no special privileges required.
 
-- **Who can trigger**: Any user submitting transactions to the network - no special privileges required
-- **Conditions**: Requires transactions that create iterators while other transactions modify their writesets and get re-executed due to conflicts
-- **Frequency**: Transaction conflicts and re-executions are normal in optimistic concurrency control systems. While the exact sequence is complex, it can occur during normal network operation under high load or be deliberately induced by an attacker submitting crafted transaction sequences
+**Conditions Required:**
+1. A validator commits a slashable infraction (double-signing, downtime, etc.)
+2. After the infraction, delegators redelegate from that validator to another (routine operation)
+3. The destination validator gets slashed for its own independent infraction
+4. The source validator's infraction is detected and slashed
 
-The codebase demonstrates awareness of this issue in other locations where proper nil checks exist [5](#0-4) , confirming that `GetLatestBeforeIndex()` returning nil is an expected condition that should be handled.
+**Frequency:** This occurs naturally during network instability periods when multiple validators are slashed. The vulnerability is systemic and manifests whenever the conditions align. It can also be strategically exploited by sophisticated actors who commit infractions, then redelegate to risky validators they control or anticipate will be slashed, thereby reducing their total slashing penalty when their original infraction is discovered.
 
 ## Recommendation
 
-Add a nil check before calling methods on the value returned by `GetLatestBeforeIndex()`, matching the pattern used elsewhere in the codebase:
+Modify `SlashRedelegation` to return the actual burned amount rather than the theoretical amount:
 
-```go
-val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+1. Track the cumulative actual `tokensToBurn` from all redelegation entries instead of the theoretical `slashAmount`
+2. Accumulate `tokensToBurn` (obtained from `Unbond`) to `totalSlashAmount` instead of accumulating the theoretical `slashAmount`
+3. Return the sum of actual `tokensToBurn` values
 
-// Check for nil before accessing methods
-if val == nil {
-    // Key doesn't exist in multiversion store before this index
-    // Return nil to indicate the key should be fetched from parent store
-    return nil
-}
+Alternatively, implement a two-phase approach:
+1. Record both theoretical and actual amounts during redelegation slashing
+2. Track the shortfall between theoretical and actual burns
+3. Adjust the validator's bonded token slash to compensate for any shortfall
 
-if val.IsEstimate() {
-    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-}
-
-if val.IsDeleted() {
-    vi.readCache[string(key)] = nil
-    return nil
-}
-vi.readCache[string(key)] = val.Value()
-return val.Value()
-```
+This ensures the slashing invariant is maintained: total actual tokens burned = `slashFactor * power` at infraction height.
 
 ## Proof of Concept
 
-The vulnerability is confirmed by multiple pieces of evidence from the codebase:
+**File:** `x/staking/keeper/slash_test.go`
+**Function:** `TestSlashRedelegationWithSlashedDestination` (to be added)
 
-**Setup**: The multiversion store's optimistic concurrency control system processes transactions in parallel and validates them for conflicts.
+**Setup:**
+1. Bootstrap test environment with validators A and B, each with 1000 tokens (power=10)
+2. Create delegator with sufficient funds
+3. Create redelegation from validator A to B of 400 tokens at height 11
+4. Mark validator A's infraction at height 10
 
-**Action**: 
-1. Transaction 0 writes keys {key1, key2, key3} with incarnation 1
-2. Transaction 1 creates an iterator that reads these keys
-3. Transaction 0 re-executes with incarnation 2, writing only {key1, key3}
-4. `removeOldWriteset()` removes key2 from the multiversion store
-5. `ValidateTransactionState(1)` is called to validate Transaction 1
+**Action:**
+1. Slash validator B by 50% at height 12 (reduces B's exchange rate from 1.0 to 0.5)
+2. Record bonded pool balance before slashing A
+3. Slash validator A by 50% at height 13 for infraction at height 10
+4. Record bonded pool balance after slashing A
 
-**Result**:
-- The validation iterator is created and iterates over the expected key range
-- When `Value()` is called for a key that was removed, `GetLatestBeforeIndex()` returns nil
-- The code attempts to call `.IsEstimate()` on nil at line 115
-- A nil pointer dereference panic occurs, crashing the validator node
+**Result:**
+- Theoretical slash for redelegation: 50% × 400 = 200 tokens
+- Actual burn from redelegation: 50% × 400 shares × 0.5 exchange rate = 100 tokens
+- Total intended slash: 50% × 1000 = 500 tokens
+- Redelegation theoretical amount subtracted from remaining: 200 tokens
+- Remaining slash from A's bonded tokens: 500 - 200 = 300 tokens
+- Total actual tokens burned: 100 + 300 = 400 tokens
+- **Expected: 500 tokens, Actual: 400 tokens, Shortfall: 100 tokens (20% under-slash)**
 
-**Evidence**:
-1. `GetLatestBeforeIndex()` explicitly returns nil in documented cases [2](#0-1) 
-2. Tests confirm nil returns are expected behavior [6](#0-5) 
-3. Other code paths properly check for nil before method calls [5](#0-4) 
-4. The vulnerable code path lacks this essential check [1](#0-0) 
+The bonded pool balance decrease confirms only 400 tokens are burned instead of the protocol-specified 500 tokens, demonstrating a violation of the slashing invariant.
 
 ## Notes
 
-This vulnerability matches the accepted impact criteria: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"** (Medium severity). The issue can be triggered through normal transaction submission without requiring administrative privileges or brute force attacks. The missing nil check is a clear programming error where the codebase demonstrates awareness of the issue in other locations but fails to apply the same defensive programming pattern in this critical path.
+The function comment at [6](#0-5)  indicates that returning theoretical amounts is intentional for handling insufficient stake scenarios. However, this design is incorrectly applied to redelegations when the destination validator has been independently slashed. In this case, the shortfall is not due to previous slashing of the same stake (which the design handles), but due to an independent validator's slashing event changing the exchange rate. This causes the total actual burn to be less than the protocol-specified `slashFactor * power`, violating the fundamental slashing invariant. This distinguishes the vulnerability from the intended behavior described in the comment.
 
 ### Citations
 
-**File:** store/multiversion/memiterator.go (L99-126)
+**File:** x/staking/keeper/slash.go (L93-102)
 ```go
-func (vi *validationIterator) Value() []byte {
-	key := vi.Iterator.Key()
-
-	// try fetch from writeset - return if exists
-	if val, ok := vi.writeset[string(key)]; ok {
-		return val
-	}
-	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
-	if val, ok := vi.readCache[string(key)]; ok {
-		return val
-	}
-
-	// get the value from the multiversion store
-	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
-
-	// if we have an estimate, write to abort channel
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-	}
-
-	// if we have a deleted value, return nil
-	if val.IsDeleted() {
-		vi.readCache[string(key)] = nil
-		return nil
-	}
-	vi.readCache[string(key)] = val.Value()
-	return val.Value()
-}
-```
-
-**File:** store/multiversion/store.go (L82-97)
-```go
-// GetLatestBeforeIndex implements MultiVersionStore.
-func (s *Store) GetLatestBeforeIndex(index int, key []byte) (value MultiVersionValueItem) {
-	keyString := string(key)
-	mvVal, found := s.multiVersionMap.Load(keyString)
-	// if the key doesn't exist in the overall map, return nil
-	if !found {
-		return nil
-	}
-	val, found := mvVal.(MultiVersionValue).GetLatestBeforeIndex(index)
-	// otherwise, we may have found a value for that key, but its not written before the index passed in
-	if !found {
-		return nil
-	}
-	// found a value prior to the passed in index, return that value (could be estimate OR deleted, but it is a definitive value)
-	return val
-}
-```
-
-**File:** store/multiversion/store.go (L112-138)
-```go
-func (s *Store) removeOldWriteset(index int, newWriteSet WriteSet) {
-	writeset := make(map[string][]byte)
-	if newWriteSet != nil {
-		// if non-nil writeset passed in, we can use that to optimize removals
-		writeset = newWriteSet
-	}
-	// if there is already a writeset existing, we should remove that fully
-	oldKeys, loaded := s.txWritesetKeys.LoadAndDelete(index)
-	if loaded {
-		keys := oldKeys.([]string)
-		// we need to delete all of the keys in the writeset from the multiversion store
-		for _, key := range keys {
-			// small optimization to check if the new writeset is going to write this key, if so, we can leave it behind
-			if _, ok := writeset[key]; ok {
-				// we don't need to remove this key because it will be overwritten anyways - saves the operation of removing + rebalancing underlying btree
+		// Iterate through redelegations from slashed source validator
+		redelegations := k.GetRedelegationsFromSrcValidator(ctx, operatorAddress)
+		for _, redelegation := range redelegations {
+			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
+			if amountSlashed.IsZero() {
 				continue
 			}
-			// remove from the appropriate item if present in multiVersionMap
-			mvVal, found := s.multiVersionMap.Load(key)
-			// if the key doesn't exist in the overall map, return nil
-			if !found {
-				continue
-			}
-			mvVal.(MultiVersionValue).Remove(index)
+
+			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
+		}
+```
+
+**File:** x/staking/keeper/slash.go (L214-217)
+```go
+// return the amount that would have been slashed assuming
+// the unbonding delegation had enough stake to slash
+// (the amount actually slashed may be less if there's
+// insufficient stake remaining)
+```
+
+**File:** x/staking/keeper/slash.go (L219-296)
+```go
+func (k Keeper) SlashRedelegation(ctx sdk.Context, srcValidator types.Validator, redelegation types.Redelegation,
+	infractionHeight int64, slashFactor sdk.Dec) (totalSlashAmount sdk.Int) {
+	now := ctx.BlockHeader().Time
+	totalSlashAmount = sdk.ZeroInt()
+	bondedBurnedAmount, notBondedBurnedAmount := sdk.ZeroInt(), sdk.ZeroInt()
+
+	// perform slashing on all entries within the redelegation
+	for _, entry := range redelegation.Entries {
+		// If redelegation started before this height, stake didn't contribute to infraction
+		if entry.CreationHeight < infractionHeight {
+			continue
+		}
+
+		if entry.IsMature(now) {
+			// Redelegation no longer eligible for slashing, skip it
+			continue
+		}
+
+		// Calculate slash amount proportional to stake contributing to infraction
+		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+		slashAmount := slashAmountDec.TruncateInt()
+		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+
+		// Unbond from target validator
+		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
+		if sharesToUnbond.IsZero() {
+			continue
+		}
+
+		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
+		if err != nil {
+			panic(err)
+		}
+
+		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
+
+		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
+		if !found {
+			// If deleted, delegation has zero shares, and we can't unbond any more
+			continue
+		}
+
+		if sharesToUnbond.GT(delegation.Shares) {
+			sharesToUnbond = delegation.Shares
+		}
+
+		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
+		if err != nil {
+			panic(fmt.Errorf("error unbonding delegator: %v", err))
+		}
+
+		dstValidator, found := k.GetValidator(ctx, valDstAddr)
+		if !found {
+			panic("destination validator not found")
+		}
+
+		// tokens of a redelegation currently live in the destination validator
+		// therefor we must burn tokens from the destination-validator's bonding status
+		switch {
+		case dstValidator.IsBonded():
+			bondedBurnedAmount = bondedBurnedAmount.Add(tokensToBurn)
+		case dstValidator.IsUnbonded() || dstValidator.IsUnbonding():
+			notBondedBurnedAmount = notBondedBurnedAmount.Add(tokensToBurn)
+		default:
+			panic("unknown validator status")
 		}
 	}
+
+	if err := k.burnBondedTokens(ctx, bondedBurnedAmount); err != nil {
+		panic(err)
+	}
+
+	if err := k.burnNotBondedTokens(ctx, notBondedBurnedAmount); err != nil {
+		panic(err)
+	}
+
+	return totalSlashAmount
 }
 ```
 
-**File:** tasks/scheduler.go (L166-183)
+**File:** x/staking/spec/02_state_transitions.md (L131-138)
+```markdown
+- The total `slashAmount` is calculated as the `slashFactor` (a chain parameter) \* `TokensFromConsensusPower`,
+  the total number of tokens bonded to the validator at the time of the infraction.
+- Every unbonding delegation and pseudo-unbonding redelegation such that the infraction occured before the unbonding or
+  redelegation began from the validator are slashed by the `slashFactor` percentage of the initialBalance.
+- Each amount slashed from redelegations and unbonding delegations is subtracted from the
+  total slash amount.
+- The `remaingSlashAmount` is then slashed from the validator's tokens in the `BondedPool` or
+  `NonBondedPool` depending on the validator's status. This reduces the total supply of tokens.
+```
+
+**File:** x/staking/types/validator.go (L304-306)
 ```go
-func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
-	var conflicts []int
-	uniq := make(map[int]struct{})
-	valid := true
-	for _, mv := range s.multiVersionStores {
-		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
-		for _, c := range mvConflicts {
-			if _, ok := uniq[c]; !ok {
-				conflicts = append(conflicts, c)
-				uniq[c] = struct{}{}
-			}
-		}
-		// any non-ok value makes valid false
-		valid = valid && ok
-	}
-	sort.Ints(conflicts)
-	return valid, conflicts
+func (v Validator) TokensFromShares(shares sdk.Dec) sdk.Dec {
+	return (shares.MulInt(v.Tokens)).Quo(v.DelegatorShares)
 }
 ```
 
-**File:** store/multiversion/mvkv.go (L161-176)
+**File:** x/staking/types/validator.go (L393-405)
 ```go
-	mvsValue := store.multiVersionStore.GetLatestBeforeIndex(store.transactionIndex, key)
-	if mvsValue != nil {
-		if mvsValue.IsEstimate() {
-			abort := scheduler.NewEstimateAbort(mvsValue.Index())
-			store.WriteAbort(abort)
-			panic(abort)
-		} else {
-			// This handles both detecting readset conflicts and updating readset if applicable
-			return store.parseValueAndUpdateReadset(strKey, mvsValue)
-		}
+func (v Validator) RemoveTokens(tokens sdk.Int) Validator {
+	if tokens.IsNegative() {
+		panic(fmt.Sprintf("should not happen: trying to remove negative tokens %v", tokens))
 	}
-	// if we didn't find it in the multiversion store, then we want to check the parent store + add to readset
-	parentValue := store.parent.Get(key)
-	store.UpdateReadSet(key, parentValue)
-	return parentValue
+
+	if v.Tokens.LT(tokens) {
+		panic(fmt.Sprintf("should not happen: only have %v tokens, trying to remove %v", v.Tokens, tokens))
+	}
+
+	v.Tokens = v.Tokens.Sub(tokens)
+
+	return v
 }
-```
-
-**File:** store/multiversion/store_test.go (L152-160)
-```go
-	// try replacing writeset1 to verify old keys removed
-	writeset1_b := make(map[string][]byte)
-	writeset1_b["key1"] = []byte("value4")
-
-	mvs.SetWriteset(1, 2, writeset1_b)
-	require.Equal(t, []byte("value4"), mvs.GetLatestBeforeIndex(2, []byte("key1")).Value())
-	require.Nil(t, mvs.GetLatestBeforeIndex(2, []byte("key2")))
-	// verify that GetLatest for key3 returns nil - because of removal from writeset
-	require.Nil(t, mvs.GetLatest([]byte("key3")))
 ```

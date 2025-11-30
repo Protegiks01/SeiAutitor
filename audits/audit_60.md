@@ -1,205 +1,266 @@
 # Audit Report
 
 ## Title
-Concurrent Capability Creation Race Condition Causes Non-Deterministic Consensus Failure
+Governance Vote Weight Manipulation via Nested Message Validation Bypass in MsgExec
 
 ## Summary
-The capability module's `NewCapability` function writes to a shared `capMap` without synchronization during concurrent transaction execution. This creates a data race where different validators end up with different capability objects mapped to the same index, causing non-deterministic authentication results and consensus failure.
+The `MsgExec` message in the authz module fails to recursively validate nested messages, allowing attackers to bypass `ValidateBasic()` checks on `MsgVoteWeighted`. This enables submission of governance votes with total weight exceeding 1.0, amplifying voting influence beyond actual voting power.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location**: `x/capability/keeper/keeper.go` line 260 in the `NewCapability` function
+**Location:**
+- [1](#0-0) 
+- [2](#0-1) 
+- [3](#0-2) 
+- [4](#0-3) 
+- [5](#0-4) 
 
-**Intended Logic**: The capability module should provide deterministic capability creation and authentication across all validators. Each capability index should map to exactly one capability object, ensuring consistent authentication results across all nodes.
+**Intended Logic:**
+All transaction messages should have their `ValidateBasic()` method called during ante handler processing. For `MsgVoteWeighted`, this validation ensures total weight equals exactly 1.0 as shown in [6](#0-5) 
 
-**Actual Logic**: 
-The sei-cosmos blockchain uses a scheduler that executes transactions concurrently in multiple goroutines with 20 workers by default. [1](#0-0) [2](#0-1) 
+**Actual Logic:**
+The ante handler only validates top-level messages via [7](#0-6) . When `MsgExec` is submitted, only its `ValidateBasic()` is called, which does not validate nested messages. During execution, when granter equals grantee (voter acting on their own behalf), the authorization check is skipped and the message handler is invoked directly without nested message validation. The `AddVote()` function only validates individual option weights, not total weight across all options.
 
-All `ScopedKeeper` instances share the same `capMap` reference: [3](#0-2) 
+**Exploitation Path:**
+1. Attacker creates `MsgExec` with grantee set to their own address
+2. Nests `MsgVoteWeighted` with voter = their address and multiple options with total weight > 1.0 (e.g., {Yes: 0.9, Abstain: 0.9})
+3. Transaction passes ante handler validation via [8](#0-7)  since only `MsgExec.ValidateBasic()` is checked
+4. During execution in `DispatchActions()`, the granter (from `MsgVoteWeighted.GetSigners()[0]`) equals grantee (from MsgExec), so authorization check is skipped
+5. `VoteWeighted` handler calls `keeper.AddVote()` which validates each option individually (both 0.9 ≤ 1.0) but not the total weight
+6. Vote is stored with total weight 1.8
+7. During tally, voting power is multiplied by each weight and accumulated, giving amplified influence
 
-The `capMap` is a plain Go map without synchronization: [4](#0-3) 
-
-When multiple transactions concurrently execute `NewCapability`, both write to `capMap[index]` without synchronization: [5](#0-4) 
-
-The OCC scheduler only tracks KVStore operations via multiversion stores [6](#0-5) , not plain Go maps. When a transaction is aborted, its KVStore writes are rolled back, but the `capMap[index]` write may persist.
-
-**Exploitation Path**:
-1. User submits transactions that call `NewCapability` (e.g., IBC operations)
-2. Scheduler executes transactions concurrently in worker goroutines
-3. Two transactions read the same index, create different capability objects (`capA`, `capB`)
-4. Both race on writing to `capMap[index]` (unsynchronized)
-5. OCC detects KVStore conflict and aborts one transaction
-6. KVStore writes are rolled back, but `capMap[index]` may contain either `capA` or `capB` depending on race outcome
-7. Different validators have different goroutine scheduling → different race outcomes → different `capMap` contents
-8. Later `GetCapability` calls [7](#0-6)  return different capability objects on different validators
-9. `AuthenticateCapability` uses `FwdCapabilityKey` which encodes the capability's memory address: [8](#0-7) 
-10. For the wrong capability object, authentication fails because the memStore key was rolled back
-11. Different validators produce different authentication results → different transaction outcomes → different state roots → consensus failure
-
-**Security Guarantee Broken**: Deterministic consensus - identical transaction sequences must produce identical state across all validators.
+**Security Guarantee Broken:**
+The governance voting invariant that each voter's influence equals exactly their voting power. The total weight constraint (must equal 1.0) can be violated, allowing arbitrary vote amplification up to 4x (using all vote options at 0.9 each).
 
 ## Impact Explanation
 
-This vulnerability affects the fundamental consensus mechanism:
+This vulnerability enables manipulation of governance proposals by allowing voters to amplify their influence beyond their actual voting power. An attacker with voting power of 100 who votes {Yes: 0.9, Abstain: 0.9} contributes 90 to Yes votes while also adding 90 to Abstain votes. During threshold calculation using the formula at [9](#0-8) , `results[Yes] / (totalVotingPower - results[Abstain])`, this yields 90/(100-90) = 900% versus normal 100/(100-0) = 100%.
 
-- **Scope**: All capability-based operations (IBC channels, ports, authorizations) become non-deterministic
-- **Consequence**: Validators disagree on capability authentication results, computing different state roots for identical transaction sequences
-- **Network Effect**: The blockchain will halt or permanently split when validators cannot reach consensus on block validity
-- **Recovery**: Requires a hard fork to fix the race condition and resync the network
-
-The code already acknowledges that `capMap` doesn't revert properly: [9](#0-8) 
+Governance in Cosmos chains controls critical functions including protocol parameter changes, software upgrades, and treasury management. Manipulation could lead to unauthorized parameter changes, malicious upgrades, or improper fund allocations. While no concrete funds are at immediate direct risk from the vote manipulation itself, the governance system's integrity is compromised, qualifying this as "unintended behavior with no concrete funds at direct risk" per the Medium severity criteria.
 
 ## Likelihood Explanation
 
-**Triggering Actors**: Any user submitting transactions that create capabilities
+**Triggerable by:** Any network participant with voting power (staked tokens)
 
-**Required Conditions**:
-- Concurrent transaction execution (enabled by default with 20 workers)
-- At least two transactions in the same block calling `NewCapability`
-- Transactions executing concurrently and reading the same capability index
+**Conditions:**
+- Active governance proposal in voting period
+- Standard transaction submission capability
+- No special privileges required
 
-**Frequency Assessment**:
-- High likelihood during normal operations
-- Default configuration uses 20 concurrent workers, maximizing race window
-- Probability increases with block size and transaction throughput
-- The race is probabilistic but inevitable under sustained traffic
-- Once triggered, all subsequent authentications for that capability index are affected
+**Frequency:** Exploitable deterministically on any governance proposal. The attack requires no timing, race conditions, or rare circumstances. Any token holder can execute this attack at will during any active voting period. The amplification factor can reach up to 4x by using all four vote options (Yes, No, Abstain, NoWithVeto) each at 0.9 weight.
 
 ## Recommendation
 
-Replace the plain `map[uint64]*types.Capability` with `sync.Map` for thread-safe concurrent access, or protect all `capMap` access with a `sync.RWMutex`:
+Modify `MsgExec.ValidateBasic()` to recursively validate all nested messages:
 
 ```go
-// Option 1: Use sync.Map
-type Keeper struct {
-    capMap sync.Map  // instead of map[uint64]*types.Capability
-    ...
-}
+func (msg MsgExec) ValidateBasic() error {
+    _, err := sdk.AccAddressFromBech32(msg.Grantee)
+    if err != nil {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+    }
 
-// Option 2: Add mutex protection
-type Keeper struct {
-    capMapMu sync.RWMutex
-    capMap   map[uint64]*types.Capability
-    ...
+    if len(msg.Msgs) == 0 {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+    }
+
+    // Validate all nested messages
+    msgs, err := msg.GetMessages()
+    if err != nil {
+        return err
+    }
+    
+    for _, m := range msgs {
+        if err := m.ValidateBasic(); err != nil {
+            return err
+        }
+    }
+
+    return nil
 }
 ```
-
-All reads must use `RLock()`/`RUnlock()` and all writes must use `Lock()`/`Unlock()` to ensure atomicity during concurrent execution.
 
 ## Proof of Concept
 
-**File**: `x/capability/keeper/keeper_test.go`
+**Setup:**
+1. Create a test chain environment with governance module enabled
+2. Create an attacker account with voting power
+3. Submit a governance proposal and wait for voting period to begin
 
-**Test Function**: `TestConcurrentCapabilityRaceCondition`
+**Action:**
+```go
+// Create malicious vote with total weight > 1.0
+maliciousVote := &types.MsgVoteWeighted{
+    ProposalId: proposal.ProposalId,
+    Voter:      attacker.String(),
+    Options: types.WeightedVoteOptions{
+        {Option: types.OptionYes, Weight: sdk.MustNewDecFromStr("0.9")},
+        {Option: types.OptionAbstain, Weight: sdk.MustNewDecFromStr("0.9")},
+    },
+}
 
-**Setup**:
-1. Initialize capability keeper with two scoped modules
-2. Initialize memory store
-3. Create two goroutines that will execute concurrently
+// Direct submission would fail ValidateBasic (total = 1.8)
+err := maliciousVote.ValidateBasic()
+// Expected: Error "Total weight overflow 1.00"
 
-**Action**:
-1. Launch two goroutines that simultaneously call `NewCapability`
-2. Both read the same index and create different capability objects
-3. Both race on writing to `capMap[index]`
-4. Simulate OCC aborting one transaction (roll back its memStore writes)
-5. Retrieve capability via `GetCapability` and authenticate via `AuthenticateCapability`
+// Wrap in MsgExec to bypass validation
+msgExec := authz.NewMsgExec(attacker, []sdk.Msg{maliciousVote})
+err = msgExec.ValidateBasic()
+// Expected: Success (no error, nested message not validated)
 
-**Result**:
-1. Running with `go test -race` detects data race on `capMap[index]`
-2. Different test runs produce different authentication outcomes depending on race timing
-3. When `capMap[index]` contains the wrong capability object, authentication fails
-4. This demonstrates non-deterministic behavior from identical transaction sequences
+// Submit transaction and execute
+txBytes := encodeTx(msgExec)
+_, _, _, err = app.BaseApp.DeliverTx(abci.RequestDeliverTx{Tx: txBytes})
+// Expected: Success
+```
+
+**Result:**
+```go
+// Verify vote stored with invalid total weight
+vote, found := app.GovKeeper.GetVote(ctx, proposal.ProposalId, attacker)
+require.True(t, found)
+totalWeight := vote.Options[0].Weight.Add(vote.Options[1].Weight)
+require.True(t, totalWeight.GT(sdk.OneDec())) // Total = 1.8 > 1.0
+
+// Verify amplified voting power during tally
+// With votingPower = 100:
+// results[Yes] = 90, results[Abstain] = 90, totalVotingPower = 100
+// Threshold = 90 / (100 - 90) = 900% vs normal 100%
+```
 
 ## Notes
 
-The vulnerability exists in production code and affects consensus determinism under the default concurrent execution configuration. The issue is acknowledged in comments but not properly mitigated for the race condition scenario.
+The vulnerability is valid and exploitable through code path analysis confirmed by examining [1](#0-0) , [2](#0-1) , and [3](#0-2) . The attack requires no special privileges and can be executed by any token holder. This constitutes a Medium severity issue per the impact category "A bug in network code that results in unintended behavior with no concrete funds at direct risk."
 
 ### Citations
 
-**File:** server/config/config.go (L25-26)
+**File:** x/authz/msgs.go (L221-232)
 ```go
-	// DefaultConcurrencyWorkers defines the default workers to use for concurrent transactions
-	DefaultConcurrencyWorkers = 20
-```
-
-**File:** baseapp/abci.go (L266-266)
-```go
-	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
-```
-
-**File:** x/capability/keeper/keeper.go (L33-33)
-```go
-		capMap        map[uint64]*types.Capability
-```
-
-**File:** x/capability/keeper/keeper.go (L83-89)
-```go
-	return ScopedKeeper{
-		cdc:      k.cdc,
-		storeKey: k.storeKey,
-		memKey:   k.memKey,
-		capMap:   k.capMap,
-		module:   moduleName,
-	}
-```
-
-**File:** x/capability/keeper/keeper.go (L260-260)
-```go
-	sk.capMap[index] = cap
-```
-
-**File:** x/capability/keeper/keeper.go (L361-388)
-```go
-func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
-	if strings.TrimSpace(name) == "" {
-		return nil, false
-	}
-	memStore := ctx.KVStore(sk.memKey)
-
-	key := types.RevCapabilityKey(sk.module, name)
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-
-	if len(indexBytes) == 0 {
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-
-		return nil, false
+func (msg MsgExec) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
 	}
 
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
+	if len(msg.Msgs) == 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
 	}
 
-	return cap, true
+	return nil
 }
 ```
 
-**File:** tasks/scheduler.go (L309-309)
+**File:** x/authz/keeper/keeper.go (L87-111)
 ```go
-	start(workerCtx, s.executeCh, workers)
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
 ```
 
-**File:** x/capability/types/keys.go (L39-50)
+**File:** x/gov/keeper/vote.go (L21-25)
 ```go
-// FwdCapabilityKey returns a forward lookup key for a given module and capability
-// reference.
-func FwdCapabilityKey(module string, cap *Capability) []byte {
-	// encode the key to a fixed length to avoid breaking consensus state machine
-	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
-	// the length 10 is picked so it's backward compatible on common architectures.
-	key := fmt.Sprintf("%#010p", cap)
-	if len(key) > 10 {
-		key = key[len(key)-10:]
+	for _, option := range options {
+		if !types.ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
+		}
 	}
-	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
-}
+```
+
+**File:** x/gov/types/vote.go (L80-84)
+```go
+func ValidWeightedVoteOption(option WeightedVoteOption) bool {
+	if !option.Weight.IsPositive() || option.Weight.GT(sdk.NewDec(1)) {
+		return false
+	}
+	return ValidVoteOption(option.Option)
+```
+
+**File:** x/gov/keeper/tally.go (L59-62)
+```go
+				for _, option := range vote.Options {
+					subPower := votingPower.Mul(option.Weight)
+					results[option.Option] = results[option.Option].Add(subPower)
+				}
+```
+
+**File:** x/gov/keeper/tally.go (L119-119)
+```go
+	if results[types.OptionYes].Quo(totalVotingPower.Sub(results[types.OptionAbstain])).GT(voteYesThreshold) {
+```
+
+**File:** x/gov/types/msgs.go (L252-271)
+```go
+	totalWeight := sdk.NewDec(0)
+	usedOptions := make(map[VoteOption]bool)
+	for _, option := range msg.Options {
+		if !ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(ErrInvalidVote, option.String())
+		}
+		totalWeight = totalWeight.Add(option.Weight)
+		if usedOptions[option.Option] {
+			return sdkerrors.Wrap(ErrInvalidVote, "Duplicated vote option")
+		}
+		usedOptions[option.Option] = true
+	}
+
+	if totalWeight.GT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight overflow 1.00")
+	}
+
+	if totalWeight.LT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight lower than 1.00")
+	}
+```
+
+**File:** baseapp/baseapp.go (L787-800)
+```go
+// validateBasicTxMsgs executes basic validator calls for messages.
+func validateBasicTxMsgs(msgs []sdk.Msg) error {
+	if len(msgs) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
+	}
+
+	for _, msg := range msgs {
+		err := msg.ValidateBasic()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+```
+
+**File:** baseapp/baseapp.go (L921-925)
+```go
+	msgs := tx.GetMsgs()
+
+	if err := validateBasicTxMsgs(msgs); err != nil {
+		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
+	}
 ```

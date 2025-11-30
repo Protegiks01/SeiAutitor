@@ -1,219 +1,325 @@
-Based on my thorough technical analysis of the codebase, I have validated this security claim against all strict criteria.
-
 # Audit Report
 
 ## Title
-Index Out of Bounds Panic in SetPubKeyDecorator Due to Missing Length Validation
+Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
 
 ## Summary
-The `SetPubKeyDecorator` in the ante handler chain lacks validation to ensure the number of public keys matches the number of signers. This allows any user to craft malformed transactions that pass `ValidateBasic()` but trigger panics during ante handler processing, causing validators to waste computational resources on transactions that should have been rejected earlier.
+The distribution module allows governance to set parameters where `baseProposerReward + bonusProposerReward + communityTax` exceeds 1.0 through individual parameter updates. This causes `voteMultiplier` to become negative in `AllocateTokens`, triggering a panic that halts the entire network during block processing.
 
 ## Impact
-Low
+High
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- Vulnerability: `x/distribution/keeper/allocation.go` (voteMultiplier calculation) [1](#0-0) 
 
-**Intended Logic:**
-The `SetPubKeyDecorator` should validate that the number of public keys matches the number of signers before iterating, ensuring safe array access and early rejection of malformed transactions.
+- Panic trigger: `types/dec_coin.go` (Sub operation) [2](#0-1) 
 
-**Actual Logic:**
-The decorator retrieves `pubkeys` from `GetPubKeys()` which returns an array based on `AuthInfo.SignerInfos` length [2](#0-1) , and `signers` from `GetSigners()` which derives signers from transaction messages [3](#0-2) . These arrays can have different lengths because they come from independent data sources. The code loops over `pubkeys` and accesses `signers[i]` without bounds validation, causing an index out of bounds panic when `len(pubkeys) > len(signers)`.
+- Validation gap: `x/distribution/types/params.go` (individual validators) [3](#0-2) 
 
-**Exploitation Path:**
-1. Attacker creates a transaction with one message containing one unique signer (N=1)
-2. Sets `AuthInfo.SignerInfos` array to have 2 elements (M=2)  
-3. Sets `Signatures` array to have 1 element (matching the 1 signer)
-4. Transaction passes `ValidateBasic()` because it only validates `len(Signatures) == len(GetSigners())` (1 == 1) [4](#0-3) 
-5. Transaction enters ante handler chain and proceeds through multiple decorators [5](#0-4) 
-6. In `SetPubKeyDecorator`, the loop iterates twice (M=2), and at i=1, accessing `signers[1]` triggers an index out of bounds panic
-7. Panic is caught by recovery middleware [6](#0-5)  and the transaction is rejected
+- Governance handler: `x/params/proposal_handler.go` [4](#0-3) 
 
-**Security Guarantee Broken:**
-The ante handler chain should efficiently reject invalid transactions during early validation stages. This vulnerability allows malformed transactions to bypass `ValidateBasic()` and consume validator resources through multiple expensive decorator executions before being rejected via panic recovery.
+**Intended logic:**
+Distribution parameters must satisfy the invariant `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. This invariant is explicitly validated in `ValidateBasic()`: [5](#0-4) 
+
+**Actual logic:**
+When parameters are updated through governance proposals, the system only validates individual parameters (checking each is between 0 and 1.0) via `Subspace.Update()`, which calls individual validator functions. The `ValidateBasic()` method that checks the combined sum constraint is only called during genesis validation, not during governance parameter updates: [6](#0-5) 
+
+Genesis validation does check the constraint: [7](#0-6) 
+
+But governance updates bypass this validation.
+
+**Exploitation path:**
+1. Three governance proposals pass independently (each appears valid with 0 ≤ value ≤ 1.0):
+   - `baseProposerReward = 0.5`
+   - `bonusProposerReward = 0.5`
+   - `communityTax = 0.1`
+   - Combined sum: 1.1 > 1.0 (violates invariant)
+
+2. During the next block's BeginBlock, `AllocateTokens` is called: [8](#0-7) 
+
+3. With high validator participation (e.g., 100%):
+   - `proposerMultiplier = 0.5 + 0.5 × 1.0 = 1.0`
+   - `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1` (negative!)
+   - `feeMultiplier` becomes negative
+   - Each validator receives negative reward tokens
+
+4. When `AllocateTokensToValidator` attempts `tokens.Sub(commission)` with negative tokens: [9](#0-8) 
+
+The Sub() operation panics with "negative coin amount", halting all nodes simultaneously.
+
+**Security guarantee broken:**
+The system fails to enforce its explicitly documented invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates.
 
 ## Impact Explanation
 
-This vulnerability enables resource exhaustion where validators waste computational resources processing malformed transactions. Each malicious transaction forces validators to:
-1. Decode the transaction
-2. Execute 7+ ante handler decorators (SetUpContext, RejectExtensionOptions, ValidateBasic decorator, TxTimeoutHeight, ValidateMemo, ConsumeGasForTxSize, DeductFee)
-3. Panic in SetPubKeyDecorator  
-4. Process panic recovery and cleanup
+**Consequences:**
+- **Total network shutdown**: All validator nodes panic simultaneously when processing any block after the misconfigured parameters take effect
+- **Cannot process transactions**: Network consensus completely halts
+- **Unrecoverable without hard fork**: Emergency governance cannot fix parameters because the network is halted
+- **Requires coordinated manual intervention**: Validators must coordinate off-chain to reset parameters and restart
 
-Since these transactions are rejected during CheckTx (mempool admission), attackers pay no gas fees while consuming validator resources. The network continues functioning and no funds are at risk, but validator efficiency is degraded. This matches the **Low severity** impact: "Causing network processing nodes to process transactions from the mempool beyond set parameters."
+**Precedent:**
+The developers explicitly recognized and fixed this exact pattern for ConsensusParams, acknowledging that parameter validation gaps "will cause a chain halt": [10](#0-9) 
+
+This confirms the severity of such validation gaps and that distribution parameters lack the same protection.
 
 ## Likelihood Explanation
 
-**Who can trigger it:**
-Any network participant can exploit this vulnerability without special permissions or resources beyond standard transaction submission capabilities.
+**Who Can Trigger:**
+Governance (requires proposals to pass democratic voting)
 
-**Required conditions:**
-- The default ante handler chain includes `SetPubKeyDecorator` (standard configuration)
-- Attacker can craft protobuf transactions (standard capability available to all users)
+**Realistic Scenario (Non-Malicious):**
+- Month 1: Proposal to increase proposer rewards (`baseProposerReward = 0.5`)
+- Month 2: Proposal to add voting bonuses (`bonusProposerReward = 0.5`)
+- Month 3: Proposal to fund community pool (`communityTax = 0.1`)
+- Each proposal reviewed individually, all appear valid (0 ≤ value ≤ 1.0)
+- No reviewer checks combined constraint across all parameters
+- Network halts inadvertently
 
-**Frequency:**
-This can be exploited repeatedly and deterministically. An attacker can pre-generate batches of malformed transactions and submit them continuously. Each transaction reliably triggers the panic during CheckTx. The attack can be sustained as long as the attacker maintains network connectivity.
+**Likelihood:** Moderate - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint. The fact that each individual change appears valid makes this particularly dangerous.
+
+While this requires governance action, it meets the "trusted role exception" because: (1) it can happen inadvertently without malicious intent, (2) it causes unrecoverable network failure beyond governance's intended authority, and (3) the system should enforce its own documented invariants.
 
 ## Recommendation
 
-Add length validation in `SetPubKeyDecorator.AnteHandle` before the iteration loop:
+1. **Immediate Fix**: Add special validation for distribution parameters in the governance proposal handler, similar to ConsensusParams validation. When any distribution parameter is updated, retrieve all current distribution parameters, apply the change, and validate the complete `Params` struct using `ValidateBasic()`.
 
-```go
-if len(pubkeys) != len(signers) {
-    return ctx, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, 
-        "invalid number of pubkeys; expected: %d, got %d", len(signers), len(pubkeys))
-}
-```
+2. **Alternative Approach**: Modify the individual validator functions to query current values of other distribution parameters and validate that the combined sum will not exceed 1.0 after the update.
 
-This validation pattern is already correctly implemented in the batch signature verifier [7](#0-6) , confirming that this check is necessary and should be consistently applied across all signature verification paths.
+3. **Defensive Programming**: Add a safety check in `AllocateTokens` to detect negative `voteMultiplier` and handle gracefully (clamp to zero, emit error event) rather than allowing the panic to propagate.
 
-Alternatively, add this validation to `Tx.ValidateBasic()` to catch the issue even earlier in the validation pipeline.
+4. **Follow Existing Pattern**: Apply the same validation pattern used for ConsensusParams to distribution parameters.
 
 ## Proof of Concept
 
-The vulnerability can be demonstrated through code analysis:
+**Test File:** `x/distribution/keeper/allocation_test.go`
 
 **Setup:**
-- Create a transaction with one message containing one unique signer
-- Manually construct `AuthInfo` with two `SignerInfo` elements
-- Set `Signatures` array to one element
+- Initialize test application using `simapp.Setup(false)`
+- Create two validators with equal voting power
+- Set misconfigured parameters via `app.DistrKeeper.SetParams()` (bypassing validation):
+  ```
+  Params{
+    CommunityTax: sdk.NewDecWithPrec(10, 2),        // 0.1
+    BaseProposerReward: sdk.NewDecWithPrec(50, 2),  // 0.5
+    BonusProposerReward: sdk.NewDecWithPrec(50, 2), // 0.5
+  }
+  ```
+  Combined sum: 1.1 > 1.0
+- Fund fee collector module with tokens
 
 **Action:**
-- Call `ValidateBasic()` - passes because `len(Signatures) == len(GetSigners())` equals (1 == 1)
-- Execute ante handler chain including `SetPubKeyDecorator`
+- Call `app.DistrKeeper.AllocateTokens(ctx, 200, 200, proposerConsAddr, votes)` with 100% validator participation
+- This results in `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1`
 
 **Result:**
-- `GetPubKeys()` returns 2 elements (from `AuthInfo.SignerInfos`)
-- `GetSigners()` returns 1 element (from message signers)
-- Loop iterates twice; at i=1, accessing `signers[1]` causes index out of bounds panic
-- Panic is caught by recovery middleware and transaction is rejected after wasting resources
+- Panic with message "negative coin amount" when `AllocateTokensToValidator` attempts `tokens.Sub(commission)` operation on negative token amounts
+- This panic would halt all nodes processing blocks with these parameters in production
 
-The vulnerability is verifiable by constructing a protobuf transaction with `len(AuthInfo.SignerInfos) ≠ len(GetSigners())` that satisfies the existing `ValidateBasic()` check.
+**Note:**
+Existing allocation tests use valid parameters with sum = 0.07 (2% + 1% + 4%): [11](#0-10) 
+
+The vulnerability test would follow the same structure but use invalid combined parameters.
 
 ## Notes
 
-This is a valid Low severity vulnerability that matches the explicitly listed impact category: "Causing network processing nodes to process transactions from the mempool beyond set parameters." The vulnerability allows transactions to bypass early validation (`ValidateBasic`) and proceed through multiple expensive decorators before being rejected via panic, wasting validator computational resources. The fix is straightforward and follows the pattern already established in the batch signature verifier.
+This vulnerability is validated because it meets all acceptance criteria:
+1. The system has an explicit invariant (ValidateBasic checks sum ≤ 1.0) that is bypassed during governance updates
+2. Causes total network shutdown matching the impact category "Network not being able to confirm new transactions"
+3. BeginBlock has no panic recovery, confirmed by codebase analysis
+4. Developer precedent with ConsensusParams confirms this pattern requires explicit fixes
+5. While governance-controlled, meets the exception clause: inadvertent trigger causing unrecoverable failure beyond intended authority - the system should enforce its own invariants
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L71-85)
+**File:** x/distribution/keeper/allocation.go (L82-84)
 ```go
-	for i, pk := range pubkeys {
-		// PublicKey was omitted from slice since it has already been set in context
-		if pk == nil {
-			if !simulate {
-				continue
-			}
-			pk = simSecp256k1Pubkey
-		}
-		// Only make check if simulate=false
-		if !simulate && !bytes.Equal(pk.Address(), signers[i]) {
-			return ctx, sdkerrors.Wrapf(sdkerrors.ErrInvalidPubKey,
-				"pubKey does not match signer address %s with signer index: %d", signers[i], i)
-		}
-
-		acc, err := GetSignerAcc(ctx, spkd.ak, signers[i])
+	communityTax := k.GetCommunityTax(ctx)
+	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
+	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
 ```
 
-**File:** x/auth/tx/builder.go (L107-128)
+**File:** x/distribution/keeper/allocation.go (L111-114)
 ```go
-func (w *wrapper) GetPubKeys() ([]cryptotypes.PubKey, error) {
-	signerInfos := w.tx.AuthInfo.SignerInfos
-	pks := make([]cryptotypes.PubKey, len(signerInfos))
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+```
 
-	for i, si := range signerInfos {
-		// NOTE: it is okay to leave this nil if there is no PubKey in the SignerInfo.
-		// PubKey's can be left unset in SignerInfo.
-		if si.PublicKey == nil {
-			continue
-		}
-
-		pkAny := si.PublicKey.GetCachedValue()
-		pk, ok := pkAny.(cryptotypes.PubKey)
-		if ok {
-			pks[i] = pk
-		} else {
-			return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "Expecting PubKey, got: %T", pkAny)
-		}
+**File:** types/dec_coin.go (L303-309)
+```go
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
 	}
 
-	return pks, nil
-}
+	return diff
 ```
 
-**File:** types/tx/types.go (L94-99)
+**File:** x/distribution/types/params.go (L67-71)
 ```go
-	if len(sigs) != len(t.GetSigners()) {
-		return sdkerrors.Wrapf(
-			sdkerrors.ErrUnauthorized,
-			"wrong number of signers; expected %d, got %d", len(t.GetSigners()), len(sigs),
+	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
 		)
 	}
 ```
 
-**File:** types/tx/types.go (L111-132)
+**File:** x/distribution/types/params.go (L76-131)
 ```go
-func (t *Tx) GetSigners() []sdk.AccAddress {
-	var signers []sdk.AccAddress
-	seen := map[string]bool{}
-
-	for _, msg := range t.GetMsgs() {
-		for _, addr := range msg.GetSigners() {
-			if !seen[addr.String()] {
-				signers = append(signers, addr)
-				seen[addr.String()] = true
-			}
-		}
+func validateCommunityTax(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	// ensure any specified fee payer is included in the required signers (at the end)
-	feePayer := t.AuthInfo.Fee.Payer
-	if feePayer != "" && !seen[feePayer] {
-		payerAddr := sdk.MustAccAddressFromBech32(feePayer)
-		signers = append(signers, payerAddr)
+	if v.IsNil() {
+		return fmt.Errorf("community tax must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("community tax must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("community tax too large: %s", v)
 	}
 
-	return signers
+	return nil
+}
+
+func validateBaseProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("base proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("base proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("base proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBonusProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("bonus proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("bonus proposer reward too large: %s", v)
+	}
+
+	return nil
 }
 ```
 
-**File:** x/auth/ante/ante.go (L48-60)
+**File:** x/params/proposal_handler.go (L26-43)
 ```go
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
-		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
-		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-		NewIncrementSequenceDecorator(options.AccountKeeper),
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
+		if !ok {
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+		}
+
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
+
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		}
 	}
+
+	return nil
+}
 ```
 
-**File:** baseapp/baseapp.go (L904-915)
+**File:** x/params/types/subspace.go (L196-219)
 ```go
-	defer func() {
-		if r := recover(); r != nil {
-			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
-			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
-			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
-			err, result = processRecovery(r, recoveryMW), nil
-			if mode != runTxModeDeliver {
-				ctx.MultiStore().ResetEvents()
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	}
+
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+		return err
+	}
+
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
+	return nil
+}
+```
+
+**File:** x/distribution/types/genesis.go (L44-50)
+```go
+// ValidateGenesis validates the genesis state of distribution genesis input
+func ValidateGenesis(gs *GenesisState) error {
+	if err := gs.Params.ValidateBasic(); err != nil {
+		return err
+	}
+	return gs.FeePool.ValidateGenesis()
+}
+```
+
+**File:** x/distribution/abci.go (L29-31)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+```
+
+**File:** x/params/types/proposal/proposal.go (L101-109)
+```go
+		// We need to verify ConsensusParams since they are only validated once the proposal passes.
+		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
+		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
+		// Therefore, we validate when we get a param-change msg for ConsensusParams
+		if pc.Subspace == "baseapp" {
+			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
+				return err
 			}
 		}
-		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
-	}()
 ```
 
-**File:** x/auth/ante/batch_sigverify.go (L66-68)
+**File:** x/distribution/keeper/allocation_test.go (L54-63)
 ```go
-		if len(pubkeys) != len(signerAddrs) {
-			v.errors[i] = sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "invalid number of pubkeys;  expected: %d, got %d", len(signerAddrs), len(pubkeys))
-			continue
+	testDistrParms := disttypes.Params{
+		CommunityTax:        sdk.NewDecWithPrec(2, 2), // 2%
+		BaseProposerReward:  sdk.NewDecWithPrec(1, 2), // 1%
+		BonusProposerReward: sdk.NewDecWithPrec(4, 2), // 4%
+		WithdrawAddrEnabled: true,
+	}
+	app.DistrKeeper.SetParams(
+		ctx,
+		testDistrParms,
+	)
 ```

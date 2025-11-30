@@ -1,261 +1,210 @@
 # Audit Report
 
 ## Title
-Unbounded Memory Allocation in BeginBlocker via SignedBlocksWindow Parameter Leading to Network Shutdown
+Front-Running Module Account Creation Causes Network-Wide Panic During Chain Upgrades
 
 ## Summary
-The `SignedBlocksWindow` parameter validation lacks an upper bound check, allowing governance to set arbitrarily large values that trigger catastrophic memory allocation during BeginBlocker processing. This causes all validator nodes to crash from out-of-memory errors, resulting in complete network shutdown requiring a hard fork to recover.
+An attacker can pre-create a `BaseAccount` at a future module's deterministic address before a chain upgrade, causing all validators to panic simultaneously when the new module's `InitGenesis` attempts to retrieve its module account. This results in total network shutdown.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
 **Location:**
-- Validation: `x/slashing/types/params.go`, lines 72-83 (validateSignedBlocksWindow function) [1](#0-0) 
+- Panic: [1](#0-0) 
+- Account creation: [2](#0-1) 
+- Blocked address check: [3](#0-2) 
+- Module address derivation: [4](#0-3) 
+- Blocked addresses initialization: [5](#0-4) 
 
-- Memory allocation: `x/slashing/keeper/signing_info.go`, lines 109-116 (ParseBitGroupsToBoolArray function) [2](#0-1) 
+**Intended logic:** 
+Module accounts should only exist as `ModuleAccountI` types at their deterministic addresses. The `blockedAddrs` mechanism should prevent users from creating accounts at module addresses. When a chain upgrade adds a new module, `GetModuleAccount` should safely create the module account during `InitGenesis`.
 
-- Vulnerable execution: `x/slashing/keeper/infractions.go`, lines 157-169 (ResizeMissedBlockArray function) [3](#0-2) 
-
-- Trigger point: `x/slashing/abci.go`, lines 36-50 (BeginBlocker concurrent processing) [4](#0-3) 
-
-**Intended logic:**
-The `SignedBlocksWindow` parameter should define a reasonable sliding window for tracking validator liveness (default 108,000 blocks). The validation function should enforce safe operational bounds to prevent resource exhaustion, similar to other parameter validators in the same file.
-
-**Actual logic:**
-The validation only checks if the value is positive (`v > 0`) with no upper bound. When governance sets an extremely large value (e.g., 10^10), the next block triggers concurrent memory allocation for all validators. Each validator's `ResizeMissedBlockArray` function creates two boolean arrays of size `window` - one in `ParseBitGroupsToBoolArray` (line 162) and another at line 163. With 100 validators and window=10^10, this requires approximately 2 TB of total memory allocation, causing immediate OOM crashes.
+**Actual logic:** 
+The `blockedAddrs` map is populated only from modules existing in `maccPerms` at app initialization [5](#0-4) . Future modules added via upgrade are not in this map. When coins are sent to a future module address, the `BlockedAddr` check passes [6](#0-5)  because the address isn't blocked yet. This creates a `BaseAccount` at the module address [2](#0-1)  using the default `ProtoBaseAccount` prototype [7](#0-6) . During upgrade, when `GetModuleAccountAndPermissions` retrieves this account and finds it's not a `ModuleAccountI`, it executes an unconditional panic [1](#0-0) .
 
 **Exploitation path:**
-1. Governance proposal submitted to change `SignedBlocksWindow` to large value (e.g., 10^10)
-2. Proposal validation passes because only `v > 0` is checked [5](#0-4) 
-3. Proposal executes, parameter updated in chain state
-4. Next block triggers BeginBlocker which processes all validators concurrently in goroutines
-5. Each goroutine calls `HandleValidatorSignatureConcurrent` which detects window size change [6](#0-5) 
-6. `ResizeMissedBlockArray` allocates two massive boolean arrays per validator (2 × window × number of validators bytes)
-7. All nodes crash from OOM simultaneously
-8. Network completely halts - no blocks can be produced
-9. Parameter persists in chain state, requiring hard fork to recover
+1. Attacker observes governance proposal announcing new module "newmodule" at upgrade height H
+2. Attacker calculates deterministic address: `crypto.AddressHash([]byte("newmodule"))` [4](#0-3) 
+3. Before upgrade, attacker submits `MsgSend` with 1 token to calculated address
+4. `BlockedAddr` check passes because address not in `blockedAddrs` yet [3](#0-2) 
+5. `SendCoins` creates `BaseAccount` at module address [2](#0-1) 
+6. At upgrade height, `RunMigrations` calls `InitGenesis` for new modules not in fromVM [8](#0-7) 
+7. Module's `InitGenesis` calls `GetModuleAccount` [9](#0-8) 
+8. `GetModuleAccountAndPermissions` finds `BaseAccount`, type assertion fails, panic occurs [1](#0-0) 
+9. All validators panic at same height during consensus execution
+10. Network completely halts
 
-**Security guarantee broken:**
-The system fails to enforce resource bounds on governance parameters. This allows governance to inadvertently cause catastrophic, unrecoverable network failure that exceeds governance's intended authority to tune operational parameters. Unlike other parameter validators in the same file that enforce upper bounds (e.g., `validateMinSignedPerWindow` checks `v.GT(sdk.OneDec())`), this validator lacks equivalent protection. [7](#0-6) 
+**Security guarantee broken:** 
+Network availability and upgrade safety. The deterministic module address derivation combined with static `blockedAddrs` creates a race condition where attackers can claim future module addresses before they're protected.
 
 ## Impact Explanation
 
-**Affected Components:**
-- All validator nodes experience OOM crashes
-- Block production and consensus completely halt
-- Network liveness and availability lost
-- Chain state contains malicious parameter that persists
+This vulnerability causes complete network shutdown affecting all validators simultaneously. When all validators panic at the same block height during upgrade execution:
 
-**Severity Analysis:**
-With `SignedBlocksWindow = 10^10` and 100 validators:
-- Each validator requires: 2 allocations × 10^10 bytes = 20 GB
-- Total concurrent allocation: 100 validators × 20 GB = 2 TB
-- All nodes crash immediately from OOM
-- Network cannot produce new blocks
-- Recovery requires hard fork (cannot fix via governance since network is down)
+- No new transactions can be confirmed after the upgrade height
+- The upgrade plan is consumed but module initialization failed, leaving state inconsistent
+- Chain cannot progress without manual intervention
+- Recovery requires coordinated hard fork with state export/import or emergency patch
+- Existing upgrade cannot be rolled back cleanly
 
-This represents total network shutdown, matching the impact criterion: "Network not being able to confirm new transactions (total network shutdown)" which is classified as **High** severity.
+This matches the specified impact criterion: "Network not being able to confirm new transactions (total network shutdown)."
 
 ## Likelihood Explanation
 
-This vulnerability requires governance proposal approval (privileged mechanism), but meets the exception criteria for privileged access because:
+**Trigger Conditions:**
+- **Who:** Any network participant with minimal funds (transaction fees + 1 token)
+- **When:** Between upgrade proposal passing and upgrade execution (typically days/weeks window)
+- **Requirements:** Knowledge of new module name (publicly available in governance proposal)
 
-1. **Inadvertent trigger is realistic**: Simple typos like typing "1000000000" instead of "1000000" (adding 3 extra zeros), or miscalculating time-based values without dividing by block time, could trigger this. No warnings or confirmation prompts exist.
+**Frequency:**
+- Can occur with every chain upgrade introducing new modules
+- Multiple chain upgrades per year in active Cosmos chains
+- High likelihood given low cost, public information, and large time window
 
-2. **Design inconsistency suggests oversight**: Other parameter validators in the same file enforce upper bounds (validateMinSignedPerWindow, validateSlashFractionDoubleSign, validateSlashFractionDowntime all check maximum values), but SignedBlocksWindow lacks this protection. Simulation tests only use values 10-1000, indicating the design never anticipated extreme values. [8](#0-7) 
+**Detection Difficulty:**
+- Attack transaction appears as normal coin transfer
+- Indistinguishable from legitimate transfers
+- Only becomes apparent when all validators crash during upgrade
 
-3. **Unrecoverable impact**: Once executed, the malicious parameter persists in chain state. The network is completely down and cannot run governance to fix itself. Recovery requires a hard fork with significant coordination cost.
-
-4. **Beyond intended authority**: Governance should tune operational parameters within safe bounds, not have the power to permanently brick the entire network. This catastrophic failure mode exceeds what governance should be able to cause.
-
-The likelihood is moderate because while governance approval is required, the lack of validation makes accidental misconfiguration realistic, and the consequences are catastrophic and unrecoverable.
+The combination of public information, minimal cost, large attack window, and inability to detect makes exploitation highly likely.
 
 ## Recommendation
 
-Add upper bound validation to `validateSignedBlocksWindow` consistent with other parameter validators:
+**Primary Fix:**
+Add graceful handling in `GetModuleAccountAndPermissions` to convert pre-existing `BaseAccount` to `ModuleAccount`:
 
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-    v, ok := i.(int64)
+if acc != nil {
+    macc, ok := acc.(types.ModuleAccountI)
     if !ok {
-        return fmt.Errorf("invalid parameter type: %T", i)
+        // Handle case where BaseAccount was created before module
+        if baseAcc, isBase := acc.(*types.BaseAccount); isBase && 
+           baseAcc.GetPubKey() == nil && baseAcc.GetSequence() == 0 {
+            // Convert to module account preserving account number
+            newMacc := types.NewModuleAccount(baseAcc, moduleName, perms...)
+            ak.SetModuleAccount(ctx, newMacc)
+            return newMacc, perms
+        }
+        panic("account is not a module account")
     }
-
-    if v <= 0 {
-        return fmt.Errorf("signed blocks window must be positive: %d", v)
-    }
-
-    // Add maximum bound to prevent resource exhaustion
-    // Maximum based on operational requirements: ~1.5 years at 0.4s blocks
-    const maxSignedBlocksWindow = int64(100_000_000)
-    if v > maxSignedBlocksWindow {
-        return fmt.Errorf("signed blocks window too large (max %d): %d", 
-            maxSignedBlocksWindow, v)
-    }
-
-    return nil
+    return macc, perms
 }
 ```
 
-This prevents arbitrarily large values while maintaining backward compatibility (current default 108,000 is well below the limit).
+**Alternative Prevention:**
+Implement proactive blocking of future module addresses by maintaining a registry of planned module names from pending upgrade proposals and adding their addresses to `blockedAddrs` dynamically.
 
 ## Proof of Concept
 
 **Setup:**
-- Initialize simapp with validator using standard test setup
-- Set initial `SignedBlocksWindow` to default value (108,000)
-- Create validator signing info by processing first block
+1. Create test app with initial `maccPerms` excluding "testmodule"
+2. Calculate deterministic module address: `types.NewModuleAddress("testmodule")`
+3. Fund attacker account with tokens
 
 **Action:**
-- Submit governance proposal to change `SignedBlocksWindow` to 10^10
-- Proposal validation passes (only checks `v > 0`)
-- Execute proposal to update parameter in chain state
-- Trigger next block's BeginBlocker
+1. Before module exists in `maccPerms`, call `BankKeeper.SendCoins(ctx, attackerAddr, moduleAddr, coins)`
+2. Verify `BaseAccount` created: `acc := AccountKeeper.GetAccount(ctx, moduleAddr); _, ok := acc.(types.ModuleAccountI)` returns false
+3. Update app's `maccPerms` to include "testmodule" with permissions
+4. Reinitialize `AccountKeeper` with new `maccPerms`
+5. Call `AccountKeeper.GetModuleAccount(ctx, "testmodule")`
 
 **Result:**
-- BeginBlocker spawns goroutines for all validators concurrently
-- Each goroutine calls `HandleValidatorSignatureConcurrent`
-- Detects window size change (108,000 → 10^10)
-- Calls `ResizeMissedBlockArray` which allocates:
-  - First: `ParseBitGroupsToBoolArray` creates `make([]bool, 10^10)` = 10 GB
-  - Second: `make([]bool, window)` = 10 GB  
-  - Total per validator: 20 GB
-- With 100 validators concurrently: 2 TB total allocation
-- All nodes crash from OOM
-- Network cannot produce blocks, requiring hard fork to recover
+- Function panics with message "account is not a module account" at [10](#0-9) 
+- Demonstrates validators would crash during upgrade when `InitGenesis` is called
+- Confirms network shutdown scenario
 
-**Notes:**
-This vulnerability is particularly severe because:
-1. Design inconsistency with other parameter validators indicates this is an oversight
-2. Realistic accidental scenario (simple typo) can trigger total network destruction
-3. Zero safeguards exist (no warnings, rate limits, or graceful degradation)
-4. Recovery requires expensive hard fork coordination
+## Notes
+
+The vulnerability stems from a fundamental design assumption that module addresses are "reserved" through the `blockedAddrs` mechanism, but this mechanism is static and only protects addresses of modules that exist at initialization time. The deterministic address derivation allows attackers to precompute future module addresses, and the account creation logic permits account creation at any non-blocked address. Combined with the unconditional panic and the upgrade flow that calls `InitGenesis` for new modules, this creates a critical vulnerability in the upgrade process.
 
 ### Citations
 
-**File:** x/slashing/types/params.go (L72-83)
+**File:** x/auth/keeper/keeper.go (L187-193)
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-	v, ok := i.(int64)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v <= 0 {
-		return fmt.Errorf("signed blocks window must be positive: %d", v)
-	}
-
-	return nil
-}
-```
-
-**File:** x/slashing/types/params.go (L85-99)
-```go
-func validateMinSignedPerWindow(i interface{}) error {
-	v, ok := i.(sdk.Dec)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v.IsNegative() {
-		return fmt.Errorf("min signed per window cannot be negative: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("min signed per window too large: %s", v)
-	}
-
-	return nil
-}
-```
-
-**File:** x/slashing/keeper/signing_info.go (L109-116)
-```go
-func (k Keeper) ParseBitGroupsToBoolArray(bitGroups []uint64, window int64) []bool {
-	boolArray := make([]bool, window)
-
-	for i := int64(0); i < window; i++ {
-		boolArray[i] = k.GetBooleanFromBitGroups(bitGroups, i)
-	}
-	return boolArray
-}
-```
-
-**File:** x/slashing/keeper/infractions.go (L52-54)
-```go
-	if found && missedInfo.WindowSize != window {
-		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
-	}
-```
-
-**File:** x/slashing/keeper/infractions.go (L157-169)
-```go
-func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
-	// we need to resize the missed block array AND update the signing info accordingly
-	switch {
-	case missedInfo.WindowSize < window:
-		// missed block array too short, lets expand it
-		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
-		newArray := make([]bool, window)
-		copy(newArray[0:index], boolArray[0:index])
-		if index+1 < missedInfo.WindowSize {
-			// insert `0`s corresponding to the difference between the new window size and old window size
-			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
+	acc := ak.GetAccount(ctx, addr)
+	if acc != nil {
+		macc, ok := acc.(types.ModuleAccountI)
+		if !ok {
+			panic("account is not a module account")
 		}
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
+		return macc, perms
 ```
 
-**File:** x/slashing/abci.go (L36-50)
+**File:** x/bank/keeper/send.go (L166-170)
 ```go
-	for i, _ := range allVotes {
-		wg.Add(1)
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
+	accExists := k.ak.HasAccount(ctx, toAddr)
+	if !accExists {
+		defer telemetry.IncrCounter(1, "new", "account")
+		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
+	}
+```
+
+**File:** x/bank/keeper/send.go (L348-355)
+```go
+func (k BaseSendKeeper) BlockedAddr(addr sdk.AccAddress) bool {
+	if len(addr) == len(CoinbaseAddressPrefix)+8 {
+		if bytes.Equal(CoinbaseAddressPrefix, addr[:len(CoinbaseAddressPrefix)]) {
+			return true
+		}
+	}
+	return k.blockedAddrs[addr.String()]
+}
+```
+
+**File:** x/auth/types/account.go (L162-165)
+```go
+// NewModuleAddress creates an AccAddress from the hash of the module's name
+func NewModuleAddress(name string) sdk.AccAddress {
+	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
+}
+```
+
+**File:** simapp/app.go (L261-263)
+```go
+	app.AccountKeeper = authkeeper.NewAccountKeeper(
+		appCodec, keys[authtypes.StoreKey], app.GetSubspace(authtypes.ModuleName), authtypes.ProtoBaseAccount, maccPerms,
+	)
+```
+
+**File:** simapp/app.go (L607-614)
+```go
+func (app *SimApp) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range maccPerms {
+		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+	}
+
+	return modAccAddrs
+}
+```
+
+**File:** x/bank/keeper/msg_server.go (L47-47)
+```go
+	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
+```
+
+**File:** types/module/module.go (L575-589)
+```go
+		} else {
+			cfgtor, ok := cfg.(configurator)
+			if !ok {
+				// Currently, the only implementator of Configurator (the interface)
+				// is configurator (the struct).
+				return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", configurator{}, cfg)
 			}
-		}(i)
-	}
+
+			moduleValUpdates := module.InitGenesis(ctx, cfgtor.cdc, module.DefaultGenesis(cfgtor.cdc))
+			ctx.Logger().Info(fmt.Sprintf("adding a new module: %s", moduleName))
+			// The module manager assumes only one module will update the
+			// validator set, and that it will not be by a new module.
+			if len(moduleValUpdates) > 0 {
+				return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "validator InitGenesis updates already set by a previous module")
+			}
 ```
 
-**File:** x/params/types/subspace.go (L196-219)
+**File:** x/mint/genesis.go (L13-13)
 ```go
-func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
-	attr, ok := s.table.m[string(key)]
-	if !ok {
-		panic(fmt.Sprintf("parameter %s not registered", string(key)))
-	}
-
-	ty := attr.ty
-	dest := reflect.New(ty).Interface()
-	s.GetIfExists(ctx, key, dest)
-
-	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
-		return err
-	}
-
-	// destValue contains the dereferenced value of dest so validation function do
-	// not have to operate on pointers.
-	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
-	if err := s.Validate(ctx, key, destValue); err != nil {
-		return err
-	}
-
-	s.Set(ctx, key, dest)
-	return nil
-}
-```
-
-**File:** x/slashing/simulation/genesis.go (L27-29)
-```go
-func GenSignedBlocksWindow(r *rand.Rand) int64 {
-	return int64(simulation.RandIntBetween(r, 10, 1000))
-}
+	ak.GetModuleAccount(ctx, types.ModuleName)
 ```

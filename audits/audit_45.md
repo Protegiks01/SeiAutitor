@@ -1,236 +1,202 @@
 # Audit Report
 
 ## Title
-Unbounded Deposit Iteration in EndBlocker Enables Block Production DoS Attack
+AllowedMsgAllowance Bypass via Nested MsgExec Messages
 
 ## Summary
-The governance module's `IterateDeposits` function processes all deposits for a proposal during EndBlocker execution without any limit on the number of depositors. Since EndBlocker runs with an infinite gas meter, an attacker can create thousands of minimal deposits from unique addresses, causing significant block processing delays (500%+ of normal block time) when the proposal finalizes, affecting all validators network-wide.
+The `AllowedMsgAllowance` feegrant restriction mechanism can be completely bypassed by wrapping disallowed message types inside an authz `MsgExec`. The AnteHandler only validates top-level messages when checking feegrant allowances, while execution proceeds with nested messages that were never validated against the allowance restrictions.
 
 ## Impact
-Medium
+Medium (Direct loss of funds)
 
 ## Finding Description
 
 **Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) [5](#0-4) 
 
-**Intended Logic:** The `IterateDeposits` function should iterate through deposits to refund or delete them when a proposal ends. The system expects reasonable deposit counts and relies on gas metering to prevent abuse.
+**Intended Logic:**
+When a granter creates an `AllowedMsgAllowance` with specific message type restrictions (e.g., only allowing `/cosmos.gov.v1beta1.MsgVote`), the system should validate ALL messages in a transaction - including nested messages within wrapper types like `MsgExec` - against the allowed list before deducting fees from the feegrant.
 
-**Actual Logic:** The function iterates through ALL deposits without any limit on depositor count. The EndBlocker context is created with an infinite gas meter [6](#0-5)  which never enforces limits [7](#0-6) . Each unique depositor creates a separate entry [8](#0-7) , and `MsgDeposit` validation has no minimum deposit requirement per transaction [9](#0-8) .
+**Actual Logic:**
+The `DeductFeeDecorator` only validates top-level messages obtained via `sdkTx.GetMsgs()`. [2](#0-1)  When a transaction contains `MsgExec`, only the `MsgExec` message type itself is checked, never the nested messages inside it. [4](#0-3)  During execution, the authz module's `DispatchActions` has implicit acceptance logic: if the message signer equals the MsgExec grantee, no authorization check occurs. [5](#0-4)  This creates a complete bypass of the feegrant message type restrictions.
 
 **Exploitation Path:**
-1. Attacker generates thousands of unique addresses (10,000-100,000)
-2. Each address submits `MsgDeposit` with minimal amount (1 token) - passes validation since no per-transaction minimum exists
-3. `AddDeposit` creates separate deposit entry for each unique depositor
-4. Deposits accumulate across multiple blocks during deposit/voting period
-5. When proposal ends, EndBlocker calls `DeleteDeposits` or `RefundDeposits`
-6. These functions iterate through ALL accumulated deposits performing expensive operations: KVStore reads, protobuf unmarshaling, bank module transfers (multiple state operations), and state deletions
-7. Since EndBlocker has infinite gas meter, no limit stops this iteration, causing substantial block processing delay
+1. Granter creates `AllowedMsgAllowance` with: `["/cosmos.gov.v1beta1.MsgVote", "/cosmos.authz.v1beta1.MsgExec"]`
+2. Attacker (grantee) constructs transaction with top-level message: `MsgExec{Grantee: Self, Msgs: [MsgSend{From: Self, To: Victim, Amount: X}]}`
+3. AnteHandler phase: `UseGrantedFees` receives `[MsgExec]` from `GetMsgs()` [1](#0-0) , validates only `MsgExec` type (passes), deducts fee from granter's account
+4. Execution phase: `MsgExec.Exec` extracts nested `[MsgSend]`, calls `DispatchActions(Self, [MsgSend])` [6](#0-5) 
+5. In `DispatchActions`: signer=Self, grantee=Self → implicit acceptance without authorization check [5](#0-4) 
+6. `MsgSend` executes successfully using feegrant funds, despite not being in allowed messages list
 
-**Security Guarantee Broken:** The blockchain's liveness property and predictable block production are compromised. All validators must complete EndBlocker processing before finalizing a block, so unbounded iteration directly impacts network-wide block times.
+**Security Guarantee Broken:**
+The fundamental security guarantee of `AllowedMsgAllowance` - that feegrant funds will ONLY be used for explicitly approved message types - is completely violated for nested messages within `MsgExec`.
 
 ## Impact Explanation
 
-With 10,000-100,000 deposits, an attacker can delay individual blocks by 500% or more of normal block time. For a chain with 1-second blocks, this means 5-10+ second delays. Each deposit iteration involves:
-- KVStore read operations (I/O-bound)
-- Protobuf unmarshaling (CPU-bound)
-- Bank module operations with multiple state reads/writes for balance updates
-- State deletion operations
-
-This cumulative burden impacts:
-- Transaction finality and user experience across the network
-- Validator synchronization
-- Dependent systems that may timeout
-- Overall network stability during the attack period
-
-The attack qualifies as: **"Temporary freezing of network transactions by delaying one block by 500% or more of the average block time of the preceding 24 hours beyond standard difficulty adjustments"** - Medium severity impact category.
+This vulnerability enables complete unauthorized drainage of feegrant balances for ANY transaction type, regardless of the granter's intended restrictions. A granter who allocates funds specifically for governance voting (believing their funds will only pay for vote transactions) can have their entire feegrant balance drained for token transfers, staking operations, or any other message type. This breaks the trust model of restricted feegrants and represents a direct financial loss of the allocated funds to the granter.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any unprivileged network participant with tokens for gas fees can execute this attack.
+**Likelihood: High**
 
-**Conditions Required:**
-- An active proposal in deposit or voting period
-- Sufficient tokens for N minimal deposits plus transaction fees
-- No special permissions required
-
-**Cost vs Impact:** The attack is economically favorable because deposits are refunded [3](#0-2)  when proposals pass or expire normally. The attacker's main cost is transaction fees plus temporary capital lockup, while the network disruption is significant. This can be repeated on any governance proposal.
-
-**Feasibility:** High - The block gas limit only constrains transactions per block during submission, but doesn't protect against accumulated state over time. An attacker can spread deposits across many blocks during the deposit period, then all get processed in a single EndBlocker iteration with infinite gas.
+This vulnerability is highly likely to be exploited because:
+1. Granters commonly and reasonably include `MsgExec` in allowed message lists to enable authz-based operations
+2. No special permissions or prior setup required - any grantee with a feegrant containing `MsgExec` can exploit
+3. The exploit is straightforward: wrap any message in MsgExec with yourself as grantee
+4. Granters are unlikely to understand that including `MsgExec` effectively removes all message type restrictions
+5. The implicit acceptance logic in DispatchActions [5](#0-4)  means no authz grant setup is needed
 
 ## Recommendation
 
-Implement one or more of the following mitigations:
+Modify `x/feegrant/filtered_fee.go` to recursively validate nested messages:
 
-1. **Add Maximum Depositors Limit:** Enforce a maximum number of unique depositors per proposal (e.g., 1,000-5,000) in the `AddDeposit` function. Reject new unique depositors once the limit is reached, though existing depositors can continue adding to their deposits.
+1. In `allMsgTypesAllowed()`, detect when a message is of type `MsgExec`
+2. For each `MsgExec` message, call its `GetMessages()` method to extract nested messages
+3. Recursively validate all nested messages against the allowed messages list
+4. Reject the transaction if ANY nested message (at any depth) has a type not in the allowed list
 
-2. **Implement Minimum Deposit Per Transaction:** Add validation in `MsgDeposit.ValidateBasic()` to enforce a meaningful minimum deposit amount per transaction (e.g., 100 tokens) to increase attack cost.
-
-3. **Batch Processing with State Tracking:** Modify `RefundDeposits` and `DeleteDeposits` to process deposits in batches across multiple blocks if the count exceeds a threshold, maintaining state about progress between blocks.
-
-4. **Gas Metering for EndBlocker Operations:** Replace the infinite gas meter with a bounded meter during EndBlocker deposit iterations, with graceful handling if gas is exhausted (e.g., continuing in the next block).
-
-The most straightforward fix is option 1 (maximum depositors limit) combined with option 2 (minimum deposit per transaction), as these prevent the attack vector while maintaining protocol functionality.
+The implementation should add recursive validation logic that unwraps `MsgExec` messages and checks all nested messages against the allowed list before accepting the feegrant usage.
 
 ## Proof of Concept
 
-**Setup:** Create a governance proposal and generate thousands of unique addresses (e.g., 5,000 for testing, scalable to 10,000-100,000).
+**Test Location:** `x/feegrant/filtered_fee_test.go`
 
-**Action:** Each unique address submits a `MsgDeposit` with minimal amount (1 token). Spread these across multiple blocks during the deposit period. After all deposits are made, advance time to expire the proposal, triggering the EndBlocker.
+**Setup:**
+- Create feegrant with `AllowedMsgAllowance` allowing only `["/cosmos.gov.v1beta1.MsgVote", "/cosmos.authz.v1beta1.MsgExec"]`
+- Create `MsgSend` with sender = grantee
+- Create `MsgExec` with grantee = self, containing the `MsgSend` as nested message
 
-**Result:** The EndBlocker execution time increases dramatically proportional to the number of unique depositors. With 5,000 deposits, the delay is measurable; with 50,000-100,000 deposits, block delays exceed 500% of normal block time, confirming Medium severity DoS. Measure:
-- Baseline time to create deposits
-- EndBlocker execution time when calling `DeleteDeposits` or `RefundDeposits`
-- Ratio demonstrating the DoS impact (should exceed 5x normal block time)
+**Action:**
+- Test 1: Attempt transaction with direct `MsgSend` → correctly rejected by [4](#0-3) 
+- Test 2: Attempt transaction with `MsgExec` wrapping `MsgSend` → bypass succeeds because validation only checks top-level messages [2](#0-1) 
 
-The vulnerability is confirmed by code analysis showing: no depositor count limits, infinite gas meter in EndBlocker context, and unbounded iteration through all accumulated deposits.
+**Result:**
+The vulnerability is confirmed when Test 2 passes validation despite `MsgSend` not being in the allowed messages list. The feegrant message type restriction is completely bypassed for nested messages within `MsgExec`.
 
 ## Notes
 
-The vulnerability is validated based on code analysis. While the report provides a conceptual PoC rather than an executable Go test, the technical claims are verified through direct code inspection:
-- Unbounded iteration is evident in the code
-- Infinite gas meter usage in EndBlocker is confirmed
-- No limits exist on depositor count or per-transaction minimums
-- The computational cost of 10K-100K iterations with bank operations would clearly cause significant delays
+This is a critical design flaw in the interaction between the feegrant and authz modules. The vulnerability exists because:
+1. Fee validation happens at the AnteHandler level with only top-level messages [1](#0-0) 
+2. Message execution happens later with full nested message extraction [6](#0-5) 
+3. The authz module's implicit acceptance logic (when signer == grantee) [5](#0-4)  requires no prior authorization setup
 
-This meets the accepted impact category for Medium severity: "Temporary freezing of network transactions by delaying one block by 500% or more of the average block time."
+The impact qualifies as "Direct loss of funds" because the feegrant balance can be completely drained for unauthorized purposes, representing a direct financial loss to the granter who allocated those funds with specific restrictions.
 
 ### Citations
 
-**File:** x/gov/keeper/deposit.go (L54-68)
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-func (keeper Keeper) DeleteDeposits(ctx sdk.Context, proposalID uint64) {
-	store := ctx.KVStore(keeper.storeKey)
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+```
 
-	keeper.IterateDeposits(ctx, proposalID, func(deposit types.Deposit) bool {
-		err := keeper.bankKeeper.BurnCoins(ctx, types.ModuleName, deposit.Amount)
-		if err != nil {
-			panic(err)
+**File:** types/tx/types.go (L22-36)
+```go
+func (t *Tx) GetMsgs() []sdk.Msg {
+	if t == nil || t.Body == nil {
+		return nil
+	}
+
+	anys := t.Body.Messages
+	res := make([]sdk.Msg, len(anys))
+	for i, any := range anys {
+		cached := any.GetCachedValue()
+		if cached == nil {
+			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
 		}
+		res[i] = cached.(sdk.Msg)
+	}
+	return res
+```
 
-		depositor := sdk.MustAccAddressFromBech32(deposit.Depositor)
+**File:** x/feegrant/filtered_fee.go (L65-86)
+```go
+func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+	if !a.allMsgTypesAllowed(ctx, msgs) {
+		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
+	}
 
-		store.Delete(types.DepositKey(proposalID, depositor))
-		return false
-	})
+	allowance, err := a.GetAllowance()
+	if err != nil {
+		return false, err
+	}
+
+	remove, err := allowance.Accept(ctx, fee, msgs)
+	if err != nil {
+		return false, err
+	}
+
+	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
+	if err != nil {
+		return false, err
+	}
+
+    return remove, nil
 }
 ```
 
-**File:** x/gov/keeper/deposit.go (L88-104)
+**File:** x/feegrant/filtered_fee.go (L98-109)
 ```go
-// IterateDeposits iterates over the all the proposals deposits and performs a callback function
-func (keeper Keeper) IterateDeposits(ctx sdk.Context, proposalID uint64, cb func(deposit types.Deposit) (stop bool)) {
-	store := ctx.KVStore(keeper.storeKey)
-	iterator := sdk.KVStorePrefixIterator(store, types.DepositsKey(proposalID))
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
 
-	defer iterator.Close()
-
-	for ; iterator.Valid(); iterator.Next() {
-		var deposit types.Deposit
-
-		keeper.cdc.MustUnmarshal(iterator.Value(), &deposit)
-
-		if cb(deposit) {
-			break
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
 		}
 	}
+
+	return true
 }
 ```
 
-**File:** x/gov/keeper/deposit.go (L139-146)
+**File:** x/authz/keeper/keeper.go (L87-111)
 ```go
-	// Add or update deposit object
-	deposit, found := keeper.GetDeposit(ctx, proposalID, depositorAddr)
-
-	if found {
-		deposit.Amount = deposit.Amount.Add(depositAmount...)
-	} else {
-		deposit = types.NewDeposit(proposalID, depositorAddr, depositAmount)
-	}
-```
-
-**File:** x/gov/keeper/deposit.go (L164-179)
-```go
-// RefundDeposits refunds and deletes all the deposits on a specific proposal
-func (keeper Keeper) RefundDeposits(ctx sdk.Context, proposalID uint64) {
-	store := ctx.KVStore(keeper.storeKey)
-
-	keeper.IterateDeposits(ctx, proposalID, func(deposit types.Deposit) bool {
-		depositor := sdk.MustAccAddressFromBech32(deposit.Depositor)
-
-		err := keeper.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, depositor, deposit.Amount)
-		if err != nil {
-			panic(err)
-		}
-
-		store.Delete(types.DepositKey(proposalID, depositor))
-		return false
-	})
-}
-```
-
-**File:** x/gov/abci.go (L20-22)
-```go
-	keeper.IterateInactiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-		keeper.DeleteProposal(ctx, proposal.ProposalId)
-		keeper.DeleteDeposits(ctx, proposal.ProposalId)
-```
-
-**File:** x/gov/abci.go (L58-62)
-```go
-			if burnDeposits {
-				keeper.DeleteDeposits(ctx, proposal.ProposalId)
-			} else {
-				keeper.RefundDeposits(ctx, proposal.ProposalId)
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
 			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
 ```
 
-**File:** types/context.go (L262-280)
+**File:** x/authz/keeper/msg_server.go (L65-83)
 ```go
-func NewContext(ms MultiStore, header tmproto.Header, isCheckTx bool, logger log.Logger) Context {
-	// https://github.com/gogo/protobuf/issues/519
-	header.Time = header.Time.UTC()
-	return Context{
-		ctx:             context.Background(),
-		ms:              ms,
-		header:          header,
-		chainID:         header.ChainID,
-		checkTx:         isCheckTx,
-		logger:          logger,
-		gasMeter:        NewInfiniteGasMeter(1, 1),
-		minGasPrice:     DecCoins{},
-		eventManager:    NewEventManager(),
-		evmEventManager: NewEVMEventManager(),
-
-		txBlockingChannels:   make(acltypes.MessageAccessOpsChannelMapping),
-		txCompletionChannels: make(acltypes.MessageAccessOpsChannelMapping),
-		txMsgAccessOps:       make(map[int][]acltypes.AccessOperation),
-	}
-```
-
-**File:** store/types/gas.go (L252-258)
-```go
-func (g *infiniteGasMeter) IsPastLimit() bool {
-	return false
-}
-
-func (g *infiniteGasMeter) IsOutOfGas() bool {
-	return false
-}
-```
-
-**File:** x/gov/types/msgs.go (L153-165)
-```go
-func (msg MsgDeposit) ValidateBasic() error {
-	if msg.Depositor == "" {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, msg.Depositor)
-	}
-	if !msg.Amount.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
-	}
-	if msg.Amount.IsAnyNegative() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
+func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil
+	msgs, err := msg.GetMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := k.DispatchActions(ctx, grantee, msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgExecResponse{Results: results}, nil
 }
 ```

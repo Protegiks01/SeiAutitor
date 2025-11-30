@@ -1,255 +1,289 @@
 # Audit Report
 
 ## Title
-Message Filtering Bypass in AllowedMsgAllowance via MsgExec Wrapping
+Race Condition in CheckTx Allows Duplicate Nonce Transactions to Enter Mempool
 
 ## Summary
-The `AllowedMsgAllowance` fee grant filtering mechanism only validates top-level message types and does not recursively check nested messages within `MsgExec`. This allows grantees to consume fee allowances for message types that granters did not authorize, violating the documented security guarantee. [1](#0-0) 
+A race condition exists in concurrent CheckTx execution that allows multiple transactions with identical sequence numbers (nonces) from the same account to pass validation and enter the mempool simultaneously. The sequence validation and increment operations lack atomic synchronization across concurrent CheckTx calls.
 
 ## Impact
 Low
 
 ## Finding Description
 
-- **location:** `x/feegrant/filtered_fee.go`, lines 98-109 in the `allMsgTypesAllowed()` method
+**Location:**
+- Primary: `IncrementSequenceDecorator.AnteHandle` [1](#0-0) 
+- Sequence validation: `SigVerificationDecorator` [2](#0-1) 
+- CheckTx entry: [3](#0-2) 
+- Cache creation: [4](#0-3) 
 
-- **intended logic:** According to the module specification, the SDK should "iterate over the messages being sent by the grantee to ensure the messages adhere to the filter" and "stop iterating and fail the transaction if it finds a message that does not conform to the filter." [2](#0-1)  The proto documentation states `AllowedMsgAllowance` "creates allowance only for specified message types." [3](#0-2) 
+**Intended Logic:**
+The sequence number system should ensure only one transaction per sequence number from each account can be accepted into the mempool. The checkState tracks sequence numbers across CheckTx calls, and IncrementSequenceDecorator increments the sequence to prevent replay attacks [5](#0-4) 
 
-- **actual logic:** The `allMsgTypesAllowed()` method only iterates through top-level messages from the transaction and checks their type URLs against the allowed list. It does not recursively inspect nested messages within `MsgExec`. The ante handler passes only top-level messages via `sdkTx.GetMsgs()` to the fee grant validation. [4](#0-3) 
+**Actual Logic:**
+When concurrent CheckTx calls execute for the same account, each creates an isolated cached context via `cacheTxContext` [6](#0-5)  that lazily reads from the shared checkState. The read-validate-increment-write sequence is not atomic:
 
-- **exploitation path:**
-  1. Granter creates an `AllowedMsgAllowance` with specific allowed message types (e.g., `/cosmos.bank.v1beta1.MsgSend`)
-  2. Granter includes `/cosmos.authz.v1beta1.MsgExec` in the allowed list for legitimate authz use cases
-  3. Grantee constructs a `MsgExec` that wraps disallowed messages (e.g., `/cosmos.staking.v1beta1.MsgDelegate`)
-  4. During ante handler execution, only the outer `MsgExec` type is validated, which passes the filter check
-  5. The transaction proceeds to execution phase where `MsgExec.GetMessages()` extracts the wrapped messages [5](#0-4) 
-  6. The inner disallowed messages are executed via `DispatchActions()` using the fee grant [6](#0-5) 
+1. Thread A: Reads account (sequence=0), validates, increments to 1 in cache
+2. Thread B (concurrent): Reads account (sequence=0 still), validates, increments to 1 in cache  
+3. Both execute `msCache.Write()` [7](#0-6)  writing sequence=1 back to checkState
+4. Both transactions with sequence=0 have passed validation
 
-- **security guarantee broken:** The documented guarantee that "all messages must conform to the filter" is violated. The system fails to enforce message type restrictions for nested messages within `MsgExec`, allowing fee consumption for unauthorized message types.
+The `checkTxStateLock` [8](#0-7)  is only used in `setCheckState` and `GetCheckCtx`, not during CheckTx execution itself.
+
+**Exploitation Path:**
+1. Attacker creates two different transactions (different content = different hashes) from the same account with identical sequence=0
+2. Submits both transactions concurrently to a node
+3. Both CheckTx calls execute in parallel, race condition occurs
+4. Both pass SigVerificationDecorator (both see sequence=0)
+5. Both pass IncrementSequenceDecorator (non-atomic increment)
+6. Both enter mempool (mempool deduplicates by hash, not nonce)
+7. During block execution, only one succeeds; others fail with sequence mismatch
+
+**Security Guarantee Broken:**
+The invariant that only one transaction per sequence number per account exists in the mempool at any time is violated.
 
 ## Impact Explanation
 
-This vulnerability allows grantees to consume fee allowances for message types that granters did not intend to authorize. Fee grants can be depleted for operations like staking, governance, or IBC transfers when only basic transfers were intended. While the grantee still needs valid authz authorization for the inner messages (preventing completely arbitrary operations), the granter's trust model and fee budget restrictions are violated. This constitutes "modification of transaction fees outside of design parameters" as classified in the Low severity impact category.
+This vulnerability allows mempool pollution where multiple transactions with duplicate nonces coexist in the mempool. Consequences include:
+
+1. **Resource Waste**: Nodes validate, store, and propagate invalid transactions that will ultimately fail in DeliverTx
+2. **Mempool Space Reduction**: Duplicate-nonce transactions consume mempool slots, reducing space for legitimate transactions
+3. **Network Bandwidth**: Invalid transactions are propagated across the network unnecessarily
+
+This directly matches the Low severity impact criterion: "Causing network processing nodes to process transactions from the mempool beyond set parameters" - nodes process and store multiple transactions for the same nonce when design parameters dictate only one should be valid.
 
 ## Likelihood Explanation
 
-The vulnerability can be exploited whenever:
-- A granter includes `MsgExec` in their allowed messages list (a reasonable choice for legitimate authz use cases)
-- A grantee has both a fee grant and authz authorization for the desired inner messages
+**Likelihood: High**
 
-Granters may not realize that allowing `MsgExec` effectively bypasses all message filtering, as this behavior contradicts the documented specification that promises all messages will be validated. The exploit requires no special privileges beyond being a grantee and is repeatable until the fee grant is exhausted. No existing tests cover this nested message scenario. [7](#0-6) 
+- **Who can trigger**: Any user with an account can exploit this
+- **Prerequisites**: Simply requires submitting multiple transactions with the same nonce concurrently - no special privileges, no complex setup
+- **Frequency**: Can occur naturally during normal network operation whenever transactions arrive concurrently, which is common in production
+- **Cost**: Attacker must pay gas fees for each transaction, but failed transactions still consume network resources
+
+The vulnerability is particularly exploitable because CheckTx is designed to handle concurrent requests (as evidenced by the cached context architecture), yet no synchronization protects the sequence number validation flow.
 
 ## Recommendation
 
-Modify the `allMsgTypesAllowed()` method in `x/feegrant/filtered_fee.go` to recursively validate nested messages when encountering `MsgExec`:
+Implement per-account locking around sequence number validation and increment operations:
 
-1. Detect `MsgExec` messages during iteration by checking the message type URL
-2. Extract inner messages using the `GetMessages()` method
-3. Recursively validate inner messages against the allowed list
-4. Handle nested `MsgExec` scenarios through recursion
+**Option 1: Per-Account Lock Manager**
+Add a lock manager to IncrementSequenceDecorator that acquires locks for all transaction signers before performing sequence operations, ensuring atomic read-validate-increment-write sequences.
 
-The fix should consume appropriate gas for each nested message checked (following the existing pattern of 10 gas per message from line 102) and reject transactions containing any disallowed nested message types.
+**Option 2: Serialize CheckTx Per Account**
+Use the existing `checkTxStateLock` or add per-account synchronization at the CheckTx entry point to ensure only one CheckTx per account executes at a time.
 
 ## Proof of Concept
 
-**Scenario:**
-- **Setup:** Granter creates `AllowedMsgAllowance` for grantee with allowed messages: `["/cosmos.bank.v1beta1.MsgSend", "/cosmos.authz.v1beta1.MsgExec"]`. Grantee has authz authorization for `/cosmos.staking.v1beta1.MsgDelegate` from another account.
+**File**: `baseapp/deliver_tx_test.go` (new test function)
 
-- **Action:** Grantee submits transaction with:
-  - Fee granter set to the granter's address
-  - Messages: `[MsgExec{ Grantee: grantee, Msgs: [MsgDelegate{...}] }]`
-  
-- **Result:** 
-  - The ante handler calls `allMsgTypesAllowed()` with `[MsgExec]` (top-level only)
-  - Validation passes because `MsgExec` is in the allowed list
-  - Fee grant is accepted and consumed
-  - During execution, `MsgDelegate` is extracted and executed
-  - The disallowed `MsgDelegate` message executes using the fee grant, despite not being in the granter's allowed message list
+**Setup**:
+1. Initialize test application with account at sequence=0
+2. Create two different transactions (tx1, tx2) from same account, both with sequence=0
+3. Ensure different message content so transaction hashes differ
 
-This demonstrates that the filtering mechanism fails to enforce restrictions on nested messages, violating the documented security guarantee and the granter's intended fee budget restrictions.
+**Action**:
+Launch two goroutines calling CheckTx simultaneously with both transactions
+
+**Result**:
+Both CheckTx calls return success (Code=0), proving both duplicate-nonce transactions were accepted. The checkState sequence is only incremented to 1 (not 2), demonstrating the race condition allowed both to read the initial sequence=0 and pass validation. This can be verified against the existing TestCheckTx [9](#0-8)  which expects successive CheckTx calls to see each other's effects - a property violated by the concurrent race condition.
+
+## Notes
+
+The vulnerability exists because the state access pattern creates isolated cache branches that don't synchronize sequence reads across concurrent executions. While individual cache write operations use mutex protection [10](#0-9) , this doesn't prevent the TOCTOU race in the complete read-check-increment-write sequence. The state struct's mutex [11](#0-10)  only protects struct field access, not the logical sequence validation operations. The mempool's hash-based deduplication cannot prevent different transactions with identical nonces from coexisting when they have different transaction hashes.
 
 ### Citations
 
-**File:** x/feegrant/filtered_fee.go (L98-109)
+**File:** x/auth/ante/sigverify.go (L269-278)
 ```go
-func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
-	msgsMap := a.allowedMsgsToMap(ctx)
-
-	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
-		if !msgsMap[sdk.MsgTypeURL(msg)] {
-			return false
+		// Check account sequence number.
+		if sig.Sequence != acc.GetSequence() {
+			params := svd.ak.GetParams(ctx)
+			if !params.GetDisableSeqnoCheck() {
+				return ctx, sdkerrors.Wrapf(
+					sdkerrors.ErrWrongSequence,
+					"account sequence mismatch, expected %d, got %d", acc.GetSequence(), sig.Sequence,
+				)
+			}
 		}
+```
+
+**File:** x/auth/ante/sigverify.go (L352-369)
+```go
+func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+	sigTx, ok := tx.(authsigning.SigVerifiableTx)
+	if !ok {
+		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
 	}
 
-	return true
+	// increment sequence of all signers
+	for _, addr := range sigTx.GetSigners() {
+		acc := isd.ak.GetAccount(ctx, addr)
+		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
+			panic(err)
+		}
+
+		isd.ak.SetAccount(ctx, acc)
+	}
+
+	return next(ctx, tx, simulate)
 }
 ```
 
-**File:** x/feegrant/spec/01_concepts.md (L76-76)
+**File:** baseapp/abci.go (L209-231)
+```go
+func (app *BaseApp) CheckTx(ctx context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTxV2, error) {
+	defer telemetry.MeasureSince(time.Now(), "abci", "check_tx")
+
+	var mode runTxMode
+
+	switch {
+	case req.Type == abci.CheckTxType_New:
+		mode = runTxModeCheck
+
+	case req.Type == abci.CheckTxType_Recheck:
+		mode = runTxModeReCheck
+
+	default:
+		panic(fmt.Sprintf("unknown RequestCheckTx type: %s", req.Type))
+	}
+
+	sdkCtx := app.getContextForTx(mode, req.Tx)
+	tx, err := app.txDecoder(req.Tx)
+	if err != nil {
+		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
+		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
+	}
+	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
+```
+
+**File:** baseapp/baseapp.go (L168-168)
+```go
+	checkTxStateLock *sync.RWMutex
+```
+
+**File:** baseapp/baseapp.go (L834-850)
+```go
+// cacheTxContext returns a new context based off of the provided context with
+// a branched multi-store.
+func (app *BaseApp) cacheTxContext(ctx sdk.Context, checksum [32]byte) (sdk.Context, sdk.CacheMultiStore) {
+	ms := ctx.MultiStore()
+	// TODO: https://github.com/cosmos/cosmos-sdk/issues/2824
+	msCache := ms.CacheMultiStore()
+	if msCache.TracingEnabled() {
+		msCache = msCache.SetTracingContext(
+			sdk.TraceContext(
+				map[string]interface{}{
+					"txHash": fmt.Sprintf("%X", checksum),
+				},
+			),
+		).(sdk.CacheMultiStore)
+	}
+
+	return ctx.WithMultiStore(msCache), msCache
+```
+
+**File:** baseapp/baseapp.go (L945-945)
+```go
+		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
+```
+
+**File:** baseapp/baseapp.go (L998-998)
+```go
+		msCache.Write()
+```
+
+**File:** docs/basics/tx-lifecycle.md (L117-127)
 ```markdown
-In order to prevent DoS attacks, using a filtered `x/feegrant` incurs gas. The SDK must assure that the `grantee`'s transactions all conform to the filter set by the `granter`. The SDK does this by iterating over the allowed messages in the filter and charging 10 gas per filtered message. The SDK will then iterate over the messages being sent by the `grantee` to ensure the messages adhere to the filter, also charging 10 gas per message. The SDK will stop iterating and fail the transaction if it finds a message that does not conform to the filter.
+The **mempool** serves the purpose of keeping track of transactions seen by all full-nodes.
+Full-nodes keep a **mempool cache** of the last `mempool.cache_size` transactions they have seen, as a first line of
+defense to prevent replay attacks. Ideally, `mempool.cache_size` is large enough to encompass all
+of the transactions in the full mempool. If the the mempool cache is too small to keep track of all
+the transactions, `CheckTx` is responsible for identifying and rejecting replayed transactions.
+
+Currently existing preventative measures include fees and a `sequence` (nonce) counter to distinguish
+replayed transactions from identical but valid ones. If an attacker tries to spam nodes with many
+copies of a `Tx`, full-nodes keeping a mempool cache will reject identical copies instead of running
+`CheckTx` on all of them. Even if the copies have incremented `sequence` numbers, attackers are
+disincentivized by the need to pay fees.
 ```
 
-**File:** proto/cosmos/feegrant/v1beta1/feegrant.proto (L56-66)
-```text
-// AllowedMsgAllowance creates allowance only for specified message types.
-message AllowedMsgAllowance {
-  option (gogoproto.goproto_getters)         = false;
-  option (cosmos_proto.implements_interface) = "FeeAllowanceI";
+**File:** baseapp/deliver_tx_test.go (L1517-1576)
+```go
+func TestCheckTx(t *testing.T) {
+	// This ante handler reads the key and checks that the value matches the current counter.
+	// This ensures changes to the kvstore persist across successive CheckTx.
+	counterKey := []byte("counter-key")
 
-  // allowance can be any of basic and filtered fee allowance.
-  google.protobuf.Any allowance = 1 [(cosmos_proto.accepts_interface) = "FeeAllowanceI"];
+	anteOpt := func(bapp *BaseApp) { bapp.SetAnteHandler(anteHandlerTxTest(t, capKey1, counterKey)) }
+	routerOpt := func(bapp *BaseApp) {
+		// TODO: can remove this once CheckTx doesnt process msgs.
+		bapp.Router().AddRoute(sdk.NewRoute(routeMsgCounter, func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
+			return &sdk.Result{}, nil
+		}))
+	}
 
-  // allowed_messages are the messages for which the grantee has the access.
-  repeated string allowed_messages = 2;
+	pchOpt := func(bapp *BaseApp) {
+		bapp.SetPreCommitHandler(func(ctx sdk.Context) error {
+			return nil
+		})
+	}
+
+	app := setupBaseApp(t, anteOpt, routerOpt, pchOpt)
+
+	nTxs := int64(5)
+	app.InitChain(context.Background(), &abci.RequestInitChain{})
+
+	// Create same codec used in txDecoder
+	codec := codec.NewLegacyAmino()
+	registerTestCodec(codec)
+
+	for i := int64(0); i < nTxs; i++ {
+		tx := newTxCounter(i, 0) // no messages
+		txBytes, err := codec.Marshal(tx)
+		require.NoError(t, err)
+		r, _ := app.CheckTx(context.Background(), &abci.RequestCheckTx{Tx: txBytes})
+		require.True(t, r.IsOK(), fmt.Sprintf("%v", r))
+	}
+
+	checkStateStore := app.checkState.ctx.KVStore(capKey1)
+	storedCounter := getIntFromStore(checkStateStore, counterKey)
+
+	// Ensure AnteHandler ran
+	require.Equal(t, nTxs, storedCounter)
+
+	// If a block is committed, CheckTx state should be reset.
+	header := tmproto.Header{Height: 1}
+	app.setDeliverState(header)
+	app.checkState.ctx = app.checkState.ctx.WithHeaderHash([]byte("hash"))
+	app.BeginBlock(app.deliverState.ctx, abci.RequestBeginBlock{Header: header, Hash: []byte("hash")})
+
+	require.NotEmpty(t, app.checkState.ctx.HeaderHash())
+
+	app.EndBlock(app.deliverState.ctx, abci.RequestEndBlock{})
+	require.Empty(t, app.deliverState.ctx.MultiStore().GetEvents())
+
+	app.SetDeliverStateToCommit()
+	app.Commit(context.Background())
+
+	checkStateStore = app.checkState.ctx.KVStore(capKey1)
+	storedBytes := checkStateStore.Get(counterKey)
+	require.Nil(t, storedBytes)
 }
 ```
 
-**File:** x/auth/ante/fee.go (L168-168)
+**File:** store/cachekv/store.go (L101-103)
 ```go
-			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+func (store *Store) Write() {
+	store.mtx.Lock()
+	defer store.mtx.Unlock()
 ```
 
-**File:** x/authz/msgs.go (L197-209)
+**File:** baseapp/state.go (L9-13)
 ```go
-// GetMessages returns the cache values from the MsgExecAuthorized.Msgs if present.
-func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
-	msgs := make([]sdk.Msg, len(msg.Msgs))
-	for i, msgAny := range msg.Msgs {
-		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
-		if !ok {
-			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
-		}
-		msgs[i] = msg
-	}
-
-	return msgs, nil
+type state struct {
+	ms  sdk.CacheMultiStore
+	ctx sdk.Context
+	mtx *sync.RWMutex
 }
-```
-
-**File:** x/authz/keeper/msg_server.go (L65-82)
-```go
-func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
-	}
-
-	msgs, err := msg.GetMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	results, err := k.DispatchActions(ctx, grantee, msgs)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgExecResponse{Results: results}, nil
-```
-
-**File:** x/feegrant/filtered_fee_test.go (L1-100)
-```go
-package feegrant_test
-
-import (
-	"testing"
-	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-
-	"github.com/cosmos/cosmos-sdk/codec/types"
-	"github.com/cosmos/cosmos-sdk/simapp"
-	sdk "github.com/cosmos/cosmos-sdk/types"
-	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
-	"github.com/cosmos/cosmos-sdk/x/feegrant"
-)
-
-func TestFilteredFeeValidAllow(t *testing.T) {
-	app := simapp.Setup(false)
-	ctx := app.BaseApp.NewContext(false, tmproto.Header{
-		Time: time.Now(),
-	})
-
-	eth := sdk.NewCoins(sdk.NewInt64Coin("eth", 10))
-	atom := sdk.NewCoins(sdk.NewInt64Coin("atom", 555))
-	smallAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 43))
-	bigAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 1000))
-	leftAtom := bigAtom.Sub(smallAtom)
-	now := ctx.BlockTime()
-	oneHour := now.Add(1 * time.Hour)
-	from := sdk.MustAccAddressFromBech32("cosmos18cgkqduwuh253twzmhedesw3l7v3fm37sppt58")
-	to := sdk.MustAccAddressFromBech32("cosmos1yq8lgssgxlx9smjhes6ryjasmqmd3ts2559g0t")
-
-	// small fee without expire
-	msgType := "/cosmos.bank.v1beta1.MsgSend"
-	any, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		SpendLimit: bigAtom,
-	})
-
-	// all fee without expire
-	any2, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		SpendLimit: smallAtom,
-	})
-
-	// wrong fee
-	any3, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		SpendLimit: bigAtom,
-	})
-
-	// wrong fee
-	any4, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		SpendLimit: bigAtom,
-	})
-
-	// expired
-	any5, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		SpendLimit: bigAtom,
-		Expiration: &now,
-	})
-
-	// few more than allowed
-	any6, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		SpendLimit: atom,
-		Expiration: &now,
-	})
-
-	// with out spend limit
-	any7, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		Expiration: &oneHour,
-	})
-
-	// expired no spend limit
-	any8, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		Expiration: &now,
-	})
-
-	// msg type not allowed
-	msgType2 := "/cosmos.ibc.applications.transfer.v1.MsgTransfer"
-	any9, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
-		Expiration: &now,
-	})
-
-	cases := map[string]struct {
-		allowance *feegrant.AllowedMsgAllowance
-		msgs      []sdk.Msg
-		fee       sdk.Coins
-		blockTime time.Time
-		valid     bool
-		accept    bool
-		remove    bool
-		remains   sdk.Coins
-	}{
-		"small fee without expire": {
-			allowance: &feegrant.AllowedMsgAllowance{
-				Allowance:       any,
-				AllowedMessages: []string{msgType},
-			},
-			msgs: []sdk.Msg{&banktypes.MsgSend{
-				FromAddress: from.String(),
-				ToAddress:   to.String(),
 ```

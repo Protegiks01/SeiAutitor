@@ -1,237 +1,216 @@
-After thorough analysis of the codebase and the security claim, I have validated this vulnerability. Here is my assessment:
-
 # Audit Report
 
 ## Title
-Capability Ownership Bypass Through Forged Capability Pointer
+ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
 
 ## Summary
-The `ClaimCapability` function does not validate that the provided capability pointer is the canonical pointer stored in `capMap`. This allows any module to forge a capability struct with a known index and claim ownership of capabilities they never legitimately received, bypassing the object-capability security model.
+The `ClaimCapability` function in the capability keeper allows a module to claim the same capability multiple times under different names, causing forward-map corruption that breaks capability authentication and creates permanent orphaned state.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** `x/capability/keeper/keeper.go`, function `ClaimCapability` (lines 287-314)
 
-**Intended Logic:**
-The capability system implements an object-capability model where capabilities can only be obtained through legitimate channels. According to the specification, `ClaimCapability` is designed for "a capability key which it has received from another module." [2](#0-1)  The security relies on pointer identity as unforgeable identifiers. [3](#0-2) 
+**Intended Logic:** The capability module should enforce that each module can claim a given capability only once. The forward mapping should consistently identify the single name associated with a capability for that module to enable proper authentication.
 
-**Actual Logic:**
-The `ClaimCapability` function only validates that the capability is not nil and the name is not empty. It then calls `addOwner` [4](#0-3)  which uses `cap.GetIndex()` to update the persistent owner set. There is no validation that the provided pointer matches the canonical pointer stored in `capMap[cap.GetIndex()]`. Since `NewCapability` is public [5](#0-4) , anyone can create a forged capability struct with any index.
+**Actual Logic:** The `ClaimCapability` function only validates whether the exact (module, name) tuple already exists in the owner set. The validation occurs in `CapabilityOwners.Set()` which checks `Owner.Key()` returning "module/name", preventing only duplicate claims with the identical name. [1](#0-0) 
+
+The architectural flaw lies in how keys are generated:
+- Forward key depends only on module and capability pointer (not name): [2](#0-1) 
+- Owner key includes both module and name: [3](#0-2) 
+
+This mismatch allows multiple owner entries per module while only one forward mapping can exist.
 
 **Exploitation Path:**
-1. Module A creates a capability with index N (canonical pointer stored in `capMap[N]`)
-2. Malicious Module M discovers index N (indices are sequential and stored in persistent state)
-3. Module M creates forged capability: `forged := types.NewCapability(N)` at a different memory address
-4. Module M calls `ClaimCapability(ctx, forged, "stolen")` - succeeds because no pointer validation exists
-5. `addOwner` adds Module M to the persistent owner set using only the index
-6. Module M calls `GetCapability(ctx, "stolen")` [6](#0-5)  which returns `capMap[N]` - the canonical pointer
-7. Module M now has full access to the capability and is listed as a legitimate owner
+1. Module "ibc" claims capability: `ClaimCapability(ctx, cap, "channel-1")`
+   - Owner set: `[{ibc, channel-1}]`
+   - Forward: `ibc/fwd/0xCAP` → "channel-1"
+   - Reverse: `ibc/rev/channel-1` → index
 
-**Security Guarantee Broken:**
-The fundamental invariant that "capabilities can only be obtained through legitimate channels" is violated. The object-capability authorization model underlying IBC security is completely bypassed.
+2. Module "ibc" claims same capability with different name: `ClaimCapability(ctx, cap, "channel-2")`
+   - `addOwner` succeeds (different name, so different owner key)
+   - Owner set: `[{ibc, channel-1}, {ibc, channel-2}]`
+   - Forward: `ibc/fwd/0xCAP` → "channel-2" [OVERWRITES at line 303] [4](#0-3) 
+   - Reverse: `ibc/rev/channel-2` → index [NEW entry at line 309] [5](#0-4) 
+
+3. Authentication fails for original name:
+   - `AuthenticateCapability(cap, "channel-1")` calls `GetCapabilityName` which returns "channel-2" [6](#0-5) 
+   - Comparison "channel-2" != "channel-1" returns false [7](#0-6) 
+
+4. Incomplete cleanup:
+   - `ReleaseCapability` retrieves name from forward map ("channel-2") [8](#0-7) 
+   - Deletes only "channel-2" mappings, leaving "channel-1" reverse mapping and owner entry permanently orphaned [9](#0-8) 
+
+**Security Guarantee Broken:** The capability authentication invariant is violated - modules lose the ability to authenticate capabilities they legitimately own under the original name.
 
 ## Impact Explanation
 
-This vulnerability enables:
-- **IBC Port/Channel Hijacking**: Malicious modules can claim ownership of IBC ports and channels they were never authorized to access, enabling unauthorized packet transmission and channel operations [7](#0-6) 
-- **Cross-chain Asset Theft**: Unauthorized IBC operations could enable direct loss of funds through unauthorized cross-chain transfers
-- **Complete Security Model Bypass**: The capability system is the foundation of access control in IBC. Its compromise affects all protocols depending on it for security
+This vulnerability affects the core security mechanism of the capability module used throughout Cosmos SDK:
 
-The severity is HIGH because it enables direct loss of funds through unauthorized IBC operations and completely undermines the security architecture.
+1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name cannot authenticate it, potentially blocking IBC channel operations or other capability-protected actions. The authentication check explicitly compares the forward-mapped name with the requested name, and this comparison fails after the forward map is overwritten.
+
+2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last claimed name's mappings are cleaned up. The reverse mappings and owner entries for earlier names remain permanently orphaned in both memory and persistent storage, creating inconsistent state that cannot be fixed without a chain upgrade.
+
+3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate in storage over time, consuming resources that cannot be reclaimed through normal operations.
+
+This fits the Medium severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**High Likelihood:**
-- Any module running on the chain can exploit this vulnerability
-- Capability indices are sequential (0, 1, 2, ...) and easily discoverable by observing state
-- The attack requires no special privileges beyond having a ScopedKeeper, which all modules receive during initialization
-- Third-party modules are common in Cosmos SDK chains (IBC apps, DeFi protocols)
-- A single compromised or buggy third-party module can exploit this
-- The existing test [8](#0-7)  shows developers were aware of forged capability risks but only tested authentication failures for unclaimed forged capabilities, not the claiming attack vector
+**Likelihood: Medium**
 
-The barrier to exploitation is simply having a module deployed on the chain, which is realistic given the prevalence of third-party modules in production chains.
+This can be triggered in realistic scenarios:
+
+- **Module Implementation Bugs:** A module that doesn't properly track claimed capabilities may attempt to claim the same capability multiple times with different names during error recovery or state reconstruction.
+
+- **IBC Channel Handshake Complexity:** The multi-step IBC channel handshake (INIT, TRY, ACK, CONFIRM) with retry logic could cause re-claiming with different channel identifiers if state management is not carefully implemented.
+
+- **Insufficient Defensive Checks:** While IBC documentation shows the defensive pattern of using `AuthenticateCapability` before claiming, this only prevents claiming with the same name. [10](#0-9)  No check exists to prevent claiming with a different name.
+
+The vulnerability requires no special privileges - any module can trigger this during normal operation. The existing test suite only validates that claiming with the same name fails, but does not test claiming with different names. [11](#0-10) 
 
 ## Recommendation
 
-Add validation in `ClaimCapability` to ensure the capability pointer is the canonical one from `capMap`:
+Add a defensive check in `ClaimCapability` to verify the calling module hasn't already claimed the capability under any name:
 
 ```go
 func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-    if cap == nil {
-        return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+    // ... existing nil and empty name checks ...
+    
+    // Check if this module already owns this capability under any name
+    existingName := sk.GetCapabilityName(ctx, cap)
+    if existingName != "" {
+        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
+            "module %s already owns capability under name %s", sk.module, existingName)
     }
     
-    // Validate capability pointer is canonical
-    canonicalCap := sk.capMap[cap.GetIndex()]
-    if canonicalCap == nil {
-        return sdkerrors.Wrap(types.ErrCapabilityNotFound, "capability does not exist")
-    }
-    if canonicalCap != cap {
-        return errors.New("capability pointer is not canonical")
-    }
-    
-    if strings.TrimSpace(name) == "" {
-        return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-    }
-    
-    // ... rest of existing logic
+    // ... rest of function ...
 }
 ```
+
+This prevents forward-map corruption by ensuring each module can only claim a given capability once, maintaining the one-to-one invariant between module and capability.
 
 ## Proof of Concept
 
-**Setup:**
-- Create two scoped keepers for different modules (sk1 for "moduleA", sk2 for "moduleB")
-- sk1 creates a legitimate capability: `cap1, _ := sk1.NewCapability(ctx, "port")` at index 0
-- sk1 NEVER passes this capability to sk2
+**Setup:** Create a scoped keeper for a module
 
 **Action:**
-```go
-// Module B creates forged capability with same index
-forged := types.NewCapability(cap1.GetIndex())
+1. Module creates capability: `cap, _ := sk.NewCapability(ctx, "original")`
+2. Module claims same capability with different name: `sk.ClaimCapability(ctx, cap, "duplicate")`
 
-// Module B claims the forged capability
-err := sk2.ClaimCapability(ctx, forged, "stolen")
-// Expected: Should fail, Actual: Succeeds (no error)
+**Expected Result:**
+- Second `ClaimCapability` should fail (module already owns capability)
 
-// Module B retrieves the canonical capability
-canonical, ok := sk2.GetCapability(ctx, "stolen")
-// Result: ok == true, canonical == cap1
-```
+**Actual Result:**
+1. Second `ClaimCapability` succeeds (vulnerability)
+2. `AuthenticateCapability(cap, "original")` returns false - authentication broken
+3. `GetCapabilityName(cap)` returns "duplicate" instead of "original" - forward map overwritten
+4. After `ReleaseCapability(cap)`, reverse mapping `module/rev/original` remains - orphaned state
+5. Owner entry `{module, "original"}` remains in persistent store - permanent corruption
 
-**Result:**
-- The claim succeeds (no error) - proving no validation exists
-- sk2 is now listed as an owner in persistent storage - proving unauthorized ownership was granted
-- sk2 can retrieve the canonical pointer via `GetCapability` - proving full access to Module A's capability
+**Notes**
 
-This represents a fundamental failure in the security design where modules can bypass isolation by forging capability structs. While modules are added through governance, defense-in-depth principles require that even a malicious or buggy module cannot compromise capabilities owned by other modules.
+The vulnerability stems from an architectural mismatch: `FwdCapabilityKey` creates keys based only on module and capability pointer (not name), allowing only one forward mapping per (module, capability) pair, while the owner set can contain multiple (module, name) entries for the same capability. This mismatch enables the corruption when a module claims the same capability multiple times with different names. While this requires a module bug to trigger, the capability module as core security infrastructure should defend against such misuse to prevent permanent state corruption.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** x/capability/types/types.go (L29-32)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
+// Key returns a composite key for an Owner.
+func (o Owner) Key() string {
+	return fmt.Sprintf("%s/%s", o.Module, o.Name)
+}
+```
+
+**File:** x/capability/types/types.go (L46-59)
+```go
+func (co *CapabilityOwners) Set(owner Owner) error {
+	i, ok := co.Get(owner)
+	if ok {
+		// owner already exists at co.Owners[i]
+		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
+	// owner does not exist in the set of owners, so we insert at position i
+	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
+	copy(co.Owners[i+1:], co.Owners[i:])
+	co.Owners[i] = owner
 
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
+	return nil
+}
+```
+
+**File:** x/capability/types/keys.go (L41-50)
+```go
+func FwdCapabilityKey(module string, cap *Capability) []byte {
+	// encode the key to a fixed length to avoid breaking consensus state machine
+	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
+	// the length 10 is picked so it's backward compatible on common architectures.
+	key := fmt.Sprintf("%#010p", cap)
+	if len(key) > 10 {
+		key = key[len(key)-10:]
+	}
+	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
+}
+```
+
+**File:** x/capability/keeper/keeper.go (L275-280)
+```go
+func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
+	if strings.TrimSpace(name) == "" || cap == nil {
+		return false
+	}
+	return sk.GetCapabilityName(ctx, cap) == name
+}
+```
+
+**File:** x/capability/keeper/keeper.go (L303-303)
+```go
 	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
-}
 ```
 
-**File:** x/capability/keeper/keeper.go (L361-388)
+**File:** x/capability/keeper/keeper.go (L309-309)
 ```go
-func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
-	if strings.TrimSpace(name) == "" {
-		return nil, false
+	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
+```
+
+**File:** x/capability/keeper/keeper.go (L323-326)
+```go
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	}
+```
+
+**File:** x/capability/keeper/keeper.go (L332-340)
+```go
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
+```
+
+**File:** x/capability/keeper/keeper.go (L392-399)
+```go
+func (sk ScopedKeeper) GetCapabilityName(ctx sdk.Context, cap *types.Capability) string {
+	if cap == nil {
+		return ""
 	}
 	memStore := ctx.KVStore(sk.memKey)
 
-	key := types.RevCapabilityKey(sk.module, name)
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-
-	if len(indexBytes) == 0 {
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-
-		return nil, false
-	}
-
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
-	}
-
-	return cap, true
+	return string(memStore.Get(types.FwdCapabilityKey(sk.module, cap)))
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L453-467)
-```go
-func (sk ScopedKeeper) addOwner(ctx sdk.Context, cap *types.Capability, name string) error {
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	capOwners := sk.getOwners(ctx, cap)
-
-	if err := capOwners.Set(types.NewOwner(sk.module, name)); err != nil {
-		return err
-	}
-
-	// update capability owner set
-	prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
-
-	return nil
-}
-```
-
-**File:** x/capability/spec/01_concepts.md (L15-22)
+**File:** docs/ibc/custom.md (L77-86)
 ```markdown
-Capabilities can be claimed by other modules which add them as owners. `ClaimCapability`
-allows a module to claim a capability key which it has received from another
-module so that future `GetCapability` calls will succeed. `ClaimCapability` MUST
-be called if a module which receives a capability wishes to access it by name in
-the future. Again, capabilities are multi-owner, so if multiple modules have a
-single Capability reference, they will all own it. If a module receives a capability
-from another module but does not call `ClaimCapability`, it may use it in the executing
-transaction but will not be able to access it afterwards.
-```
-
-**File:** docs/architecture/adr-003-dynamic-capability-store.md (L10-20)
-```markdown
-Full implementation of the [IBC specification](https://github.com/cosmos/ibs) requires the ability to create and authenticate object-capability keys at runtime (i.e., during transaction execution),
-as described in [ICS 5](https://github.com/cosmos/ibc/tree/master/spec/core/ics-005-port-allocation#technical-specification). In the IBC specification, capability keys are created for each newly initialised
-port & channel, and are used to authenticate future usage of the port or channel. Since channels and potentially ports can be initialised during transaction execution, the state machine must be able to create
-object-capability keys at this time.
-
-At present, the Cosmos SDK does not have the ability to do this. Object-capability keys are currently pointers (memory addresses) of `StoreKey` structs created at application initialisation in `app.go` ([example](https://github.com/cosmos/gaia/blob/dcbddd9f04b3086c0ad07ee65de16e7adedc7da4/app/app.go#L132))
-and passed to Keepers as fixed arguments ([example](https://github.com/cosmos/gaia/blob/dcbddd9f04b3086c0ad07ee65de16e7adedc7da4/app/app.go#L160)). Keepers cannot create or store capability keys during transaction execution — although they could call `NewKVStoreKey` and take the memory address
-of the returned struct, storing this in the Merklised store would result in a consensus fault, since the memory address will be different on each machine (this is intentional — were this not the case, the keys would be predictable and couldn't serve as object capabilities).
-
-Keepers need a way to keep a private map of store keys which can be altered during transaction execution, along with a suitable mechanism for regenerating the unique memory addresses (capability keys) in this map whenever the application is started or restarted, along with a mechanism to revert capability creation on tx failure.
-This ADR proposes such an interface & mechanism.
-```
-
-**File:** x/capability/types/types.go (L14-16)
-```go
-func NewCapability(index uint64) *Capability {
-	return &Capability{Index: index}
-}
-```
-
-**File:** docs/ibc/custom.md (L75-93)
-```markdown
-    counterpartyVersion string,
-) error {
     // Module may have already claimed capability in OnChanOpenInit in the case of crossing hellos
     // (ie chainA and chainB both call ChanOpenInit before one of them calls ChanOpenTry)
     // If the module can already authenticate the capability then the module already owns it so we don't need to claim
@@ -242,18 +221,10 @@ func NewCapability(index uint64) *Capability {
             return err
         }
     }
-
-    // ... do custom initialization logic
-
-    // Use above arguments to determine if we want to abort handshake
-    err := checkArguments(args)
-    return err
-}
 ```
 
-**File:** x/capability/keeper/keeper_test.go (L125-127)
+**File:** x/capability/keeper/keeper_test.go (L165-166)
 ```go
-	forgedCap := types.NewCapability(cap1.Index) // index should be the same index as the first capability
-	suite.Require().False(sk1.AuthenticateCapability(suite.ctx, forgedCap, "transfer"))
-	suite.Require().False(sk2.AuthenticateCapability(suite.ctx, forgedCap, "transfer"))
+	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
+	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
 ```

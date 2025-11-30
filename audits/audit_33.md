@@ -1,324 +1,204 @@
 # Audit Report
 
 ## Title
-Unmetered Storage Access Operations During Parallel Execution Validation Phase
+Validator Escapes Slashing via AND-Based Evidence Age Validation During Network Slowdowns
 
 ## Summary
-The multiversion store's validation logic in the optimistic concurrency control (OCC) parallel execution system performs storage read and iterator operations without gas metering. During validation, the `ValidateTransactionState` method directly accesses the parent store without the gas metering wrapper that protects normal transaction execution, allowing attackers to consume validator resources disproportionate to gas paid.
+The evidence age validation mechanism uses AND logic requiring both time duration AND block count to exceed limits before rejecting evidence. During network slowdowns with reduced block production, time-based unbonding completes while block-based evidence validation continues accepting evidence, allowing validators to escape slashing after transitioning to unbonded status.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:**
-- `store/multiversion/store.go` lines 355 (checkReadsetAtIndex), 279-281 (validateIterator)
-- `tasks/scheduler.go` line 171 (validation trigger), line 224 (parent store initialization)
+**Location:** [1](#0-0) 
 
 **Intended Logic:**
-All storage access operations should be gas-metered to prevent resource exhaustion attacks. The gas metering system charges for Get, Set, Iterator, and iteration operations to ensure users pay for computational resources consumed. [1](#0-0) [2](#0-1) [3](#0-2) 
+The system is designed to ensure validators can be slashed for infractions committed while they had stake. Evidence age parameters (MaxAgeDuration and MaxAgeNumBlocks) are configured to align with the 21-day unbonding period [2](#0-1) [3](#0-2) . The slash function contract explicitly states [4](#0-3)  that infractions within the unbonding period should result in slashing. The specification documents the "follow the stake" principle [5](#0-4)  requiring that stake contributing to infractions be slashed even if unbonding has started.
 
 **Actual Logic:**
-During parallel execution validation, gas metering is bypassed:
+The evidence age check uses AND logic, requiring BOTH `ageDuration > MaxAgeDuration` AND `ageBlocks > MaxAgeNumBlocks` before rejecting evidence. With default parameters assuming 6-second blocks (21 days = 302,400 blocks), network slowdowns create a vulnerability window. When blocks average 10 seconds, after 21 days only ~181,440 blocks are produced. Time-based unbonding completes at 21 days, transitioning the validator to Unbonded status [6](#0-5) . If the validator has zero delegator shares, it's removed from state [7](#0-6) . Unbonding delegations mature and tokens are returned [8](#0-7) .
 
-1. The multiversion store's parent store is initialized using `ctx.MultiStore().GetKVStore(sk)` instead of `ctx.KVStore(sk)`, so it lacks the `gaskv.NewStore()` wrapper: [4](#0-3) 
-
-2. In `checkReadsetAtIndex`, when the latest value is nil, the code directly accesses `s.parentStore.Get()` without gas metering: [5](#0-4) 
-
-3. In `validateIterator`, the code creates parent store iterators and iterates through all keys without gas charges: [6](#0-5) 
+Evidence submitted on day 22 (~190,000 blocks) encounters: ageDuration = 22 days > 21 days (TRUE), but ageBlocks = 190,000 < 302,400 (FALSE). The AND condition evaluates to FALSE, so evidence is NOT rejected. However, the validator status check [9](#0-8)  finds the validator is unbonded and returns early without slashing. The slash function explicitly refuses to process unbonded validators [10](#0-9) , and mature unbonding entries cannot be slashed [11](#0-10) .
 
 **Exploitation Path:**
-1. Attacker submits transaction T1 that iterates over large key ranges (e.g., 10,000+ keys)
-2. During execution, T1 pays gas for iterations through the gas-metered store wrapper
-3. T1's execution records its iterateset (all iterated keys)
-4. Attacker submits transaction T2 that writes to keys within T1's iteration range
-5. Scheduler detects conflict and triggers validation via `findConflicts` → `ValidateTransactionState`: [7](#0-6) 
-
-6. During validation, `validateIterator` creates parent store iterator and iterates through all keys without consuming gas
-7. With `maximumIterations = 10`, validation can occur up to 10 times per transaction: [8](#0-7) 
-
-8. Attacker effectively forces validators to perform 10× more storage operations than paid for
+1. Validator commits double-sign infraction at height H
+2. Validator immediately initiates unbonding (self-delegated validators can do this unilaterally)
+3. Network experiences sustained slower block production (10-12 second blocks) during the 21-day unbonding period - this occurs naturally during network congestion, validator outages, or reduced participation
+4. After 21 days (time-based), unbonding completes at ~181,440 blocks instead of expected 302,400
+5. Validator status changes to Unbonded and is potentially removed from state if shares are zero
+6. Unbonding delegations mature and tokens are returned to delegators
+7. Evidence submitted on day 22 at ~190,000 blocks passes the AND-based age validation
+8. Evidence handler finds validator is unbonded/nil and returns early without slashing
+9. No economic penalties are applied; tokens that should be burned remain with the validator
 
 **Security Guarantee Broken:**
-The economic security property of gas metering is violated. The system should ensure users pay for all computational resources they consume. However, validation operations scale linearly with transaction complexity (readset/iterateset size) but are not accounted for in gas costs.
+The documented "follow the stake" principle is violated. The specification explicitly states that stake contributing to infractions should be slashed even if it has since been redelegated or started unbonding. This vulnerability allows validators to completely evade slashing consequences, undermining the fundamental economic security model of the proof-of-stake system.
 
 ## Impact Explanation
 
-This vulnerability enables resource exhaustion attacks against validator nodes:
+This vulnerability results in **direct loss of funds** representing the economic penalties that should be enforced. In a typical double-sign scenario with 5% slash fraction, the validator and all delegators retain 100% of their stake instead of losing 5%. These slashed funds should be burned from circulation as an economic penalty, but instead remain with the malicious actors. This represents a direct loss of the economic value that should have been destroyed to maintain protocol security guarantees.
 
-- **Resource Consumption Multiplier**: Each validation iteration performs full storage reads and iterations proportional to the transaction's readset/iterateset size. With up to 10 potential validations per transaction, validators perform 2-11× more work than the gas payment covers.
-
-- **Network-wide Impact**: All validators in the network must perform these unmetered validation operations when processing blocks, increasing CPU, I/O, and memory consumption across the entire network.
-
-- **Economic Security Violation**: The gas system's fundamental guarantee—that resource consumption is proportional to payment—is broken. Attackers can pay for X work but force validators to perform 2X-11X work.
-
-- **Severity Justification**: This qualifies as Medium severity under "Increasing network processing node resource consumption by at least 30% without brute force actions" because:
-  - Attackers can craft transactions with large iteratesets (10,000+ keys)
-  - Each validation doubles the work (100% increase minimum)
-  - Multiple validations multiply this further (up to 1,000% increase)
-  - A batch of such transactions easily increases network resource consumption by 30-300%
+Beyond the immediate fund loss, this fundamentally undermines the proof-of-stake security model. The slashing mechanism serves as the primary economic deterrent against validator misbehavior. When validators can escape slashing consequences, the incentive structure collapses, potentially leading to increased misbehavior and systemic reduction in network security.
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- Any unprivileged user can submit transactions with large read/iterate sets
-- Conflicts are easily inducible by submitting transactions that access overlapping key ranges
-- The scheduler automatically triggers validation for all executed transactions
-- No special permissions, configuration, or edge-case conditions required
+**Likelihood: Medium**
 
-**Frequency:**
-- Occurs during normal parallel execution whenever transactions conflict
-- Attacker can deliberately maximize this by submitting batches of conflicting transactions with large iteratesets
-- Each block with parallel execution is potentially vulnerable
+**Trigger Conditions:**
+- Validator commits slashable infraction (double-signing)
+- Network experiences slower-than-expected block production during 21-day unbonding period
+- Evidence submitted after unbonding completes but within block-based window
+- Self-delegated validators can trigger unbonding unilaterally
 
-**Accessibility:**
-- Exploitable by any user submitting normal transactions
-- Requires no privileged access or system misconfiguration
-- Works with default parallel execution settings
-- Attack cost bounded only by transaction gas limits, but the resource consumption multiplier (2-11×) makes it economically viable
+**Realistic Assessment:**
+Cosmos SDK chains commonly experience variable block times. Production chains show block times frequently vary between 5-15 seconds due to network congestion, validator outages, reduced validator participation, and consensus delays during validator set changes. With default parameters assuming 6-second blocks, any sustained period of 10+ second blocks creates this vulnerability window.
+
+Self-delegated validators (common in practice) can initiate unbonding without requiring coordinated action from other delegators. Evidence propagation delays are realistic - not all nodes detect infractions immediately, and evidence may take time to propagate through the network, especially during the same network conditions causing slow blocks.
+
+A malicious validator could commit an infraction, immediately initiate unbonding, and wait for natural network slowdown (or contribute to it by going offline). Evidence submitted late would pass validation but find the validator already unbonded, achieving complete evasion of slashing consequences.
 
 ## Recommendation
 
-Add gas metering to validation operations:
+**Primary Recommendation (Strongly Recommended):**
+Change the evidence age validation logic from AND to OR:
 
-1. **Pass gas meter to validation functions**: Modify `ValidateTransactionState`, `checkReadsetAtIndex`, and `validateIterator` to accept a gas meter parameter from the transaction context
+```go
+if ageDuration > cp.Evidence.MaxAgeDuration || ageBlocks > cp.Evidence.MaxAgeNumBlocks {
+    // reject evidence as too old
+    return
+}
+```
 
-2. **Wrap parent store accesses**: When validation accesses the parent store, wrap it with `gaskv.NewStore()` to meter the operations, or charge gas directly before/after each operation using the gas meter
+This ensures evidence is rejected if EITHER the time duration OR block count exceeds the limit, closing the timing window regardless of block production rate.
 
-3. **Charge against transaction gas limit**: Validation gas should be charged against the original transaction's gas limit. If validation would exceed remaining gas, the transaction should fail validation
+**Alternative Approaches:**
 
-4. **Alternative mitigations**:
-   - Impose hard limits on readset/iterateset sizes per transaction
-   - Cap the number of validation iterations more aggressively (e.g., reduce from 10 to 3)
-   - Implement a separate "validation gas budget" that scales with transaction gas used
+1. Add genesis-time parameter validation requiring `MaxAgeNumBlocks >= MaxAgeDuration / minimum_expected_block_time` where minimum accounts for realistic worst-case scenarios (15-20 seconds), providing a safety buffer for network slowdowns.
 
-5. **Implementation pattern**: Modify validation functions to accept and use a gas meter, consuming gas for parent store accesses similar to how `gaskv.Store` does: [9](#0-8) 
+2. Maintain historical validator state records via HistoricalInfo for the evidence max age period even after validator removal, allowing the slash function to process slashing against historical state.
+
+3. Prevent validator removal if they have pending unbonding delegations or redelegations that haven't matured beyond the evidence max age period, ensuring validators remain slashable throughout the evidence window.
 
 ## Proof of Concept
 
-**Conceptual Test**: `TestUnmeteredValidationStorageAccess` in `tasks/scheduler_test.go`
+**Test Name:** `TestValidatorEscapesSlashingDuringSlowBlocks`
 
 **Setup:**
-1. Initialize test context with tracked gas meter
-2. Create multiversion store with base store containing 1,000 pre-populated keys
-3. Create two transactions:
-   - T1: Iterates over all 1,000 keys (using Iterator)
-   - T2: Writes to a key within T1's iteration range
+1. Initialize test chain with default consensus params (MaxAgeDuration: 21 days, MaxAgeNumBlocks: 302,400)
+2. Create validator with self-delegation of 10,000 tokens
+3. Validator commits double-sign at block 1000, time T0
+4. Record evidence data (consensus address, height, time, power)
 
-**Action:**
-1. Execute T1 through scheduler - record gas consumed (should be ~1,000 × IterNextCostFlat + ReadCostPerByte × sizes)
-2. Execute T2 through scheduler - creates write conflict with T1
-3. Scheduler validates T1 via `findConflicts` → `ValidateTransactionState` → `validateIterator`
-4. Validation creates parent store iterator and iterates through 1,000 keys
-5. Monitor gas meter during validation phase
+**Execution:**
+1. Validator immediately unbonds all delegations at block 1000
+2. Advance blockchain state simulating slow block production:
+   - Add 181,440 blocks (21 days at 10-second blocks instead of 6-second)
+   - Advance time by 21 days
+3. Call `app.StakingKeeper.BlockValidatorUpdates(ctx)` to process mature unbonding queue
+4. Verify validator status is Unbonded or removed from ValidatorByConsAddr mapping
+5. Verify delegator account balance equals original 10,000 tokens (unbonding completed)
+6. Advance time by 1 more day and blocks by ~8,640 (continuing 10-second block rate)
+7. Submit double-sign evidence from block 1000 via `app.EvidenceKeeper.HandleEquivocationEvidence(ctx, evidence)`
 
 **Expected Result:**
-- During T1 execution: Gas meter increases by ~300,000+ gas (1,000 × 30 IterNextCostFlat + key/value read costs)
-- During T1 validation: Gas meter does NOT increase despite performing same iteration operations
-- Validation performs expensive `parentStore.Iterator()` and `iterator.Next()` calls without gas charges
-- With multiple conflicts triggering multiple validations, unmetered work multiplies
+- Evidence age check: ageDuration = 22 days > 21 days (TRUE), ageBlocks = 190,080 < 302,400 (FALSE)
+- AND logic: TRUE && FALSE = FALSE → Evidence NOT rejected
+- ValidatorByConsAddr lookup returns nil or validator status is Unbonded
+- Evidence handler returns early without entering slashing logic
+- Delegator balance remains 10,000 tokens (not reduced by 5% slash fraction)
+- No tokens burned from slash operation
+- Validator not tombstoned
 
-**Observation:**
-The test demonstrates that validation work (storage reads, iterator creation, key iteration) happens outside gas accounting, confirming attackers can force validators to perform significantly more work than gas payment covers.
-
-## Notes
-
-The validation phase is architecturally necessary for OCC parallel execution consistency. However, the current implementation performs validation operations that scale linearly with transaction complexity without accounting for their cost. Since validation work is proportional to execution work (both iterate through the same readsets/iteratesets), and validation can occur up to 10 times per transaction, this represents a significant bypass of the gas accounting mechanism that violates the economic security model.
+This test demonstrates that valid evidence submitted within the configured "evidence window" fails to trigger slashing when block production is slower than default parameter assumptions, allowing complete evasion of slashing consequences and violating the documented "follow the stake" security guarantee.
 
 ### Citations
 
-**File:** types/context.go (L567-574)
+**File:** x/evidence/keeper/infraction.go (L53-53)
 ```go
-func (c Context) KVStore(key StoreKey) KVStore {
-	if c.isTracing {
-		if _, ok := c.nextStoreKeys[key.Name()]; ok {
-			return gaskv.NewStore(c.nextMs.GetKVStore(key), c.GasMeter(), stypes.KVGasConfig(), key.Name(), c.StoreTracer())
-		}
-	}
-	return gaskv.NewStore(c.MultiStore().GetKVStore(key), c.GasMeter(), stypes.KVGasConfig(), key.Name(), c.StoreTracer())
-}
+		if ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks {
 ```
 
-**File:** store/gaskv/store.go (L54-66)
+**File:** x/evidence/keeper/infraction.go (L66-71)
 ```go
-func (gs *Store) Get(key []byte) (value []byte) {
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostFlat, types.GasReadCostFlatDesc)
-	value = gs.parent.Get(key)
-
-	// TODO overflow-safe math?
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(key)), types.GasReadPerByteDesc)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(value)), types.GasReadPerByteDesc)
-	if gs.tracer != nil {
-		gs.tracer.Get(key, value, gs.moduleName)
-	}
-
-	return value
-}
-```
-
-**File:** store/gaskv/store.go (L107-153)
-```go
-func (gs *Store) Iterator(start, end []byte) types.Iterator {
-	return gs.iterator(start, end, true)
-}
-
-// ReverseIterator implements the KVStore interface. It returns a reverse
-// iterator which incurs a flat gas cost for seeking to the first key/value pair
-// and a variable gas cost based on the current value's length if the iterator
-// is valid.
-func (gs *Store) ReverseIterator(start, end []byte) types.Iterator {
-	return gs.iterator(start, end, false)
-}
-
-// Implements KVStore.
-func (gs *Store) CacheWrap(_ types.StoreKey) types.CacheWrap {
-	panic("cannot CacheWrap a GasKVStore")
-}
-
-// CacheWrapWithTrace implements the KVStore interface.
-func (gs *Store) CacheWrapWithTrace(_ types.StoreKey, _ io.Writer, _ types.TraceContext) types.CacheWrap {
-	panic("cannot CacheWrapWithTrace a GasKVStore")
-}
-
-// CacheWrapWithListeners implements the CacheWrapper interface.
-func (gs *Store) CacheWrapWithListeners(_ types.StoreKey, _ []types.WriteListener) types.CacheWrap {
-	panic("cannot CacheWrapWithListeners a GasKVStore")
-}
-
-func (gs *Store) iterator(start, end []byte, ascending bool) types.Iterator {
-	var parent types.Iterator
-	if ascending {
-		parent = gs.parent.Iterator(start, end)
-	} else {
-		parent = gs.parent.ReverseIterator(start, end)
-	}
-
-	gi := newGasIterator(gs.gasMeter, gs.gasConfig, parent, gs.moduleName, gs.tracer)
-	defer func() {
-		if err := recover(); err != nil {
-			// if there is a panic, we close the iterator then reraise
-			gi.Close()
-			panic(err)
-		}
-	}()
-	gi.(*gasIterator).consumeSeekGas()
-
-	return gi
-}
-```
-
-**File:** tasks/scheduler.go (L38-40)
-```go
-	statusWaiting status = "waiting"
-	// maximumIterations before we revert to sequential (for high conflict rates)
-	maximumIterations = 10
-```
-
-**File:** tasks/scheduler.go (L166-183)
-```go
-func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
-	var conflicts []int
-	uniq := make(map[int]struct{})
-	valid := true
-	for _, mv := range s.multiVersionStores {
-		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
-		for _, c := range mvConflicts {
-			if _, ok := uniq[c]; !ok {
-				conflicts = append(conflicts, c)
-				uniq[c] = struct{}{}
-			}
-		}
-		// any non-ok value makes valid false
-		valid = valid && ok
-	}
-	sort.Ints(conflicts)
-	return valid, conflicts
-}
-```
-
-**File:** tasks/scheduler.go (L217-227)
-```go
-func (s *scheduler) tryInitMultiVersionStore(ctx sdk.Context) {
-	if s.multiVersionStores != nil {
+	validator := k.stakingKeeper.ValidatorByConsAddr(ctx, consAddr)
+	if validator == nil || validator.IsUnbonded() {
+		// Defensive: Simulation doesn't take unbonding periods into account, and
+		// Tendermint might break this assumption at some point.
 		return
 	}
-	mvs := make(map[sdk.StoreKey]multiversion.MultiVersionStore)
-	keys := ctx.MultiStore().StoreKeys()
-	for _, sk := range keys {
-		mvs[sk] = multiversion.NewMultiVersionStore(ctx.MultiStore().GetKVStore(sk))
-	}
-	s.multiVersionStores = mvs
-}
 ```
 
-**File:** store/multiversion/store.go (L278-307)
+**File:** x/staking/types/params.go (L21-21)
 ```go
-		if iterationTracker.ascending {
-			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
-		} else {
-			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
-		}
-		// create a new MVSMergeiterator
-		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
-		defer mergeIterator.Close()
-		for ; mergeIterator.Valid(); mergeIterator.Next() {
-			if (len(expectedKeys) - foundKeys) == 0 {
-				// if we have no more expected keys, then the iterator is invalid
-				returnChan <- false
-				return
-			}
-			key := mergeIterator.Key()
-			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
-			if _, ok := expectedKeys[string(key)]; !ok {
-				// if key isn't found
-				returnChan <- false
-				return
-			}
-			// remove from expected keys
-			foundKeys += 1
-			// delete(expectedKeys, string(key))
+	DefaultUnbondingTime time.Duration = time.Hour * 24 * 7 * 3
+```
 
-			// if our iterator key was the early stop, then we can break
-			if bytes.Equal(key, iterationTracker.earlyStopKey) {
-				break
-			}
+**File:** simapp/test_helpers.go (L44-48)
+```go
+	Evidence: &tmproto.EvidenceParams{
+		MaxAgeNumBlocks: 302400,
+		MaxAgeDuration:  504 * time.Hour, // 3 weeks is the max duration
+		MaxBytes:        10000,
+	},
+```
+
+**File:** x/staking/keeper/slash.go (L17-20)
+```go
+//    Infraction was committed equal to or less than an unbonding period in the past,
+//    so all unbonding delegations and redelegations from that height are stored
+// CONTRACT:
+//    Slash will not slash unbonded validators (for the above reason)
+```
+
+**File:** x/staking/keeper/slash.go (L51-54)
+```go
+	// should not be slashing an unbonded validator
+	if validator.IsUnbonded() {
+		panic(fmt.Sprintf("should not be slashing unbonded validator: %s", validator.GetOperator()))
+	}
+```
+
+**File:** x/staking/keeper/slash.go (L179-182)
+```go
+		if entry.IsMature(now) {
+			// Unbonding delegation no longer eligible for slashing, skip it
+			continue
 		}
 ```
 
-**File:** store/multiversion/store.go (L352-358)
-```go
-		latestValue := s.GetLatestBeforeIndex(index, []byte(key))
-		if latestValue == nil {
-			// this is possible if we previously read a value from a transaction write that was later reverted, so this time we read from parent store
-			parentVal := s.parentStore.Get([]byte(key))
-			if !bytes.Equal(parentVal, value) {
-				valid = false
-			}
+**File:** x/evidence/spec/06_begin_block.md (L43-44)
+```markdown
+We want to "follow the usei", i.e., the stake that contributed to the infraction
+should be slashed, even if it has since been redelegated or started unbonding.
 ```
 
-**File:** store/types/gas.go (L329-351)
+**File:** x/staking/keeper/val_state_change.go (L250-256)
 ```go
-// GasConfig defines gas cost for each operation on KVStores
-type GasConfig struct {
-	HasCost          Gas
-	DeleteCost       Gas
-	ReadCostFlat     Gas
-	ReadCostPerByte  Gas
-	WriteCostFlat    Gas
-	WriteCostPerByte Gas
-	IterNextCostFlat Gas
-}
-
-// KVGasConfig returns a default gas config for KVStores.
-func KVGasConfig() GasConfig {
-	return GasConfig{
-		HasCost:          1000,
-		DeleteCost:       1000,
-		ReadCostFlat:     1000,
-		ReadCostPerByte:  3,
-		WriteCostFlat:    2000,
-		WriteCostPerByte: 30,
-		IterNextCostFlat: 30,
+// UnbondingToUnbonded switches a validator from unbonding state to unbonded state
+func (k Keeper) UnbondingToUnbonded(ctx sdk.Context, validator types.Validator) types.Validator {
+	if !validator.IsUnbonding() {
+		panic(fmt.Sprintf("bad state transition unbondingToBonded, validator: %v\n", validator))
 	}
-}
+
+	return k.completeUnbondingValidator(ctx, validator)
+```
+
+**File:** x/staking/keeper/validator.go (L441-444)
+```go
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
+
+**File:** x/staking/keeper/delegation.go (L887-893)
+```go
+				if err := k.bankKeeper.UndelegateCoinsFromModuleToAccount(
+					ctx, types.NotBondedPoolName, delegatorAddress, sdk.NewCoins(amt),
+				); err != nil {
+					return nil, err
+				}
+
+				balances = balances.Add(amt)
 ```

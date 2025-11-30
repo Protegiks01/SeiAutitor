@@ -1,10 +1,12 @@
+Based on my thorough investigation of the codebase, I can confirm this **IS a valid vulnerability**. Here is my validation:
+
 # Audit Report
 
 ## Title
-Unbounded Iterator Resource Consumption in Query Pagination Enabling DoS via Excessive Iteration
+Unrecovered Panic in Governance Proposal Handler Causes Complete Network Halt
 
 ## Summary
-The query pagination system accepts arbitrarily large limit parameters without validation and uses infinite gas meters that never enforce resource limits. Combined with the `countTotal=true` flag that forces complete store iteration, this enables attackers to trigger expensive database iterations consuming disproportionate CPU, I/O, and memory resources through public gRPC query endpoints, facilitating denial-of-service attacks against validator nodes.
+The governance module's `EndBlocker` function executes proposal handlers without panic recovery. When a proposal handler panics during execution, the panic propagates uncaught through the entire call chain, causing all validator nodes to crash simultaneously at the same block height, resulting in a complete network shutdown. [1](#0-0) 
 
 ## Impact
 Medium
@@ -12,306 +14,296 @@ Medium
 ## Finding Description
 
 **Location:**
-- `types/query/pagination.go`: Lines 14-21 (MaxLimit definition), Lines 105-142 (Paginate function) [1](#0-0) [2](#0-1) 
+- Primary: `x/gov/abci.go`, line 74 where the handler is invoked without panic recovery
+- Secondary: `baseapp/abci.go`, lines 178-201 where EndBlock lacks panic recovery [2](#0-1) 
 
-- `types/context.go`: Line 272 (infinite gas meter initialization) [3](#0-2) 
-
-- `store/types/gas.go`: Lines 252-258 (infinite gas meter implementation) [4](#0-3) 
-
-- `baseapp/abci.go`: Lines 757-759 (query context creation) [5](#0-4) 
-
-- `x/bank/keeper/grpc_query.go`: Lines 62-70, 164-170 (vulnerable query handler examples) [6](#0-5) [7](#0-6) 
-
-**Intended logic:**
-The pagination system should limit query resource consumption proportional to the data requested. Gas metering on iterators is designed to track and limit expensive operations. Query contexts should enforce resource limits to prevent abuse, with the `MaxLimit` constant serving as an upper bound on pagination parameters.
+**Intended logic:** 
+The governance EndBlocker should execute passed proposal handlers safely. If a handler fails, the proposal should be marked as failed and the chain should continue processing blocks. The cached context isolates state changes for rollback on error.
 
 **Actual logic:**
-1. Query contexts are created with an infinite gas meter via `NewInfiniteGasMeter(1, 1)` where `IsPastLimit()` always returns false and `IsOutOfGas()` always returns false, providing no enforcement mechanism.
-
-2. The `MaxLimit` constant is set to `math.MaxUint64` but serves only as documentation—no validation enforces this limit in the `Paginate` function. The function only checks for negative values or zero.
-
-3. When `countTotal=true` is set with offset-based pagination, the iteration loop continues through ALL remaining items in the store even after collecting the requested results (the break only occurs when `!countTotal` is true).
-
-4. Gas is consumed during iteration via `consumeSeekGas()` in the gas iterator, but the infinite gas meter tracks without enforcing limits.
+The code only handles errors returned by the handler (`if err == nil` check), but provides no protection against panics. When a handler panics, it propagates uncaught through `gov.EndBlocker` → module manager's `EndBlock` → `BaseApp.EndBlock` → validator node crash. [3](#0-2) 
 
 **Exploitation path:**
-
-**Attack Vector 1 - Large Limit Attack:**
-1. Attacker identifies public gRPC query endpoint (e.g., `AllBalances`, `DenomsMetadata`)
-2. Crafts request with `limit` parameter set to extremely large value (e.g., 10,000,000)
-3. Node receives request and creates query context with infinite gas meter
-4. Pagination begins iterating through entries without limit validation
-5. Each `Next()` call consumes gas (tracked but not enforced) and performs disk I/O
-6. Node performs massive disk I/O and CPU processing for millions of key-value pairs
-
-**Attack Vector 2 - CountTotal Attack:**
-1. Attacker targets paginated query on large store (bank balances, staking delegations)
-2. Sets `limit=1` and `countTotal=true` with `offset=0`
-3. Node collects 1 result but continues iterating through ENTIRE store to count all items
-4. For stores with millions of entries, this causes full iteration with minimal response payload
-5. Attacker repeats query multiple times or targets multiple stores simultaneously
+1. A module registers a governance proposal handler containing code that can panic (e.g., nil pointer dereference, array out of bounds, type assertion failure, or panic-inducing functions)
+2. A governance proposal of that type is submitted and passes through normal voting
+3. When the voting period ends, `gov.EndBlocker` executes during block finalization
+4. The handler is invoked and panics at line 74 of `x/gov/abci.go`
+5. No defer/recover exists in the call stack to catch the panic
+6. All validator nodes crash at the same block height due to deterministic execution
+7. Network completely halts - cannot produce new blocks
 
 **Security guarantee broken:**
-This violates the fundamental resource accounting invariant where operations should consume resources proportional to their computational cost, with enforcement mechanisms preventing resource exhaustion. While gas is tracked, the infinite gas meter on queries provides no enforcement, creating an asymmetric attack surface where external actors can consume unbounded validator resources without proportional cost or authentication.
+Availability and fault tolerance. The chain should gracefully handle proposal handler failures without causing network-wide consensus failure. The SDK provides panic recovery in other critical paths (ProcessProposal, PrepareProposal, Query, runTx) but not in EndBlock. [4](#0-3) 
 
 ## Impact Explanation
 
-**Affected Resources:**
-- **CPU:** Iterating through millions of items requires significant CPU for deserialization, key-value processing, and data structure operations
-- **I/O:** Reading millions of key-value pairs from persistent storage causes sustained heavy disk I/O load
-- **Memory:** Iterator state, loaded values, and result accumulation consume memory scaling with iteration count
-- **Network Availability:** Overloaded nodes become slow or unresponsive, degrading service quality
+This vulnerability results in:
+- All validator nodes crashing simultaneously at the same block height
+- Complete network shutdown - no new blocks can be produced
+- All transaction processing halts
+- Network cannot reach consensus
+- Requires coordinated hard fork with patched binary to recover
+- Economic impact: trading halts, DeFi protocols freeze, funds temporarily inaccessible
 
-**System Impact:**
-An attacker can target any validator or full node exposing public RPC endpoints (standard practice in blockchain networks). Sustained or repeated queries can maintain resource consumption exceeding 30% baseline levels. Multiple attackers or parallel queries amplify impact. This can cause:
-- Validator nodes to miss block proposals or attestations
-- Degraded query response times affecting user experience  
-- Node instability under sustained load
-- Network health deterioration if multiple validators are targeted
-
-This maps directly to the impact category: **"Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours"** - classified as Medium severity.
+This matches the approved impact: "Network not being able to confirm new transactions (total network shutdown)" classified as **Medium** severity.
 
 ## Likelihood Explanation
 
-**Exploitability: High**
+**Trigger requirements:**
+- Governance proposal must pass (requires majority token holder support)
+- Handler must contain code that can panic
 
-- **Who can trigger:** Any user with network access to gRPC query endpoints (publicly accessible on most networks)
-- **Conditions required:** None beyond normal network operation
-- **Authentication:** Not required  
-- **Attack cost:** Minimal—only network bandwidth for HTTP/gRPC requests
-- **Complexity:** Trivial—requires only crafting valid pagination parameters in standard gRPC requests
+**Likelihood: Medium**
 
-**Frequency & Feasibility:**
-- Can be exploited continuously through repeated queries
-- Multiple attackers can coordinate for amplified impact  
-- No rate limiting exists at the code level for query complexity
-- Each large store (bank, staking, governance, metadata) represents a separate attack vector
-- Production blockchains have stores with millions of entries making attacks practical
-- Standard tooling (grpcurl, custom scripts) can easily craft malicious queries
+The likelihood is realistic because:
+1. Third-party modules commonly integrate custom proposal handlers
+2. Handlers can have implementation bugs: nil pointer dereferences, array bounds violations, type assertions, division by zero
+3. Real production code demonstrates panic-inducing patterns (e.g., `MustMarshal` in upgrade keeper) [5](#0-4) [6](#0-5) [7](#0-6) 
 
-The vulnerability is highly likely to be exploited given the public accessibility of RPC endpoints, lack of authentication requirements, absence of code-level protections, and existence of large stores in production environments.
+**Key justification:** This doesn't require malicious governance. A buggy handler from a legitimate module suffices. The exception clause applies: "unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." Governance's intended authority is to pass/fail proposals, not to halt the entire network.
 
 ## Recommendation
 
-Implement multiple layers of protection:
+Add panic recovery to the governance EndBlocker or BaseApp's EndBlock, mirroring the pattern used in `ProcessProposal`: [8](#0-7) 
 
-1. **Enforce Maximum Limit Validation in Paginate function:**
-   - Replace `MaxLimit = math.MaxUint64` with a reasonable upper bound (e.g., 1000)
-   - Add validation: `if limit > MaxLimit { return nil, fmt.Errorf("limit exceeds maximum allowed value of %d", MaxLimit) }`
+Specifically:
+1. Wrap the handler execution (around lines 67-92 in `x/gov/abci.go`) with a defer/recover block
+2. In the recovery handler:
+   - Log the panic details (proposal ID, type, stack trace)
+   - Mark the proposal as failed (`proposal.Status = types.StatusFailed`)
+   - Continue processing remaining proposals
+   - Return normally to prevent node crash
 
-2. **Restrict CountTotal Functionality:**
-   - Disable `countTotal` for stores known to be large
-   - Implement maximum count threshold that stops iteration early
-   - Consider alternative counting mechanisms (cached counts, approximate counts)
-
-3. **Add Query Resource Limits:**
-   - Implement bounded gas meters for queries with reasonable limits
-   - Add timeout mechanisms for long-running queries  
-   - Consider application-level rate limiting based on query complexity
-
-4. **Monitor and Alert:**
-   - Add metrics for query iteration counts and duration
-   - Implement alerting for abnormal query patterns
-   - Log queries exceeding thresholds for security analysis
+This provides defense-in-depth: even if a handler panics, the chain continues operating and the proposal is safely marked as failed.
 
 ## Proof of Concept
 
+While no executable PoC is provided, the vulnerability is evident from code inspection:
+
 **Setup:**
-1. Deploy a node with a store containing millions of entries (e.g., bank balances with 1,000,000+ denominations)
-2. Configure public gRPC endpoint exposure (standard production configuration)
+- Standard Cosmos SDK chain with governance module enabled
+- Custom proposal handler containing panic-inducing code (e.g., nil dereference, array out of bounds, type assertion failure)
 
-**Attack Vector 1 - Large Limit:**
-1. Send gRPC query: `grpcurl -d '{"address":"<addr>","pagination":{"limit":10000000}}' <node>:9090 cosmos.bank.v1beta1.Query/AllBalances`
-2. Observe: Query accepted without validation error, node begins iterating through millions of entries
-3. Monitor: CPU usage spikes, disk I/O increases significantly, query takes extended time to complete
-4. Result: No error returned, but disproportionate resource consumption occurs
+**Action:**
+- Submit and pass governance proposal
+- Advance to voting period end
+- `gov.EndBlocker` executes and calls the panicking handler
 
-**Attack Vector 2 - CountTotal:**
-1. Send gRPC query: `grpcurl -d '{"address":"<addr>","pagination":{"limit":1,"count_total":true}}' <node>:9090 cosmos.bank.v1beta1.Query/AllBalances`  
-2. Observe: Only 1 result returned but `pagination.total` shows full count
-3. Monitor: Full store iteration occurs despite limit=1, execution time proportional to total entries
-4. Result: Timing analysis confirms full iteration with minimal response payload
+**Result:**
+- Panic propagates through call chain: handler → `gov.EndBlocker` → module manager → `BaseApp.EndBlock`
+- Validator node crashes
+- All validators crash at same height (deterministic execution)
+- Network halts
 
-**Verification:**
-- Gas meter `Limit()` returns 0 (infinite)
-- Gas meter `IsOutOfGas()` returns false throughout iteration
-- No validation error for large limit values
-- Resource consumption disproportionate to response size
-
-The vulnerability is directly observable through code analysis showing the absence of limit validation [8](#0-7) , infinite gas meter usage [4](#0-3) , and countTotal full iteration behavior [9](#0-8) .
+The existing test `TestEndBlockerProposalHandlerFailed` tests error handling but not panic scenarios, confirming this gap in defensive programming. [9](#0-8) 
 
 ## Notes
 
-This vulnerability represents a fundamental design flaw in the query resource management system. While transaction processing correctly enforces gas limits to prevent resource exhaustion, the query system completely bypasses these protections by using infinite gas meters. The combination of unbounded limit parameters, forced full-iteration via `countTotal`, and lack of validation creates a severe asymmetry where malicious requests can trigger massive backend resource consumption.
-
-The technical mechanisms are definitively confirmed in the codebase through multiple code citations. The practical exploitability is high given public RPC endpoint accessibility and standard blockchain store sizes. While individual node operators might implement external protections (reverse proxies, rate limiters), the code itself provides no safeguards, making this a valid protocol-level vulnerability requiring remediation at the SDK level.
+This vulnerability is valid because:
+1. It matches an approved Medium severity impact ("network shutdown")
+2. The technical deficiency is objectively present (no panic recovery in EndBlock while other ABCI methods have it)
+3. ProcessProposal's panic recovery proves this is a known concern and expected defensive programming pattern
+4. Handler bugs are realistic in production systems
+5. The exception clause for privileged roles applies - governance inadvertently triggering network halt exceeds their intended authority
+6. The inconsistency with other handler execution paths (Query, ProcessProposal, PrepareProposal, runTx all have panic recovery) indicates an oversight, not intentional design
+7. Defense-in-depth is a reasonable expectation for critical blockchain infrastructure
 
 ### Citations
 
-**File:** types/query/pagination.go (L14-21)
+**File:** x/gov/abci.go (L67-92)
 ```go
-// DefaultLimit is the default `limit` for queries
-// if the `limit` is not supplied, paginate will use `DefaultLimit`
-const DefaultLimit = 100
+		if passes {
+			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
+			cacheCtx, writeCache := ctx.CacheContext()
 
-// MaxLimit is the maximum limit the paginate function can handle
-// which equals the maximum value that can be stored in uint64
-const MaxLimit = math.MaxUint64
+			// The proposal handler may execute state mutating logic depending
+			// on the proposal content. If the handler fails, no state mutation
+			// is written and the error message is logged.
+			err := handler(cacheCtx, proposal.GetContent())
+			if err == nil {
+				proposal.Status = types.StatusPassed
+				tagValue = types.AttributeValueProposalPassed
+				logMsg = "passed"
 
+				// The cached context is created with a new EventManager. However, since
+				// the proposal handler execution was successful, we want to track/keep
+				// any events emitted, so we re-emit to "merge" the events into the
+				// original Context's EventManager.
+				ctx.EventManager().EmitEvents(cacheCtx.EventManager().Events())
+
+				// write state to the underlying multi-store
+				writeCache()
+			} else {
+				proposal.Status = types.StatusFailed
+				tagValue = types.AttributeValueProposalFailed
+				logMsg = fmt.Sprintf("passed, but failed on execution: %s", err)
+			}
 ```
 
-**File:** types/query/pagination.go (L48-75)
+**File:** baseapp/abci.go (L178-201)
 ```go
-func Paginate(
-	prefixStore types.KVStore,
-	pageRequest *PageRequest,
-	onResult func(key []byte, value []byte) error,
-) (*PageResponse, error) {
+func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
+	// Clear DeliverTx Events
+	ctx.MultiStore().ResetEvents()
 
-	// if the PageRequest is nil, use default PageRequest
-	if pageRequest == nil {
-		pageRequest = &PageRequest{}
+	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
+
+	if app.endBlocker != nil {
+		res = app.endBlocker(ctx, req)
+		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
 	}
 
-	offset := pageRequest.Offset
-	key := pageRequest.Key
-	limit := pageRequest.Limit
-	countTotal := pageRequest.CountTotal
-	reverse := pageRequest.Reverse
-
-	if offset > 0 && key != nil {
-		return nil, fmt.Errorf("invalid request, either offset or key is expected, got both")
+	if cp := app.GetConsensusParams(ctx); cp != nil {
+		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
 	}
 
-	if limit == 0 {
-		limit = DefaultLimit
-
-		// count total results when the limit is zero/not supplied
-		countTotal = true
+	// call the streaming service hooks with the EndBlock messages
+	for _, streamingListener := range app.abciListeners {
+		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
+			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
+		}
 	}
 
+	return res
+}
 ```
 
-**File:** types/query/pagination.go (L105-142)
+**File:** baseapp/abci.go (L1037-1052)
 ```go
-	iterator := getIterator(prefixStore, nil, reverse)
-	defer iterator.Close()
+	defer func() {
+		if err := recover(); err != nil {
+			app.logger.Error(
+				"panic recovered in PrepareProposal",
+				"height", req.Height,
+				"time", req.Time,
+				"panic", err,
+			)
 
-	end := offset + limit
+			resp = &abci.ResponsePrepareProposal{
+				TxRecords: utils.Map(req.Txs, func(tx []byte) *abci.TxRecord {
+					return &abci.TxRecord{Action: abci.TxRecord_UNMODIFIED, Tx: tx}
+				}),
+			}
+		}
+	}()
+```
 
-	var count uint64
-	var nextKey []byte
+**File:** baseapp/abci.go (L1106-1118)
+```go
+	defer func() {
+		if err := recover(); err != nil {
+			app.logger.Error(
+				"panic recovered in ProcessProposal",
+				"height", req.Height,
+				"time", req.Time,
+				"hash", fmt.Sprintf("%X", req.Hash),
+				"panic", err,
+			)
 
-	for ; iterator.Valid(); iterator.Next() {
-		count++
+			resp = &abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_REJECT}
+		}
+	}()
+```
 
-		if count <= offset {
+**File:** types/module/module.go (L642-670)
+```go
+func (m *Manager) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) abci.ResponseEndBlock {
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+	validatorUpdates := []abci.ValidatorUpdate{}
+	defer telemetry.MeasureSince(time.Now(), "module", "total_end_block")
+	for _, moduleName := range m.OrderEndBlockers {
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
 			continue
 		}
-		if count <= end {
-			err := onResult(iterator.Key(), iterator.Value())
-			if err != nil {
-				return nil, err
+		moduleStartTime := time.Now()
+		moduleValUpdates := module.EndBlock(ctx, req)
+		telemetry.ModuleMeasureSince(moduleName, moduleStartTime, "module", "end_block")
+		// use these validator updates if provided, the module manager assumes
+		// only one module will update the validator set
+		if len(moduleValUpdates) > 0 {
+			if len(validatorUpdates) > 0 {
+				panic("validator EndBlock updates already set by a previous module")
 			}
-		} else if count == end+1 {
-			nextKey = iterator.Key()
 
-			if !countTotal {
-				break
-			}
+			validatorUpdates = moduleValUpdates
 		}
-		if iterator.Error() != nil {
-			return nil, iterator.Error()
-		}
+
 	}
 
-	res := &PageResponse{NextKey: nextKey}
-	if countTotal {
-		res.Total = count
+	return abci.ResponseEndBlock{
+		ValidatorUpdates: validatorUpdates,
+		Events:           ctx.EventManager().ABCIEvents(),
 	}
-
-	return res, nil
 }
 ```
 
-**File:** types/context.go (L261-272)
+**File:** x/upgrade/keeper/keeper.go (L200-201)
 ```go
-// create a new context
-func NewContext(ms MultiStore, header tmproto.Header, isCheckTx bool, logger log.Logger) Context {
-	// https://github.com/gogo/protobuf/issues/519
-	header.Time = header.Time.UTC()
-	return Context{
-		ctx:             context.Background(),
-		ms:              ms,
-		header:          header,
-		chainID:         header.ChainID,
-		checkTx:         isCheckTx,
-		logger:          logger,
-		gasMeter:        NewInfiniteGasMeter(1, 1),
+	bz := k.cdc.MustMarshal(&plan)
+	store.Set(types.PlanKey(), bz)
 ```
 
-**File:** store/types/gas.go (L252-258)
+**File:** codec/proto_codec.go (L46-53)
 ```go
-func (g *infiniteGasMeter) IsPastLimit() bool {
-	return false
-}
-
-func (g *infiniteGasMeter) IsOutOfGas() bool {
-	return false
-}
-```
-
-**File:** baseapp/abci.go (L755-761)
-```go
-	checkStateCtx := app.checkState.Context()
-	// branch the commit-multistore for safety
-	ctx := sdk.NewContext(
-		cacheMS, checkStateCtx.BlockHeader(), true, app.logger,
-	).WithMinGasPrices(app.minGasPrices).WithBlockHeight(height)
-
-	return ctx, nil
-```
-
-**File:** x/bank/keeper/grpc_query.go (L62-70)
-```go
-	pageRes, err := query.Paginate(accountStore, req.Pagination, func(_, value []byte) error {
-		var result sdk.Coin
-		err := k.cdc.Unmarshal(value, &result)
-		if err != nil {
-			return err
-		}
-		balances = append(balances, result)
-		return nil
-	})
-```
-
-**File:** x/bank/keeper/grpc_query.go (L154-180)
-```go
-// DenomsMetadata implements Query/DenomsMetadata gRPC method.
-func (k BaseKeeper) DenomsMetadata(c context.Context, req *types.QueryDenomsMetadataRequest) (*types.QueryDenomsMetadataResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
-	}
-
-	ctx := sdk.UnwrapSDKContext(c)
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), types.DenomMetadataPrefix)
-
-	metadatas := []types.Metadata{}
-	pageRes, err := query.Paginate(store, req.Pagination, func(_, value []byte) error {
-		var metadata types.Metadata
-		k.cdc.MustUnmarshal(value, &metadata)
-
-		metadatas = append(metadatas, metadata)
-		return nil
-	})
-
+func (pc *ProtoCodec) MustMarshal(o ProtoMarshaler) []byte {
+	bz, err := pc.Marshal(o)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		panic(err)
 	}
 
-	return &types.QueryDenomsMetadataResponse{
-		Metadatas:  metadatas,
-		Pagination: pageRes,
-	}, nil
+	return bz
+}
+```
+
+**File:** simapp/app.go (L309-309)
+```go
+		AddRoute(upgradetypes.RouterKey, upgrade.NewSoftwareUpgradeProposalHandler(app.UpgradeKeeper))
+```
+
+**File:** x/gov/abci_test.go (L564-606)
+```go
+func TestEndBlockerProposalHandlerFailed(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+	addrs := simapp.AddTestAddrs(app, ctx, 1, valTokens)
+	params := app.StakingKeeper.GetParams(ctx)
+	params.MinCommissionRate = sdk.NewDec(0)
+	app.StakingKeeper.SetParams(ctx, params)
+
+	SortAddresses(addrs)
+
+	stakingHandler := staking.NewHandler(app.StakingKeeper)
+	app.FinalizeBlock(context.Background(), &abci.RequestFinalizeBlock{Height: app.LastBlockHeight() + 1})
+
+	valAddr := sdk.ValAddress(addrs[0])
+
+	createValidators(t, stakingHandler, ctx, []sdk.ValAddress{valAddr}, []int64{10})
+	staking.EndBlocker(ctx, app.StakingKeeper)
+
+	// Create a proposal where the handler will pass for the test proposal
+	// because the value of contextKeyBadProposal is true.
+	ctx = ctx.WithValue(contextKeyBadProposal, true)
+	proposal, err := app.GovKeeper.SubmitProposal(ctx, TestProposal)
+	require.NoError(t, err)
+
+	proposalCoins := sdk.NewCoins(sdk.NewCoin(sdk.DefaultBondDenom, app.StakingKeeper.TokensFromConsensusPower(ctx, 10)))
+	newDepositMsg := types.NewMsgDeposit(addrs[0], proposal.ProposalId, proposalCoins)
+
+	handleAndCheck(t, gov.NewHandler(app.GovKeeper), ctx, newDepositMsg)
+
+	err = app.GovKeeper.AddVote(ctx, proposal.ProposalId, addrs[0], types.NewNonSplitVoteOption(types.OptionYes))
+	require.NoError(t, err)
+
+	newHeader := ctx.BlockHeader()
+	newHeader.Time = ctx.BlockHeader().Time.Add(app.GovKeeper.GetDepositParams(ctx).MaxDepositPeriod).Add(app.GovKeeper.GetVotingParams(ctx).VotingPeriod)
+	ctx = ctx.WithBlockHeader(newHeader)
+
+	// Set the contextKeyBadProposal value to false so that the handler will fail
+	// during the processing of the proposal in the EndBlocker.
+	ctx = ctx.WithValue(contextKeyBadProposal, false)
+
+	// validate that the proposal fails/has been rejected
+	gov.EndBlocker(ctx, app.GovKeeper)
 }
 ```

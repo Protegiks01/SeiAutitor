@@ -1,211 +1,216 @@
-Based on my thorough investigation of the codebase, I can confirm this **IS a valid vulnerability**. Here is my validation:
+Based on my investigation, I will now validate this security claim.
 
----
+## Investigation Summary
+
+I have traced through the complete execution flow and verified each component of the claim:
+
+**1. Code Path Verification:**
+
+The panic occurs in `HandleValidatorSignatureConcurrent` when it cannot find a validator's pubkey: [1](#0-0) 
+
+The pubkey is deleted immediately when a validator is removed: [2](#0-1) 
+
+This hook is called during validator removal: [3](#0-2) 
+
+**2. Timing Analysis:**
+
+ValidatorUpdateDelay is set to 1 block: [4](#0-3) 
+
+This means when a validator set update is returned at the end of block N, the validator stops signing at block N+2, but still signs block N+1.
+
+The critical sequence in `BlockValidatorUpdates`: [5](#0-4) 
+
+When unbonding completes and delegator shares are zero, the validator is immediately removed: [6](#0-5) 
+
+**3. Trigger Conditions:**
+
+The code explicitly supports instant unbonding scenarios: [7](#0-6) 
+
+The validation only requires positive unbonding time: [8](#0-7) 
+
+**4. Evidence of Correct Pattern:**
+
+The evidence keeper demonstrates the correct architectural approach - graceful handling instead of panicking: [9](#0-8) 
+
+## Validation Decision
+
+This is a **VALID** vulnerability with **Medium** severity.
 
 # Audit Report
 
 ## Title
-Unrecovered Panic in Governance Proposal Handler Causes Complete Network Halt
+Chain Halt Due to Race Condition Between Validator Removal and Signature Processing
 
 ## Summary
-The governance module's `EndBlocker` function executes proposal handlers without panic recovery. When a proposal handler panics during execution, the panic propagates uncaught through the entire call chain, causing all validator nodes to crash simultaneously at the same block height, resulting in a complete network shutdown. [1](#0-0) 
+When a validator completes unbonding with zero delegator shares, the `AfterValidatorRemoved` hook immediately deletes its pubkey mapping. However, due to ValidatorUpdateDelay (1 block), the next block's BeginBlocker must still process this validator's signature from the previous block. When `GetPubkey` fails, the system panics, causing a complete chain halt.
 
 ## Impact
 Medium
 
 ## Finding Description
+- **location:** `x/slashing/keeper/infractions.go` line 28-30 (panic point), `x/slashing/keeper/hooks.go` line 42 (premature deletion), `x/staking/keeper/validator.go` line 180 (removal trigger)
 
-**Location:**
-- Primary: `x/gov/abci.go`, line 74 where the handler is invoked
-- Secondary: `baseapp/abci.go`, lines 178-201 where EndBlock lacks panic recovery [2](#0-1) 
+- **intended logic:** Validator metadata should remain accessible for processing signatures from blocks where the validator was still in the active set. Cleanup should occur only after all signature processing is complete.
 
-**Intended logic:** 
-The governance EndBlocker should execute passed proposal handlers safely. If a handler fails, the proposal should be marked as failed and the chain should continue processing blocks. The cached context isolates state changes for rollback on error.
+- **actual logic:** The `AfterValidatorRemoved` hook deletes the pubkey mapping immediately during `RemoveValidator`. However, ValidatorUpdateDelay causes a 1-block lag where the removed validator's signature from the previous block must still be processed in the next block's BeginBlocker. When `HandleValidatorSignatureConcurrent` calls `GetPubkey`, it receives an error and panics.
 
-**Actual logic:**
-The code only handles errors returned by the handler (`if err == nil` check at line 74), but provides no protection against panics. When a handler panics, it propagates uncaught through `gov.EndBlocker` → `BaseApp.EndBlock` → validator node crash.
+- **exploitation path:**
+  1. Block N EndBlocker: A validator with zero delegations completes its unbonding period (requires unbonding time ≤ block time)
+  2. `ApplyAndReturnValidatorSetUpdates` returns a zero-power update for the validator
+  3. `UnbondAllMatureValidators` calls `RemoveValidator` since delegator shares are zero
+  4. `AfterValidatorRemoved` hook deletes the pubkey mapping
+  5. Block N+1 BeginBlocker: Processes `LastCommitInfo.Votes` from block N
+  6. Block N was signed by the old validator set (including the removed validator)
+  7. `HandleValidatorSignatureConcurrent` is called for the removed validator
+  8. `GetPubkey` returns error "address not found"
+  9. System panics with "Validator consensus-address %s not found"
+  10. Chain halts completely, requiring manual intervention
 
-**Exploitation path:**
-1. A module registers a governance proposal handler containing code that can panic (e.g., nil pointer dereference, array out of bounds, type assertion failure, or use of panic-inducing functions like `MustMarshal`)
-2. A governance proposal of that type is submitted and passes through normal voting
-3. When the voting period ends, `gov.EndBlocker` executes during block finalization
-4. The handler is invoked and panics
-5. No defer/recover exists in the call stack to catch the panic
-6. All validator nodes crash at the same block height
-7. Network completely halts - cannot produce new blocks
-
-**Security guarantee broken:**
-Availability and fault tolerance. The chain should gracefully handle proposal handler failures without causing network-wide consensus failure.
+- **security guarantee broken:** The blockchain's liveness guarantee is violated. The system cannot recover automatically and requires coordinated manual intervention or an emergency patch.
 
 ## Impact Explanation
-
-This vulnerability results in:
-- All validator nodes crashing simultaneously at the same block height
-- Complete network shutdown - no new blocks can be produced
-- All transaction processing halts
-- Network cannot reach consensus
-- Requires coordinated hard fork with patched binary to recover
-- Economic impact: trading halts, DeFi protocols freeze, funds temporarily inaccessible
-
-This matches the approved impact: "Network not being able to confirm new transactions (total network shutdown)" classified as **Medium** severity.
+This vulnerability causes complete network shutdown matching the "Network not being able to confirm new transactions (total network shutdown)" impact category. All validators are unable to progress past the block where the panic occurs. The chain cannot self-recover and requires external coordination, emergency patch deployment, or potentially a hard fork to resume operations.
 
 ## Likelihood Explanation
+**Production environments:** Very low likelihood due to standard 3-week unbonding periods creating a sufficient timing buffer.
 
-**Trigger requirements:**
-- Governance proposal must pass (requires majority token holder support)
-- Handler must contain code that can panic
+**Test environments:** High likelihood as instant unbonding is commonly used.
 
-**Likelihood: Medium**
+**Triggering conditions:**
+- Requires unbonding time ≤ block time for the race condition to occur
+- The code explicitly supports this configuration through validation accepting any positive duration
+- Can be triggered through normal validator operations (delegator unbonding)
+- No special privileges or malicious intent required
 
-The likelihood is realistic because:
-1. Third-party modules commonly integrate custom proposal handlers
-2. Handlers can have implementation bugs: nil pointer dereferences, array bounds violations, type assertions, division by zero
-3. Real production code demonstrates panic-inducing patterns (e.g., `MustMarshal` in upgrade keeper) [3](#0-2) [4](#0-3) [5](#0-4) 
-
-4. The inconsistency with `ProcessProposal` (which HAS panic recovery) indicates this is an oversight [6](#0-5) 
-
-**Key justification:** This doesn't require malicious governance. A buggy handler from a legitimate module suffices. The exception clause applies: "unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." Governance's intended authority is to pass/fail proposals, not to halt the entire network.
+**Configuration validity:** The code explicitly acknowledges and supports instant unbonding scenarios, making this a legitimate code defect rather than a misconfiguration issue.
 
 ## Recommendation
+Implement graceful handling of missing pubkeys in `HandleValidatorSignatureConcurrent`, consistent with the evidence keeper's approach:
 
-Add panic recovery to the governance EndBlocker, mirroring the pattern used in `ProcessProposal`:
-
-1. Wrap the handler execution (around lines 67-92 in `x/gov/abci.go`) with a defer/recover block
-2. In the recovery handler:
-   - Log the panic details (proposal ID, type, stack trace)
-   - Mark the proposal as failed (`proposal.Status = types.StatusFailed`)
-   - Continue processing remaining proposals
-   - Return normally to prevent node crash
-
-This provides defense-in-depth: even if a handler panics, the chain continues operating and the proposal is safely marked as failed.
-
-## Proof of Concept
-
-While no executable PoC is provided, the vulnerability is evident from code inspection:
-
-**Setup:**
-- Standard Cosmos SDK chain with governance module enabled
-- Custom proposal handler containing panic-inducing code (e.g., nil dereference)
-
-**Action:**
-- Submit and pass governance proposal
-- Advance to voting period end
-- `gov.EndBlocker` executes and calls the panicking handler
-
-**Result:**
-- Panic propagates through call chain: handler → `gov.EndBlocker` → module manager → `BaseApp.EndBlock`
-- Validator node crashes
-- All validators crash at same height
-- Network halts
-
-The existing test `TestEndBlockerProposalHandlerFailed` tests error handling but not panic scenarios, confirming this gap in defensive programming.
-
-## Notes
-
-This vulnerability is valid because:
-1. It matches an approved Medium severity impact ("network shutdown")
-2. The technical deficiency is objectively present (no panic recovery)
-3. ProcessProposal's panic recovery proves this is a known concern
-4. Handler bugs are realistic in production systems
-5. The exception clause for privileged roles applies - governance inadvertently triggering network halt exceeds their intended authority
-6. The inconsistency indicates an oversight, not intentional design
-
-### Citations
-
-**File:** x/gov/abci.go (L67-92)
 ```go
-		if passes {
-			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
-			cacheCtx, writeCache := ctx.CacheContext()
-
-			// The proposal handler may execute state mutating logic depending
-			// on the proposal content. If the handler fails, no state mutation
-			// is written and the error message is logged.
-			err := handler(cacheCtx, proposal.GetContent())
-			if err == nil {
-				proposal.Status = types.StatusPassed
-				tagValue = types.AttributeValueProposalPassed
-				logMsg = "passed"
-
-				// The cached context is created with a new EventManager. However, since
-				// the proposal handler execution was successful, we want to track/keep
-				// any events emitted, so we re-emit to "merge" the events into the
-				// original Context's EventManager.
-				ctx.EventManager().EmitEvents(cacheCtx.EventManager().Events())
-
-				// write state to the underlying multi-store
-				writeCache()
-			} else {
-				proposal.Status = types.StatusFailed
-				tagValue = types.AttributeValueProposalFailed
-				logMsg = fmt.Sprintf("passed, but failed on execution: %s", err)
-			}
-```
-
-**File:** baseapp/abci.go (L178-201)
-```go
-func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
-	// Clear DeliverTx Events
-	ctx.MultiStore().ResetEvents()
-
-	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
-
-	if app.endBlocker != nil {
-		res = app.endBlocker(ctx, req)
-		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
-	}
-
-	if cp := app.GetConsensusParams(ctx); cp != nil {
-		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
-	}
-
-	// call the streaming service hooks with the EndBlock messages
-	for _, streamingListener := range app.abciListeners {
-		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
-			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
-		}
-	}
-
-	return res
+consAddr = sdk.ConsAddress(addr)
+if _, err := k.GetPubkey(ctx, addr); err != nil {
+    logger.Info("Validator pubkey not found, likely recently removed", "address", consAddr)
+    return
 }
 ```
 
-**File:** baseapp/abci.go (L1106-1118)
-```go
-	defer func() {
-		if err := recover(); err != nil {
-			app.logger.Error(
-				"panic recovered in ProcessProposal",
-				"height", req.Height,
-				"time", req.Time,
-				"hash", fmt.Sprintf("%X", req.Hash),
-				"panic", err,
-			)
+Alternatively, delay pubkey deletion in the `AfterValidatorRemoved` hook for ValidatorUpdateDelay + 1 blocks to ensure signature processing completes before cleanup.
 
-			resp = &abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_REJECT}
-		}
-	}()
+## Proof of Concept
+**Setup:**
+1. Create test app with unbonding period of 1 nanosecond
+2. Create validator with self-delegation
+3. Call EndBlocker to bond the validator
+4. Undelegate all tokens
+
+**Action:**
+1. Call EndBlocker - triggers `UnbondAllMatureValidators` which removes validator and deletes pubkey
+2. Advance to next block
+3. Call BeginBlocker with `LastCommitInfo` containing the removed validator's vote
+
+**Result:**
+Panic occurs with message "Validator consensus-address %s not found" when BeginBlocker attempts to call `GetPubkey` for the removed validator, demonstrating the chain halt vulnerability.
+
+## Notes
+While this primarily affects test environments, it represents a legitimate code defect because:
+1. The code explicitly supports short unbonding periods through permissive validation
+2. The evidence keeper demonstrates graceful handling as the correct architectural pattern
+3. The failure mode (panic causing chain halt) is catastrophic and requires manual intervention
+4. Chains might theoretically choose shorter unbonding periods for operational reasons
+5. This creates an architectural inconsistency that should be resolved for defensive programming and system robustness
+
+### Citations
+
+**File:** x/slashing/keeper/infractions.go (L28-30)
+```go
+	if _, err := k.GetPubkey(ctx, addr); err != nil {
+		panic(fmt.Sprintf("Validator consensus-address %s not found", consAddr))
+	}
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L200-201)
+**File:** x/slashing/keeper/hooks.go (L41-43)
 ```go
-	bz := k.cdc.MustMarshal(&plan)
-	store.Set(types.PlanKey(), bz)
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+}
 ```
 
-**File:** codec/proto_codec.go (L46-53)
+**File:** x/staking/keeper/validator.go (L180-180)
 ```go
-func (pc *ProtoCodec) MustMarshal(o ProtoMarshaler) []byte {
-	bz, err := pc.Marshal(o)
+	k.AfterValidatorRemoved(ctx, valConsAddr, validator.GetOperator())
+```
+
+**File:** x/staking/keeper/validator.go (L441-444)
+```go
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
+
+**File:** types/staking.go (L17-26)
+```go
+	// Delay, in blocks, between when validator updates are returned to the
+	// consensus-engine and when they are applied. For example, if
+	// ValidatorUpdateDelay is set to X, and if a validator set update is
+	// returned with new validators at the end of block 10, then the new
+	// validators are expected to sign blocks beginning at block 11+X.
+	//
+	// This value is constant as this should not change without a hard fork.
+	// For Tendermint this should be set to 1 block, for more details see:
+	// https://tendermint.com/docs/spec/abci/apps.html#endblock
+	ValidatorUpdateDelay int64 = 1
+```
+
+**File:** x/staking/keeper/val_state_change.go (L17-33)
+```go
+func (k Keeper) BlockValidatorUpdates(ctx sdk.Context) []abci.ValidatorUpdate {
+	// Calculate validator set changes.
+	//
+	// NOTE: ApplyAndReturnValidatorSetUpdates has to come before
+	// UnbondAllMatureValidatorQueue.
+	// This fixes a bug when the unbonding period is instant (is the case in
+	// some of the tests). The test expected the validator to be completely
+	// unbonded after the Endblocker (go from Bonded -> Unbonding during
+	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
+	// UnbondAllMatureValidatorQueue).
+	validatorUpdates, err := k.ApplyAndReturnValidatorSetUpdates(ctx)
 	if err != nil {
 		panic(err)
 	}
 
-	return bz
-}
+	// unbond all mature validators from the unbonding queue
+	k.UnbondAllMatureValidators(ctx)
 ```
 
-**File:** simapp/app.go (L309-309)
+**File:** x/staking/types/params.go (L167-177)
 ```go
-		AddRoute(upgradetypes.RouterKey, upgrade.NewSoftwareUpgradeProposalHandler(app.UpgradeKeeper))
+func validateUnbondingTime(i interface{}) error {
+	v, ok := i.(time.Duration)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v <= 0 {
+		return fmt.Errorf("unbonding time must be positive: %d", v)
+	}
+
+	return nil
+```
+
+**File:** x/evidence/keeper/infraction.go (L29-40)
+```go
+	if _, err := k.slashingKeeper.GetPubkey(ctx, consAddr.Bytes()); err != nil {
+		// Ignore evidence that cannot be handled.
+		//
+		// NOTE: We used to panic with:
+		// `panic(fmt.Sprintf("Validator consensus-address %v not found", consAddr))`,
+		// but this couples the expectations of the app to both Tendermint and
+		// the simulator.  Both are expected to provide the full range of
+		// allowable but none of the disallowed evidence types.  Instead of
+		// getting this coordination right, it is easier to relax the
+		// constraints and ignore evidence that cannot be handled.
+		return
+	}
 ```

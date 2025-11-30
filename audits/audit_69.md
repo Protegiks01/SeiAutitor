@@ -1,349 +1,202 @@
 # Audit Report
 
 ## Title
-Genesis Transaction Validation Bypass Enables Chain Startup Denial-of-Service
+Authentication Bypass via Zero-Threshold Multisig Public Key Deserialization
 
 ## Summary
-A critical validation gap exists between the `CollectTxs` function (used during genesis transaction collection) and `DeliverGenTxs` (used during chain initialization). The `CollectTxs` function does not call `ValidateBasic()` on genesis transaction messages, while `DeliverGenTxs` does call it and panics unconditionally on validation failure. This allows invalid genesis transactions to be included in genesis.json, causing all nodes to panic and preventing the network from ever starting.
+The `LegacyAminoPubKey` protobuf deserialization bypasses constructor validation that enforces threshold > 0, allowing creation of multisig accounts that accept transactions without any valid signatures. This creates "anyone can spend" addresses where funds can be stolen without possessing any private keys.
 
 ## Impact
-Medium
+High - Direct loss of funds
 
 ## Finding Description
 
-**Location:** 
-- Validation gap: [1](#0-0) 
-- Panic on validation failure: [2](#0-1) 
-- ValidateBasic checks: [3](#0-2) 
+**Location:**
+- [1](#0-0) 
+- [2](#0-1) 
+- [3](#0-2) 
+- [4](#0-3) 
 
-**Intended Logic:** 
-Genesis transactions should be thoroughly validated during the `collect-gentxs` phase to ensure only valid transactions are included in genesis.json. During chain startup, these pre-validated transactions should execute successfully without errors, allowing the network to initialize properly.
+**Intended logic:**
+The constructor enforces that multisig threshold must be greater than 0 to ensure at least one signature is required for transaction authorization. [5](#0-4) 
 
-**Actual Logic:** 
-The `CollectTxs` function validates account balances and delegation amounts but does NOT call `ValidateBasic()` on the message itself. [4](#0-3)  It only performs balance and fund sufficiency checks, not comprehensive message field validation.
+**Actual logic:**
+The protobuf `Unmarshal` method directly deserializes the `Threshold` field without any validation. When `threshold=0`, signature verification checks become ineffective:
+- At line 60: `if len(sigs) < int(m.Threshold)` becomes `if len(sigs) < 0` which is always false (array length is non-negative)
+- At line 64: `if bitarray.NumTrueBitsBefore(size) < int(m.Threshold)` becomes checking against 0, always false for non-negative counts
+- The verification loop only processes set bits in the bitarray; with no bits set, it returns success without verifying any signatures
 
-However, during chain startup, the transaction delivery pipeline calls `validateBasicTxMsgs` [5](#0-4)  which calls `ValidateBasic()` on each message. [6](#0-5) 
+**Exploitation path:**
+1. Attacker creates a `LegacyAminoPubKey` with `Threshold: 0` by directly instantiating the struct or using protobuf marshal/unmarshal (bypassing the constructor)
+2. Attacker computes the address from this malicious key using `Address()` method
+3. Victim sends funds to this address (via exchange withdrawal, DAO treasury setup, protocol integration, or social engineering)
+4. Attacker creates a transaction with the threshold=0 pubkey in SignerInfo and an empty `MultiSignatureData` with zero actual signatures
+5. Transaction passes `ValidateBasic` which only checks outer signatures array length > 0 [6](#0-5) 
+6. `SetPubKeyDecorator` sets the malicious pubkey on the account without validation
+7. `VerifyMultisignature` passes all checks due to threshold=0
+8. Transaction executes without any valid cryptographic signatures, enabling fund theft
 
-The `MsgCreateValidator.ValidateBasic()` performs critical validations that CollectTxs skips, including empty description checks and empty commission checks. [3](#0-2) 
-
-**Exploitation Path:**
-1. Genesis participant creates a gentx JSON file with empty `CommissionRates{}` or `Description{}`
-2. Places the file in the gentxs directory before `collect-gentxs` runs
-3. `CollectTxs` processes the transaction, validates balances, but skips `ValidateBasic()` call
-4. Invalid gentx is included in genesis.json
-5. During chain startup, `InitGenesis` is called [7](#0-6) 
-6. `InitGenesis` calls `DeliverGenTxs` which iterates through gentxs [8](#0-7) 
-7. For the invalid gentx, the delivery pipeline calls `ValidateBasic()` which returns an error
-8. `DeliverTx` returns a non-OK response
-9. Code unconditionally panics: `if !res.IsOK() { panic(res.Log) }` [9](#0-8) 
-10. Node crashes and cannot complete genesis
-11. All nodes using the same genesis.json experience the same panic
-12. Network cannot start
-
-**Security Guarantee Broken:** 
-The system fails to provide defense-in-depth validation. The validation boundary is inconsistent - some checks happen during collection (balances), while critical message validity checks only occur during delivery. This allows invalid data to bypass initial validation and cause system failure at the critical initialization phase.
+**Security guarantee broken:**
+Transactions must be cryptographically signed by authorized private key holders. This vulnerability creates addresses where NO private keys are needed—anyone who knows the public keys can spend funds, violating blockchain's fundamental signature-based authentication model.
 
 ## Impact Explanation
 
-This vulnerability causes **complete network failure at genesis**:
+This vulnerability enables direct fund theft through multiple attack vectors:
 
-- **Irrecoverable without manual intervention**: The chain cannot self-recover. Requires identifying the malicious gentx, removing it, and regenerating genesis.json
-- **Affects all nodes simultaneously**: Since all nodes use the same genesis.json, all validators fail to start
-- **Network never reaches operational state**: No blocks are produced, no transactions can be processed
-- **Pre-consensus DoS**: Prevents the chain from even initializing consensus mechanisms
+1. **Social engineering**: Attackers can promote "secure multisig addresses" for DAOs, treasuries, or escrows that appear legitimate but are threshold=0 and completely insecure
 
-The impact severity matches the explicit criteria from the provided impact list: "Network not being able to confirm new transactions (total network shutdown)" - classified as Medium severity.
+2. **Protocol integration risks**: Smart contracts or off-chain systems that verify multisig structure but don't validate the threshold could inadvertently use these insecure addresses
+
+3. **Immediate theft**: Anyone who discovers a threshold=0 multisig address and knows its public key composition can immediately steal all funds sent to it
+
+4. **Systemic authentication failure**: Violates the core blockchain security model where transaction authorization requires cryptographic proof of private key possession
+
+All funds sent to threshold=0 multisig addresses are at immediate risk of theft by any party that discovers the public key composition.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-- Any genesis participant who can submit a gentx file
-- Malicious initial validators
-- Compromised genesis coordinators
-- Could even happen accidentally through human error
+**Who can trigger:** Any unprivileged user can create and exploit threshold=0 multisig addresses.
 
-**Required Conditions:**
-- Access to place a gentx file during genesis ceremony (standard for genesis participants)
-- Knowledge that empty commission/description fields bypass CollectTxs but fail ValidateBasic
-- Timing: must occur before `collect-gentxs` execution
+**Conditions required:**
+- Attacker creates a threshold=0 multisig key (trivial - direct struct instantiation or protobuf manipulation)
+- Funds are sent to the derived address (could occur through legitimate channels: exchange withdrawals, DAO setups, protocol integrations, user transfers)
+- No special timing, network conditions, or privileges required
 
-**Frequency:**
-While exploitable only during genesis (one-time window), the impact is catastrophic. The attack requires minimal sophistication - simply creating a JSON file with empty commission or description fields. An honest participant could even trigger this accidentally by making a mistake in their gentx configuration.
-
-**Key Point**: Even though genesis participants are somewhat privileged roles, this qualifies under the exception clause: "even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." A single participant (trusted or not) making an error should not be able to prevent the entire network from ever starting.
+**Frequency:** The vulnerability is exploitable on-demand during normal network operation. The attack is deterministic and reliable—once funds arrive at a threshold=0 address, they can be stolen immediately by anyone who knows the public key composition.
 
 ## Recommendation
 
-Add `ValidateBasic()` validation in the `CollectTxs` function to ensure parity between collection-time and delivery-time validation. After line 136 where messages are extracted, add:
+Implement comprehensive validation for multisig threshold values:
 
+1. **Add post-deserialization validation in `VerifyMultisignature`:**
+Add threshold validation at the beginning of the method before any signature checks.
+
+2. **Add validation in `SetPubKey`:**
+Validate that multisig pubkeys have valid threshold values before setting them on accounts.
+
+3. **Add interface-level validation:**
+Add a `Validate()` method to the `cryptotypes.PubKey` interface that all implementations must provide, ensuring no invalid pubkeys enter the system through any deserialization path.
+
+Example validation:
 ```go
-msgs := genTx.GetMsgs()
-for _, msg := range msgs {
-    if err := msg.ValidateBasic(); err != nil {
-        return appGenTxs, persistentPeers, fmt.Errorf("gentx %s failed ValidateBasic: %w", fo.Name(), err)
+func (m *LegacyAminoPubKey) Validate() error {
+    if m.Threshold == 0 {
+        return fmt.Errorf("threshold must be greater than 0")
     }
+    if int(m.Threshold) > len(m.PubKeys) {
+        return fmt.Errorf("threshold cannot exceed number of pubkeys")
+    }
+    return nil
 }
 ```
-
-This closes the validation gap and ensures invalid gentxs are rejected during collection rather than causing a panic during genesis.
 
 ## Proof of Concept
 
+**Test location:** `crypto/keys/multisig/multisig_test.go`
+
 **Setup:**
-The existing test suite already demonstrates that empty CommissionRates{} can be constructed: [10](#0-9) 
+Create a threshold=0 multisig directly (bypassing constructor) and an empty MultiSignatureData:
+- Generate pubkeys using existing `generatePubKeys` helper
+- Pack them into Any types
+- Create `LegacyAminoPubKey` struct directly with `Threshold: 0`
+- Create `MultiSignatureData` with correct BitArray size but empty Signatures array
 
-**Test Case:**
-Add the following test case to `TestDeliverGenTxs` in `x/genutil/gentx_test.go`:
+**Action:**
+Call `VerifyMultisignature` with the threshold=0 pubkey and empty signature data.
 
-```go
-{
-    "invalid gentx with empty commission causes panic",
-    func() {
-        _ = suite.setAccountBalance(addr1, 50)
-        
-        amount := sdk.NewInt64Coin(sdk.DefaultBondDenom, 10)
-        emptyComm := stakingtypes.CommissionRates{} // Invalid - empty commission
-        desc := stakingtypes.NewDescription("validator", "", "", "", "")
-        minSelfDel := sdk.OneInt()
-        
-        invalidMsg, err := stakingtypes.NewMsgCreateValidator(
-            sdk.ValAddress(pk1.Address()), 
-            pk1, 
-            amount, 
-            desc, 
-            emptyComm, // Will fail ValidateBasic during delivery
-            minSelfDel,
-        )
-        suite.Require().NoError(err)
-        
-        tx, err := helpers.GenTx(
-            suite.encodingConfig.TxConfig,
-            []sdk.Msg{invalidMsg},
-            sdk.Coins{sdk.NewInt64Coin(sdk.DefaultBondDenom, 10)},
-            helpers.DefaultGenTxGas,
-            suite.ctx.ChainID(),
-            []uint64{0},
-            []uint64{0},
-            priv1,
-        )
-        suite.Require().NoError(err)
-        
-        genTxs = make([]json.RawMessage, 1)
-        genTx, err := suite.encodingConfig.TxConfig.TxJSONEncoder()(tx)
-        suite.Require().NoError(err)
-        genTxs[0] = genTx
-    },
-    false, // expPass = false, expecting panic
-},
-```
-
-**Expected Result:**
-The test should panic when `DeliverGenTxs` is called (verified by the panic expectation at line 272 of the test suite), confirming that an invalid gentx bypasses collection validation but causes a panic during genesis delivery.
-
-**Verification:**
-Run `go test -v ./x/genutil/... -run TestDeliverGenTxs` with this test case to observe the panic, proving the validation gap is exploitable and causes network startup failure.
+**Expected result:**
+- Verification should fail with an error about invalid threshold
+- **Actual result**: Verification returns `nil` (success) without any error
+- This confirms threshold=0 bypasses all signature checks
+- Demonstrates complete authentication bypass where transactions succeed without any valid cryptographic signatures
 
 ## Notes
 
-This vulnerability represents a critical validation gap in the genesis process. While genesis participants have a special role, the principle of defense-in-depth requires consistent validation at all boundaries. The fact that `CollectTxs` performs *some* validations (balances, funds) but not *all* validations (`ValidateBasic()`) creates an exploitable inconsistency that can prevent the entire network from starting.
+This vulnerability stems from a fundamental mismatch between constructor validation and protobuf deserialization paths. The constructor's explicit panic on `threshold <= 0` clearly indicates this was never intended behavior. The issue affects the core authentication mechanism and represents a critical security failure that violates blockchain's fundamental trust model—that transactions must be cryptographically authorized by private key holders. This creates exploitable "anyone can spend" addresses where funds can be stolen by any party that knows the public key composition, without needing any private keys whatsoever.
 
 ### Citations
 
-**File:** x/genutil/collect.go (L70-184)
+**File:** crypto/keys/multisig/keys.pb.go (L206-220)
 ```go
-// CollectTxs processes and validates application's genesis Txs and returns
-// the list of appGenTxs, and persistent peers required to generate genesis.json.
-func CollectTxs(cdc codec.JSONCodec, txJSONDecoder sdk.TxDecoder, moniker, genTxsDir string,
-	genDoc tmtypes.GenesisDoc, genBalIterator types.GenesisBalancesIterator,
-) (appGenTxs []sdk.Tx, persistentPeers string, err error) {
-	// prepare a map of all balances in genesis state to then validate
-	// against the validators addresses
-	var appState map[string]json.RawMessage
-	if err := json.Unmarshal(genDoc.AppState, &appState); err != nil {
-		return appGenTxs, persistentPeers, err
-	}
-
-	var fos []os.FileInfo
-	fos, err = ioutil.ReadDir(genTxsDir)
-	if err != nil {
-		return appGenTxs, persistentPeers, err
-	}
-
-	balancesMap := make(map[string]bankexported.GenesisBalance)
-
-	genBalIterator.IterateGenesisBalances(
-		cdc, appState,
-		func(balance bankexported.GenesisBalance) (stop bool) {
-			balancesMap[balance.GetAddress().String()] = balance
-			return false
-		},
-	)
-
-	// addresses and IPs (and port) validator server info
-	var addressesIPs []string
-
-	for _, fo := range fos {
-		if fo.IsDir() {
-			continue
-		}
-		if !strings.HasSuffix(fo.Name(), ".json") {
-			continue
-		}
-
-		// get the genTx
-		jsonRawTx, err := ioutil.ReadFile(filepath.Join(genTxsDir, fo.Name()))
-		if err != nil {
-			return appGenTxs, persistentPeers, err
-		}
-
-		var genTx sdk.Tx
-		if genTx, err = txJSONDecoder(jsonRawTx); err != nil {
-			return appGenTxs, persistentPeers, err
-		}
-
-		appGenTxs = append(appGenTxs, genTx)
-
-		// the memo flag is used to store
-		// the ip and node-id, for example this may be:
-		// "528fd3df22b31f4969b05652bfe8f0fe921321d5@192.168.2.37:26656"
-
-		memoTx, ok := genTx.(sdk.TxWithMemo)
-		if !ok {
-			return appGenTxs, persistentPeers, fmt.Errorf("expected TxWithMemo, got %T", genTx)
-		}
-		nodeAddrIP := memoTx.GetMemo()
-		if len(nodeAddrIP) == 0 {
-			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
-		}
-
-		// genesis transactions must be single-message
-		msgs := genTx.GetMsgs()
-
-		// TODO abstract out staking message validation back to staking
-		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
-
-		// validate delegator and validator addresses and funds against the accounts in the state
-		delAddr := msg.DelegatorAddress
-		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
-		if err != nil {
-			return appGenTxs, persistentPeers, err
-		}
-
-		delBal, delOk := balancesMap[delAddr]
-		if !delOk {
-			_, file, no, ok := runtime.Caller(1)
-			if ok {
-				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
+			m.Threshold = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowKeys
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Threshold |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
 			}
+```
 
-			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
-		}
-
-		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
-		if !valOk {
-			_, file, no, ok := runtime.Caller(1)
-			if ok {
-				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
-			}
-			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
-		}
-
-		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
-			return appGenTxs, persistentPeers, fmt.Errorf(
-				"insufficient fund for delegation %v: %v < %v",
-				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
-			)
-		}
-
-		// exclude itself from persistent peers
-		if msg.Description.Moniker != moniker {
-			addressesIPs = append(addressesIPs, nodeAddrIP)
-		}
+**File:** crypto/keys/multisig/multisig.go (L21-24)
+```go
+func NewLegacyAminoPubKey(threshold int, pubKeys []cryptotypes.PubKey) *LegacyAminoPubKey {
+	if threshold <= 0 {
+		panic("threshold k of n multisignature: k <= 0")
 	}
+```
 
-	sort.Strings(addressesIPs)
-	persistentPeers = strings.Join(addressesIPs, ",")
+**File:** crypto/keys/multisig/multisig.go (L50-66)
+```go
+func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
+	bitarray := sig.BitArray
+	sigs := sig.Signatures
+	size := bitarray.Count()
+	pubKeys := m.GetPubKeys()
+	// ensure bit array is the correct size
+	if len(pubKeys) != size {
+		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
+	}
+	// ensure size of signature list
+	if len(sigs) < int(m.Threshold) || len(sigs) > size {
+		return fmt.Errorf("signature size is incorrect %d", len(sigs))
+	}
+	// ensure at least k signatures are set
+	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
+		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
+	}
+```
 
-	return appGenTxs, persistentPeers, nil
+**File:** x/auth/types/account.go (L87-97)
+```go
+func (acc *BaseAccount) SetPubKey(pubKey cryptotypes.PubKey) error {
+	if pubKey == nil {
+		acc.PubKey = nil
+		return nil
+	}
+	any, err := codectypes.NewAnyWithValue(pubKey)
+	if err == nil {
+		acc.PubKey = any
+	}
+	return err
 }
 ```
 
-**File:** x/genutil/gentx.go (L96-117)
+**File:** x/auth/ante/sigverify.go (L89-97)
 ```go
-func DeliverGenTxs(
-	ctx sdk.Context, genTxs []json.RawMessage,
-	stakingKeeper types.StakingKeeper, deliverTx deliverTxfn,
-	txEncodingConfig client.TxEncodingConfig,
-) ([]abci.ValidatorUpdate, error) {
-
-	for _, genTx := range genTxs {
-		tx, err := txEncodingConfig.TxJSONDecoder()(genTx)
+		// account already has pubkey set,no need to reset
+		if acc.GetPubKey() != nil {
+			continue
+		}
+		err = acc.SetPubKey(pk)
 		if err != nil {
-			panic(err)
+			return ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidPubKey, err.Error())
 		}
-
-		bz, err := txEncodingConfig.TxEncoder()(tx)
-		if err != nil {
-			panic(err)
-		}
-
-		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
-		if !res.IsOK() {
-			panic(res.Log)
-		}
-	}
+		spkd.ak.SetAccount(ctx, acc)
 ```
 
-**File:** x/staking/types/msg.go (L120-126)
+**File:** types/tx/types.go (L88-92)
 ```go
-	if msg.Description == (Description{}) {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "empty description")
+	sigs := t.Signatures
+
+	if len(sigs) == 0 {
+		return sdkerrors.ErrNoSignatures
 	}
-
-	if msg.Commission == (CommissionRates{}) {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "empty commission")
-	}
-```
-
-**File:** baseapp/baseapp.go (L787-800)
-```go
-// validateBasicTxMsgs executes basic validator calls for messages.
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-	if len(msgs) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
-	}
-
-	for _, msg := range msgs {
-		err := msg.ValidateBasic()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-```
-
-**File:** baseapp/baseapp.go (L923-923)
-```go
-	if err := validateBasicTxMsgs(msgs); err != nil {
-```
-
-**File:** x/genutil/genesis.go (L12-20)
-```go
-func InitGenesis(
-	ctx sdk.Context, stakingKeeper types.StakingKeeper,
-	deliverTx deliverTxfn, genesisState types.GenesisState,
-	txEncodingConfig client.TxEncodingConfig,
-) (validators []abci.ValidatorUpdate, err error) {
-	if len(genesisState.GenTxs) > 0 {
-		validators, err = DeliverGenTxs(ctx, genesisState.GenTxs, stakingKeeper, deliverTx, txEncodingConfig)
-	}
-	return
-```
-
-**File:** x/genutil/gentx_test.go (L30-32)
-```go
-	desc  = stakingtypes.NewDescription("testname", "", "", "", "")
-	comm  = stakingtypes.CommissionRates{}
-)
 ```

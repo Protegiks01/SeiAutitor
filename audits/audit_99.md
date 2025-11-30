@@ -1,185 +1,264 @@
 # Audit Report
 
 ## Title
-Transaction Rollback Inconsistency in Capability Module Causes Node Panic
+Message Filtering Bypass in AllowedMsgAllowance via MsgExec Wrapping
 
 ## Summary
-The capability module's `ReleaseCapability` function creates a state inconsistency when called within a failing transaction. The function deletes entries from both the transactional memStore and the non-transactional `capMap` Go map. When the transaction fails and rolls back, memStore deletions are reverted but `capMap` deletions persist, causing `GetCapability` to panic when it finds an index in memStore but nil in capMap. [1](#0-0) 
+The `AllowedMsgAllowance` fee grant filtering mechanism only validates top-level message types and does not recursively check nested messages within `MsgExec`. This allows grantees to consume fee allowances for message types that granters did not authorize, violating the documented security guarantee. [1](#0-0) 
 
 ## Impact
-Medium
+Low
 
 ## Finding Description
 
-- **location**: `x/capability/keeper/keeper.go` lines 319-356 (`ReleaseCapability`) and lines 361-388 (`GetCapability`)
+- **location:** `x/feegrant/filtered_fee.go`, lines 98-109 in the `allMsgTypesAllowed()` method
 
-- **intended logic**: When a transaction fails, all state changes should be rolled back atomically. The capability module should maintain consistency between persistent store, memory store, and the in-memory `capMap`. Transaction rollback should restore all three storage layers to their pre-transaction state.
+- **intended logic:** According to the module specification, the SDK should "iterate over the messages being sent by the grantee to ensure the messages adhere to the filter" and "stop iterating and fail the transaction if it finds a message that does not conform to the filter." [2](#0-1)  The proto documentation states `AllowedMsgAllowance` "creates allowance only for specified message types." [3](#0-2) 
 
-- **actual logic**: The `capMap` is a shared Go map that is NOT part of the transactional store system. [2](#0-1)  When `ReleaseCapability` executes, it deletes from memStore [3](#0-2)  and from capMap. [4](#0-3)  If the transaction fails, memStore deletions are rolled back (part of cached context), but capMap deletion persists (just a Go map operation).
+- **actual logic:** The `allMsgTypesAllowed()` method only iterates through top-level messages from the transaction and checks their type URLs against the allowed list. It does not recursively inspect nested messages within `MsgExec`. The ante handler passes only top-level messages via `sdkTx.GetMsgs()` to the fee grant validation. [4](#0-3) 
 
-- **exploitation path**:
-  1. A capability exists in both memStore and capMap
-  2. A transaction creates a cached context [5](#0-4) 
-  3. `ReleaseCapability` is called within the cached context, deleting from both memStore and capMap
-  4. Transaction fails due to gas exhaustion, validation error, or any runtime error
-  5. The transaction execution framework does not write the cache [6](#0-5) 
-  6. MemStore deletions are reverted, but capMap deletion persists
-  7. Later `GetCapability` retrieves the index from memStore successfully [7](#0-6)  but finds `capMap[index]` returns nil [8](#0-7) , triggering panic
+- **exploitation path:**
+  1. Granter creates an `AllowedMsgAllowance` with specific allowed message types (e.g., `/cosmos.bank.v1beta1.MsgSend`)
+  2. Granter includes `/cosmos.authz.v1beta1.MsgExec` in the allowed list for legitimate authz use cases
+  3. Grantee constructs a `MsgExec` that wraps disallowed messages (e.g., `/cosmos.staking.v1beta1.MsgDelegate`)
+  4. During ante handler execution, only the outer `MsgExec` type is validated, which passes the filter check
+  5. The transaction proceeds to execution phase where `MsgExec.GetMessages()` extracts the wrapped messages [5](#0-4) 
+  6. The inner disallowed messages are executed via `DispatchActions()` using the fee grant [6](#0-5) 
 
-- **security guarantee broken**: This violates transaction atomicity guarantees and node availability. The code acknowledges this class of issue with a TODO comment [9](#0-8)  but only handles the `NewCapability` case (extra entries in map), not the `ReleaseCapability` case (missing entries in map).
+- **security guarantee broken:** The documented guarantee that "all messages must conform to the filter" is violated. The system fails to enforce message type restrictions for nested messages within `MsgExec`, allowing fee consumption for unauthorized message types.
 
 ## Impact Explanation
 
-This vulnerability causes node panics leading to crashes. When a corrupted capability is accessed via `GetCapability`, the node immediately panics and terminates. Each failed transaction containing `ReleaseCapability` permanently corrupts one capability in the capMap until node restart.
-
-The impact includes:
-- **Node crashes**: The panic at line 384 immediately terminates the node process
-- **Validator impact**: If ≥30% of validators encounter this during normal operations (e.g., IBC channel management), consensus is degraded
-- **Persistent corruption**: The corrupted state persists until node restart, and can recur if the same transaction patterns repeat
-- **Non-deterministic failures**: Different nodes may have different capMap states based on their transaction execution history
-
-This matches the Medium severity impact: "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"
+This vulnerability allows grantees to consume fee allowances for message types that granters did not intend to authorize. Fee grants can be depleted for operations like staking, governance, or IBC transfers when only basic transfers were intended. While the grantee still needs valid authz authorization for the inner messages (preventing completely arbitrary operations), the granter's trust model and fee budget restrictions are violated. This constitutes "modification of transaction fees outside of design parameters" as classified in the Low severity impact category.
 
 ## Likelihood Explanation
 
-**High likelihood** - This can be triggered during normal network operations:
+The vulnerability can be exploited whenever:
+- A granter includes `MsgExec` in their allowed messages list (a reasonable choice for legitimate authz use cases)
+- A grantee has both a fee grant and authz authorization for the desired inner messages
 
-- **Trigger conditions**: Any transaction that calls `ReleaseCapability` and subsequently fails (e.g., IBC channel close with gas exhaustion, port unbinding with validation errors)
-- **Who can trigger**: Any user submitting transactions; no special privileges required
-- **Frequency**: Transaction failures are routine in blockchain operations due to gas limits, state conflicts, or validation errors
-- **Cumulative effect**: Each failure corrupts one capability; over time, more capabilities become corrupted, increasing the probability of panics during normal operations
+Granters may not realize that allowing `MsgExec` effectively bypasses all message filtering, as this behavior contradicts the documented specification that promises all messages will be validated. The exploit requires no special privileges beyond being a grantee and is repeatable until the fee grant is exhausted. No existing tests cover this nested message scenario. [7](#0-6) 
 
 ## Recommendation
 
-Implement transactional semantics for capMap operations:
+Modify the `allMsgTypesAllowed()` method in `x/feegrant/filtered_fee.go` to recursively validate nested messages when encountering `MsgExec`:
 
-1. **Deferred capMap Updates** (Recommended): Store pending capMap operations in the cached context and apply them only on successful commit:
-   - Extend the cached context to track pending capMap additions/deletions
-   - Implement a post-commit hook that applies these operations when `msCache.Write()` is called
-   - Discard pending operations if the cache is not written
+1. Detect `MsgExec` messages during iteration by checking the message type URL
+2. Extract inner messages using the `GetMessages()` method
+3. Recursively validate inner messages against the allowed list
+4. Handle nested `MsgExec` scenarios through recursion
 
-2. **Alternative - Defensive GetCapability**: Modify `GetCapability` to detect and recover from inconsistencies:
-   - If `capMap[index]` is nil but index exists in memStore, check if capability exists in persistent store
-   - If found in persistent store, recreate the capMap entry
-   - Only panic if the inconsistency cannot be resolved
+The fix should consume appropriate gas for each nested message checked (following the existing pattern of 10 gas per message) and reject transactions containing any disallowed nested message types.
 
 ## Proof of Concept
 
-**File**: `x/capability/keeper/keeper_test.go`
+**Scenario:**
+- **Setup:** Granter creates `AllowedMsgAllowance` for grantee with allowed messages: `["/cosmos.bank.v1beta1.MsgSend", "/cosmos.authz.v1beta1.MsgExec"]`. Grantee has authz authorization for `/cosmos.staking.v1beta1.MsgDelegate` from another account.
 
-**Setup**: Create a capability in the original context, verify it exists in both memStore and capMap.
+- **Action:** Grantee submits transaction with:
+  - Fee granter set to the granter's address
+  - Messages: `[MsgExec{ Grantee: grantee, Msgs: [MsgDelegate{...}] }]`
+  
+- **Result:** 
+  - The ante handler calls `allMsgTypesAllowed()` with `[MsgExec]` (top-level only)
+  - Validation passes because `MsgExec` is in the allowed list
+  - Fee grant is accepted and consumed
+  - During execution, `MsgDelegate` is extracted and executed
+  - The disallowed `MsgDelegate` message executes using the fee grant, despite not being in the granter's allowed message list
 
-**Action**: 
-1. Create a cached context via `CacheMultiStore()` [10](#0-9) 
-2. Call `ReleaseCapability` in the cached context (deletes from both stores)
-3. Do NOT call `msCache.Write()` (simulate transaction failure/rollback)
-4. Attempt to call `GetCapability` from the original context
-
-**Result**: The test should panic with message "capability found in memstore is missing from map" because:
-- The index exists in memStore (deletion was rolled back)
-- But `capMap[index]` returns nil (deletion was NOT rolled back)
-- This triggers the panic at line 384
-
-Test code structure (following existing test pattern from `TestRevertCapability`):
-```go
-func (suite *KeeperTestSuite) TestReleaseCapabilityPanicOnTransactionRollback() {
-    sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
-    
-    // Setup: Create capability in original context
-    cap, err := sk.NewCapability(suite.ctx, "transfer")
-    suite.Require().NoError(err)
-    suite.Require().NotNil(cap)
-    
-    // Verify capability exists
-    got, ok := sk.GetCapability(suite.ctx, "transfer")
-    suite.Require().True(ok)
-    suite.Require().Equal(cap, got)
-    
-    // Action: Release in cached context without writing
-    ms := suite.ctx.MultiStore()
-    msCache := ms.CacheMultiStore()
-    cacheCtx := suite.ctx.WithMultiStore(msCache)
-    err = sk.ReleaseCapability(cacheCtx, cap)
-    suite.Require().NoError(err)
-    // NOT calling msCache.Write() - simulating transaction failure
-    
-    // Result: Should panic when accessing from original context
-    suite.Require().Panics(func() {
-        sk.GetCapability(suite.ctx, "transfer")
-    })
-}
-```
+This demonstrates that the filtering mechanism fails to enforce restrictions on nested messages, violating the documented security guarantee and the granter's intended fee budget restrictions.
 
 ## Notes
 
-The existing `TestRevertCapability` test validates the opposite scenario (creating a capability in a cached context without committing), demonstrating that the test infrastructure exists to reproduce this vulnerability. The TODO comment in the code explicitly acknowledges awareness of transaction rollback issues with the capMap but only addresses one direction of the problem.
+The vulnerability is valid because:
+1. It matches the explicitly listed impact "Modification of transaction fees outside of design parameters" (Low severity)
+2. The code flow demonstrates that fee grant validation only checks top-level messages in the ante handler
+3. The documented specification promises that all messages will be validated, but this is violated for nested messages
+4. The exploitation path is realistic and requires no special privileges beyond being a grantee with authz authorization
+5. The granter's fee budget policy is bypassed, allowing consumption for unauthorized message types
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L33-33)
+**File:** x/feegrant/filtered_fee.go (L98-109)
 ```go
-		capMap        map[uint64]*types.Capability
-```
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
 
-**File:** x/capability/keeper/keeper.go (L48-48)
-```go
-		capMap   map[uint64]*types.Capability
-```
-
-**File:** x/capability/keeper/keeper.go (L332-336)
-```go
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-```
-
-**File:** x/capability/keeper/keeper.go (L349-349)
-```go
-		delete(sk.capMap, cap.GetIndex())
-```
-
-**File:** x/capability/keeper/keeper.go (L368-369)
-```go
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-```
-
-**File:** x/capability/keeper/keeper.go (L372-377)
-```go
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-```
-
-**File:** x/capability/keeper/keeper.go (L382-384)
-```go
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
-```
-
-**File:** types/context.go (L589-592)
-```go
-func (c Context) CacheContext() (cc Context, writeCache func()) {
-	cms := c.MultiStore().CacheMultiStore()
-	cc = c.WithMultiStore(cms).WithEventManager(NewEventManager())
-	return cc, cms.Write
-```
-
-**File:** baseapp/baseapp.go (L1015-1017)
-```go
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
+		}
 	}
+
+	return true
+}
 ```
 
-**File:** x/capability/keeper/keeper_test.go (L282-283)
+**File:** x/feegrant/spec/01_concepts.md (L76-76)
+```markdown
+In order to prevent DoS attacks, using a filtered `x/feegrant` incurs gas. The SDK must assure that the `grantee`'s transactions all conform to the filter set by the `granter`. The SDK does this by iterating over the allowed messages in the filter and charging 10 gas per filtered message. The SDK will then iterate over the messages being sent by the `grantee` to ensure the messages adhere to the filter, also charging 10 gas per message. The SDK will stop iterating and fail the transaction if it finds a message that does not conform to the filter.
+```
+
+**File:** proto/cosmos/feegrant/v1beta1/feegrant.proto (L56-66)
+```text
+// AllowedMsgAllowance creates allowance only for specified message types.
+message AllowedMsgAllowance {
+  option (gogoproto.goproto_getters)         = false;
+  option (cosmos_proto.implements_interface) = "FeeAllowanceI";
+
+  // allowance can be any of basic and filtered fee allowance.
+  google.protobuf.Any allowance = 1 [(cosmos_proto.accepts_interface) = "FeeAllowanceI"];
+
+  // allowed_messages are the messages for which the grantee has the access.
+  repeated string allowed_messages = 2;
+}
+```
+
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-	msCache := ms.CacheMultiStore()
-	cacheCtx := suite.ctx.WithMultiStore(msCache)
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+```
+
+**File:** x/authz/msgs.go (L197-209)
+```go
+// GetMessages returns the cache values from the MsgExecAuthorized.Msgs if present.
+func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
+	msgs := make([]sdk.Msg, len(msg.Msgs))
+	for i, msgAny := range msg.Msgs {
+		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
+		if !ok {
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
+		}
+		msgs[i] = msg
+	}
+
+	return msgs, nil
+}
+```
+
+**File:** x/authz/keeper/msg_server.go (L65-82)
+```go
+func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
+	}
+
+	msgs, err := msg.GetMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := k.DispatchActions(ctx, grantee, msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgExecResponse{Results: results}, nil
+```
+
+**File:** x/feegrant/filtered_fee_test.go (L1-100)
+```go
+package feegrant_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
+
+	"github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/simapp"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"github.com/cosmos/cosmos-sdk/x/feegrant"
+)
+
+func TestFilteredFeeValidAllow(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{
+		Time: time.Now(),
+	})
+
+	eth := sdk.NewCoins(sdk.NewInt64Coin("eth", 10))
+	atom := sdk.NewCoins(sdk.NewInt64Coin("atom", 555))
+	smallAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 43))
+	bigAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 1000))
+	leftAtom := bigAtom.Sub(smallAtom)
+	now := ctx.BlockTime()
+	oneHour := now.Add(1 * time.Hour)
+	from := sdk.MustAccAddressFromBech32("cosmos18cgkqduwuh253twzmhedesw3l7v3fm37sppt58")
+	to := sdk.MustAccAddressFromBech32("cosmos1yq8lgssgxlx9smjhes6ryjasmqmd3ts2559g0t")
+
+	// small fee without expire
+	msgType := "/cosmos.bank.v1beta1.MsgSend"
+	any, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// all fee without expire
+	any2, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: smallAtom,
+	})
+
+	// wrong fee
+	any3, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// wrong fee
+	any4, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// expired
+	any5, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+		Expiration: &now,
+	})
+
+	// few more than allowed
+	any6, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: atom,
+		Expiration: &now,
+	})
+
+	// with out spend limit
+	any7, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &oneHour,
+	})
+
+	// expired no spend limit
+	any8, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	// msg type not allowed
+	msgType2 := "/cosmos.ibc.applications.transfer.v1.MsgTransfer"
+	any9, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	cases := map[string]struct {
+		allowance *feegrant.AllowedMsgAllowance
+		msgs      []sdk.Msg
+		fee       sdk.Coins
+		blockTime time.Time
+		valid     bool
+		accept    bool
+		remove    bool
+		remains   sdk.Coins
+	}{
+		"small fee without expire": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any,
+				AllowedMessages: []string{msgType},
+			},
+			msgs: []sdk.Msg{&banktypes.MsgSend{
+				FromAddress: from.String(),
+				ToAddress:   to.String(),
 ```

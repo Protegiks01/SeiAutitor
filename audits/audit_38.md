@@ -1,10 +1,10 @@
 # Audit Report
 
 ## Title
-Goroutine Leak in validateIterator Due to Blocking Channel Send Without Cancellation
+Pre-Creation of BaseAccount at Future Module Address Causes Network Halt During Chain Upgrades
 
 ## Summary
-The `validateIterator` function in the multiversion store spawns a goroutine that can leak permanently when encountering multiple estimate values during iterator validation. The goroutine performs blocking channel sends without any cancellation mechanism, causing it to hang indefinitely after the main function returns, leading to progressive resource exhaustion on validator nodes.
+An attacker can send coins to the deterministic address of a future module before a chain upgrade, creating a `BaseAccount` at that address. When the new module's `InitGenesis` calls `GetModuleAccount` during upgrade execution, the type assertion fails and triggers a panic, causing all validators to halt simultaneously and preventing the network from producing new blocks.
 
 ## Impact
 Medium
@@ -12,266 +12,179 @@ Medium
 ## Finding Description
 
 **Location:**
-- Primary goroutine spawn: [1](#0-0) 
-- Blocking send without protection: [2](#0-1) 
-- Channel trigger points during iteration: [3](#0-2)  and [4](#0-3) 
+- Panic trigger: [1](#0-0) 
+- Account creation: [2](#0-1) 
+- Blocked address check: [3](#0-2) 
+- Module address calculation: [4](#0-3) 
+- Blocked address registry: [5](#0-4) 
+- Static module permissions: [6](#0-5) 
 
 **Intended Logic:**
-The validation goroutine should replay iterator operations to verify consistency. When an estimate value is encountered (indicating a dependency on an unfinished transaction), it should signal abort via `abortChannel`, allowing the main function to return `false` for validation failure. The goroutine should then terminate cleanly, either through completion or early exit.
+When a chain upgrade adds a new module, the upgrade handler should safely call `InitGenesis`, which retrieves or creates the module account via `GetModuleAccount`. Module accounts should only exist as `ModuleAccountI` types at their deterministic addresses, and regular users should not be able to create accounts at future module addresses before they are registered.
 
 **Actual Logic:**
-The goroutine performs a blocking channel send when encountering estimates at [2](#0-1) . The channel has buffer size 1 as shown at [5](#0-4) . When three or more estimates exist in the iteration range:
-
-1. First estimate triggers blocking send → buffer accepts value (buffer: 1/1)
-2. Main function receives from `abortChannel` → buffer empties (buffer: 0/1)
-3. Main function returns `false` and exits at [6](#0-5) 
-4. Goroutine continues iteration (no cancellation mechanism exists)
-5. Second estimate triggers blocking send → buffer accepts value (buffer: 1/1)
-6. Goroutine encounters third estimate
-7. Third blocking send attempts but buffer is full and no receiver exists → goroutine blocks forever
-
-The goroutine lacks any cancellation mechanism (no context, done channel, or timeout), differing from the safe non-blocking pattern used in [7](#0-6)  where a `select` with `default` case prevents blocking.
+The blocked address mechanism in `ModuleAccountAddrs()` only includes addresses of currently registered modules from the static `maccPerms` map [6](#0-5) . A future module's address is not in this map, so the `BlockedAddr` check [3](#0-2)  passes, allowing any user to send coins to that address. This triggers automatic `BaseAccount` creation [2](#0-1) . During upgrade, when `InitGenesis` calls `GetModuleAccount` [7](#0-6) , the `GetModuleAccountAndPermissions` function performs a type assertion and unconditionally panics when finding a `BaseAccount` instead of `ModuleAccountI` [1](#0-0) .
 
 **Exploitation Path:**
-1. Network operates with OCC (Optimistic Concurrency Control) enabled - standard configuration
-2. Multiple concurrent transactions access overlapping key ranges, creating estimate values for keys being written by in-flight transactions
-3. A subsequent transaction performs iteration over a range containing these keys (common operation, no special transaction structure required)
-4. Transaction completes and `ValidateTransactionState` is called at [8](#0-7) 
-5. Validation goroutine spawned, begins iterating with merge iterator
-6. During iteration, `skipUntilExistsOrInvalid()` calls `cache.Value()` to check for deleted items
-7. `validationIterator.Value()` encounters first estimate, sends abort to channel
-8. Main function receives abort and returns `false`
-9. Goroutine continues, encounters second estimate, sends to channel (succeeds, buffer has space)
-10. Goroutine encounters third estimate, attempts send, blocks permanently
-11. Goroutine leaked: consumes 2-8KB stack memory + heap allocations for iterator structures
+1. Governance proposal passes to add new module at upgrade height H (module name is public information)
+2. Attacker calculates deterministic module address using `NewModuleAddress(moduleName)` [4](#0-3) 
+3. Before height H, attacker submits `MsgSend` transferring 1 token to the calculated address
+4. `BlockedAddr` check passes because the module is not yet registered [5](#0-4) 
+5. `SendCoins` creates a `BaseAccount` at the module address [2](#0-1) 
+6. At height H, upgrade executes and `RunMigrations` calls `InitGenesis` for the new module [8](#0-7) 
+7. Module's `InitGenesis` calls `GetModuleAccount` [7](#0-6) 
+8. `GetModuleAccountAndPermissions` finds the `BaseAccount`, type assertion fails, and panics [1](#0-0) 
+9. All validators execute identical deterministic code and panic at the same height
+10. Network completely halts - no new blocks can be produced
 
 **Security Guarantee Broken:**
-Resource management invariant - all spawned goroutines must have bounded lifecycle with proper cancellation mechanisms to prevent resource leaks.
+Network availability and consensus liveness. The system fails to safely handle module upgrades when accounts are pre-created at future module addresses.
 
 ## Impact Explanation
 
-This vulnerability causes progressive resource exhaustion on validator nodes:
-
-- **Memory Consumption**: Each leaked goroutine consumes 2-8KB of stack space plus heap allocations for iterator structures
-- **Accumulation**: With frequent validations during high transaction throughput, hundreds to thousands of goroutines can leak over hours
-- **Performance Degradation**: Increased memory pressure and goroutine scheduler overhead degrades overall node performance
-- **Node Instability**: Severe cases can cause out-of-memory conditions or node crashes
-
-The vulnerability directly satisfies the Medium severity impact: **"Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."** During sustained high-contention workloads where multiple transactions access overlapping keys, the cumulative effect of leaked goroutines can easily exceed 30% resource increase within 24 hours.
+This vulnerability causes total network shutdown affecting all validators simultaneously. All validator nodes panic during the upgrade block's execution, preventing the network from producing new blocks after the upgrade height. The chain state becomes inconsistent with the upgrade plan consumed but module initialization incomplete. No transactions can be confirmed, and recovery requires coordinated emergency response with either a hard fork or emergency patch deployment to all validators.
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- OCC-based parallel transaction execution (default operational mode)
-- Transactions performing iterator operations over key ranges (common pattern in Cosmos SDK applications)
-- High-contention scenarios where multiple concurrent transactions write to overlapping keys (frequent during peak usage)
-
-**Frequency:**
-The vulnerability can trigger multiple times per block during:
-- High transaction volume periods
-- Applications with shared state across many transactions (e.g., DeFi protocols, token transfers)
-- Any workload where the OCC scheduler creates estimates for unfinished transactions
-
-**Who Can Trigger:**
-Any network participant submitting standard transactions - no special privileges, transaction structure, or adversarial behavior required. The leak occurs as a side effect of normal transaction validation.
-
-**Likelihood Assessment:**
-High likelihood in production environments. The conditions are standard operational scenarios rather than edge cases. Networks with moderate to high transaction throughput will regularly encounter this issue.
+**High likelihood** due to:
+- **Minimal cost**: Only requires standard transaction fees plus 1 token of minimal denomination
+- **No special privileges**: Any network participant can execute the attack
+- **Public information**: Module names are disclosed in governance proposals days or weeks before execution
+- **Ample time window**: Attackers have the entire period between proposal passage and upgrade execution to perform the attack
+- **100% success rate**: If executed before the upgrade, the attack succeeds due to deterministic execution across all validators
+- **Detection difficulty**: The malicious transaction appears as a normal coin transfer
+- **High frequency**: Affects every chain upgrade that introduces new modules (multiple per year in active chains)
 
 ## Recommendation
 
-Implement proper goroutine lifecycle management using one of these approaches:
+Implement graceful handling in `GetModuleAccountAndPermissions` to detect and convert pre-existing unused `BaseAccount` instances to proper module accounts:
 
-**Option 1 (Recommended):** Use context-based cancellation:
 ```go
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-
-go func(ctx context.Context, ...) {
-    for ; mergeIterator.Valid(); mergeIterator.Next() {
-        select {
-        case <-ctx.Done():
-            return
-        default:
+if acc != nil {
+    macc, ok := acc.(types.ModuleAccountI)
+    if !ok {
+        // Handle pre-created BaseAccount
+        if baseAcc, isBase := acc.(*types.BaseAccount); isBase && 
+           baseAcc.GetPubKey() == nil && baseAcc.GetSequence() == 0 {
+            // Convert to module account - safe when account is unused
+            newMacc := types.NewModuleAccount(baseAcc, moduleName, perms...)
+            ak.SetModuleAccount(ctx, newMacc)
+            return newMacc, perms
         }
-        // ... iteration logic
+        panic("account is not a module account")
     }
-}(ctx, ...)
-```
-
-**Option 2:** Apply the non-blocking send pattern already used in `WriteAbort` to the validation iterator:
-```go
-// In memiterator.go validationIterator.Value()
-if val.IsEstimate() {
-    select {
-    case vi.abortChannel <- occtypes.NewEstimateAbort(val.Index()):
-    default:
-        // Channel full, abort already signaled
-    }
+    return macc, perms
 }
 ```
 
-**Option 3:** Add a done channel that main closes upon return:
-```go
-doneChannel := make(chan struct{})
-defer close(doneChannel)
+The conversion is safe when the `BaseAccount` has never been used for transactions (verified by `GetPubKey() == nil && GetSequence() == 0`).
 
-go func(..., done <-chan struct{}) {
-    for ; mergeIterator.Valid(); mergeIterator.Next() {
-        select {
-        case <-done:
-            return
-        default:
-        }
-        // ... iteration logic
-    }
-}(..., doneChannel)
-```
-
-Option 2 is simplest and aligns with the existing safe pattern shown in [7](#0-6) .
+**Alternative mitigation**: Extend the blocked address mechanism to include a registry of reserved future module addresses based on planned upgrade proposals.
 
 ## Proof of Concept
 
-**Test File:** `store/multiversion/store_test.go`
-
 **Setup:**
-1. Create parent KVStore with initial keys
-2. Initialize MultiVersionStore
-3. Set estimate values at multiple transaction indices for keys within an iteration range:
-   - `mvs.SetEstimatedWriteset(1, 1, map[string][]byte{"key1": []byte("est")})`
-   - `mvs.SetEstimatedWriteset(2, 1, map[string][]byte{"key2": []byte("est")})`
-   - `mvs.SetEstimatedWriteset(3, 1, map[string][]byte{"key3": []byte("est")})`
-4. Create VersionIndexedStore for a later transaction index (e.g., index 5)
-5. Perform iteration over the range containing these keys
-6. Call `WriteToMultiVersionStore()` to register the iteration set
+- Create test application and context using [9](#0-8) 
+- Calculate deterministic address for module "futuremodule" using [4](#0-3) 
+- Fund attacker account with coins
 
 **Action:**
-1. Count goroutines before validation: `numBefore := runtime.NumGoroutine()`
-2. Call `valid, _ := mvs.ValidateTransactionState(5)`
-3. Validation goroutine spawns, begins iterating
-4. Encounters first estimate → sends to abortChannel
-5. Main function receives and returns `false`
-6. Goroutine continues iteration
-7. Encounters second estimate → sends to abortChannel (succeeds, buffer available)
-8. Encounters third estimate → attempts send, blocks forever
-9. Count goroutines after: `numAfter := runtime.NumGoroutine()`
-10. Wait and force GC: `time.Sleep(100*time.Millisecond); runtime.GC()`
-11. Count again: `numFinal := runtime.NumGoroutine()`
+- Attacker sends 1 token to calculated module address via `app.BankKeeper.SendCoins()`
+- Automatic `BaseAccount` creation occurs [2](#0-1) 
+- Verify `BaseAccount` exists at module address using `app.AccountKeeper.GetAccount()`
+- Simulate upgrade by calling `app.AccountKeeper.GetModuleAccount(ctx, "futuremodule")`
 
 **Result:**
-- `valid == false` (correct validation failure)
-- `numAfter > numBefore` (goroutine count increased)
-- `numFinal == numAfter` (goroutine count doesn't decrease, confirming permanent leak)
-- Goroutine remains blocked on channel send indefinitely
-
-The test demonstrates that despite validation returning the correct result (`false`), a goroutine is permanently leaked in the process, violating the resource management invariant.
+- Test confirms `BaseAccount` (not `ModuleAccountI`) exists at the calculated module address
+- Calling `GetModuleAccount` triggers panic with message "account is not a module account" [1](#0-0) 
+- Demonstrates network would halt if this occurred during actual upgrade execution
 
 ## Notes
 
-The vulnerability is confirmed by the architectural inconsistency: the normal execution path uses non-blocking sends with `select/default` at [7](#0-6) , while the validation path uses blocking sends without protection at [2](#0-1) . This suggests the developers were aware of the channel blocking hazard but didn't apply the protective pattern consistently throughout the codebase.
-
-The leak requires at least three estimates in a single iteration range with appropriate timing, which while not occurring on every validation, is sufficiently common during high-contention workloads to constitute a real production risk.
+The vulnerability exploits the gap between governance proposal announcement and upgrade execution, where future module addresses are not yet protected by the blocked address mechanism [5](#0-4) . This allows pre-creation of incompatible account types at reserved addresses, violating the invariant that module addresses should only contain module accounts.
 
 ### Citations
 
-**File:** store/multiversion/store.go (L262-318)
+**File:** x/auth/keeper/keeper.go (L187-192)
 ```go
-func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
-	// collect items from multiversion store
-	sortedItems := s.CollectIteratorItems(index)
-	// add the iterationtracker writeset keys to the sorted items
-	for key := range tracker.writeset {
-		sortedItems.Set([]byte(key), []byte{})
-	}
-	validChannel := make(chan bool, 1)
-	abortChannel := make(chan occtypes.Abort, 1)
-
-	// listen for abort while iterating
-	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
-		var parentIter types.Iterator
-		expectedKeys := iterationTracker.iteratedKeys
-		foundKeys := 0
-		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
-		if iterationTracker.ascending {
-			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
-		} else {
-			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+	acc := ak.GetAccount(ctx, addr)
+	if acc != nil {
+		macc, ok := acc.(types.ModuleAccountI)
+		if !ok {
+			panic("account is not a module account")
 		}
-		// create a new MVSMergeiterator
-		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
-		defer mergeIterator.Close()
-		for ; mergeIterator.Valid(); mergeIterator.Next() {
-			if (len(expectedKeys) - foundKeys) == 0 {
-				// if we have no more expected keys, then the iterator is invalid
-				returnChan <- false
-				return
-			}
-			key := mergeIterator.Key()
-			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
-			if _, ok := expectedKeys[string(key)]; !ok {
-				// if key isn't found
-				returnChan <- false
-				return
-			}
-			// remove from expected keys
-			foundKeys += 1
-			// delete(expectedKeys, string(key))
+```
 
-			// if our iterator key was the early stop, then we can break
-			if bytes.Equal(key, iterationTracker.earlyStopKey) {
-				break
-			}
+**File:** x/bank/keeper/send.go (L166-170)
+```go
+	accExists := k.ak.HasAccount(ctx, toAddr)
+	if !accExists {
+		defer telemetry.IncrCounter(1, "new", "account")
+		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
+	}
+```
+
+**File:** x/bank/keeper/send.go (L348-355)
+```go
+func (k BaseSendKeeper) BlockedAddr(addr sdk.AccAddress) bool {
+	if len(addr) == len(CoinbaseAddressPrefix)+8 {
+		if bytes.Equal(CoinbaseAddressPrefix, addr[:len(CoinbaseAddressPrefix)]) {
+			return true
 		}
-		// return whether we found the exact number of expected keys
-		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
-	}(tracker, sortedItems, validChannel, abortChannel)
-	select {
-	case <-abortChannel:
-		// if we get an abort, then we know that the iterator is invalid
-		return false
-	case valid := <-validChannel:
-		return valid
 	}
+	return k.blockedAddrs[addr.String()]
 }
 ```
 
-**File:** store/multiversion/store.go (L388-397)
+**File:** x/auth/types/account.go (L162-165)
 ```go
-func (s *Store) ValidateTransactionState(index int) (bool, []int) {
-	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
-
-	// TODO: can we parallelize for all iterators?
-	iteratorValid := s.checkIteratorAtIndex(index)
-
-	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
-
-	return iteratorValid && readsetValid, conflictIndices
+// NewModuleAddress creates an AccAddress from the hash of the module's name
+func NewModuleAddress(name string) sdk.AccAddress {
+	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
 }
 ```
 
-**File:** store/multiversion/memiterator.go (L115-116)
+**File:** simapp/app.go (L134-142)
 ```go
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-```
-
-**File:** store/multiversion/mergeiterator.go (L241-241)
-```go
-			valueC := iter.cache.Value()
-```
-
-**File:** store/multiversion/mergeiterator.go (L253-253)
-```go
-			valueC := iter.cache.Value()
-```
-
-**File:** store/multiversion/mvkv.go (L127-133)
-```go
-func (store *VersionIndexedStore) WriteAbort(abort scheduler.Abort) {
-	select {
-	case store.abortChannel <- abort:
-	default:
-		fmt.Println("WARN: abort channel full, discarding val")
+	// module account permissions
+	maccPerms = map[string][]string{
+		authtypes.FeeCollectorName:     nil,
+		distrtypes.ModuleName:          nil,
+		minttypes.ModuleName:           {authtypes.Minter},
+		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
+		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
+		govtypes.ModuleName:            {authtypes.Burner},
 	}
+```
+
+**File:** simapp/app.go (L607-614)
+```go
+func (app *SimApp) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range maccPerms {
+		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+	}
+
+	return modAccAddrs
 }
+```
+
+**File:** x/mint/genesis.go (L13-13)
+```go
+	ak.GetModuleAccount(ctx, types.ModuleName)
+```
+
+**File:** types/module/module.go (L583-583)
+```go
+			moduleValUpdates := module.InitGenesis(ctx, cfgtor.cdc, module.DefaultGenesis(cfgtor.cdc))
+```
+
+**File:** x/auth/keeper/integration_test.go (L12-17)
+```go
+func createTestApp(isCheckTx bool) (*simapp.SimApp, sdk.Context) {
+	app := simapp.Setup(isCheckTx)
+	ctx := app.BaseApp.NewContext(isCheckTx, tmproto.Header{})
+	app.AccountKeeper.SetParams(ctx, authtypes.DefaultParams())
+
+	return app, ctx
 ```

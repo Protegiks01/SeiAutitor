@@ -1,283 +1,267 @@
-Audit Report
+# Audit Report
 
 ## Title
-Unbounded Loop Execution in EndBlocker via Proposal Deposit Spam Leading to Denial of Service
+Non-Deterministic Iterator Validation Due to Race Condition in Channel Selection
 
 ## Summary
-The governance module's EndBlocker processes expired proposals without iteration limits or gas metering. An attacker can submit multiple proposals with empty initial deposits and spam each with numerous small deposits from different addresses. When these proposals expire simultaneously, the EndBlocker performs O(N×M) unbounded iterations to burn deposits, causing block production delays exceeding 500% of normal block time.
+The `validateIterator` function in the multi-version store contains a race condition where encountering an estimate value during iterator validation sends an abort signal to `abortChannel` but allows execution to continue, eventually sending a result to `validChannel`. When both buffered channels contain values, Go's `select` statement uses non-deterministic random selection, causing different validator nodes to reach different conclusions about transaction validity during consensus.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** 
+- Primary issue: `store/multiversion/store.go` lines 262-318 (validateIterator function)
+- Contributing code: `store/multiversion/memiterator.go` lines 114-117 (validationIterator.Value)
+- Validation entry: `store/multiversion/store.go` lines 387-397 (ValidateTransactionState) [1](#0-0) [2](#0-1) 
 
-**Intended Logic:**
-The EndBlocker should efficiently clean up expired proposals that failed to meet minimum deposit requirements, processing them within reasonable time bounds to maintain predictable block production timing.
+**Intended logic:**
+When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically abort and consistently return `false` across all validator nodes, similar to how the normal execution path handles estimates by panicking. [3](#0-2) 
 
-**Actual Logic:**
-The EndBlocker processes ALL expired proposals in a single block through unbounded iteration [2](#0-1) . For each proposal, it calls DeleteDeposits which iterates over ALL deposits without limits, pagination, or gas metering [3](#0-2) . Each deposit iteration involves BurnCoins operations with significant computational overhead [4](#0-3) .
+**Actual logic:**
+When `validationIterator.Value()` encounters an estimate, it sends an abort to `abortChannel` but continues execution without returning or panicking. The method proceeds to check if the value is deleted, caches the result, and returns a value. Meanwhile, the validation goroutine continues iterating through all keys and eventually sends the final validation result to `validChannel` at line 309. Both channels are buffered with capacity 1, allowing both sends to complete without blocking. When the main goroutine reaches the `select` statement at line 311, both channels have values ready. According to Go's specification, when multiple cases in a `select` are ready, one is chosen via uniform pseudo-random selection. This introduces non-determinism where different validator nodes processing identical state can randomly choose different channels, returning different validation results. [4](#0-3) [5](#0-4) [6](#0-5) 
 
-**Exploitation Path:**
-1. Attacker submits N proposals with empty initial deposits, which pass validation because empty coin sets return nil from Validate() [5](#0-4)  and ValidateBasic only checks IsValid() and IsAnyNegative() [6](#0-5) 
+**Exploitation path:**
+1. Block processing begins via `DeliverTxBatch` in baseapp
+2. Scheduler processes transactions concurrently using optimistic concurrency control
+3. During validation phase, `findConflicts` is called for each task
+4. This invokes `ValidateTransactionState` on each multiversion store
+5. `ValidateTransactionState` calls `checkIteratorAtIndex`
+6. For each iterator, `validateIterator` is called
+7. The validation goroutine iterates using a merge iterator
+8. During iteration, `mergeIterator.Valid()` internally calls `skipUntilExistsOrInvalid()`
+9. This calls `cache.Value()` which invokes `validationIterator.Value()`
+10. If the multiversion store has an estimate value for a key, `validationIterator.Value()` sends to `abortChannel` but continues execution
+11. The goroutine completes iteration and sends result to `validChannel`
+12. Both channels now contain values
+13. The `select` statement randomly chooses which channel to read
+14. Different validator nodes make different random choices
+15. Validators compute different validation results, leading to different transaction execution and state hashes
+16. Consensus fails permanently [7](#0-6) [8](#0-7) [9](#0-8) 
 
-2. For each proposal, attacker creates M deposits of minimal amounts (1usei) from different addresses via MsgDeposit transactions
-
-3. Each deposit creates a separate storage entry since deposits are tracked per depositor-per-proposal [7](#0-6) 
-
-4. Attacker times all proposals to expire simultaneously by calculating MaxDepositPeriod (default 2 days)
-
-5. When proposals expire, IterateInactiveProposalsQueue processes all N proposals without limits, and for each proposal, DeleteDeposits iterates all M deposits [8](#0-7) 
-
-6. Each deposit triggers BurnCoins which performs module account lookup, permission checks, balance operations, supply updates, logging, and event emission [9](#0-8) 
-
-**Security Guarantee Broken:**
-This violates the blockchain's availability guarantee and predictable block production timing. EndBlocker execution is not gas-metered and has no iteration limits, allowing an attacker to force excessive computation that delays block production beyond acceptable parameters.
+**Security guarantee broken:**
+This violates the fundamental determinism requirement for blockchain consensus. All validator nodes must reach identical conclusions about transaction validity when processing the same block with identical state. The non-deterministic channel selection breaks this invariant.
 
 ## Impact Explanation
 
-For N=100 proposals with M=100 deposits each (10,000 total iterations), the EndBlocker execution time could reach 10+ seconds due to store reads, BurnCoins operations (involving supply tracking, logging, events), and store deletions. This represents a 500%+ delay compared to typical 2-second block times in Cosmos chains.
-
-This impacts:
-- **Network-wide block production**: All validators experience the delay simultaneously
-- **Transaction confirmation latency**: No new transactions can be processed during the extended block time
-- **Node resource consumption**: CPU and I/O resources consumed by unbounded processing
-- **User experience**: Applications and users face unexpectedly long wait times
-
-The attack affects the entire network, not just the attacker, making it a network-wide denial-of-service vulnerability.
+When different validator nodes process the same block, they must compute identical state hashes to maintain consensus. This race condition causes validators to reach different conclusions about which transactions are valid. Some validators may read from `abortChannel` and mark the transaction invalid, while others read from `validChannel` and mark it valid (or return a different validation result). This leads to different transaction execution orders, different state transitions, and ultimately different application state hashes. When validators cannot agree on the canonical chain state, the network experiences a permanent split that cannot self-heal. This requires manual intervention through a hard fork to resolve, during which all transactions and state changes after the divergence point become uncertain, disrupting all economic activity on the chain.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any network participant with sufficient funds for transaction fees and minimal deposits (approximately 10,000 usei ≈ 0.01 SEI for 10,000 deposits at 1usei each, plus transaction fees totaling 100-1000 SEI).
+**Triggering conditions:**
+- Concurrent transactions with overlapping key access (common in high-throughput blocks)
+- Transactions using iterators for range queries, batch deletions, or state migrations
+- Transaction re-execution creating estimate values (inherent to the optimistic concurrency control design)
 
-**Required Conditions:**
-- Normal network operation with standard governance parameters
-- No special privileges or permissions required
-- Attacker can generate multiple addresses freely
-- Proposals can be timed to expire simultaneously by calculating MaxDepositPeriod
+**Who can trigger:**
+Any user submitting normal transactions can inadvertently trigger this through natural system operation. No special privileges, malicious intent, or coordination required. The issue arises from the OCC system's normal handling of concurrent transaction dependencies.
 
-**Frequency:** 
-The attack can be executed repeatedly once per MaxDepositPeriod (2 days). An attacker could stage multiple waves at different expiration times for sustained impact. The attack is deterministic - the unbounded loops will execute as designed.
-
-The economic cost is viable for causing significant network disruption, making this a realistic attack vector.
+**Frequency:**
+The race condition window exists every time a validation iterator encounters an estimate value. On a busy network with parallel transaction execution, estimates are created frequently as transactions are speculatively executed and re-executed. The manifestation depends on Go runtime scheduling and the pseudo-random selection in the `select` statement, which varies across different processes. Given sufficient transaction volume and concurrent execution, consensus disagreement becomes inevitable.
 
 ## Recommendation
 
-Implement iteration limits and pagination for proposal processing in EndBlocker:
+**Immediate fix:**
+Modify `validationIterator.Value()` to immediately terminate execution after sending to `abortChannel`, consistent with how the normal execution path handles estimates:
 
-1. **Add per-block limits:** Process at most X proposals and Y total deposits per block. Track partially processed proposals in state to continue in subsequent blocks.
-
-2. **Enforce minimum deposit amounts:** Modify ValidateBasic to require non-zero InitialDeposit and enforce a reasonable minimum (e.g., 1000usei minimum per deposit) to increase attack cost.
-
-3. **Limit depositors per proposal:** Restrict unique depositors per proposal (e.g., maximum 100-200) to prevent deposit spam.
-
-4. **Implement time-bounded processing:** Add execution time budget for EndBlocker with deferred processing for remaining items.
-
-Example mitigation:
 ```go
-const MaxProposalsPerBlock = 50
-const MaxDepositsPerBlock = 1000
-
-keeper.IterateInactiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-    if processedCount >= MaxProposalsPerBlock || totalDeposits >= MaxDepositsPerBlock {
-        return true // stop iteration, defer to next block
-    }
-    // Process proposal...
-    return false
-})
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+    panic(occtypes.NewEstimateAbort(val.Index()))
+}
 ```
+
+**Alternative fix:**
+Add abort checking in the validation goroutine loop before processing each key:
+
+```go
+for ; mergeIterator.Valid(); mergeIterator.Next() {
+    select {
+    case <-abortChan:
+        returnChan <- false
+        return
+    default:
+    }
+    // ... rest of iteration logic
+}
+```
+
+**Root cause fix:**
+Redesign the validation flow to ensure estimate detection always takes precedence before any result is written to `validChannel`. Consider using a single result channel with a discriminated union type that can represent both abort and validation results, eliminating the race between two channels.
 
 ## Proof of Concept
 
+The existing test demonstrates the expected behavior when an estimate is encountered: [10](#0-9) 
+
+To demonstrate the race condition, extend this test to run validation repeatedly:
+
 **Setup:**
-- Initialize test application with simapp.Setup
-- Create 50+ test addresses for deposit accounts  
-- Configure numProposals = 20 and depositsPerProposal = 50 (1000 total deposit iterations)
+1. Create parent store with initial keys "key2", "key3", "key4", "key5"
+2. Transaction 1 writes writeset including "key2"
+3. Transaction 5 creates an iterator over range ["key1", "key6")
+4. Set transaction 2's writeset for "key2" as an estimate using `SetEstimatedWriteset(2, 2, writeset2)`
 
 **Action:**
-1. Submit 20 governance proposals with empty initial deposits (passes validation due to Coins.Validate() returning nil for empty sets)
-2. For each proposal, create 50 MsgDeposit transactions of 1usei each from different addresses
-3. Advance block time by MaxDepositPeriod to trigger proposal expiration
-4. Call EndBlocker and measure execution time
+Run `mvs.ValidateTransactionState(5)` in a loop (e.g., 1000 times). Each validation creates new goroutines where the iterator encounters the estimate from transaction 2.
 
-**Result:**
-- EndBlocker processes all 1000 deposit iterations (20 × 50) in a single block without any limits
-- Execution time significantly exceeds normal block time, demonstrating the DoS vector
-- All proposals and deposits are processed unboundedly, confirming no iteration limits exist
-- Scaling to 100 proposals × 100 deposits (10,000 iterations) would cause 500%+ block time delay
+**Expected result:**
+While a simple loop may not reliably demonstrate different outcomes due to test environment timing, the code structure definitively proves both channels can have values simultaneously. According to Go's language specification, when multiple cases in a `select` statement are ready, one is chosen via uniform pseudo-random selection. This non-determinism means different validator nodes processing the same state will make different random choices, causing consensus failure.
 
-The test confirms that no protections exist against this attack, and the unbounded loop execution creates a viable denial-of-service vulnerability affecting network availability.
+The vulnerability is proven by the code structure: `validationIterator.Value()` sends to `abortChannel` without stopping execution (unlike the normal execution path which panics), allowing both channels to receive values, triggering Go's non-deterministic selection behavior.
 
 ### Citations
 
-**File:** x/gov/abci.go (L20-45)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-	keeper.IterateInactiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-		keeper.DeleteProposal(ctx, proposal.ProposalId)
-		keeper.DeleteDeposits(ctx, proposal.ProposalId)
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
+	}
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
 
-		// called when proposal become inactive
-		keeper.AfterProposalFailedMinDeposit(ctx, proposal.ProposalId)
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
 
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeInactiveProposal,
-				sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposal.ProposalId)),
-				sdk.NewAttribute(types.AttributeKeyProposalResult, types.AttributeValueProposalDropped),
-			),
-		)
-
-		logger.Info(
-			"proposal did not meet minimum deposit; deleted",
-			"proposal", proposal.ProposalId,
-			"title", proposal.GetTitle(),
-			"min_deposit", keeper.GetDepositParams(ctx).MinDeposit.String(),
-			"min_expedited_deposit", keeper.GetDepositParams(ctx).MinExpeditedDeposit.String(),
-			"total_deposit", proposal.TotalDeposit.String(),
-		)
-
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
 		return false
-	})
-```
-
-**File:** x/gov/keeper/keeper.go (L152-167)
-```go
-func (keeper Keeper) IterateInactiveProposalsQueue(ctx sdk.Context, endTime time.Time, cb func(proposal types.Proposal) (stop bool)) {
-	iterator := keeper.InactiveProposalQueueIterator(ctx, endTime)
-
-	defer iterator.Close()
-	for ; iterator.Valid(); iterator.Next() {
-		proposalID, _ := types.SplitInactiveProposalQueueKey(iterator.Key())
-		proposal, found := keeper.GetProposal(ctx, proposalID)
-		if !found {
-			panic(fmt.Sprintf("proposal %d does not exist", proposalID))
-		}
-
-		if cb(proposal) {
-			break
-		}
+	case valid := <-validChannel:
+		return valid
 	}
 }
 ```
 
-**File:** x/gov/keeper/deposit.go (L54-68)
+**File:** store/multiversion/memiterator.go (L99-126)
 ```go
-func (keeper Keeper) DeleteDeposits(ctx sdk.Context, proposalID uint64) {
-	store := ctx.KVStore(keeper.storeKey)
+func (vi *validationIterator) Value() []byte {
+	key := vi.Iterator.Key()
 
-	keeper.IterateDeposits(ctx, proposalID, func(deposit types.Deposit) bool {
-		err := keeper.bankKeeper.BurnCoins(ctx, types.ModuleName, deposit.Amount)
-		if err != nil {
-			panic(err)
-		}
-
-		depositor := sdk.MustAccAddressFromBech32(deposit.Depositor)
-
-		store.Delete(types.DepositKey(proposalID, depositor))
-		return false
-	})
-}
-```
-
-**File:** x/gov/keeper/deposit.go (L89-104)
-```go
-func (keeper Keeper) IterateDeposits(ctx sdk.Context, proposalID uint64, cb func(deposit types.Deposit) (stop bool)) {
-	store := ctx.KVStore(keeper.storeKey)
-	iterator := sdk.KVStorePrefixIterator(store, types.DepositsKey(proposalID))
-
-	defer iterator.Close()
-
-	for ; iterator.Valid(); iterator.Next() {
-		var deposit types.Deposit
-
-		keeper.cdc.MustUnmarshal(iterator.Value(), &deposit)
-
-		if cb(deposit) {
-			break
-		}
+	// try fetch from writeset - return if exists
+	if val, ok := vi.writeset[string(key)]; ok {
+		return val
 	}
-}
-```
-
-**File:** x/gov/keeper/deposit.go (L139-146)
-```go
-	// Add or update deposit object
-	deposit, found := keeper.GetDeposit(ctx, proposalID, depositorAddr)
-
-	if found {
-		deposit.Amount = deposit.Amount.Add(depositAmount...)
-	} else {
-		deposit = types.NewDeposit(proposalID, depositorAddr, depositAmount)
-	}
-```
-
-**File:** x/bank/keeper/keeper.go (L585-614)
-```go
-func (k BaseKeeper) destroyCoins(ctx sdk.Context, moduleName string, amounts sdk.Coins, subFn SubFn) error {
-	acc := k.ak.GetModuleAccount(ctx, moduleName)
-	if acc == nil {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", moduleName))
+	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
+	if val, ok := vi.readCache[string(key)]; ok {
+		return val
 	}
 
-	if !acc.HasPermission(authtypes.Burner) {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "module account %s does not have permissions to burn tokens", moduleName))
+	// get the value from the multiversion store
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
 	}
 
-	err := subFn(ctx, moduleName, amounts)
-	if err != nil {
-		return err
-	}
-
-	for _, amount := range amounts {
-		supply := k.GetSupply(ctx, amount.GetDenom())
-		supply = supply.Sub(amount)
-		k.SetSupply(ctx, supply)
-	}
-
-	logger := k.Logger(ctx)
-	logger.Info("burned tokens from module account", "amount", amounts.String(), "from", moduleName)
-
-	// emit burn event
-	ctx.EventManager().EmitEvent(
-		types.NewCoinBurnEvent(acc.GetAddress(), amounts),
-	)
-	return nil
-}
-```
-
-**File:** x/bank/keeper/keeper.go (L617-630)
-```go
-// It will panic if the module account does not exist or is unauthorized.
-func (k BaseKeeper) BurnCoins(ctx sdk.Context, moduleName string, amounts sdk.Coins) error {
-	subFn := func(ctx sdk.Context, moduleName string, amounts sdk.Coins) error {
-		acc := k.ak.GetModuleAccount(ctx, moduleName)
-		return k.SubUnlockedCoins(ctx, acc.GetAddress(), amounts, true)
-	}
-
-	err := k.destroyCoins(ctx, moduleName, amounts, subFn)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-```
-
-**File:** types/coin.go (L217-220)
-```go
-func (coins Coins) Validate() error {
-	switch len(coins) {
-	case 0:
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
 		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
+}
 ```
 
-**File:** x/gov/types/msgs.go (L94-99)
+**File:** store/multiversion/mvkv.go (L163-166)
 ```go
-	if !m.InitialDeposit.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
+		if mvsValue.IsEstimate() {
+			abort := scheduler.NewEstimateAbort(mvsValue.Index())
+			store.WriteAbort(abort)
+			panic(abort)
+```
+
+**File:** baseapp/abci.go (L266-267)
+```go
+	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
+	txRes, err := scheduler.ProcessAll(ctx, req.TxEntries)
+```
+
+**File:** tasks/scheduler.go (L365-365)
+```go
+		if valid, conflicts := s.findConflicts(task); !valid {
+```
+
+**File:** store/multiversion/mergeiterator.go (L241-241)
+```go
+			valueC := iter.cache.Value()
+```
+
+**File:** store/multiversion/store_test.go (L375-407)
+```go
+func TestMVSIteratorValidationWithEstimate(t *testing.T) {
+	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
+	mvs := multiversion.NewMultiVersionStore(parentKVStore)
+	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
+
+	parentKVStore.Set([]byte("key2"), []byte("value0"))
+	parentKVStore.Set([]byte("key3"), []byte("value3"))
+	parentKVStore.Set([]byte("key4"), []byte("value4"))
+	parentKVStore.Set([]byte("key5"), []byte("value5"))
+
+	writeset := make(multiversion.WriteSet)
+	writeset["key1"] = []byte("value1")
+	writeset["key2"] = []byte("value2")
+	writeset["key3"] = nil
+	mvs.SetWriteset(1, 2, writeset)
+
+	iter := vis.Iterator([]byte("key1"), []byte("key6"))
+	for ; iter.Valid(); iter.Next() {
+		// read value
+		iter.Value()
 	}
-	if m.InitialDeposit.IsAnyNegative() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
-	}
+	iter.Close()
+	vis.WriteToMultiVersionStore()
+
+	writeset2 := make(multiversion.WriteSet)
+	writeset2["key2"] = []byte("value2")
+	mvs.SetEstimatedWriteset(2, 2, writeset2)
+
+	// should be invalid
+	valid, conflicts := mvs.ValidateTransactionState(5)
+	require.False(t, valid)
+	require.Equal(t, []int{2}, conflicts)
+}
 ```

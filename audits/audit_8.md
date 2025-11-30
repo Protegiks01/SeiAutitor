@@ -1,304 +1,264 @@
 # Audit Report
 
 ## Title
-Unbounded SignedBlocksWindow Parameter Enables Network-Wide Denial of Service via Memory Exhaustion
+Fee Grant Bypass via Authz MsgExec - AllowedMsgAllowance Validation Only Checks Outer Messages
 
 ## Summary
-The `SignedBlocksWindow` parameter in the slashing module lacks upper bound validation in its validation function, allowing governance proposals to set arbitrarily large values (e.g., 1 billion) that cause simultaneous memory exhaustion across all validator nodes during block processing, resulting in network-wide shutdown requiring a hard fork to recover.
+The feegrant module's `AllowedMsgAllowance` validates only top-level transaction messages and fails to recursively check inner messages wrapped within `authz.MsgExec`. This allows grantees to bypass message type restrictions by wrapping unauthorized message types inside `MsgExec`, causing fee granters to pay for operations they explicitly excluded from their allowance.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
 **Location:**
-- Parameter validation: [1](#0-0) 
-- Resize operation: [2](#0-1) 
-- Concurrent validator processing: [3](#0-2) 
-- Bool array allocation: [4](#0-3) 
+- Fee deduction ante handler: [1](#0-0) 
+- Allowance validation: [2](#0-1) 
+- Message type checking: [3](#0-2) 
+- MsgExec execution: [4](#0-3) 
+- Inner message dispatch: [5](#0-4) 
 
 **Intended Logic:**
-The `SignedBlocksWindow` parameter defines a sliding window size for tracking validator liveness. Parameter validation should enforce reasonable bounds to prevent resource exhaustion and system instability, protecting against both malicious attacks and accidental misconfigurations.
+When a fee granter creates an `AllowedMsgAllowance`, they specify an allowlist of message types the grantee may execute using the fee grant. The feegrant module should validate that ALL messages in the transaction—including nested messages within `MsgExec`—match the allowed types before deducting fees from the granter's account.
 
 **Actual Logic:**
-The `validateSignedBlocksWindow` function only verifies that the value is positive (`v > 0`) with no upper bound constraint. [1](#0-0) 
-
-When the window size changes via governance proposal, the next block's `BeginBlocker` processes all validators concurrently in goroutines. [3](#0-2)  Each validator's `HandleValidatorSignatureConcurrent` detects the window size change and calls `ResizeMissedBlockArray`. [5](#0-4) 
-
-The `ResizeMissedBlockArray` function allocates bool arrays proportional to the window size: `ParseBitGroupsToBoolArray` creates one array for parsing existing data, and `make([]bool, window)` creates another for the new window. [6](#0-5)  In Go, each bool uses 1 byte, so a window of 1 billion allocates approximately 1GB per array, totaling ~2GB per validator during resize.
+The ante handler calls `UseGrantedFees` with only `sdkTx.GetMsgs()`, which returns top-level transaction messages. [1](#0-0)  When the transaction contains `MsgExec`, the `AllowedMsgAllowance.Accept` method [2](#0-1)  validates only whether `MsgExec` itself appears in the allowed list via `allMsgTypesAllowed`. [3](#0-2)  The inner messages nested within `MsgExec` are never validated against the allowance. Later, the `MsgExec` handler extracts these inner messages [4](#0-3)  and executes them via `DispatchActions` [5](#0-4)  without re-validating fee grant restrictions.
 
 **Exploitation Path:**
-1. An operator (accidentally via typo) or attacker submits a governance `ParameterChangeProposal` setting `SignedBlocksWindow` to 1,000,000,000
-2. Proposal passes through standard governance voting period (2+ days) [7](#0-6) 
-3. Parameter change executes via `handleParameterChangeProposal` when proposal passes [8](#0-7) 
-4. The `Update` function validates the new value, but validation only checks `v > 0` - passes with no upper bound check [1](#0-0) 
-5. On the next block's `BeginBlocker`, all validators (e.g., 100) are processed concurrently [3](#0-2) 
-6. Each validator's goroutine allocates ~2GB for array resizing (old + new arrays)
-7. With 100 validators: ~200GB allocated simultaneously across all validator nodes
-8. Validator nodes exhaust available memory, crash with OOM errors, or hang indefinitely
-9. Network halts as validators cannot process blocks, requiring coordinated hard fork to recover
+1. Alice (fee granter) creates an `AllowedMsgAllowance` for Bob allowing `["/cosmos.bank.v1beta1.MsgSend", "/cosmos.authz.v1beta1.MsgExec"]` (intentionally excluding `/cosmos.bank.v1beta1.MsgBurn`)
+2. Charlie grants Bob authz permission to execute `MsgBurn` on Charlie's behalf
+3. Bob constructs a transaction with outer message `MsgExec` wrapping an inner `MsgBurn` message, with `FeeGranter` field set to Alice's address
+4. Ante handler receives transaction and calls `UseGrantedFees(ctx, Alice, Bob, fee, [MsgExec])`
+5. `AllowedMsgAllowance` validates only `MsgExec` type (allowed) and approves
+6. Alice's account is debited for transaction fees
+7. `MsgExec` handler extracts inner `MsgBurn` message using `GetMessages()` [6](#0-5) 
+8. Inner `MsgBurn` executes via authz validation without fee grant re-validation
+9. Result: Alice paid fees for `MsgBurn` execution, which was NOT in her allowed messages list
 
 **Security Guarantee Broken:**
-The blockchain's availability and liveness guarantees are violated. Parameter validation serves as a defensive security boundary that should prevent governance actions from causing catastrophic system failures beyond the intended scope of parameter adjustment. While governance is trusted to tune network parameters, it should not be able to accidentally or intentionally trigger complete network shutdown requiring hard fork recovery through a single parameter value.
+The message type filtering mechanism of `AllowedMsgAllowance` is completely bypassed. Fee granters cannot restrict which message types consume their grants when `MsgExec` is included in the allowed list, defeating the entire purpose of the allowance filtering feature.
 
 ## Impact Explanation
 
-**Affected Components:**
-- All validator nodes across the network
-- Network consensus and block production capability
-- Transaction processing and finality
+This vulnerability results in **direct loss of funds** for fee granters through unauthorized fee deductions. When Alice creates an `AllowedMsgAllowance` to restrict which operations Bob can perform using her fee grant, she expects the system to enforce these restrictions. However, if Alice includes `MsgExec` in the allowed messages (reasonable for supporting authz workflows), Bob can wrap any unauthorized message type inside `MsgExec` and have Alice pay the fees.
 
-**Consequences:**
-- **Total network shutdown**: All validators simultaneously attempt memory-exhaustive resize operations at the same block height, causing synchronized node failures
-- **Requires hard fork to recover**: Once validators crash at a specific block height, the chain cannot progress without coordinating a binary upgrade or hard fork to cap/revert the parameter value
-- **Can occur accidentally**: A simple typo when entering the parameter value (e.g., 100000000 instead of 100000 - adding extra zeros) would trigger this vulnerability during routine network maintenance
-- **Disproportionate impact**: The consequence (network-wide shutdown requiring hard fork) far exceeds the intended scope of parameter tuning
-
-This matches the defined Medium severity impact: "Network not being able to confirm new transactions (total network shutdown)".
+The severity is amplified because:
+- **Complete security model bypass**: The entire purpose of `AllowedMsgAllowance` is to restrict message types, but this mechanism is rendered useless
+- **Systematic exploitation**: Attackers can drain fee grants by repeatedly wrapping unauthorized messages in `MsgExec`
+- **Collaboration attacks**: Multiple parties can coordinate (one provides authz grants, another exploits the fee grant)
+- **Realistic scenario**: Including `MsgExec` in allowed messages is a reasonable configuration for users wanting authz functionality
 
 ## Likelihood Explanation
 
 **Who Can Trigger:**
-Anyone capable of passing a governance proposal through standard voting mechanisms, which requires either:
-- Significant stake ownership (typically majority voting power)
-- Strong community support for the proposal
-- In validator-heavy networks, coordinated validator approval
+Any user (grantee) who possesses:
+1. A fee grant with `AllowedMsgAllowance` that includes `MsgExec` in the allowed messages list
+2. Authz permissions from any other account to execute messages on their behalf
 
 **Conditions Required:**
-- Single governance proposal submission and successful vote
-- No special timing requirements or state prerequisites
-- Occurs during normal block processing operations
-- No coordination needed beyond standard governance flow
+- Normal blockchain operation with no special network conditions
+- Fee granter must have included `MsgExec` in the allowed messages (common for users enabling authz features)
+- Grantee must have authz grants from other accounts (easily obtainable through standard authz module operations)
+- No admin privileges or special keys required
 
-**Likelihood Factors:**
-- **High accidental trigger risk**: Network operators regularly adjust this parameter for optimization; entering wrong values (extra zeros) is a realistic human error
-- **Simple execution**: Only requires setting a large integer value through standard governance interface
-- **Expected parameter adjustment**: The parameter is meant to be tuned occasionally, increasing exposure to misconfiguration
-- **No technical sophistication needed**: Standard governance proposal submission
-
-The vulnerability has **moderate-to-high likelihood** because parameter changes are routine governance activities, and the absence of bounds checking means any large value (whether accidental or malicious) will trigger the issue.
+**Frequency:**
+This vulnerability can be exploited repeatedly until the fee grant is exhausted. Each exploit transaction drains fees from the granter for unauthorized message types. The attack is deterministic with no timing dependencies, race conditions, or probabilistic elements.
 
 ## Recommendation
 
-**Immediate Fix:**
-Add upper bound validation to the `validateSignedBlocksWindow` function:
+Modify the fee grant validation to recursively extract and validate ALL messages, including those nested within `MsgExec`:
+
+1. In the ante handler, implement a recursive message extraction function before calling `UseGrantedFees`:
 
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-    v, ok := i.(int64)
-    if !ok {
-        return fmt.Errorf("invalid parameter type: %T", i)
+func extractAllMessages(msgs []sdk.Msg) []sdk.Msg {
+    allMsgs := []sdk.Msg{}
+    for _, msg := range msgs {
+        allMsgs = append(allMsgs, msg)
+        if execMsg, ok := msg.(*authz.MsgExec); ok {
+            innerMsgs, err := execMsg.GetMessages()
+            if err == nil {
+                allMsgs = append(allMsgs, extractAllMessages(innerMsgs)...)
+            }
+        }
     }
-    
-    if v <= 0 {
-        return fmt.Errorf("signed blocks window must be positive: %d", v)
-    }
-    
-    // Add maximum bound to prevent memory exhaustion
-    const MaxSignedBlocksWindow = int64(1_000_000) // ~11 days at 1s block time
-    if v > MaxSignedBlocksWindow {
-        return fmt.Errorf("signed blocks window exceeds maximum allowed value (max %d): %d", MaxSignedBlocksWindow, v)
-    }
-    
-    return nil
+    return allMsgs
 }
 ```
 
-**Rationale:**
-- Current default is 108,000 blocks (~30 hours at 1s block time) [9](#0-8) 
-- Maximum of 1,000,000 blocks (~11 days) provides 10x operational headroom
-- Prevents both malicious attacks and accidental typos
-- Ensures memory requirements remain within reasonable bounds (tens of MB vs hundreds of GB)
+2. Update the ante handler to pass all extracted messages to `UseGrantedFees`:
+```go
+allMsgs := extractAllMessages(sdkTx.GetMsgs())
+err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, allMsgs)
+```
 
-**Additional Safeguards:**
-Consider implementing incremental resize operations or memory usage monitoring if supporting larger window changes becomes necessary in future network upgrades.
+This ensures the allowance validates the actual messages being executed, not merely wrapper messages that bypass restrictions.
 
 ## Proof of Concept
 
-**Test Structure:**
-```go
-// File: x/slashing/keeper/keeper_test.go
-func TestLargeSignedBlocksWindowMemoryExhaustion(t *testing.T) {
-    // Setup: Initialize test application and context
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Create test validators (reduced from production count for test feasibility)
-    numValidators := 10
-    validators := createTestValidators(app, ctx, numValidators)
-    
-    // Set initial reasonable window size
-    params := app.SlashingKeeper.GetParams(ctx)
-    params.SignedBlocksWindow = 100000 // Default-like value
-    app.SlashingKeeper.SetParams(ctx, params)
-    
-    // ACTION: Simulate governance proposal changing to extremely large window
-    params.SignedBlocksWindow = 50000000 // 50 million (reduced but still demonstrates issue)
-    app.SlashingKeeper.SetParams(ctx, params)
-    
-    // TRIGGER: Process next block with all validator signatures
-    // This attempts to resize arrays for all validators concurrently
-    req := abci.RequestBeginBlock{
-        LastCommitInfo: abci.LastCommitInfo{
-            Votes: createValidatorVotes(validators),
-        },
-    }
-    
-    // RESULT: Measure excessive memory allocation and performance degradation
-    startMem := getCurrentMemoryUsage()
-    startTime := time.Now()
-    
-    slashing.BeginBlocker(ctx, req, app.SlashingKeeper)
-    
-    duration := time.Since(startTime)
-    memoryUsed := getCurrentMemoryUsage() - startMem
-    
-    // Assertions demonstrating the vulnerability
-    // Even with reduced validator count (10) and window (50M), observe significant impact
-    assert.True(t, memoryUsed > 500*1024*1024, 
-        "Expected > 500MB memory allocation for 10 validators with 50M window")
-    assert.True(t, duration > 5*time.Second, 
-        "Expected significant processing time delay")
-    
-    // NOTE: With production parameters (100+ validators, 1 billion window),
-    // nodes would crash with out-of-memory errors, halting the network
-}
-```
+**Setup:**
+- Initialize chain with three accounts: Alice (fee granter), Bob (grantee/attacker), Charlie (authz granter)
+- Fund Alice and Charlie with tokens
+- Alice creates fee grant to Bob with `AllowedMsgAllowance` allowing `MsgSend` and `MsgExec` (but NOT `MsgBurn`)
+- Charlie grants Bob authz to execute `MsgBurn`
+- Record Alice's initial balance
 
-**Expected Behavior:**
-The test demonstrates that without upper bound validation:
-- Large window values cause excessive memory allocation (hundreds of MB even with reduced parameters)
-- Significant performance degradation (multi-second block processing delays)
-- With production parameters (100+ validators, 1 billion window), validator nodes would crash with OOM errors, causing complete network shutdown requiring hard fork recovery
+**Action:**
+- Bob constructs `MsgBurn` to burn Charlie's tokens
+- Bob wraps `MsgBurn` inside `MsgExec`
+- Bob creates transaction with Alice as fee granter and submits it
+
+**Result:**
+- Transaction succeeds
+- Alice's balance decreased by fee amount (she paid fees for unauthorized `MsgBurn`)
+- Charlie's tokens were burned (inner message executed)
+- Alice paid fees for `MsgBurn` which was NOT in her allowed messages list, demonstrating the security guarantee of `AllowedMsgAllowance` is broken
 
 ## Notes
 
-This vulnerability qualifies as valid despite requiring governance action because:
+This vulnerability exists at the architectural level where fee validation (ante handler phase) and message execution (message router phase) are temporally separated. Fee validation sees only the transaction structure before message unpacking, while message execution later unpacks and dispatches nested messages. This separation, combined with the lack of recursive message extraction in fee grant validation, creates the bypass opportunity.
 
-1. **Impact exceeds intended authority**: Parameter adjustment is meant for network tuning, not causing catastrophic failures requiring hard forks
-2. **Defensive security boundary**: Parameter validation should prevent system-breaking values regardless of who sets them
-3. **Accidental trigger**: Can occur through simple typos during legitimate maintenance operations
-4. **Severity classification**: Precisely matches the defined Medium impact: "Network not being able to confirm new transactions (total network shutdown)"
-5. **Unrecoverable failure**: Requires coordinated hard fork intervention, not normal governance or operational procedures
-
-The absence of upper bound validation represents a missing defensive safeguard that enables disproportionate consequences from routine parameter adjustments.
+The vulnerability is particularly concerning because it's a reasonable practice to include `MsgExec` in allowed messages for users leveraging authz functionality, the bypass is complete with no safeguards, and multiple nested levels of `MsgExec` would amplify the issue further.
 
 ### Citations
 
-**File:** x/slashing/types/params.go (L13-13)
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-	DefaultSignedBlocksWindow   = int64(108000) // ~12 hours based on 0.4s block times
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
 ```
 
-**File:** x/slashing/types/params.go (L72-83)
+**File:** x/feegrant/filtered_fee.go (L65-86)
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-	v, ok := i.(int64)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
+func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+	if !a.allMsgTypesAllowed(ctx, msgs) {
+		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
 	}
 
-	if v <= 0 {
-		return fmt.Errorf("signed blocks window must be positive: %d", v)
+	allowance, err := a.GetAllowance()
+	if err != nil {
+		return false, err
 	}
 
-	return nil
+	remove, err := allowance.Accept(ctx, fee, msgs)
+	if err != nil {
+		return false, err
+	}
+
+	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
+	if err != nil {
+		return false, err
+	}
+
+    return remove, nil
 }
 ```
 
-**File:** x/slashing/keeper/infractions.go (L52-54)
+**File:** x/feegrant/filtered_fee.go (L98-109)
 ```go
-	if found && missedInfo.WindowSize != window {
-		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
-	}
-```
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
 
-**File:** x/slashing/keeper/infractions.go (L157-181)
-```go
-func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
-	// we need to resize the missed block array AND update the signing info accordingly
-	switch {
-	case missedInfo.WindowSize < window:
-		// missed block array too short, lets expand it
-		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
-		newArray := make([]bool, window)
-		copy(newArray[0:index], boolArray[0:index])
-		if index+1 < missedInfo.WindowSize {
-			// insert `0`s corresponding to the difference between the new window size and old window size
-			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
 		}
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
-		missedInfo.WindowSize = window
-	case missedInfo.WindowSize > window:
-		// if window size is reduced, we would like to make a clean state so that no validators are unexpectedly jailed due to more recent missed blocks
-		newMissedBlocks := make([]bool, window)
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newMissedBlocks)
-		signInfo.MissedBlocksCounter = int64(0)
-		missedInfo.WindowSize = window
-		signInfo.IndexOffset = 0
-		index = 0
 	}
-	return missedInfo, signInfo, index
+
+	return true
 }
 ```
 
-**File:** x/slashing/abci.go (L35-50)
+**File:** x/authz/keeper/msg_server.go (L72-77)
 ```go
-	allVotes := req.LastCommitInfo.GetVotes()
-	for i, _ := range allVotes {
-		wg.Add(1)
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
+	msgs, err := msg.GetMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := k.DispatchActions(ctx, grantee, msgs)
+```
+
+**File:** x/authz/keeper/keeper.go (L76-139)
+```go
+func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
+	results := make([][]byte, len(msgs))
+
+	for i, msg := range msgs {
+		signers := msg.GetSigners()
+		if len(signers) != 1 {
+			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
+		}
+
+		granter := signers[0]
+
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
 			}
-		}(i)
-	}
-```
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
 
-**File:** x/slashing/keeper/signing_info.go (L109-116)
-```go
-func (k Keeper) ParseBitGroupsToBoolArray(bitGroups []uint64, window int64) []bool {
-	boolArray := make([]bool, window)
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
 
-	for i := int64(0); i < window; i++ {
-		boolArray[i] = k.GetBooleanFromBitGroups(bitGroups, i)
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
+
+		handler := k.router.Handler(msg)
+		if handler == nil {
+			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
+		}
+
+		msgResp, err := handler(ctx, msg)
+		if err != nil {
+			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
+		}
+
+		results[i] = msgResp.Data
+
+		// emit the events from the dispatched actions
+		events := msgResp.Events
+		sdkEvents := make([]sdk.Event, 0, len(events))
+		for _, event := range events {
+			e := event
+			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
+
+			sdkEvents = append(sdkEvents, sdk.Event(e))
+		}
+
+		ctx.EventManager().EmitEvents(sdkEvents)
 	}
-	return boolArray
+
+	return results, nil
 }
 ```
 
-**File:** x/gov/types/params.go (L14-17)
+**File:** x/authz/msgs.go (L198-209)
 ```go
-const (
-	DefaultPeriod          time.Duration = time.Hour * 24 * 2 // 2 days
-	DefaultExpeditedPeriod time.Duration = time.Hour * 24     // 1 day
-)
-```
-
-**File:** x/params/proposal_handler.go (L26-42)
-```go
-func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
-	for _, c := range p.Changes {
-		ss, ok := k.GetSubspace(c.Subspace)
+func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
+	msgs := make([]sdk.Msg, len(msg.Msgs))
+	for i, msgAny := range msg.Msgs {
+		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
 		if !ok {
-			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
 		}
-
-		k.Logger(ctx).Info(
-			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
-		)
-
-		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
-			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
-		}
+		msgs[i] = msg
 	}
 
-	return nil
+	return msgs, nil
+}
 ```

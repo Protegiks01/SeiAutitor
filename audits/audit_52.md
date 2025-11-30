@@ -1,165 +1,207 @@
 # Audit Report
 
 ## Title
-Vote Deletion Causes Vote Loss When Expedited Proposals Convert to Regular Proposals
+Index Out of Bounds Panic in SetPubKeyDecorator Due to Missing Length Validation
 
 ## Summary
-The governance module's `Tally` function unconditionally deletes all votes during processing. When an expedited proposal fails its threshold and converts to a regular proposal with an extended voting period, all votes cast during the expedited period are permanently deleted. The second tally finds no votes, causing the proposal to fail due to lack of quorum despite having received legitimate votes.
+The `SetPubKeyDecorator` in the ante handler chain lacks validation to ensure the number of public keys matches the number of signers, allowing crafted transactions to pass `ValidateBasic()` but trigger index out of bounds panics during ante handler processing, wasting validator computational resources.
 
 ## Impact
-Medium
+Low
 
 ## Finding Description
 
-**Location:**
-- Vote deletion: `x/gov/keeper/tally.go` line 69
-- Expedited-to-regular conversion: `x/gov/abci.go` lines 95-106  
-- Tally invocation: `x/gov/abci.go` line 51
-- Vote deletion implementation: `x/gov/keeper/vote.go` lines 127-130
+**Location:** [1](#0-0) 
 
 **Intended Logic:**
-When an expedited proposal fails to meet the higher voting threshold, it should convert to a regular proposal with an extended voting period. The code comment explicitly states "Once the regular voting period expires again, the tally is repeated according to the regular proposal rules" [1](#0-0) , indicating that votes from the expedited period should be counted in the final tally. This interpretation is supported by the fact that deposits are explicitly preserved during conversion [2](#0-1) .
+The `SetPubKeyDecorator` should validate that the number of public keys matches the number of signers before iterating over them, ensuring safe array access and early rejection of malformed transactions.
 
 **Actual Logic:**
-The `Tally` function iterates over all votes and unconditionally deletes each one via `keeper.deleteVote(ctx, vote.ProposalId, voter)` [3](#0-2) . The `deleteVote` function permanently removes votes from storage [4](#0-3) . When an expedited proposal's voting period ends, `EndBlocker` calls `Tally` [5](#0-4) , which deletes all votes. If the proposal then converts to regular [6](#0-5) , the votes are already gone. When the regular voting period ends and `Tally` is called again, no votes exist to count.
+The decorator retrieves `pubkeys` from `GetPubKeys()` [2](#0-1)  which returns an array based on `AuthInfo.SignerInfos` length, and `signers` from `GetSigners()` [3](#0-2)  which derives signers from transaction messages. These arrays can have different lengths because they come from independent data sources. The code loops over `pubkeys` and accesses `signers[i]` without bounds validation, causing an index out of bounds panic when `len(pubkeys) > len(signers)`.
 
 **Exploitation Path:**
-1. Any user submits an expedited proposal with required deposit
-2. Validators and delegators vote during the expedited voting period
-3. Expedited voting period ends with votes insufficient for expedited threshold (e.g., 55% YES vs 67% required)
-4. `EndBlocker` invokes `Tally`, which processes and deletes all votes
-5. Proposal converts to regular with extended `VotingEndTime`
-6. Regular voting period expires
-7. `EndBlocker` invokes `Tally` again but finds zero votes
-8. Proposal fails quorum check despite having received legitimate votes
+1. Attacker creates a transaction with one message containing one unique signer
+2. Sets `AuthInfo.SignerInfos` array to have 2 elements
+3. Sets `Signatures` array to have 1 element
+4. Transaction passes `ValidateBasic()` [4](#0-3)  because it only validates `len(Signatures) == len(GetSigners())` (1 == 1)
+5. Transaction enters ante handler chain [5](#0-4)  and proceeds through multiple decorators
+6. In `SetPubKeyDecorator`, the loop iterates twice, and at i=1, accessing `signers[1]` triggers an index out of bounds panic
+7. Panic is caught by recovery middleware [6](#0-5)  and the transaction is rejected
 
 **Security Guarantee Broken:**
-The governance protocol's integrity is violated. Votes legitimately cast are not counted in the final tally, contradicting the documented behavior that the tally should be "repeated" and creating an inconsistency where deposits are preserved but votes are not.
+The ante handler chain should efficiently reject invalid transactions during early validation stages. This vulnerability allows malformed transactions to bypass `ValidateBasic()` and consume validator resources through multiple expensive decorator executions before being rejected via panic recovery.
 
 ## Impact Explanation
 
-This vulnerability affects the core governance mechanism of the Cosmos SDK Layer 1 blockchain. All votes cast during the expedited voting period are permanently lost when the proposal converts to regular, effectively nullifying voter participation. Governance proposals that should pass (considering all votes from both periods) will instead fail, or vice versa, leading to incorrect governance outcomes that affect protocol parameters, upgrades, and other governance-controlled features.
-
-The issue fits the **Medium** severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." The governance module is Layer 1 network code exhibiting unintended behavior (vote loss), with no direct fund loss (deposits are preserved).
+This vulnerability enables resource exhaustion where validators waste computational resources processing malformed transactions. Each malicious transaction forces validators to decode the transaction and execute 7+ ante handler decorators (SetUpContext, RejectExtensionOptions, ValidateBasic decorator, TxTimeoutHeight, ValidateMemo, ConsumeGasForTxSize, DeductFee) before panicking in SetPubKeyDecorator and processing panic recovery. Since these transactions are rejected during CheckTx (mempool admission), attackers pay no gas fees while consuming validator resources. The network continues functioning and no funds are at risk, but validator efficiency is degraded.
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any participant in governance - this requires no special privileges beyond normal governance participation.
+**Who can trigger it:**
+Any network participant can exploit this vulnerability without special permissions or resources beyond standard transaction submission capabilities.
 
-**Conditions required:**
-- An expedited proposal must be submitted and reach voting period
-- The proposal must receive votes during expedited period  
-- The proposal must fail expedited threshold but remain valid for conversion to regular
+**Required conditions:**
+- The default ante handler chain includes `SetPubKeyDecorator` (standard configuration)
+- Attacker can craft protobuf transactions (standard capability)
 
-**Frequency:** This occurs whenever an expedited proposal fails its threshold and converts to regular, which is an expected and documented feature. The existing test suite demonstrates this exact scenario [7](#0-6) , but works around the issue by adding a NEW vote after conversion [8](#0-7)  rather than relying on votes from the expedited period, confirming that votes are not preserved.
+**Frequency:**
+This can be exploited repeatedly and deterministically. An attacker can pre-generate batches of malformed transactions and submit them continuously. Each transaction reliably triggers the panic during CheckTx.
 
 ## Recommendation
 
-Modify the `Tally` function to accept a boolean parameter indicating whether votes should be deleted:
+Add length validation in `SetPubKeyDecorator.AnteHandle` before the iteration loop:
 
 ```go
-func (keeper Keeper) Tally(ctx sdk.Context, proposal types.Proposal, deleteVotes bool) (passes bool, burnDeposits bool, tallyResults types.TallyResult)
-```
-
-In `EndBlocker`, call `Tally(ctx, proposal, false)` for expedited proposals that may convert to regular, and only delete votes after the final tally or when a proposal reaches a terminal state (passed, rejected, failed). Alternatively, refactor to only call `deleteVote` when the proposal is in a terminal state, not during intermediate tallies.
-
-## Proof of Concept
-
-The existing test `TestExpeditedProposalPassAndConvertToRegular` in `x/gov/abci_test.go` demonstrates this behavior. After the proposal converts from expedited to regular at line 461 [9](#0-8) , the test adds a NEW vote at line 521 [8](#0-7)  for the regular proposal to potentially pass. This confirms that votes from the expedited period are not available for the regular tally.
-
-**Test scenario verification:**
-1. Vote is cast during expedited period (exists in storage)
-2. `EndBlocker` called when expedited period ends, triggering first tally  
-3. Proposal converts from expedited to regular with extended voting period
-4. Vote from expedited period has been deleted from storage (verifiable via `GetVote`)
-5. When regular voting period ends and `EndBlocker` called again, no votes exist
-6. Proposal fails due to lack of quorum despite having received legitimate votes
-
-## Notes
-
-The vulnerability is confirmed by multiple evidence points:
-- Unconditional vote deletion in `Tally` [3](#0-2) 
-- Conversion logic extending voting period [6](#0-5)   
-- Code comment stating tally should be "repeated" [1](#0-0) 
-- Preservation of deposits but not votes [2](#0-1) 
-- Existing test's workaround of adding new votes after conversion [8](#0-7) 
-
-This is a valid Medium severity vulnerability that breaks the governance protocol's integrity through an implementation inconsistency between documented intent and actual behavior.
-
-### Citations
-
-**File:** x/gov/abci.go (L51-51)
-```go
-		passes, burnDeposits, tallyResults := keeper.Tally(ctx, proposal)
-```
-
-**File:** x/gov/abci.go (L53-63)
-```go
-		// If an expedited proposal fails, we do not want to update
-		// the deposit at this point since the proposal is converted to regular.
-		// As a result, the deposits are either deleted or refunded in all casses
-		// EXCEPT when an expedited proposal fails.
-		if !(proposal.IsExpedited && !passes) {
-			if burnDeposits {
-				keeper.DeleteDeposits(ctx, proposal.ProposalId)
-			} else {
-				keeper.RefundDeposits(ctx, proposal.ProposalId)
-			}
-		}
-```
-
-**File:** x/gov/abci.go (L95-106)
-```go
-			if proposal.IsExpedited {
-				// When expedited proposal fails, it is converted to a regular proposal.
-				// As a result, the voting period is extended.
-				// Once the regular voting period expires again, the tally is repeated
-				// according to the regular proposal rules.
-				proposal.IsExpedited = false
-				votingParams := keeper.GetVotingParams(ctx)
-				proposal.VotingEndTime = proposal.VotingStartTime.Add(votingParams.VotingPeriod)
-
-				keeper.InsertActiveProposalQueue(ctx, proposal.ProposalId, proposal.VotingEndTime)
-				tagValue = types.AttributeValueExpeditedConverted
-				logMsg = "expedited proposal converted to regular"
-```
-
-**File:** x/gov/keeper/tally.go (L69-69)
-```go
-		keeper.deleteVote(ctx, vote.ProposalId, voter)
-```
-
-**File:** x/gov/keeper/vote.go (L127-130)
-```go
-func (keeper Keeper) deleteVote(ctx sdk.Context, proposalID uint64, voterAddr sdk.AccAddress) {
-	store := ctx.KVStore(keeper.storeKey)
-	store.Delete(types.VoteKey(proposalID, voterAddr))
+if len(pubkeys) != len(signers) {
+    return ctx, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, 
+        "invalid number of pubkeys; expected: %d, got %d", len(signers), len(pubkeys))
 }
 ```
 
-**File:** x/gov/abci_test.go (L361-369)
-```go
-			name:                       "expedited fails, converted to regular - regular eventually passes",
-			isExpeditedPasses:          false,
-			isRegularEventuallyPassing: true,
-		},
-		{
-			name:                       "expedited fails, converted to regular - regular eventually fails",
-			isExpeditedPasses:          false,
-			isRegularEventuallyPassing: false,
-		},
-```
+This validation pattern is already correctly implemented in the batch signature verifier [7](#0-6) , confirming that this check is necessary and should be consistently applied across all signature verification paths.
 
-**File:** x/gov/abci_test.go (L461-461)
-```go
-			gov.EndBlocker(ctx, app.GovKeeper)
-```
+## Proof of Concept
 
-**File:** x/gov/abci_test.go (L519-523)
+The vulnerability can be demonstrated through code analysis:
+
+**Setup:**
+- Create a transaction with one message containing one unique signer
+- Manually construct `AuthInfo` with two `SignerInfo` elements
+- Set `Signatures` array to one element
+
+**Action:**
+- Call `ValidateBasic()` - passes because `len(Signatures) == len(GetSigners())` equals (1 == 1)
+- Execute ante handler chain including `SetPubKeyDecorator`
+
+**Result:**
+- `GetPubKeys()` returns 2 elements (from `AuthInfo.SignerInfos`)
+- `GetSigners()` returns 1 element (from message signers)
+- Loop iterates twice; at i=1, accessing `signers[1]` causes index out of bounds panic
+- Panic is caught by recovery middleware and transaction is rejected after wasting resources
+
+## Notes
+
+This is a valid Low severity vulnerability that matches the impact category: "Causing network processing nodes to process transactions from the mempool beyond set parameters." The vulnerability allows transactions to bypass early validation and proceed through multiple expensive decorators before being rejected via panic, wasting validator computational resources. The fix is straightforward and follows the pattern already established in the batch signature verifier.
+
+### Citations
+
+**File:** x/auth/ante/sigverify.go (L71-85)
 ```go
-			if tc.isRegularEventuallyPassing {
-				// Validator votes YES, letting the converted regular proposal pass.
-				err = app.GovKeeper.AddVote(ctx, proposal.ProposalId, addrs[0], types.NewNonSplitVoteOption(types.OptionYes))
-				require.NoError(t, err)
+	for i, pk := range pubkeys {
+		// PublicKey was omitted from slice since it has already been set in context
+		if pk == nil {
+			if !simulate {
+				continue
 			}
+			pk = simSecp256k1Pubkey
+		}
+		// Only make check if simulate=false
+		if !simulate && !bytes.Equal(pk.Address(), signers[i]) {
+			return ctx, sdkerrors.Wrapf(sdkerrors.ErrInvalidPubKey,
+				"pubKey does not match signer address %s with signer index: %d", signers[i], i)
+		}
+
+		acc, err := GetSignerAcc(ctx, spkd.ak, signers[i])
+```
+
+**File:** x/auth/tx/builder.go (L107-128)
+```go
+func (w *wrapper) GetPubKeys() ([]cryptotypes.PubKey, error) {
+	signerInfos := w.tx.AuthInfo.SignerInfos
+	pks := make([]cryptotypes.PubKey, len(signerInfos))
+
+	for i, si := range signerInfos {
+		// NOTE: it is okay to leave this nil if there is no PubKey in the SignerInfo.
+		// PubKey's can be left unset in SignerInfo.
+		if si.PublicKey == nil {
+			continue
+		}
+
+		pkAny := si.PublicKey.GetCachedValue()
+		pk, ok := pkAny.(cryptotypes.PubKey)
+		if ok {
+			pks[i] = pk
+		} else {
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "Expecting PubKey, got: %T", pkAny)
+		}
+	}
+
+	return pks, nil
+}
+```
+
+**File:** types/tx/types.go (L94-99)
+```go
+	if len(sigs) != len(t.GetSigners()) {
+		return sdkerrors.Wrapf(
+			sdkerrors.ErrUnauthorized,
+			"wrong number of signers; expected %d, got %d", len(t.GetSigners()), len(sigs),
+		)
+	}
+```
+
+**File:** types/tx/types.go (L111-132)
+```go
+func (t *Tx) GetSigners() []sdk.AccAddress {
+	var signers []sdk.AccAddress
+	seen := map[string]bool{}
+
+	for _, msg := range t.GetMsgs() {
+		for _, addr := range msg.GetSigners() {
+			if !seen[addr.String()] {
+				signers = append(signers, addr)
+				seen[addr.String()] = true
+			}
+		}
+	}
+
+	// ensure any specified fee payer is included in the required signers (at the end)
+	feePayer := t.AuthInfo.Fee.Payer
+	if feePayer != "" && !seen[feePayer] {
+		payerAddr := sdk.MustAccAddressFromBech32(feePayer)
+		signers = append(signers, payerAddr)
+	}
+
+	return signers
+}
+```
+
+**File:** x/auth/ante/ante.go (L48-60)
+```go
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
+		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
+		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
+		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+		NewIncrementSequenceDecorator(options.AccountKeeper),
+	}
+```
+
+**File:** baseapp/baseapp.go (L904-915)
+```go
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
+		}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
+```
+
+**File:** x/auth/ante/batch_sigverify.go (L66-68)
+```go
+		if len(pubkeys) != len(signerAddrs) {
+			v.errors[i] = sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "invalid number of pubkeys;  expected: %d, got %d", len(signerAddrs), len(pubkeys))
+			continue
 ```

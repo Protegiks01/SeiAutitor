@@ -1,286 +1,474 @@
 # Audit Report
 
 ## Title
-Authentication Bypass via Zero-Threshold Multisig Public Key Deserialization
+AllowedMsgAllowance Bypass via Nested MsgExec Messages
 
 ## Summary
-The `LegacyAminoPubKey` protobuf deserialization bypasses constructor validation, allowing creation of multisig accounts with `threshold=0` that accept transactions without any valid signatures. This enables complete authentication bypass and creation of "anyone can spend" addresses, resulting in direct fund theft.
+The `AllowedMsgAllowance` feegrant restriction can be bypassed by wrapping disallowed message types inside an authz `MsgExec`. The AnteHandler only validates top-level messages when checking feegrant allowances, allowing unauthorized execution of any message type while using a restricted feegrant to pay fees.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** 
-- `crypto/keys/multisig/keys.pb.go` (protobuf unmarshaling)
-- `crypto/keys/multisig/multisig.go:50-66` (verification logic)
-- `x/auth/ante/sigverify.go:89-97` (pubkey setting)
-- `x/auth/types/account.go:87-97` (account validation)
+**Location:**
+- x/auth/ante/fee.go (line 168) [1](#0-0) 
+
+- x/feegrant/filtered_fee.go (lines 65-86, 98-109) [2](#0-1) [3](#0-2) 
+
+- types/tx/types.go (lines 22-36) [4](#0-3) 
+
+- x/authz/keeper/keeper.go (lines 87-111) [5](#0-4) 
 
 **Intended Logic:**
-The constructor enforces that multisig threshold must be greater than 0 to ensure at least one signature is required for transaction authorization. [1](#0-0) 
+The `AllowedMsgAllowance` should restrict feegrants to only pay fees for specific message types. When a granter creates a feegrant with specific allowed message type URLs, the system should reject any transaction attempting to use this feegrant for other message types, including nested messages within wrapper types like `MsgExec`.
 
 **Actual Logic:**
-The protobuf `Unmarshal` method directly deserializes the `Threshold` field without any validation. [2](#0-1) 
-
-When `threshold=0`, the signature verification checks become ineffective:
-- Line 60: `len(sigs) < int(m.Threshold)` becomes `0 < 0` (always false)
-- Line 64: `bitarray.NumTrueBitsBefore(size) < int(m.Threshold)` becomes `0 < 0` (always false) [3](#0-2) 
+The `DeductFeeDecorator` calls `UseGrantedFees` with only top-level messages obtained via `sdkTx.GetMsgs()`, which returns messages from `t.Body.Messages` without extracting nested messages from `MsgExec`. [4](#0-3)  The `allMsgTypesAllowed` validation only checks these top-level message types against the allowed list, never examining nested messages within `MsgExec`. [3](#0-2) 
 
 **Exploitation Path:**
-1. Attacker creates a `LegacyAminoPubKey` with `Threshold: 0` by directly marshaling/unmarshaling via protobuf (bypassing constructor)
-2. Attacker computes the address derived from this malicious key
-3. Victim sends funds to this address (via exchange withdrawal, user error, or social engineering)
-4. Attacker creates a transaction with the threshold=0 pubkey in SignerInfo and a `MultiSignatureData` containing zero signatures (created via `multisig.NewMultisig(n)`)
-5. Transaction passes `ValidateBasic` which only checks that outer `Signatures` array is non-empty [4](#0-3) 
-6. `SetPubKeyDecorator` sets the malicious pubkey on the account without validation [5](#0-4) [6](#0-5) 
-7. `SigVerificationDecorator` calls `VerifyMultisignature`, which passes all checks due to threshold=0
-8. Transaction executes without any valid signatures, enabling fund theft
+1. Attacker obtains a feegrant with `AllowedMsgAllowance` that includes `/cosmos.authz.v1beta1.MsgExec` in the allowed messages list
+2. Attacker creates a transaction containing a `MsgExec` message where they are the grantee
+3. Inside the `MsgExec`, the attacker wraps any disallowed message type (e.g., `/cosmos.bank.v1beta1.MsgSend`) where they are the signer
+4. AnteHandler validates only the top-level `MsgExec` against the feegrant allowance and approves it [1](#0-0) 
+5. Fees are deducted from the feegrant
+6. During execution, `DispatchActions` implicitly accepts the nested message since the signer equals the grantee (no authorization check needed) [5](#0-4) 
+7. The disallowed nested message executes successfully using the feegrant to pay fees
 
 **Security Guarantee Broken:**
-Transactions must be cryptographically signed by authorized private key holders. This vulnerability creates addresses where NO private keys are needed—anyone who knows the public key composition can spend funds without possessing any private keys.
+The message type restriction mechanism in feegrant authorization is bypassed. The guarantee that feegrant funds will only be used for explicitly approved message types is completely circumvented for nested messages.
 
 ## Impact Explanation
 
-This vulnerability enables:
-- **Direct fund theft**: Anyone who knows the public keys of a threshold=0 multisig can steal all funds sent to that address without possessing any private keys
-- **Social engineering attacks**: Attackers can promote "secure multisig addresses" that are actually threshold=0 and completely insecure
-- **Systemic authentication failure**: Violates the core blockchain security property that transactions require valid signatures
+This vulnerability enables unauthorized drainage of feegrant balances for transaction types outside the granter's intended restrictions. The granter loses control over how their allocated funds are spent, potentially allowing complete exhaustion of the feegrant balance for any message type where the grantee is the signer. This breaks the trust model of restricted feegrants, which are specifically designed for limited delegation scenarios (e.g., allowing governance voting but preventing token transfers).
 
-All funds sent to threshold=0 multisig addresses are at immediate risk of theft by anyone who discovers the public key composition. This is a fundamental breakdown of the authentication mechanism.
+While the funds are technically still used for fees (their intended purpose), they're applied to unauthorized transaction types, representing a direct loss of the granter's allocated funds limited to the feegrant balance. This qualifies as "Direct loss of funds" from the impact criteria.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any unprivileged user can create transactions with threshold=0 multisig keys.
+**Likelihood: High**
 
-**Conditions Required:**
-- Attacker creates a threshold=0 multisig key and computes its address
-- Someone sends funds to this address (through exchange, user transfer, or social engineering)
-- No special timing, network conditions, or privileges required
+The vulnerability can be exploited by any grantee whose feegrant includes `MsgExec` in the allowed messages list. Required conditions:
+- Granter creates an `AllowedMsgAllowance` including `/cosmos.authz.v1beta1.MsgExec` in the allowed messages
+- No additional authz grant is required due to implicit acceptance when signer equals grantee
 
-**Frequency:** Exploitable on-demand during normal network operation. The attack is deterministic and reliable—once funds arrive at a threshold=0 address, they can be stolen immediately by anyone who knows the pubkey composition.
+The exploit is straightforward and requires no special privileges beyond possession of the feegrant. Granters might reasonably include `MsgExec` in allowed lists without understanding the nested message implications, making this highly likely to occur in practice.
 
 ## Recommendation
 
-Add post-deserialization validation for `LegacyAminoPubKey`:
+Modify the `AllowedMsgAllowance.Accept` method in `x/feegrant/filtered_fee.go` to recursively validate nested messages within `MsgExec` and other message wrapper types:
 
-1. **Implement validation method in `LegacyAminoPubKey`:**
-   - Add a `Validate()` method that checks `threshold > 0` and `threshold <= len(pubKeys)`
+1. Update `allMsgTypesAllowed` to detect `MsgExec` message types
+2. For each `MsgExec`, call its `GetMessages()` method to extract nested messages
+3. Recursively validate all nested messages against the allowed messages list
+4. Reject the transaction if any nested message type is not in the allowed list
 
-2. **Call validation in critical paths:**
-   - In `BaseAccount.SetPubKey()` before accepting any public key
-   - At the beginning of `VerifyMultisignature()` before signature verification
-   - In transaction `ValidateBasic()` to check all public keys in SignerInfo structures
-
-3. **Add a `Validate()` method to the `cryptotypes.PubKey` interface** that all implementations must provide for structural validation, ensuring consistent validation across all public key types.
+Alternative: Document that including `MsgExec` in `AllowedMessages` effectively allows all message types where the grantee is the signer, and warn granters about this implication.
 
 ## Proof of Concept
 
-**Test Location:** `crypto/keys/multisig/multisig_test.go` (proposed)
+**Test Location:** x/feegrant/filtered_fee_test.go (new test to be added)
+
+**Test Function:** `TestFilteredFeeBypassWithMsgExec`
 
 **Setup:**
-- Create a `LegacyAminoPubKey` directly with `Threshold: 0` (bypassing constructor)
-- Generate one secp256k1 public key for the multisig
-- Create an empty `MultiSignatureData` via `multisig.NewMultisig(1)` with zero signatures
+- Create a feegrant with `AllowedMsgAllowance` restricting to only `/cosmos.gov.v1beta1.MsgVote` and `/cosmos.authz.v1beta1.MsgExec`
+- Create accounts for granter and grantee
+- Fund granter account
+- Grant the allowance from granter to grantee
 
 **Action:**
-- Marshal and unmarshal the threshold=0 key to simulate network deserialization
-- Call `VerifyMultisignature` with the zero-signature MultiSignatureData
+- Test 1: Create transaction with direct `MsgSend` from grantee using the feegrant - should be rejected
+- Test 2: Create transaction with `MsgExec` (grantee as executor) wrapping `MsgSend` (grantee as signer) using the feegrant - currently passes validation
 
 **Result:**
-- Verification returns `nil` (success) instead of error
-- Confirms that threshold=0 bypasses all signature checks
-- Demonstrates complete authentication bypass
+- Test 1: Validation correctly rejects with "message does not exist in allowed messages" error
+- Test 2: The `MsgExec` wrapping the disallowed `MsgSend` passes feegrant validation. The nested `MsgSend` is never validated against the feegrant allowance, demonstrating the bypass. The feegrant balance is depleted for an unauthorized message type.
 
 ## Notes
 
-This vulnerability stems from the mismatch between constructor validation and protobuf deserialization. The constructor's panic on `threshold <= 0` clearly indicates this was never intended behavior. The issue affects the core authentication mechanism and represents a critical security failure that violates blockchain's fundamental trust model—transactions must be cryptographically authorized.
+The exploit relies on the implicit acceptance logic in `DispatchActions()` [5](#0-4)  where if the message signer equals the MsgExec grantee, no authorization check is performed. This means the attacker doesn't need to create any prior authz grant - they can directly execute any message where they are the signer by wrapping it in MsgExec.
 
-The vulnerability is particularly dangerous because:
-1. It's completely invisible to users sending funds to such addresses
-2. The exploit is deterministic and reliable
-3. No private keys are needed for theft
-4. Multiple parties could independently discover and exploit the same vulnerable address
+The existing test suite in `x/feegrant/filtered_fee_test.go` [6](#0-5)  does not include any tests for nested message validation, indicating this scenario was not previously considered during development.
 
 ### Citations
 
-**File:** crypto/keys/multisig/multisig.go (L21-33)
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-func NewLegacyAminoPubKey(threshold int, pubKeys []cryptotypes.PubKey) *LegacyAminoPubKey {
-	if threshold <= 0 {
-		panic("threshold k of n multisignature: k <= 0")
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+```
+
+**File:** x/feegrant/filtered_fee.go (L65-86)
+```go
+func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+	if !a.allMsgTypesAllowed(ctx, msgs) {
+		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
 	}
-	if len(pubKeys) < threshold {
-		panic("threshold k of n multisignature: len(pubKeys) < k")
-	}
-	anyPubKeys, err := packPubKeys(pubKeys)
+
+	allowance, err := a.GetAllowance()
 	if err != nil {
-		panic(err)
+		return false, err
 	}
-	return &LegacyAminoPubKey{Threshold: uint32(threshold), PubKeys: anyPubKeys}
+
+	remove, err := allowance.Accept(ctx, fee, msgs)
+	if err != nil {
+		return false, err
+	}
+
+	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
+	if err != nil {
+		return false, err
+	}
+
+    return remove, nil
 }
 ```
 
-**File:** crypto/keys/multisig/multisig.go (L50-66)
+**File:** x/feegrant/filtered_fee.go (L98-109)
 ```go
-func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
-	bitarray := sig.BitArray
-	sigs := sig.Signatures
-	size := bitarray.Count()
-	pubKeys := m.GetPubKeys()
-	// ensure bit array is the correct size
-	if len(pubKeys) != size {
-		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
+
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
+		}
 	}
-	// ensure size of signature list
-	if len(sigs) < int(m.Threshold) || len(sigs) > size {
-		return fmt.Errorf("signature size is incorrect %d", len(sigs))
-	}
-	// ensure at least k signatures are set
-	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
-		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
-	}
+
+	return true
+}
 ```
 
-**File:** crypto/keys/multisig/keys.pb.go (L173-274)
+**File:** types/tx/types.go (L22-36)
 ```go
-func (m *LegacyAminoPubKey) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowKeys
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= uint64(b&0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: LegacyAminoPubKey: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: LegacyAminoPubKey: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Threshold", wireType)
-			}
-			m.Threshold = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowKeys
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.Threshold |= uint32(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PubKeys", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowKeys
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthKeys
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthKeys
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.PubKeys = append(m.PubKeys, &types.Any{})
-			if err := m.PubKeys[len(m.PubKeys)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipKeys(dAtA[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if (skippy < 0) || (iNdEx+skippy) < 0 {
-				return ErrInvalidLengthKeys
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-```
-
-**File:** types/tx/types.go (L88-92)
-```go
-	sigs := t.Signatures
-
-	if len(sigs) == 0 {
-		return sdkerrors.ErrNoSignatures
-	}
-```
-
-**File:** x/auth/ante/sigverify.go (L89-97)
-```go
-		// account already has pubkey set,no need to reset
-		if acc.GetPubKey() != nil {
-			continue
-		}
-		err = acc.SetPubKey(pk)
-		if err != nil {
-			return ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidPubKey, err.Error())
-		}
-		spkd.ak.SetAccount(ctx, acc)
-```
-
-**File:** x/auth/types/account.go (L87-97)
-```go
-func (acc *BaseAccount) SetPubKey(pubKey cryptotypes.PubKey) error {
-	if pubKey == nil {
-		acc.PubKey = nil
+func (t *Tx) GetMsgs() []sdk.Msg {
+	if t == nil || t.Body == nil {
 		return nil
 	}
-	any, err := codectypes.NewAnyWithValue(pubKey)
-	if err == nil {
-		acc.PubKey = any
+
+	anys := t.Body.Messages
+	res := make([]sdk.Msg, len(anys))
+	for i, any := range anys {
+		cached := any.GetCachedValue()
+		if cached == nil {
+			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
+		}
+		res[i] = cached.(sdk.Msg)
 	}
-	return err
+	return res
+```
+
+**File:** x/authz/keeper/keeper.go (L87-111)
+```go
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
+```
+
+**File:** x/feegrant/filtered_fee_test.go (L1-281)
+```go
+package feegrant_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
+
+	"github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/simapp"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"github.com/cosmos/cosmos-sdk/x/feegrant"
+)
+
+func TestFilteredFeeValidAllow(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{
+		Time: time.Now(),
+	})
+
+	eth := sdk.NewCoins(sdk.NewInt64Coin("eth", 10))
+	atom := sdk.NewCoins(sdk.NewInt64Coin("atom", 555))
+	smallAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 43))
+	bigAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 1000))
+	leftAtom := bigAtom.Sub(smallAtom)
+	now := ctx.BlockTime()
+	oneHour := now.Add(1 * time.Hour)
+	from := sdk.MustAccAddressFromBech32("cosmos18cgkqduwuh253twzmhedesw3l7v3fm37sppt58")
+	to := sdk.MustAccAddressFromBech32("cosmos1yq8lgssgxlx9smjhes6ryjasmqmd3ts2559g0t")
+
+	// small fee without expire
+	msgType := "/cosmos.bank.v1beta1.MsgSend"
+	any, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// all fee without expire
+	any2, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: smallAtom,
+	})
+
+	// wrong fee
+	any3, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// wrong fee
+	any4, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// expired
+	any5, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+		Expiration: &now,
+	})
+
+	// few more than allowed
+	any6, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: atom,
+		Expiration: &now,
+	})
+
+	// with out spend limit
+	any7, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &oneHour,
+	})
+
+	// expired no spend limit
+	any8, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	// msg type not allowed
+	msgType2 := "/cosmos.ibc.applications.transfer.v1.MsgTransfer"
+	any9, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	cases := map[string]struct {
+		allowance *feegrant.AllowedMsgAllowance
+		msgs      []sdk.Msg
+		fee       sdk.Coins
+		blockTime time.Time
+		valid     bool
+		accept    bool
+		remove    bool
+		remains   sdk.Coins
+	}{
+		"small fee without expire": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any,
+				AllowedMessages: []string{msgType},
+			},
+			msgs: []sdk.Msg{&banktypes.MsgSend{
+				FromAddress: from.String(),
+				ToAddress:   to.String(),
+				Amount:      bigAtom,
+			}},
+			fee:     smallAtom,
+			accept:  true,
+			remove:  false,
+			remains: leftAtom,
+		},
+		"all fee without expire": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any2,
+				AllowedMessages: []string{msgType},
+			},
+			fee:    smallAtom,
+			accept: true,
+			remove: true,
+		},
+		"wrong fee": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any3,
+				AllowedMessages: []string{msgType},
+			},
+			fee:    eth,
+			accept: false,
+		},
+		"non-expired": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any4,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       smallAtom,
+			blockTime: now,
+			accept:    true,
+			remove:    false,
+			remains:   leftAtom,
+		},
+		"expired": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any5,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       smallAtom,
+			blockTime: oneHour,
+			accept:    false,
+			remove:    true,
+		},
+		"fee more than allowed": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any6,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       bigAtom,
+			blockTime: now,
+			accept:    false,
+		},
+		"with out spend limit": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any7,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       bigAtom,
+			blockTime: now,
+			accept:    true,
+		},
+		"expired no spend limit": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any8,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       bigAtom,
+			blockTime: oneHour,
+			accept:    false,
+		},
+		"msg type not allowed": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any9,
+				AllowedMessages: []string{msgType2},
+			},
+			msgs: []sdk.Msg{&banktypes.MsgSend{
+				FromAddress: from.String(),
+				ToAddress:   to.String(),
+				Amount:      bigAtom,
+			}},
+			valid:  true,
+			fee:    bigAtom,
+			accept: false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := tc.allowance.ValidateBasic()
+			require.NoError(t, err)
+
+			ctx := app.BaseApp.NewContext(false, tmproto.Header{}).WithBlockTime(tc.blockTime)
+
+			removed, err := tc.allowance.Accept(ctx, tc.fee, tc.msgs)
+			if !tc.accept {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			require.Equal(t, tc.remove, removed)
+			if !removed {
+				allowance, _ := tc.allowance.GetAllowance()
+				assert.Equal(t, tc.remains, allowance.(*feegrant.BasicAllowance).SpendLimit)
+			}
+		})
+	}
+}
+
+func TestFilteredFeeValidAllowance(t *testing.T) {
+	app := simapp.Setup(false)
+
+	smallAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 488))
+	bigAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 1000))
+	leftAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 512))
+
+	basicAllowance, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	cases := map[string]struct {
+		allowance *feegrant.AllowedMsgAllowance
+		// all other checks are ignored if valid=false
+		fee       sdk.Coins
+		blockTime time.Time
+		valid     bool
+		accept    bool
+		remove    bool
+		remains   sdk.Coins
+	}{
+		"internal fee is updated": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       basicAllowance,
+				AllowedMessages: []string{"/cosmos.bank.v1beta1.MsgSend"},
+			},
+			fee:     smallAtom,
+			accept:  true,
+			remove:  false,
+			remains: leftAtom,
+		},
+	}
+
+	for name, stc := range cases {
+		tc := stc // to make scopelint happy
+		t.Run(name, func(t *testing.T) {
+			err := tc.allowance.ValidateBasic()
+			require.NoError(t, err)
+
+			ctx := app.BaseApp.NewContext(false, tmproto.Header{}).WithBlockTime(tc.blockTime)
+
+			// now try to deduct
+			removed, err := tc.allowance.Accept(ctx, tc.fee, []sdk.Msg{
+				&banktypes.MsgSend{
+					FromAddress: "gm",
+					ToAddress:   "gn",
+					Amount:      tc.fee,
+				},
+			})
+			if !tc.accept {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			require.Equal(t, tc.remove, removed)
+			if !removed {
+				var basicAllowanceLeft feegrant.BasicAllowance
+				app.AppCodec().Unmarshal(tc.allowance.Allowance.Value, &basicAllowanceLeft)
+
+				assert.Equal(t, tc.remains, basicAllowanceLeft.SpendLimit)
+			}
+		})
+	}
 }
 ```

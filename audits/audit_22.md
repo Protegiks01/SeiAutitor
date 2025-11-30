@@ -1,10 +1,10 @@
 # Audit Report
 
 ## Title
-Consensus Failure Due to Non-Deterministic skipUpgradeHeights Configuration Causing Permanent Chain Split
+Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
 
 ## Summary
-The upgrade module's `skipUpgradeHeights` mechanism allows validators to bypass scheduled upgrades using the `--unsafe-skip-upgrades` CLI flag. This local per-node configuration creates non-deterministic state transitions during BeginBlock execution: validators with skip configured delete the upgrade plan from consensus state and continue, while validators without skip panic and halt. This causes an unrecoverable consensus failure and permanent network partition requiring a hard fork.
+The distribution module allows governance to set parameters where `baseProposerReward + bonusProposerReward + communityTax` exceeds 1.0 through individual parameter updates. This causes `voteMultiplier` to become negative in `AllocateTokens`, triggering a panic that halts the entire network during block processing.
 
 ## Impact
 High
@@ -12,203 +12,314 @@ High
 ## Finding Description
 
 **Location:**
-- Primary divergence point: [1](#0-0) 
-- State modification in skip path: [2](#0-1) 
-- State deletion from consensus: [3](#0-2) 
-- Local configuration storage: [4](#0-3) 
-- CLI flag parsing: [5](#0-4) 
+- Vulnerability: `x/distribution/keeper/allocation.go` (voteMultiplier calculation) [1](#0-0) 
 
-**Intended Logic:**
-The upgrade module ensures all validators execute scheduled upgrades at the same block height to maintain consensus determinism. The `skipUpgradeHeights` is documented as an emergency mechanism requiring coordination: "If over two-thirds run their nodes with this flag on the old binary, it will allow the chain to continue" [6](#0-5) 
+- Panic trigger: `types/dec_coin.go` (Sub operation) [2](#0-1) 
 
-**Actual Logic:**
-The `skipUpgradeHeights` is a local per-node map with no validation ensuring all validators share the same configuration. During BeginBlock at an upgrade height:
-1. Validators WITH skip configured: Call `skipUpgrade()` which executes `ClearUpgradePlan(ctx)`, deleting the upgrade plan from the KV store (modifying consensus state)
-2. Validators WITHOUT skip: Skip the skip path, find no handler, panic via `panicUpgradeNeeded()` before committing state
+- Validation gap: `x/distribution/types/params.go` (individual validators) [3](#0-2) 
 
-**Exploitation Path:**
-1. Governance schedules an upgrade at height H via standard proposal
-2. Before height H, due to miscommunication or emergency response, some validators configure `--unsafe-skip-upgrades=H` while others don't
-3. At height H during BeginBlock:
-   - Validators with skip: Clear upgrade plan from consensus state, continue processing, commit modified state, produce AppHash without plan
-   - Validators without skip: Panic before state commit, cannot participate in consensus
-4. Network partitions based on voting power distribution:
-   - If ≥2/3 voting power has skip: Chain continues on one fork, validators without skip permanently stuck at height H-1
-   - If <2/3 voting power has skip: Chain cannot reach consensus, total network halt
-5. No in-protocol recovery mechanism exists; requires coordinated hard fork
+- Governance handler: `x/params/proposal_handler.go` [4](#0-3) 
 
-**Security Guarantee Broken:**
-Consensus determinism - the fundamental invariant that all validators must execute identical state transitions for the same block height. The code allows different validators to execute different state modifications based on local configuration, violating this core consensus property.
+**Intended logic:**
+Distribution parameters must satisfy the invariant `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. This invariant is explicitly validated in `ValidateBasic()`: [5](#0-4) 
+
+**Actual logic:**
+When parameters are updated through governance proposals, the system only validates individual parameters (checking each is between 0 and 1.0) via `Subspace.Update()`, which calls individual validator functions. The `ValidateBasic()` method that checks the combined sum constraint is only called during genesis validation, not during governance parameter updates: [6](#0-5) 
+
+Genesis validation does check the constraint: [7](#0-6) 
+
+But governance updates bypass this validation.
+
+**Exploitation path:**
+1. Three governance proposals pass independently (each appears valid with 0 ≤ value ≤ 1.0):
+   - `baseProposerReward = 0.5`
+   - `bonusProposerReward = 0.5`
+   - `communityTax = 0.1`
+   - Combined sum: 1.1 > 1.0 (violates invariant)
+
+2. During the next block's BeginBlock, `AllocateTokens` is called: [8](#0-7) 
+
+3. With high validator participation (e.g., 100%):
+   - `proposerMultiplier = 0.5 + 0.5 × 1.0 = 1.0`
+   - `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1` (negative!)
+   - `feeMultiplier` becomes negative
+   - Each validator receives negative reward tokens
+
+4. When `AllocateTokensToValidator` attempts `tokens.Sub(commission)` with negative tokens: [9](#0-8) 
+
+The Sub() operation panics with "negative coin amount", halting all nodes simultaneously.
+
+**Security guarantee broken:**
+The system fails to enforce its explicitly documented invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates.
 
 ## Impact Explanation
 
 **Consequences:**
-- **Permanent chain split**: Validators diverge into incompatible state machines at the upgrade height with no recovery path
-- **Network partition severity depends on validator configuration**:
-  - If ≥2/3 validators skip: Chain continues without non-skipping validators (permanent exclusion)
-  - If <2/3 validators skip: Total network shutdown (cannot reach consensus threshold)
-- **Requires hard fork**: No in-protocol mechanism exists to reconcile the divergent states; requires social consensus and coordinated emergency hard fork
-- **Transaction safety compromised**: All transactions in blocks after the divergence are at risk
+- **Total network shutdown**: All validator nodes panic simultaneously when processing any block after the misconfigured parameters take effect
+- **Cannot process transactions**: Network consensus completely halts
+- **Unrecoverable without hard fork**: Emergency governance cannot fix parameters because the network is halted
+- **Requires coordinated manual intervention**: Validators must coordinate off-chain to reset parameters and restart
 
-This precisely matches the High severity impact category: "Unintended permanent chain split requiring hard fork (network partition requiring hard fork)".
+**Precedent:**
+The developers explicitly recognized and fixed this exact pattern for ConsensusParams, acknowledging that parameter validation gaps "will cause a chain halt": [10](#0-9) 
+
+This confirms the severity of such validation gaps and that distribution parameters lack the same protection.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-1. Scheduled upgrade exists in state (normal governance operation)
-2. Validators use `--unsafe-skip-upgrades` flag (designed emergency mechanism)
-3. Not all validators coordinate on identical skip configurations
-4. Upgrade height is reached
-
-**Probability Assessment:**
-Moderate to High during upgrade emergencies. The mechanism is specifically designed for emergencies (flag named "unsafe-skip-upgrades"), precisely when coordination is most difficult. Trigger scenarios include:
-- Emergency response with incomplete validator communication
-- Time zone differences preventing synchronized decision-making
-- Independent validator decisions without full network coordination
-- Social engineering convincing subset of validators to skip
-- Documentation mentions coordination but code doesn't enforce it
-
 **Who Can Trigger:**
-Validator operators through node configuration. While validators are privileged actors, this represents inadvertent operational misconfiguration rather than intentional attack. Critically, the consequence (permanent chain split requiring hard fork) exceeds validators' intended authority and control - they intend to skip a problematic upgrade, not destroy network consensus.
+Governance (requires proposals to pass democratic voting)
+
+**Realistic Scenario (Non-Malicious):**
+- Month 1: Proposal to increase proposer rewards (`baseProposerReward = 0.5`)
+- Month 2: Proposal to add voting bonuses (`bonusProposerReward = 0.5`)
+- Month 3: Proposal to fund community pool (`communityTax = 0.1`)
+- Each proposal reviewed individually, all appear valid (0 ≤ value ≤ 1.0)
+- No reviewer checks combined constraint across all parameters
+- Network halts inadvertently
+
+**Likelihood:** Moderate - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint. The fact that each individual change appears valid makes this particularly dangerous.
+
+While this requires governance action, it meets the "trusted role exception" because: (1) it can happen inadvertently without malicious intent, (2) it causes unrecoverable network failure beyond governance's intended authority, and (3) the system should enforce its own documented invariants.
 
 ## Recommendation
 
-**Primary Fix - Remove State Modification from Skip Path:**
-Modify `skipUpgrade()` to NOT delete the upgrade plan from consensus state:
+1. **Immediate Fix**: Add special validation for distribution parameters in the governance proposal handler, similar to ConsensusParams validation. When any distribution parameter is updated, retrieve all current distribution parameters, apply the change, and validate the complete `Params` struct using `ValidateBasic()`.
 
-```go
-func skipUpgrade(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
-    skipUpgradeMsg := fmt.Sprintf("UPGRADE \"%s\" SKIPPED at %d: %s", plan.Name, plan.Height, plan.Info)
-    ctx.Logger().Info(skipUpgradeMsg)
-    // DO NOT clear the plan from consensus state
-    // k.ClearUpgradePlan(ctx)  // Remove this line
-}
-```
+2. **Alternative Approach**: Modify the individual validator functions to query current values of other distribution parameters and validate that the combined sum will not exceed 1.0 after the update.
 
-The upgrade plan remains in consensus state (maintaining determinism) but is locally ignored by nodes with skip configured. All validators maintain identical state regardless of skip configuration.
+3. **Defensive Programming**: Add a safety check in `AllocateTokens` to detect negative `voteMultiplier` and handle gracefully (clamp to zero, emit error event) rather than allowing the panic to propagate.
 
-**Alternative Fix - Governance-Based Skip:**
-Include skip decisions in the upgrade plan itself via governance parameters, ensuring all validators agree on skip decisions before reaching the upgrade height through on-chain consensus.
-
-**Immediate Mitigation:**
-- Add prominent documentation warning that ALL validators MUST coordinate identical `--unsafe-skip-upgrades` values
-- Add startup validation that logs critical warnings when skip heights are configured
-- Consider requiring governance approval for skip decisions to ensure network-wide coordination
+4. **Follow Existing Pattern**: Apply the same validation pattern used for ConsensusParams to distribution parameters.
 
 ## Proof of Concept
 
-**Test Location:** `x/upgrade/abci_test.go`
+**Test File:** `x/distribution/keeper/allocation_test.go`
 
 **Setup:**
-Simulate two validators with different skip configurations to demonstrate consensus failure:
-- Validator A: Initialize with `setupTest(10, map[int64]bool{15: true})` - has skip configured for height 15
-- Validator B: Initialize with `setupTest(10, map[int64]bool{})` - no skip configured
-- Both validators schedule the same upgrade at height 15 via governance proposal
+- Initialize test application using `simapp.Setup(false)`
+- Create two validators with equal voting power
+- Set misconfigured parameters via `app.DistrKeeper.SetParams()` (bypassing validation):
+  ```
+  Params{
+    CommunityTax: sdk.NewDecWithPrec(10, 2),        // 0.1
+    BaseProposerReward: sdk.NewDecWithPrec(50, 2),  // 0.5
+    BonusProposerReward: sdk.NewDecWithPrec(50, 2), // 0.5
+  }
+  ```
+  Combined sum: 1.1 > 1.0
+- Fund fee collector module with tokens
 
 **Action:**
-Execute BeginBlock at height 15 on both validators:
-```go
-newCtx := ctx.WithBlockHeight(15)
-req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
+- Call `app.DistrKeeper.AllocateTokens(ctx, 200, 200, proposerConsAddr, votes)` with 100% validator participation
+- This results in `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1`
 
-// Validator A
-validatorA.module.BeginBlock(newCtx, req)  // Does NOT panic
+**Result:**
+- Panic with message "negative coin amount" when `AllocateTokensToValidator` attempts `tokens.Sub(commission)` operation on negative token amounts
+- This panic would halt all nodes processing blocks with these parameters in production
 
-// Validator B  
-validatorB.module.BeginBlock(newCtx, req)  // PANICS
-```
+**Note:**
+Existing allocation tests use valid parameters with sum = 0.07 (2% + 1% + 4%): [11](#0-10) 
 
-**Expected Result:**
-- Validator A: Executes successfully (skip configured), clears upgrade plan from state via `ClearUpgradePlan()`, continues processing
-- Validator B: Panics via `panicUpgradeNeeded()` (no skip, no handler), halts before committing
-- State divergence: Validator A has no upgrade plan in store, Validator B retains it
-- Consensus failure: Validators cannot agree on block validity at height 15, producing different AppHashes
-
-The existing tests (`TestSkipUpgradeSkippingAll`, `TestUpgradeWithoutSkip`) only test single validators in isolation and do not expose the multi-validator consensus failure scenario.
+The vulnerability test would follow the same structure but use invalid combined parameters.
 
 ## Notes
 
-This vulnerability is particularly critical because:
-
-1. **Emergency Context**: The flag is explicitly designed for emergencies ("unsafe"), when coordination is inherently most difficult
-2. **No Safeguards**: Zero code-level validation prevents mismatched configurations across validators
-3. **Silent Until Failure**: Validators are unaware of others' configurations until the upgrade height triggers consensus failure
-4. **Irreversible Damage**: Once triggered, requires social consensus and coordinated hard fork to resolve - no in-protocol recovery
-5. **Documentation Gap**: While documentation mentions coordination is needed, the implementation provides no enforcement mechanism
-
-The root cause is allowing consensus-critical state transitions to depend on local per-node configuration without any validation or coordination mechanism, fundamentally violating consensus determinism.
+This vulnerability is validated because it meets all acceptance criteria:
+1. The system has an explicit invariant (ValidateBasic checks sum ≤ 1.0) that is bypassed during governance updates
+2. Causes total network shutdown matching the impact category "Network not being able to confirm new transactions"
+3. BeginBlock has no panic recovery, confirmed by codebase analysis
+4. Developer precedent with ConsensusParams confirms this pattern requires explicit fixes
+5. While governance-controlled, meets the exception clause: inadvertent trigger causing unrecoverable failure beyond intended authority - the system should enforce its own invariants
 
 ### Citations
 
-**File:** x/upgrade/abci.go (L61-72)
+**File:** x/distribution/keeper/allocation.go (L82-84)
 ```go
-	if plan.ShouldExecute(ctx) {
-		// If skip upgrade has been set for current height, we clear the upgrade plan
-		if k.IsSkipHeight(ctx.BlockHeight()) {
-			skipUpgrade(k, ctx, plan)
-			return
-		}
-		// If we don't have an upgrade handler for this upgrade name, then we need to shutdown
-		if !k.HasHandler(plan.Name) {
-			panicUpgradeNeeded(k, ctx, plan)
-		}
-		applyUpgrade(k, ctx, plan)
-		return
+	communityTax := k.GetCommunityTax(ctx)
+	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
+	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
 ```
 
-**File:** x/upgrade/abci.go (L120-125)
+**File:** x/distribution/keeper/allocation.go (L111-114)
 ```go
-// skipUpgrade logs a message that the upgrade has been skipped and clears the upgrade plan.
-func skipUpgrade(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
-	skipUpgradeMsg := fmt.Sprintf("UPGRADE \"%s\" SKIPPED at %d: %s", plan.Name, plan.Height, plan.Info)
-	ctx.Logger().Info(skipUpgradeMsg)
-	k.ClearUpgradePlan(ctx)
-}
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L37-45)
+**File:** types/dec_coin.go (L303-309)
 ```go
-type Keeper struct {
-	homePath           string                          // root directory of app config
-	skipUpgradeHeights map[int64]bool                  // map of heights to skip for an upgrade
-	storeKey           sdk.StoreKey                    // key to access x/upgrade store
-	cdc                codec.BinaryCodec               // App-wide binary codec
-	upgradeHandlers    map[string]types.UpgradeHandler // map of plan name to upgrade handler
-	versionSetter      xp.ProtocolVersionSetter        // implements setting the protocol version field on BaseApp
-	downgradeVerified  bool                            // tells if we've already sanity checked that this binary version isn't being used against an old state.
-}
-```
-
-**File:** x/upgrade/keeper/keeper.go (L320-330)
-```go
-// ClearUpgradePlan clears any schedule upgrade and associated IBC states.
-func (k Keeper) ClearUpgradePlan(ctx sdk.Context) {
-	// clear IBC states everytime upgrade plan is removed
-	oldPlan, found := k.GetUpgradePlan(ctx)
-	if found {
-		k.ClearIBCState(ctx, oldPlan.Height)
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
 	}
 
-	store := ctx.KVStore(k.storeKey)
-	store.Delete(types.PlanKey())
-}
+	return diff
 ```
 
-**File:** simapp/simd/cmd/root.go (L262-265)
+**File:** x/distribution/types/params.go (L67-71)
 ```go
-	skipUpgradeHeights := make(map[int64]bool)
-	for _, h := range cast.ToIntSlice(appOpts.Get(server.FlagUnsafeSkipUpgrades)) {
-		skipUpgradeHeights[int64(h)] = true
+	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
+		)
 	}
 ```
 
-**File:** x/upgrade/doc.go (L128-134)
+**File:** x/distribution/types/params.go (L76-131)
 ```go
-However, let's assume that we don't realize the upgrade has a bug until shortly before it will occur
-(or while we try it out - hitting some panic in the migration). It would seem the blockchain is stuck,
-but we need to allow an escape for social consensus to overrule the planned upgrade. To do so, there's
-a --unsafe-skip-upgrades flag to the start command, which will cause the node to mark the upgrade
-as done upon hitting the planned upgrade height(s), without halting and without actually performing a migration.
-If over two-thirds run their nodes with this flag on the old binary, it will allow the chain to continue through
-the upgrade with a manual override. (This must be well-documented for anyone syncing from genesis later on).
+func validateCommunityTax(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("community tax must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("community tax must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("community tax too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBaseProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("base proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("base proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("base proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBonusProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("bonus proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("bonus proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+```
+
+**File:** x/params/proposal_handler.go (L26-43)
+```go
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
+		if !ok {
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+		}
+
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
+
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		}
+	}
+
+	return nil
+}
+```
+
+**File:** x/params/types/subspace.go (L196-219)
+```go
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	}
+
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+		return err
+	}
+
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
+	return nil
+}
+```
+
+**File:** x/distribution/types/genesis.go (L44-50)
+```go
+// ValidateGenesis validates the genesis state of distribution genesis input
+func ValidateGenesis(gs *GenesisState) error {
+	if err := gs.Params.ValidateBasic(); err != nil {
+		return err
+	}
+	return gs.FeePool.ValidateGenesis()
+}
+```
+
+**File:** x/distribution/abci.go (L29-31)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+```
+
+**File:** x/params/types/proposal/proposal.go (L101-109)
+```go
+		// We need to verify ConsensusParams since they are only validated once the proposal passes.
+		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
+		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
+		// Therefore, we validate when we get a param-change msg for ConsensusParams
+		if pc.Subspace == "baseapp" {
+			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
+				return err
+			}
+		}
+```
+
+**File:** x/distribution/keeper/allocation_test.go (L54-63)
+```go
+	testDistrParms := disttypes.Params{
+		CommunityTax:        sdk.NewDecWithPrec(2, 2), // 2%
+		BaseProposerReward:  sdk.NewDecWithPrec(1, 2), // 1%
+		BonusProposerReward: sdk.NewDecWithPrec(4, 2), // 4%
+		WithdrawAddrEnabled: true,
+	}
+	app.DistrKeeper.SetParams(
+		ctx,
+		testDistrParms,
+	)
 ```

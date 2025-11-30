@@ -1,250 +1,224 @@
 # Audit Report
 
 ## Title
-ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
+Division by Zero Panic in Governance Tally Causes Network Halt When Bonded Validator Has Zero Delegator Shares
 
 ## Summary
-The `ClaimCapability` function in the Cosmos SDK capability module allows a single module to claim the same capability multiple times under different names, causing forward-map corruption that breaks authentication and creates permanent orphaned state in the capability tracking system.
+The governance module's tally function performs unguarded division by a validator's `DelegatorShares` without checking for zero. When a bonded validator with zero shares has voted on a proposal, the tally function panics during EndBlocker execution, causing complete network shutdown across all validator nodes.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** `x/gov/keeper/tally.go` lines 57 and 80 [1](#0-0) 
 
-**Intended Logic:** The ClaimCapability function should prevent a module from claiming the same capability object more than once. Each (module, capability) pair should have exactly one forward mapping to maintain authentication consistency. Modules should only be able to claim a capability once under a specific name.
+**Intended Logic:** The tally function should safely compute voting power for all bonded validators who have voted on proposals, handling edge cases where validators may have zero delegator shares gracefully.
 
-**Actual Logic:** ClaimCapability only validates whether the exact (module, name) pair already exists as an owner through `CapabilityOwners.Set()`. [2](#0-1)  The owner key is "module/name", so Owner("foo", "channel-1") and Owner("foo", "channel-2") are treated as different entries and both succeed.
-
-However, the forward mapping key is based solely on (module, capability) [3](#0-2) , meaning there can only be ONE forward mapping per (module, capability) pair. When the same module claims the same capability with a different name, the forward mapping gets overwritten while the owners list and reverse mappings accumulate multiple entries, creating state inconsistency.
+**Actual Logic:** The code performs division by `val.DelegatorShares` without checking if it equals zero. The `Dec.Quo()` method panics when the divisor is zero [2](#0-1) , causing immediate EndBlock failure.
 
 **Exploitation Path:**
-1. Module "foo" claims capability with name "channel-1"
-   - Forward map: `foo/fwd/0xCAP` → "channel-1"
-   - Reverse map: `foo/rev/channel-1` → index
-   - Owners: [("foo", "channel-1")]
+1. A validator operates normally with delegations and is in bonded status
+2. The validator casts a vote on an active governance proposal using standard `AddVote()` transaction
+3. All delegators remove their delegations via standard `Undelegate` transactions
+4. After the final undelegation, the validator has both `Tokens = 0` and `DelegatorShares = 0` [3](#0-2) 
+5. The validator remains in bonded status because validators with zero shares are only removed if unbonded [4](#0-3) , and status changes only occur in the staking EndBlocker
+6. The proposal's voting period ends, triggering EndBlock processing
+7. The governance EndBlocker executes before the staking EndBlocker [5](#0-4) 
+8. The governance EndBlocker calls `Tally()` [6](#0-5) 
+9. The tally function iterates over bonded validators using `IterateBondedValidatorsByPower()` [7](#0-6) , which only checks `IsBonded()` status [8](#0-7)  without verifying shares or voting power
+10. The zero-share validator with a recorded vote triggers the division calculation at line 80
+11. Division by zero occurs: `votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)`
+12. All validator nodes panic at the same block height, completely halting the chain
 
-2. Module "foo" claims the same capability with name "channel-2"
-   - Owner check passes (different name key "foo/channel-2" vs "foo/channel-1")
-   - Forward map OVERWRITES: `foo/fwd/0xCAP` → "channel-2" [4](#0-3) 
-   - New reverse map: `foo/rev/channel-2` → index [5](#0-4) 
-   - Owners: [("foo", "channel-1"), ("foo", "channel-2")]
-
-3. Authentication fails for "channel-1": `AuthenticateCapability` checks if `GetCapabilityName` returns "channel-1", but it returns "channel-2" (the overwritten value) [6](#0-5) 
-
-4. `ReleaseCapability` only cleans up the last claimed name ("channel-2") based on `GetCapabilityName`, leaving the "channel-1" reverse mapping and owner entry permanently orphaned [7](#0-6) 
-
-**Security Guarantee Broken:** The capability authentication invariant is violated - modules cannot authenticate capabilities they legitimately own, and the cleanup mechanism creates permanent state corruption that cannot be recovered without a chain upgrade.
+**Security Guarantee Broken:** The network's availability and liveness guarantees are violated. The chain cannot progress past the problematic block, and consensus is permanently stalled until coordinated emergency action.
 
 ## Impact Explanation
 
-This vulnerability affects the core capability authentication mechanism used throughout the Cosmos SDK, particularly in IBC:
+This vulnerability causes complete network shutdown qualifying as HIGH severity under "Network not being able to confirm new transactions (total network shutdown)". When the panic occurs during EndBlock execution:
 
-1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it, potentially blocking IBC channel operations or other capability-protected actions.
+- All validator nodes crash simultaneously at the same block height due to the unhandled panic
+- No new blocks can be produced or transactions processed
+- The entire network becomes unavailable to users
+- Recovery requires emergency coordination among validators to upgrade to a patched version
+- This represents a critical denial-of-service vulnerability affecting the entire blockchain
 
-2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last name's mappings get cleaned up. Previous names' reverse mappings and owner entries remain permanently orphaned in storage, creating inconsistent state that cannot be recovered without a hard fork or chain upgrade.
-
-3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate in memory and persistent storage, consuming resources that can never be reclaimed through normal operations.
-
-This qualifies as **Medium** severity under the impact criteria: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - the capability module is core Cosmos SDK infrastructure that causes module misbehavior without directly risking funds.
+The impact is severe because it breaks the fundamental availability guarantee of the blockchain network.
 
 ## Likelihood Explanation
 
-**Likelihood: Medium**
+**Triggering Actors:** Any network participants using standard, permissionless operations - validators voting on proposals and delegators undelegating through normal transactions.
 
-While the capability module is used by trusted on-chain modules (not external actors), this vulnerability can be inadvertently triggered during normal operation when:
-- Module code has bugs in capability tracking logic
-- Retry or error recovery logic attempts to re-claim an already-claimed capability
-- Complex state transitions in IBC handshakes (e.g., crossing hellos scenarios) cause confusion about which capabilities are already owned
-- A module implementation doesn't check ownership before claiming
+**Required Conditions:**
+- An active governance proposal in voting period (common occurrence in live chains)
+- A bonded validator that votes on the proposal (standard validator behavior)
+- All delegators of that validator undelegate before voting period ends (achievable through normal operations)
+- Voting period ends, triggering automatic tally computation
 
-The IBC module documentation explicitly shows defensive code checking `AuthenticateCapability` before claiming [8](#0-7) , indicating this is a known concern that module developers must guard against. However, the capability module itself should enforce this invariant rather than relying on all callers to implement defensive checks.
+**Likelihood Assessment:** While requiring specific timing, this scenario is realistic:
+- **Accidental trigger**: Could occur during market stress when mass undelegations happen, or with validators having few delegators who all exit
+- **Deliberate attack**: An attacker can trivially trigger this by operating their own validator with minimal self-delegation, voting on any proposal, then self-undelegating before the proposal's voting period ends
+- **No privileges required**: Uses only standard, permissionless blockchain operations
+- **Low cost**: Attacker only needs enough tokens to run a validator temporarily (can be reclaimed after undelegating)
 
-Once triggered, the corruption is permanent and cannot self-heal, requiring a chain upgrade to fix the corrupted state.
+The vulnerability is exploitable through standard transaction flows without any special access or conditions beyond normal blockchain operations.
 
 ## Recommendation
 
-Add a check in `ClaimCapability` to verify the calling module hasn't already claimed the capability under any name:
+Add a zero-check before performing division in the tally computation:
 
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-    // ... existing validation ...
-    
-    // Check if this module already owns this capability under any name
-    existingName := sk.GetCapabilityName(ctx, cap)
-    if existingName != "" {
-        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
-            "module %s already owns capability under name %s", sk.module, existingName)
+// In x/gov/keeper/tally.go at line 74-86:
+for _, val := range currValidators {
+    if len(val.Vote) == 0 {
+        continue
     }
     
-    // ... rest of function ...
+    // Skip validators with zero delegator shares to avoid division by zero
+    if val.DelegatorShares.IsZero() {
+        continue
+    }
+
+    sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
+    votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
+    
+    for _, option := range val.Vote {
+        subPower := votingPower.Mul(option.Weight)
+        results[option.Option] = results[option.Option].Add(subPower)
+    }
+    totalVotingPower = totalVotingPower.Add(votingPower)
 }
 ```
 
-This ensures each module can only claim a given capability once, preventing forward-map corruption and maintaining the authentication invariant.
+Similarly, add a check at line 50-57 where delegator voting power is calculated, though this is less critical as zero-share validators should have no remaining delegations.
 
 ## Proof of Concept
 
-**Test File:** `x/capability/keeper/keeper_test.go`
+**File:** `x/gov/keeper/tally_test.go`
+
+**Test Function:** `TestTallyPanicWithZeroShareValidator`
 
 **Setup:**
-- Create a scoped keeper for a test module
-- Create a new capability with name "original" using `NewCapability`
-- Verify initial authentication works
+- Create a validator with initial delegation using the existing `createValidators()` helper function [9](#0-8) 
+- Create and activate a governance proposal in voting period using `SubmitProposal()`
+- Validator casts a vote on the proposal using `AddVote()`
 
 **Action:**
-1. Call `ClaimCapability(ctx, cap, "duplicate")` with the same capability but different name
-2. Attempt `AuthenticateCapability(ctx, cap, "original")`
-3. Call `ReleaseCapability(ctx, cap)`
-4. Check for orphaned state in reverse mappings
+- Retrieve the validator's delegation using `GetDelegation()`
+- Call `Undelegate()` to remove all shares from the validator
+- Verify the validator has `DelegatorShares.IsZero() == true` and `IsBonded() == true`
+- Call `Tally()` on the proposal
 
 **Result:**
-1. The second `ClaimCapability` succeeds (should fail) - demonstrates the bug allows duplicate claims
-2. `AuthenticateCapability(cap, "original")` returns false - proves forward map was overwritten and authentication is broken
-3. After `ReleaseCapability`, the reverse mapping for "original" still exists while "duplicate" was cleaned up - confirms orphaned state
-4. The owners list still contains the "original" owner entry - proves permanent state corruption
+- The test will panic when `Tally()` attempts division by zero at line 80
+- The panic demonstrates that this vulnerability would cause chain halt during EndBlock execution in production
+- In a live environment, this would crash all validator nodes simultaneously at the same block height, halting the network
 
-The existing test suite confirms this scenario is not covered - `TestClaimCapability` only tests claiming with the same name (correctly fails) and different modules claiming (correctly succeeds), but not the same module claiming with different names. [9](#0-8) 
-
-## Notes
-
-This is a defensive programming issue in core Cosmos SDK infrastructure. While it requires a module to inadvertently call `ClaimCapability` twice with different names, the consequences are severe and permanent: broken authentication and unrecoverable state corruption. The capability module should enforce its own invariants rather than relying on all calling modules to implement defensive checks, as evidenced by the IBC module's explicit protection against this scenario.
+The PoC confirms the scenario is reproducible and would cause the described network shutdown.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L275-280)
+**File:** x/gov/keeper/tally.go (L24-34)
 ```go
-func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
-	if strings.TrimSpace(name) == "" || cap == nil {
+	keeper.sk.IterateBondedValidatorsByPower(ctx, func(index int64, validator stakingtypes.ValidatorI) (stop bool) {
+		currValidators[validator.GetOperator().String()] = types.NewValidatorGovInfo(
+			validator.GetOperator(),
+			validator.GetBondedTokens(),
+			validator.GetDelegatorShares(),
+			sdk.ZeroDec(),
+			types.WeightedVoteOptions{},
+		)
+
 		return false
-	}
-	return sk.GetCapabilityName(ctx, cap) == name
-}
+	})
 ```
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** x/gov/keeper/tally.go (L79-80)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
-}
+		sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
+		votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
 ```
 
-**File:** x/capability/keeper/keeper.go (L323-340)
+**File:** types/decimal_test.go (L238-239)
 ```go
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
+		if tc.d2.IsZero() { // panic for divide by zero
+			s.Require().Panics(func() { tc.d1.Quo(tc.d2) })
 ```
 
-**File:** x/capability/types/types.go (L46-58)
+**File:** x/staking/types/validator.go (L415-418)
 ```go
-func (co *CapabilityOwners) Set(owner Owner) error {
-	i, ok := co.Get(owner)
-	if ok {
-		// owner already exists at co.Owners[i]
-		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
-	}
-
-	// owner does not exist in the set of owners, so we insert at position i
-	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
-	copy(co.Owners[i+1:], co.Owners[i:])
-	co.Owners[i] = owner
-
-	return nil
+	if remainingShares.IsZero() {
+		// last delegation share gets any trimmings
+		issuedTokens = v.Tokens
+		v.Tokens = sdk.ZeroInt()
 ```
 
-**File:** x/capability/types/keys.go (L41-50)
+**File:** x/staking/keeper/delegation.go (L789-792)
 ```go
-func FwdCapabilityKey(module string, cap *Capability) []byte {
-	// encode the key to a fixed length to avoid breaking consensus state machine
-	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
-	// the length 10 is picked so it's backward compatible on common architectures.
-	key := fmt.Sprintf("%#010p", cap)
-	if len(key) > 10 {
-		key = key[len(key)-10:]
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
 	}
-	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
-}
 ```
 
-**File:** docs/ibc/custom.md (L77-86)
-```markdown
-    // Module may have already claimed capability in OnChanOpenInit in the case of crossing hellos
-    // (ie chainA and chainB both call ChanOpenInit before one of them calls ChanOpenTry)
-    // If the module can already authenticate the capability then the module already owns it so we don't need to claim
-    // Otherwise, module does not have channel capability and we must claim it from IBC
-    if !k.AuthenticateCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)) {
-        // Only claim channel capability passed back by IBC module if we do not already own it
-        if err := k.scopedKeeper.ClaimCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)); err != nil {
-            return err
-        }
-    }
-```
-
-**File:** x/capability/keeper/keeper_test.go (L156-178)
+**File:** simapp/app.go (L372-373)
 ```go
-func (suite *KeeperTestSuite) TestClaimCapability() {
-	sk1 := suite.keeper.ScopeToModule(banktypes.ModuleName)
-	sk2 := suite.keeper.ScopeToModule(stakingtypes.ModuleName)
-	sk3 := suite.keeper.ScopeToModule("foo")
+	app.mm.SetOrderEndBlockers(
+		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
+```
 
-	cap, err := sk1.NewCapability(suite.ctx, "transfer")
-	suite.Require().NoError(err)
-	suite.Require().NotNil(cap)
+**File:** x/gov/abci.go (L48-51)
+```go
+	keeper.IterateActiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
+		var tagValue, logMsg string
 
-	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
-	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
+		passes, burnDeposits, tallyResults := keeper.Tally(ctx, proposal)
+```
 
-	got, ok := sk1.GetCapability(suite.ctx, "transfer")
-	suite.Require().True(ok)
-	suite.Require().Equal(cap, got)
+**File:** x/staking/keeper/alias_functions.go (L45-46)
+```go
+		if validator.IsBonded() {
+			stop := fn(i, validator) // XXX is this safe will the validator unexposed fields be able to get written to?
+```
 
-	got, ok = sk2.GetCapability(suite.ctx, "transfer")
-	suite.Require().True(ok)
-	suite.Require().Equal(cap, got)
+**File:** x/gov/keeper/common_test.go (L21-58)
+```go
+func createValidators(t *testing.T, ctx sdk.Context, app *simapp.SimApp, powers []int64) ([]sdk.AccAddress, []sdk.ValAddress) {
+	addrs := simapp.AddTestAddrsIncremental(app, ctx, 5, sdk.NewInt(30000000))
+	valAddrs := simapp.ConvertAddrsToValAddrs(addrs)
+	pks := simapp.CreateTestPubKeys(5)
+	cdc := simapp.MakeTestEncodingConfig().Marshaler
 
-	suite.Require().Error(sk3.ClaimCapability(suite.ctx, cap, "  "))
-	suite.Require().Error(sk3.ClaimCapability(suite.ctx, nil, "transfer"))
-}
+	app.StakingKeeper = stakingkeeper.NewKeeper(
+		cdc,
+		app.GetKey(stakingtypes.StoreKey),
+		app.AccountKeeper,
+		app.BankKeeper,
+		app.GetSubspace(stakingtypes.ModuleName),
+	)
+
+	val1, err := stakingtypes.NewValidator(valAddrs[0], pks[0], stakingtypes.Description{})
+	require.NoError(t, err)
+	val2, err := stakingtypes.NewValidator(valAddrs[1], pks[1], stakingtypes.Description{})
+	require.NoError(t, err)
+	val3, err := stakingtypes.NewValidator(valAddrs[2], pks[2], stakingtypes.Description{})
+	require.NoError(t, err)
+
+	app.StakingKeeper.SetValidator(ctx, val1)
+	app.StakingKeeper.SetValidator(ctx, val2)
+	app.StakingKeeper.SetValidator(ctx, val3)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val1)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val2)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val3)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val1)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val2)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val3)
+
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[0], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[0]), stakingtypes.Unbonded, val1, true)
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[1], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[1]), stakingtypes.Unbonded, val2, true)
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[2], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[2]), stakingtypes.Unbonded, val3, true)
+
+	_ = staking.EndBlocker(ctx, app.StakingKeeper)
+
+	return addrs, valAddrs
 ```

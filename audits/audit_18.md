@@ -1,125 +1,275 @@
 # Audit Report
 
 ## Title
-Governance Module Allows Zero-Deposit Proposal Spam Enabling Resource Exhaustion Attack
+Deferred Fee Cache Never Flushed Leading to Permanent Loss of Transaction Fees
 
 ## Summary
-The governance module's `ValidateBasic()` function fails to enforce the specification requirement that proposals must have non-zero initial deposits, allowing attackers to spam the network with unlimited proposals at minimal cost (only gas fees), leading to resource exhaustion that can exceed the 30% resource consumption threshold.
+The bank module's deferred cache mechanism collects transaction fees but fails to flush them to module accounts because the bank module lacks an EndBlock implementation. All transaction fees are permanently lost as they remain trapped in the deferred cache, never reaching the fee collector account for validator distribution.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
 **Location:**
-- Validation logic: [1](#0-0) 
-- Proposal submission handler: [2](#0-1) 
-- Deposit processing: [3](#0-2) 
-- EndBlocker cleanup: [4](#0-3) 
+- Primary issue: [1](#0-0) 
+- Fee deduction entry point: [2](#0-1) 
+- Cache storage: [3](#0-2) 
+- Unreachable flush function: [4](#0-3) 
 
 **Intended Logic:**
-According to the governance specification, proposals should require non-zero initial deposits to prevent spam. The specification explicitly states at [5](#0-4)  that if `initialDeposit.Atoms <= 0`, the transaction should throw an error.
+The code comment explicitly documents the intended behavior: [5](#0-4) 
+
+The intended flow:
+1. Transaction fees → `DeferredSendCoinsFromAccountToModule` deducts from user and stores in cache
+2. EndBlock → bank module calls `WriteDeferredBalances` to flush cache to module accounts
+3. BeginBlock → distribution module retrieves and distributes fees to validators
 
 **Actual Logic:**
-The implementation's `ValidateBasic()` function only checks if coins are valid (`IsValid()`) and not negative (`IsAnyNegative()`), but does NOT reject zero or empty deposits. The underlying `Coins.Validate()` function explicitly allows empty coin collections [6](#0-5) , returning nil (success) for zero-length arrays.
-
-Additionally, no rate limiting mechanism exists in the ante handler chain [7](#0-6) .
-
-When `AddDeposit()` is called with empty coins, the `SendCoinsFromAccountToModule()` operation succeeds as a no-op. The for loop in `SubUnlockedCoins` [8](#0-7)  doesn't execute with empty coins, allowing the proposal to be created with zero total deposit.
-
-Critically, existing tests explicitly verify that zero deposits are accepted [9](#0-8) , confirming this is intentional implementation behavior that contradicts the specification.
+1. Ante handler processes fees via `DeferredSendCoinsFromAccountToModule` [2](#0-1) 
+2. User balance immediately reduced, fees stored in deferred cache [6](#0-5) 
+3. Module manager skips bank module during EndBlock because it doesn't implement the `EndBlockAppModule` interface [7](#0-6) 
+4. Fees persist in memory store across blocks [8](#0-7) 
+5. Distribution module queries actual balances only, excluding deferred cache [9](#0-8)  and [10](#0-9) 
+6. Zero fees distributed to validators
 
 **Exploitation Path:**
-1. Attacker submits `MsgSubmitProposal` transactions with `InitialDeposit: sdk.Coins{}` (empty coins)
-2. `ValidateBasic()` passes since empty coins are considered valid
-3. Proposal is created via `SubmitProposalWithExpedite()` and stored in state
-4. Proposals remain in inactive queue for `MaxDepositPeriod` (default 2 days) [10](#0-9) 
-5. During this period, proposals consume storage space, memory, and processing time
-6. Attacker can sustain attack continuously, submitting thousands of proposals
-7. After deposit period expires, EndBlocker must iterate and cleanup all expired proposals [11](#0-10) 
+No attacker action required - occurs automatically during normal operation:
+1. Any user submits a transaction with fees
+2. Ante handler deducts fees from user account
+3. Fees stored in deferred cache, user balance reduced
+4. EndBlock executes but bank module has no EndBlock method, so module manager skips it
+5. Distribution BeginBlock queries fee collector balance: returns 0
+6. Fees permanently inaccessible in deferred cache, never flushed to actual balances
 
 **Security Guarantee Broken:**
-The governance system's denial-of-service protection invariant is violated. The specification's deposit requirement is meant to economically disincentivize spam, but the implementation allows bypassing this entirely, enabling resource exhaustion attacks.
+Fundamental accounting invariant violated: `total_supply = sum(all_account_balances)`. User balances decrease but no account is credited, causing systemic fund loss equal to all accumulated transaction fees.
 
 ## Impact Explanation
 
-An attacker can execute this attack at minimal cost (only gas fees, no deposits required) to cause significant resource consumption:
+**Direct Loss of Funds:** Every transaction fee is deducted from user accounts but never credited to the fee collector module account. The fees remain trapped in the deferred cache, which is:
+- Not included in balance queries used by distribution module
+- Never flushed to actual balances (no EndBlock implementation to call `WriteDeferredBalances`)
+- Permanently inaccessible for distribution to validators
 
-1. **State Bloat**: Each proposal adds persistent storage overhead across all nodes
-2. **EndBlocker Processing**: Must process multiple expired proposals per block (versus normally 0-1), representing a 10-35x increase in governance module workload
-3. **Query Performance**: Functions like `GetProposals()` [12](#0-11)  must iterate through all proposals, causing severe degradation with large numbers
-4. **Memory Consumption**: Loading proposals significantly increases RAM usage across all nodes
+**Cascading Effects:**
+- **Broken validator economics**: Validators receive no fee rewards, fundamentally undermining network security incentives
+- **Accounting corruption**: Total supply tracking becomes incorrect as fees vanish from observable circulation
+- **Cumulative damage**: Problem compounds with every transaction across every block, with losses growing continuously
 
-The combined CPU, memory, I/O, and query processing overhead can exceed the 30% resource consumption threshold. If the governance EndBlocker normally represents 1-2% of total node processing, a 10-35x increase brings it to 10-70%, translating to a significant increase in total node resource consumption that meets or exceeds the 30% threshold.
+This qualifies as **direct loss of funds** and **permanent freezing of funds requiring hard fork to fix** per the impact criteria.
 
 ## Likelihood Explanation
 
-**Likelihood: HIGH**
+**Probability:** 100% - Occurs automatically on every transaction that includes fees
 
-- **Who can execute**: Any user with funds for transaction gas fees
-- **Prerequisites**: None beyond basic transaction submission capability
-- **Cost**: Minimal - only standard transaction gas fees with no deposit required
-- **Detectability**: No detection mechanisms exist in the codebase
-- **Preventability**: No rate limiting or minimum deposit enforcement
-- **Sustainability**: Attack can be maintained continuously as old proposals expire and new ones are submitted
+**Who Can Trigger:** Any network participant submitting transactions (normal usage, not an attack)
 
-The attack is trivial to execute through standard transaction submission and requires no special privileges or complex setup.
+**Conditions Required:** None - this is the default behavior during normal network operation with standard transactions
+
+**Evidence from Tests:** Multiple test files explicitly demonstrate that `WriteDeferredBalances` must be manually called after using `DeferredSendCoinsFromAccountToModule`: [11](#0-10) , [12](#0-11) , and [13](#0-12) 
+
+The test in `fee_test.go` explicitly demonstrates:
+- Fee collector balance remains 0 after ante handler processes fees
+- Manual call to `WriteDeferredBalances` is required
+- Only after manual flush does the fee collector balance increase by the expected fee amount
 
 ## Recommendation
 
-Implement multiple protective measures:
+**Immediate Fix:**
+Implement an EndBlock method in the bank module's `AppModule` struct to flush the deferred cache. Add to `x/bank/module.go`:
 
-1. **Enforce Non-Zero Initial Deposit**: Add validation to reject zero/empty deposits in `ValidateBasic()`:
 ```go
-if m.InitialDeposit.IsZero() || m.InitialDeposit.Empty() {
-    return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, "initial deposit cannot be zero or empty")
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    am.keeper.WriteDeferredBalances(ctx)
+    return []abci.ValidatorUpdate{}
 }
 ```
 
-2. **Implement Rate Limiting**: Add an ante decorator to limit proposal submissions per address per time period
+This will:
+1. Satisfy the `EndBlockAppModule` interface [14](#0-13) 
+2. Ensure module manager calls bank's EndBlock instead of skipping it
+3. Flush deferred fees to module accounts before distribution BeginBlock executes
 
-3. **Increase Gas Cost**: Set higher gas consumption for proposal submission to make spam attacks economically infeasible
+**Additional Measures:**
+- Add invariant checks to detect balance discrepancies between deferred cache and actual balances
+- The bank module is already listed in `OrderEndBlockers` [15](#0-14)  but was being skipped - this fix activates that ordering
+- Requires coordinated network upgrade to deploy the fix
 
 ## Proof of Concept
 
-The vulnerability is proven by the existing test suite which explicitly validates that zero-deposit proposals are accepted. In the test file, `coinsZero` (defined as `sdk.NewCoins()`) is used with `expectPass: true`, confirming that proposals with empty deposits pass validation and are stored in state.
+The existing test suite provides proof of this vulnerability:
 
-**Reproduction steps:**
-1. Submit a `MsgSubmitProposal` with `InitialDeposit: sdk.Coins{}`
-2. Observe that `ValidateBasic()` passes
-3. Verify proposal is created and stored in state with `TotalDeposit.IsZero() == true`
-4. Proposal remains in inactive queue consuming resources
-5. After deposit period, EndBlocker must process and cleanup the proposal
+**Setup:**
+- Initialize user account with balance
+- Initialize fee collector module account
+- Standard blockchain configuration
 
-This can be scaled to spam thousands of proposals, each consuming storage and processing resources, while bypassing the intended deposit-based spam protection mechanism.
+**Action:**
+1. Call `DeferredSendCoinsFromAccountToModule` (as ante handler does during fee processing)
+2. Do NOT call `WriteDeferredBalances` (mimicking production behavior where bank module has no EndBlock)
+
+**Result:**
+1. User balance decreased by fee amount ✓
+2. Fee collector actual balance remains 0 ✓ (fees stuck in deferred cache)
+3. `GetAllBalances(feeCollector)` returns 0 ✓ (bypasses deferred cache)
+4. Distribution module sees 0 balance to distribute ✓
+5. Accounting invariant broken: fees permanently lost ✓
+
+The test evidence in [12](#0-11)  clearly demonstrates that without the manual call to `WriteDeferredBalances`, fees remain in the deferred cache and never reach the fee collector's actual balance, confirming the vulnerability in production code where this manual call does not exist.
 
 ## Notes
 
-This vulnerability exists due to a critical gap between the specification and implementation. The specification explicitly requires non-zero deposits to prevent spam, but the implementation's validation logic inadvertently allows empty coin collections. The existing test suite confirms this is intentional implementation behavior, making it a severe specification violation. The absence of rate limiting compounds this issue, making sustained attacks economically viable at scale.
+This vulnerability is particularly critical because:
+1. The code documentation explicitly states the intended behavior that was never implemented
+2. The deferred cache infrastructure exists and is actively used for fee collection
+3. The critical flush operation exists but is unreachable due to missing EndBlock
+4. Memory stores persist across blocks, so fees accumulate indefinitely in an inaccessible state
+5. This affects the core economic mechanism of the blockchain (validator fee rewards)
+6. Every transaction with fees triggers this issue - 100% reproduction rate with zero special conditions
 
 ### Citations
 
-**File:** x/gov/types/msgs.go (L90-113)
+**File:** x/bank/module.go (L107-210)
 ```go
-func (m MsgSubmitProposal) ValidateBasic() error {
-	if m.Proposer == "" {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, m.Proposer)
-	}
-	if !m.InitialDeposit.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
-	}
-	if m.InitialDeposit.IsAnyNegative() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
-	}
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
 
-	content := m.GetContent()
-	if content == nil {
-		return sdkerrors.Wrap(ErrInvalidProposalContent, "missing content")
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
+}
+
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
 	}
-	if !IsValidProposalType(content.ProposalType()) {
-		return sdkerrors.Wrap(ErrInvalidProposalType, content.ProposalType())
+}
+
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
+
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
+}
+```
+
+**File:** x/auth/ante/fee.go (L208-208)
+```go
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+```
+
+**File:** x/bank/keeper/keeper.go (L406-406)
+```go
+// In the EndBlocker, it will then perform one deposit for each module account.
+```
+
+**File:** x/bank/keeper/keeper.go (L408-432)
+```go
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
-	if err := content.ValidateBasic(); err != nil {
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
+	}
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
 		return err
 	}
 
@@ -127,229 +277,133 @@ func (m MsgSubmitProposal) ValidateBasic() error {
 }
 ```
 
-**File:** x/gov/keeper/msg_server.go (L27-39)
+**File:** x/bank/keeper/keeper.go (L434-483)
 ```go
-func (k msgServer) SubmitProposal(goCtx context.Context, msg *types.MsgSubmitProposal) (*types.MsgSubmitProposalResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	proposal, err := k.Keeper.SubmitProposalWithExpedite(ctx, msg.GetContent(), msg.IsExpedited)
-	if err != nil {
-		return nil, err
+// WriteDeferredDepositsToModuleAccounts Iterates on all the deferred deposits and deposit them into the store
+func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
 
-	defer telemetry.IncrCounter(1, types.ModuleName, "proposal")
+	// maps between bech32 stringified module account address and balance
+	moduleAddrBalanceMap := make(map[string]sdk.Coins)
+	// slice of modules to be sorted for consistent write order later
+	moduleList := []string{}
 
-	votingStarted, err := k.Keeper.AddDeposit(ctx, proposal.ProposalId, msg.GetProposer(), msg.GetInitialDeposit())
-	if err != nil {
-		return nil, err
-	}
-```
-
-**File:** x/gov/keeper/deposit.go (L108-162)
-```go
-func (keeper Keeper) AddDeposit(ctx sdk.Context, proposalID uint64, depositorAddr sdk.AccAddress, depositAmount sdk.Coins) (bool, error) {
-	// Checks to see if proposal exists
-	proposal, ok := keeper.GetProposal(ctx, proposalID)
-	if !ok {
-		return false, sdkerrors.Wrapf(types.ErrUnknownProposal, "%d", proposalID)
-	}
-
-	// Check if proposal is still depositable
-	if (proposal.Status != types.StatusDepositPeriod) && (proposal.Status != types.StatusVotingPeriod) {
-		return false, sdkerrors.Wrapf(types.ErrInactiveProposal, "%d", proposalID)
-	}
-
-	// update the governance module's account coins pool
-	err := keeper.bankKeeper.SendCoinsFromAccountToModule(ctx, depositorAddr, types.ModuleName, depositAmount)
-	if err != nil {
-		return false, err
-	}
-
-	// Update proposal
-	proposal.TotalDeposit = proposal.TotalDeposit.Add(depositAmount...)
-	keeper.SetProposal(ctx, proposal)
-
-	// Check if deposit has provided sufficient total funds to transition the proposal into the voting period
-	activatedVotingPeriod := false
-
-	if proposal.Status == types.StatusDepositPeriod && proposal.TotalDeposit.IsAllGTE(keeper.GetDepositParams(ctx).GetMinimumDeposit(proposal.IsExpedited)) {
-		keeper.ActivateVotingPeriod(ctx, proposal)
-
-		activatedVotingPeriod = true
-	}
-
-	// Add or update deposit object
-	deposit, found := keeper.GetDeposit(ctx, proposalID, depositorAddr)
-
-	if found {
-		deposit.Amount = deposit.Amount.Add(depositAmount...)
-	} else {
-		deposit = types.NewDeposit(proposalID, depositorAddr, depositAmount)
-	}
-
-	// called when deposit has been added to a proposal, however the proposal may not be active
-	keeper.AfterProposalDeposit(ctx, proposalID, depositorAddr)
-
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			types.EventTypeProposalDeposit,
-			sdk.NewAttribute(sdk.AttributeKeyAmount, depositAmount.String()),
-			sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposalID)),
-		),
-	)
-
-	keeper.SetDeposit(ctx, deposit)
-
-	return activatedVotingPeriod, nil
-}
-```
-
-**File:** x/gov/abci.go (L19-45)
-```go
-	// delete inactive proposal from store and its deposits
-	keeper.IterateInactiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-		keeper.DeleteProposal(ctx, proposal.ProposalId)
-		keeper.DeleteDeposits(ctx, proposal.ProposalId)
-
-		// called when proposal become inactive
-		keeper.AfterProposalFailedMinDeposit(ctx, proposal.ProposalId)
-
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeInactiveProposal,
-				sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposal.ProposalId)),
-				sdk.NewAttribute(types.AttributeKeyProposalResult, types.AttributeValueProposalDropped),
-			),
-		)
-
-		logger.Info(
-			"proposal did not meet minimum deposit; deleted",
-			"proposal", proposal.ProposalId,
-			"title", proposal.GetTitle(),
-			"min_deposit", keeper.GetDepositParams(ctx).MinDeposit.String(),
-			"min_expedited_deposit", keeper.GetDepositParams(ctx).MinExpeditedDeposit.String(),
-			"total_deposit", proposal.TotalDeposit.String(),
-		)
-
+	// iterate over deferred cache and accumulate totals per module
+	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
+		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
+		if !ok {
+			// add to list of modules
+			moduleList = append(moduleList, moduleAddr.String())
+			// set the map value
+			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
+			return false
+		}
+		// add to currCoins
+		newCoins := currCoins.Add(amount)
+		// update map
+		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
 		return false
 	})
-```
+	// sort module list
+	sort.Strings(moduleList)
 
-**File:** x/gov/spec/03_messages.md (L40-43)
-```markdown
-  initialDeposit = txGovSubmitProposal.InitialDeposit
-  if (initialDeposit.Atoms <= 0) OR (sender.AtomBalance < initialDeposit.Atoms)
-    // InitialDeposit is negative or null OR sender has insufficient funds
-    throw
-```
-
-**File:** types/coin.go (L217-220)
-```go
-func (coins Coins) Validate() error {
-	switch len(coins) {
-	case 0:
-		return nil
-```
-
-**File:** x/auth/ante/ante.go (L47-61)
-```go
-	anteDecorators := []sdk.AnteFullDecorator{
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
-		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
-		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-		NewIncrementSequenceDecorator(options.AccountKeeper),
-	}
-	anteHandler, anteDepGenerator := sdk.ChainAnteDecorators(anteDecorators...)
-```
-
-**File:** x/bank/keeper/send.go (L209-246)
-```go
-func (k BaseSendKeeper) SubUnlockedCoins(ctx sdk.Context, addr sdk.AccAddress, amt sdk.Coins, checkNeg bool) error {
-	if !amt.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
-	}
-
-	lockedCoins := k.LockedCoins(ctx, addr)
-
-	for _, coin := range amt {
-		balance := k.GetBalance(ctx, addr, coin.Denom)
-		if checkNeg {
-			locked := sdk.NewCoin(coin.Denom, lockedCoins.AmountOf(coin.Denom))
-			spendable := balance.Sub(locked)
-
-			_, hasNeg := sdk.Coins{spendable}.SafeSub(sdk.Coins{coin})
-			if hasNeg {
-				return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, "%s is smaller than %s", spendable, coin)
-			}
+	// iterate through module list and add the balance to module bank balances in sorted order
+	for _, moduleBech32Addr := range moduleList {
+		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
+		if !ok {
+			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
+			ctx.Logger().Error(err.Error())
+			panic(err)
 		}
-
-		var newBalance sdk.Coin
-		if checkNeg {
-			newBalance = balance.Sub(coin)
-		} else {
-			newBalance = balance.SubUnsafe(coin)
-		}
-
-		err := k.setBalance(ctx, addr, newBalance, checkNeg)
+		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
 		if err != nil {
-			return err
+			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
+			panic(err)
 		}
 	}
 
-	// emit coin spent event
-	ctx.EventManager().EmitEvent(
-		types.NewCoinSpentEvent(addr, amt),
-	)
-	return nil
+	// clear deferred cache
+	k.deferredCache.Clear(ctx)
+	return ctx.EventManager().ABCIEvents()
 }
 ```
 
-**File:** x/gov/types/msgs_test.go (L39-39)
+**File:** types/module/module.go (L226-229)
 ```go
-		{"Test Proposal", "the purpose of this proposal is to test", ProposalTypeText, addrs[0], coinsZero, true},
-```
-
-**File:** x/gov/types/params.go (L14-16)
-```go
-const (
-	DefaultPeriod          time.Duration = time.Hour * 24 * 2 // 2 days
-	DefaultExpeditedPeriod time.Duration = time.Hour * 24     // 1 day
-```
-
-**File:** x/gov/keeper/keeper.go (L152-167)
-```go
-func (keeper Keeper) IterateInactiveProposalsQueue(ctx sdk.Context, endTime time.Time, cb func(proposal types.Proposal) (stop bool)) {
-	iterator := keeper.InactiveProposalQueueIterator(ctx, endTime)
-
-	defer iterator.Close()
-	for ; iterator.Valid(); iterator.Next() {
-		proposalID, _ := types.SplitInactiveProposalQueueKey(iterator.Key())
-		proposal, found := keeper.GetProposal(ctx, proposalID)
-		if !found {
-			panic(fmt.Sprintf("proposal %d does not exist", proposalID))
-		}
-
-		if cb(proposal) {
-			break
-		}
-	}
+type EndBlockAppModule interface {
+	AppModule
+	EndBlock(sdk.Context, abci.RequestEndBlock) []abci.ValidatorUpdate
 }
 ```
 
-**File:** x/gov/keeper/proposal.go (L129-135)
+**File:** types/module/module.go (L647-650)
 ```go
-func (keeper Keeper) GetProposals(ctx sdk.Context) (proposals types.Proposals) {
-	keeper.IterateProposals(ctx, func(proposal types.Proposal) bool {
-		proposals = append(proposals, proposal)
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
+			continue
+		}
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** x/bank/keeper/view.go (L64-72)
+```go
+func (k BaseViewKeeper) GetAllBalances(ctx sdk.Context, addr sdk.AccAddress) sdk.Coins {
+	balances := sdk.NewCoins()
+	k.IterateAccountBalances(ctx, addr, func(balance sdk.Coin) bool {
+		balances = append(balances, balance)
 		return false
 	})
-	return
+
+	return balances.Sort()
 }
+```
+
+**File:** x/distribution/keeper/allocation.go (L26-26)
+```go
+	feesCollectedInt := k.bankKeeper.GetAllBalances(ctx, feeCollector.GetAddress())
+```
+
+**File:** x/bank/keeper/keeper_test.go (L679-679)
+```go
+	app.BankKeeper.WriteDeferredBalances(ctx)
+```
+
+**File:** x/auth/ante/fee_test.go (L176-193)
+```go
+	resultFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+	suite.Assert().Equal(
+		expectedFeeCollectorBalance,
+		resultFeeCollectorBalance,
+	)
+
+	// Fee Collector actual account balance deposit coins into the fee collector account
+	suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
+
+	depositFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+
+	expectedAtomFee := feeAmount.AmountOf("usei")
+
+	suite.Assert().Equal(
+		// Called antehandler twice, expect fees to be deducted twice
+		expectedFeeCollectorBalance.Add(sdk.NewCoin("usei", expectedAtomFee)).Add(sdk.NewCoin("usei", expectedAtomFee)),
+		depositFeeCollectorBalance,
+	)
+```
+
+**File:** x/bank/keeper/deferred_cache_test.go (L66-66)
+```go
+	app.BankKeeper.WriteDeferredBalances(ctx)
+```
+
+**File:** simapp/app.go (L374-374)
+```go
+		capabilitytypes.ModuleName, authtypes.ModuleName, banktypes.ModuleName, distrtypes.ModuleName,
 ```

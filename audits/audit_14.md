@@ -1,235 +1,258 @@
-# Audit Report
+# Audit Report Validation
 
-## Title
-Network Halt Due to Insufficient Validation of Upgrade Plan Names Allowing Whitespace
+After thorough analysis of the codebase and tracing the execution flow, I can confirm this is a **valid vulnerability**.
 
-## Summary
-The upgrade module's `ValidateBasic()` function only validates that plan names are non-empty but does not check for whitespace-only names or names with leading/trailing whitespace. This allows governance proposals to schedule upgrades with malformed names that cause a complete network halt when exact string matching fails during handler lookup at the upgrade height.
+## Audit Report
 
-## Impact
+### Title
+Scheduler Commits State Changes from Failed Transactions Due to Missing Response Code Validation
+
+### Summary
+The concurrent transaction scheduler in `tasks/scheduler.go` validates transactions only for Optimistic Concurrency Control (OCC) conflicts but fails to check transaction response codes. This allows transactions that fail access operation validation to have their state changes permanently committed to the blockchain, violating the fundamental invariant that failed transactions should not modify state. [1](#0-0) 
+
+### Impact
 Medium
 
-## Finding Description
+### Finding Description
 
 **Location:**
-- Validation: [1](#0-0) 
-- Handler registration: [2](#0-1) 
-- Handler lookup: [3](#0-2) 
-- Panic trigger: [4](#0-3) 
-- Panic function: [5](#0-4) 
-- Governance validation: [6](#0-5) 
-- Scheduling validation: [7](#0-6) 
+- Primary vulnerability: `tasks/scheduler.go`, `shouldRerun` method (lines 354-390)
+- Unconditional write: `tasks/scheduler.go`, line 576
+- Final commitment: `tasks/scheduler.go`, line 345
 
-**Intended Logic:**
-The validation should ensure upgrade plan names are valid, non-empty identifiers that can reliably match registered upgrade handlers. When an upgrade height is reached, the system should successfully match the scheduled plan name with a registered handler and execute the upgrade without network disruption.
+**Intended logic:**
+Only transactions that complete successfully should have their state changes committed to the blockchain. In normal sequential execution, when a transaction fails validation and returns an error, the cached state changes are not written to the parent store. [2](#0-1) 
 
-**Actual Logic:**
-The current validation only checks `len(p.Name) == 0`, which rejects empty strings but accepts whitespace-only names (e.g., `" "`, `"  "`) and names with leading/trailing whitespace (e.g., `" v2.0"`, `"v2.0 "`). The handler lookup in `HasHandler()` performs exact string matching using Go map lookup without any trimming or normalization. When a mismatch occurs between the scheduled plan name and registered handler name, the system triggers a panic.
+**Actual logic:**
+In the OCC concurrent execution path:
+1. Transactions execute and can fail access operation validation, returning an error [3](#0-2) 
+2. Errors are converted to ResponseDeliverTx with non-zero code [4](#0-3) 
+3. `WriteToMultiVersionStore()` is called unconditionally after execution, persisting all writes regardless of response code [5](#0-4) 
+4. The `shouldRerun` method only checks for OCC conflicts via `findConflicts` and never examines `task.Response.Code`
+5. If no OCC conflicts are detected, the transaction is marked as "validated"
+6. `WriteLatestToStore()` commits all "validated" transactions' writes to the blockchain state [6](#0-5) 
 
-**Exploitation Path:**
-1. A governance proposal is submitted with an upgrade plan containing a name with whitespace (e.g., `" v2.0"` with leading space or invisible Unicode whitespace)
-2. The proposal passes `ValidateBasic()` validation because `len(" v2.0") = 5 ≠ 0`
-3. The proposal goes through governance voting and passes (whitespace may be invisible in UIs or go unnoticed)
-4. The upgrade is scheduled via `ScheduleUpgrade()` which calls the insufficient `ValidateBasic()`
-5. Developers register an upgrade handler using the trimmed name `"v2.0"` following standard naming conventions
-6. At the upgrade height, `BeginBlocker()` in `abci.go` checks if a handler exists for `" v2.0"` (with space)
-7. The `HasHandler()` lookup fails because `" v2.0" != "v2.0"` (exact string match in map)
-8. All validator nodes execute `panicUpgradeNeeded()` and halt simultaneously
-9. The entire network stops producing blocks, requiring coordinated manual intervention
+**Exploitation path:**
+1. User submits transaction T1 with incorrect access operation declarations (due to bugs in mappings or malicious WASM contracts)
+2. T1 executes and makes state modifications via VersionIndexedStore
+3. Access operation validation fails during execution, returning error
+4. `WriteToMultiVersionStore()` persists T1's writes to multiversion store unconditionally
+5. Scheduler's `shouldRerun(T1)` checks only for OCC conflicts, not response codes
+6. If no OCC conflicts detected, T1 marked as "validated"
+7. `WriteLatestToStore()` commits T1's writes to blockchain state despite validation failure
+8. Subsequent transactions read corrupted state
 
-**Security Guarantee Broken:**
-The network availability guarantee is violated. The system enters a complete denial-of-service state where no transactions can be processed, breaking the fundamental blockchain property of liveness.
+**Security guarantee broken:**
+The fundamental blockchain invariant stated in the code that "State only gets persisted if all messages are valid and get executed successfully" is violated. [7](#0-6) 
 
-## Impact Explanation
+### Impact Explanation
 
-**Affected Process:** Network consensus and block production
+This vulnerability results in permanent state corruption with cascading effects:
 
-**Consequences:**
-When all validator nodes panic at the same block height due to handler name mismatch, the blockchain cannot produce new blocks, resulting in:
-- Complete halt of transaction processing
-- No new blocks produced across the entire network
-- Requires coordinated manual intervention by all validators to recover (either skip the upgrade height via node restart with skip flags, or deploy binaries with matching handler names including whitespace)
-- Potential loss of user confidence and economic damage from network downtime
-- Service disruption for all applications and users depending on the chain
+1. **State Corruption**: Transactions that fail access operation validation have writes permanently committed despite returning error codes
+2. **Cascading Effects**: Valid transactions reading corrupted state execute with incorrect data
+3. **Smart Contract Integrity**: Smart contracts relying on accurate state produce incorrect results
+4. **Detection Difficulty**: Failed transactions appear "validated" by scheduler, making corruption subtle
 
-This directly matches the explicitly listed impact: "Network not being able to confirm new transactions (total network shutdown)" which is classified as Medium severity.
+This matches the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
-## Likelihood Explanation
+### Likelihood Explanation
 
-**Who Can Trigger:**
-Any participant who can submit governance proposals (requires minimum deposit amount) and achieve voting approval through the democratic governance process. This is not a privileged action - governance is designed to be accessible to the community.
+**Who can trigger:**
+Any user submitting transactions when:
+- Access operation dependency mappings contain bugs
+- WASM contracts have incorrect dependency declarations
+- Dynamic dependency generator has bugs
 
-**Conditions Required:**
-- A governance proposal with a plan name containing whitespace must be submitted
-- The proposal must pass the voting threshold (requires community approval)
-- Developers must register handlers with different names (typically trimmed versions, which is standard practice)
-- The blockchain must reach the scheduled upgrade height
+**Conditions required:**
+- Transaction must have incomplete/incorrect access operation declarations
+- Transaction must fail `ValidateAccessOperations` during execution [8](#0-7) 
+- The multiversion store OCC validation must not detect a conflict
+- Concurrent transaction execution must be enabled (OCC mode)
 
-**Likelihood:**
-While governance upgrades happen infrequently, the risk of whitespace introduction is realistic and non-trivial:
-- **Invisible whitespace**: Zero-width spaces (U+200B), non-breaking spaces (U+00A0), and other Unicode whitespace characters are invisible in most UIs but would cause the exact string match to fail
-- **Copy-paste artifacts**: Copying upgrade names from Slack, Discord, documentation, or terminal output frequently introduces leading/trailing whitespace unintentionally
-- **UI limitations**: Many blockchain explorers and governance UIs trim or don't clearly display leading/trailing whitespace, making it difficult for voters and developers to notice
-- **Standard developer practices**: Developers follow clean naming conventions without whitespace and may not perform byte-level verification of on-chain plan names
-- **No validation warnings**: The system provides no warning that whitespace will cause critical issues
+**Frequency:**
+Can occur during normal block production if access operation mappings have bugs. More likely with complex WASM contracts where dependency tracking is difficult. Given the complexity of maintaining accurate access operation declarations, bugs are reasonably probable.
 
-Once triggered (either accidentally or maliciously), the result is deterministic: complete network halt requiring emergency coordination.
+### Recommendation
 
-## Recommendation
-
-Add comprehensive whitespace validation to the `ValidateBasic()` function in `x/upgrade/types/plan.go`:
+Modify the `shouldRerun` method in `tasks/scheduler.go` to check transaction response code before marking as validated:
 
 ```go
-func (p Plan) ValidateBasic() error {
-    if !p.Time.IsZero() {
-        return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
-    }
-    if p.UpgradedClientState != nil {
-        return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
-    }
-    
-    // Trim whitespace and validate
-    trimmedName := strings.TrimSpace(p.Name)
-    if len(trimmedName) == 0 {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty or contain only whitespace")
+case statusExecuted, statusValidated:
+    // Check if response has an error code
+    if task.Response != nil && task.Response.Code != 0 {
+        s.invalidateTask(task)
+        task.Reset()
+        task.Increment()
+        return true
     }
     
-    // Reject names with leading/trailing whitespace
-    if trimmedName != p.Name {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot have leading or trailing whitespace")
+    // Existing OCC conflict check
+    if valid, conflicts := s.findConflicts(task); !valid {
+        // ... existing logic
     }
-    
-    if p.Height <= 0 {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
-    }
+```
 
-    return nil
+Alternatively, modify `executeTask` to conditionally call `WriteToMultiVersionStore()` only for successful transactions:
+
+```go
+if resp.Code == 0 {
+    for _, v := range task.VersionStores {
+        v.WriteToMultiVersionStore()
+    }
+} else {
+    for _, v := range task.VersionStores {
+        v.WriteEstimatesToMultiVersionStore()
+    }
 }
 ```
 
-This ensures plan names are validated for both content (non-empty after trimming) and format (no leading/trailing whitespace), preventing the network halt scenario.
+### Proof of Concept
 
-## Proof of Concept
-
-**File:** `x/upgrade/abci_test.go`
+The vulnerability is demonstrable through code analysis:
 
 **Setup:**
-1. Use the existing `setupTest()` helper function to initialize a test environment with the upgrade keeper
-2. Initialize the test suite with appropriate block height and empty skip map
+- Normal execution path: Cache writes only committed if `err == nil` [2](#0-1) 
 
 **Action:**
-```go
-func TestWhitespaceNameCausesNetworkHalt(t *testing.T) {
-    // Setup test environment
-    s := setupTest(10, map[int64]bool{})
-    
-    // Test 1: Whitespace-only name passes validation incorrectly
-    planWithSpaces := types.Plan{Name: "   ", Height: 15}
-    err := planWithSpaces.ValidateBasic()
-    require.NoError(t, err) // BUG: Should fail but passes
-    
-    // Test 2: Schedule upgrade with leading whitespace
-    planWithLeading := types.Plan{Name: " test-upgrade", Height: 15}
-    err = s.handler(s.ctx, &types.SoftwareUpgradeProposal{
-        Title: "Test Proposal", 
-        Plan: planWithLeading,
-    })
-    require.NoError(t, err) // Proposal accepted
-    
-    // Test 3: Developer registers handler with trimmed name (standard practice)
-    s.keeper.SetUpgradeHandler("test-upgrade", func(_ sdk.Context, _ types.Plan, vm module.VersionMap) (module.VersionMap, error) {
-        return vm, nil
-    })
-    
-    // Test 4: Advance to upgrade height
-    newCtx := s.ctx.WithBlockHeight(15)
-    req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
-    
-    // Test 5: BeginBlocker panics due to handler name mismatch
-    require.Panics(t, func() {
-        s.module.BeginBlock(newCtx, req)
-    }) // VULNERABILITY: All validators panic, network halts
-    
-    // Test 6: Verify it only works with exact match including whitespace
-    s.keeper.SetUpgradeHandler(" test-upgrade", func(_ sdk.Context, _ types.Plan, vm module.VersionMap) (module.VersionMap, error) {
-        return vm, nil
-    })
-    require.NotPanics(t, func() {
-        s.module.BeginBlock(newCtx, req)
-    }) // Works only when whitespace matches exactly
-}
-```
+- OCC execution path: Writes committed unconditionally [9](#0-8) 
+- Validation only checks OCC conflicts, not response codes [10](#0-9) 
 
 **Result:**
-The test demonstrates that:
-1. Whitespace-only names (`"   "`) incorrectly pass `ValidateBasic()` 
-2. Names with leading/trailing whitespace are accepted through governance
-3. When handlers are registered with trimmed names (standard developer practice), `BeginBlock()` panics at upgrade height
-4. This panic occurs simultaneously on all validator nodes, causing complete network shutdown
-5. Recovery requires exact string match including whitespace, which is non-intuitive and error-prone
+- Failed transactions (response code != 0) have writes committed via `WriteLatestToStore()` because scheduler marks them "validated" based solely on absence of OCC conflicts
+- This breaks the documented invariant that state only persists for successful transactions
 
-The PoC can be executed with: `go test -v -run TestWhitespaceNameCausesNetworkHalt ./x/upgrade/`
+### Notes
+
+The vulnerability is validated through comprehensive code analysis showing the scheduler bypasses response code validation that exists in normal sequential execution. The comment at line 162 in baseapp.go indicates this OCC validation system is still under development, suggesting this gap was likely unintentional. [11](#0-10)
 
 ### Citations
 
-**File:** x/upgrade/types/plan.go (L28-30)
+**File:** tasks/scheduler.go (L344-346)
 ```go
-	if len(p.Name) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
+	for _, mv := range s.multiVersionStores {
+		mv.WriteLatestToStore()
 	}
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L67-69)
+**File:** tasks/scheduler.go (L354-390)
 ```go
-func (k Keeper) SetUpgradeHandler(name string, upgradeHandler types.UpgradeHandler) {
-	k.upgradeHandlers[name] = upgradeHandler
+func (s *scheduler) shouldRerun(task *deliverTxTask) bool {
+	switch task.Status {
+
+	case statusAborted, statusPending:
+		return true
+
+	// validated tasks can become unvalidated if an earlier re-run task now conflicts
+	case statusExecuted, statusValidated:
+		// With the current scheduler, we won't actually get to this step if a previous task has already been determined to be invalid,
+		// since we choose to fail fast and mark the subsequent tasks as invalid as well.
+		// TODO: in a future async scheduler that no longer exhaustively validates in order, we may need to carefully handle the `valid=true` with conflicts case
+		if valid, conflicts := s.findConflicts(task); !valid {
+			s.invalidateTask(task)
+			task.AppendDependencies(conflicts)
+
+			// if the conflicts are now validated, then rerun this task
+			if dependenciesValidated(s.allTasksMap, task.Dependencies) {
+				return true
+			} else {
+				// otherwise, wait for completion
+				task.SetStatus(statusWaiting)
+				return false
+			}
+		} else if len(conflicts) == 0 {
+			// mark as validated, which will avoid re-validating unless a lower-index re-validates
+			task.SetStatus(statusValidated)
+			return false
+		}
+		// conflicts and valid, so it'll validate next time
+		return false
+
+	case statusWaiting:
+		// if conflicts are done, then this task is ready to run again
+		return dependenciesValidated(s.allTasksMap, task.Dependencies)
+	}
+	panic("unexpected status: " + task.Status)
 }
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L177-180)
+**File:** tasks/scheduler.go (L571-577)
 ```go
-func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
-	if err := plan.ValidateBasic(); err != nil {
-		return err
+	task.SetStatus(statusExecuted)
+	task.Response = &resp
+
+	// write from version store to multiversion stores
+	for _, v := range task.VersionStores {
+		v.WriteToMultiVersionStore()
 	}
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L359-362)
+**File:** baseapp/baseapp.go (L978-992)
 ```go
-func (k Keeper) HasHandler(name string) bool {
-	_, ok := k.upgradeHandlers[name]
-	return ok
-}
+		// Dont need to validate in checkTx mode
+		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
+			storeAccessOpEvents := msCache.GetEvents()
+			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
+
+			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
+			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+			if len(missingAccessOps) != 0 {
+				for op := range missingAccessOps {
+					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
+					op.EmitValidationFailMetrics()
+				}
+				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
+				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
+			}
 ```
 
-**File:** x/upgrade/abci.go (L68-70)
+**File:** baseapp/baseapp.go (L1015-1017)
 ```go
-		if !k.HasHandler(plan.Name) {
-			panicUpgradeNeeded(k, ctx, plan)
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
+	}
+```
+
+**File:** baseapp/baseapp.go (L1155-1174)
+```go
+		if ctx.MsgValidator() == nil {
+			continue
+		}
+		storeAccessOpEvents := msgMsCache.GetEvents()
+		accessOps := ctx.TxMsgAccessOps()[i]
+		missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+		// TODO: (occ) This is where we are currently validating our per message dependencies,
+		// whereas validation will be done holistically based on the mvkv for OCC approach
+		if len(missingAccessOps) != 0 {
+			for op := range missingAccessOps {
+				ctx.Logger().Info((fmt.Sprintf("eventMsgName=%s Missing Access Operation:%s ", eventMsgName, op.String())))
+				op.EmitValidationFailMetrics()
+			}
+			errMessage := fmt.Sprintf("Invalid Concurrent Execution messageIndex=%d, missing %d access operations", i, len(missingAccessOps))
+			// we need to bubble up the events for inspection
+			return &sdk.Result{
+				Log:    strings.TrimSpace(msgLogs.String()),
+				Events: events.ToABCIEvents(),
+			}, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
 		}
 ```
 
-**File:** x/upgrade/abci.go (L101-112)
+**File:** baseapp/abci.go (L280-283)
 ```go
-func panicUpgradeNeeded(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
-	// Write the upgrade info to disk. The UpgradeStoreLoader uses this info to perform or skip
-	// store migrations.
-	err := k.DumpUpgradeInfoWithInfoToDisk(ctx.BlockHeight(), plan.Name, plan.Info)
-	if err != nil {
-		panic(fmt.Errorf("unable to write upgrade info to filesystem: %s", err.Error()))
-	}
-
-	upgradeMsg := BuildUpgradeNeededMsg(plan)
-	ctx.Logger().Error(upgradeMsg)
-
-	panic(upgradeMsg)
+// State only gets persisted if all messages are valid and get executed successfully.
+// Otherwise, the ResponseDeliverTx will contain relevant error information.
+// Regardless of tx execution outcome, the ResponseDeliverTx will contain relevant
+// gas execution context.
 ```
 
-**File:** x/upgrade/types/proposal.go (L32-36)
+**File:** baseapp/abci.go (L304-311)
 ```go
-func (sup *SoftwareUpgradeProposal) ValidateBasic() error {
-	if err := sup.Plan.ValidateBasic(); err != nil {
-		return err
-	}
-	return gov.ValidateAbstract(sup)
+	gInfo, result, anteEvents, _, _, _, resCtx, err := app.runTx(ctx.WithTxBytes(req.Tx).WithTxSum(checksum).WithVoteInfos(app.voteInfos), runTxModeDeliver, tx, checksum)
+	if err != nil {
+		resultStr = "failed"
+		// if we have a result, use those events instead of just the anteEvents
+		if result != nil {
+			return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(result.Events, app.indexEvents), app.trace)
+		}
+		return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(anteEvents, app.indexEvents), app.trace)
 ```

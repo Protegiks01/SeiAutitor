@@ -1,221 +1,226 @@
-Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**.
-
 # Audit Report
 
 ## Title
-Stale Validator Set in Governance Tally Due to Module Execution Order
+Duplicate Upgrade Name Allows Network Shutdown via Plan Overwrite
 
 ## Summary
-The governance tally mechanism uses an inconsistent validator set where validators are filtered by stale bonded status from the previous block while their voting power reflects current delegations. This temporal mismatch occurs because the governance EndBlocker executes before the staking EndBlocker, causing validator status transitions to lag behind power index updates.
+The `ScheduleUpgrade` function in the x/upgrade module only validates that an upgrade name hasn't been completed, but fails to check if a pending upgrade with the same name exists at a different height. This allows a second governance proposal to overwrite a pending upgrade using the same name but different height, causing all validators who upgraded early to panic simultaneously at the original scheduled height, resulting in complete network shutdown.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
 **Location:**
-- Governance tally: [1](#0-0) 
-- Validator iteration with bonded filter: [2](#0-1) 
-- Module execution order: [3](#0-2) 
+- Validation check: [1](#0-0) 
+- Plan overwrite logic: [2](#0-1) 
+- Panic trigger: [3](#0-2) 
 
 **Intended Logic:**
-The governance tally should compute proposal outcomes using a consistent validator set where both power rankings and bonded status reflect the same state snapshot, ensuring that the active validator set (top N validators by power) is accurately represented in the tally.
+The upgrade system should coordinate upgrade execution by ensuring each upgrade has a unique name and consistent scheduling. Validators should be able to reliably prepare for upgrades at the scheduled height without risk of plan changes causing chain halts.
 
 **Actual Logic:**
-1. When delegations occur during transaction processing, `AddValidatorTokensAndShares` updates the validator power index immediately [4](#0-3) 
-2. Validator status transitions (bonded ↔ unbonding ↔ unbonded) only occur in `ApplyAndReturnValidatorSetUpdates` during the staking EndBlocker [5](#0-4) 
-3. The module execution order specifies governance EndBlocker before staking EndBlocker, causing governance tally to execute with stale validator statuses [3](#0-2) 
-4. The tally calls `IterateBondedValidatorsByPower` which iterates by current power but filters using `validator.IsBonded()`, reflecting bonded status from the start of the block [6](#0-5) 
+The validation only checks if an upgrade name has been completed [1](#0-0) , not if a pending upgrade with the same name exists. The function then unconditionally overwrites any existing plan [2](#0-1) , as explicitly documented in the comment [4](#0-3) .
 
 **Exploitation Path:**
-1. Attacker identifies a proposal reaching voting period end (timestamp-based and publicly predictable)
-2. Attacker identifies validators near the maxValidators boundary (e.g., ranks 99-101 when max=100)
-3. In the same block as the tally, attacker submits a large delegation to an unbonded validator or undelegation from a bonded validator
-4. The power index updates immediately, changing validator rankings
-5. Governance EndBlocker runs first via [7](#0-6) , computing tally with current token amounts but stale bonded status
-6. Newly-powerful validators (still marked unbonded) are excluded from tally
-7. Weakened validators (still marked bonded) may be included in tally
-8. Proposal outcome reflects an incorrect validator set
+1. Governance passes proposal scheduling upgrade "v2" at height 1000
+2. Validators monitor governance, upgrade their binaries, and register handler for "v2" via `SetUpgradeHandler` [5](#0-4) 
+3. Before height 1000, governance passes another proposal scheduling upgrade "v2" at height 1100 (same name, different height)
+4. The second proposal overwrites the first plan without validation because only completion is checked
+5. At height 1000 when BeginBlocker executes:
+   - The stored plan indicates execution at height 1100
+   - `plan.ShouldExecute(ctx)` returns false [6](#0-5)  because 1100 > 1000
+   - However, `k.HasHandler("v2")` returns true because validators already upgraded
+   - BeginBlocker detects this mismatch and panics [3](#0-2)  with "BINARY UPDATED BEFORE TRIGGER!"
+6. All validators running the upgraded binary panic simultaneously, causing complete network shutdown
 
 **Security Guarantee Broken:**
-The governance integrity invariant is violated: tallies should reflect the actual active validator set's voting power at tally time. Instead, the tally uses a hybrid inconsistent state with current delegated amounts but previous block's bonded status, potentially including/excluding the wrong validators.
+Network availability and upgrade coordination guarantees. The system fails to prevent conflicting upgrade schedules, allowing a trusted governance action (rescheduling) to inadvertently cause total network shutdown beyond the intended authority scope.
 
 ## Impact Explanation
 
-This vulnerability directly affects governance proposal outcomes:
-- Proposals that should pass may fail if favorable validators are incorrectly excluded from the tally
-- Proposals that should fail may pass if unfavorable validators are incorrectly included
-- Quorum calculations use an incorrect validator set denominator [8](#0-7) 
-- While there is no direct fund loss, governance decisions control protocol parameters, software upgrades, and resource allocation
-- Undermines the legitimacy and integrity of the governance system
+The vulnerability causes total network shutdown with the following consequences:
 
-This matches the Medium severity criterion: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+- **Network Availability**: All validators with upgraded binaries panic simultaneously when the original scheduled height is reached
+- **Transaction Confirmation**: No new transactions can be confirmed during the shutdown
+- **Block Production**: Complete halt in block production requiring manual coordination to recover
+- **Recovery Complexity**: Requires validators to manually coordinate to restart with correct binary or use skip-upgrade flags
+
+This directly matches the HIGH severity impact category: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- Any network participant can submit delegation/undelegation transactions (no special privileges required)
-- Attacker needs sufficient stake to move validators across the active set boundary (feasible for high-stake actors or coordinated groups)
-- Requires timing delegations to coincide with proposal tallies, which are predictable via voting period end times
-- More likely when validator power distribution is close to the maxValidators cutoff
+**Who Can Trigger:**
+Any participant who can get governance proposals passed (requires majority vote). Critically, this does not require malicious intent—it can happen accidentally during normal governance operations.
+
+**Conditions Required:**
+1. First governance proposal schedules upgrade X at height H1
+2. Validators upgrade binaries before H1 is reached (standard best practice)
+3. Second governance proposal schedules upgrade X at height H2 (H2 > H1) before H1 is reached  
+4. Network automatically reaches height H1
 
 **Frequency:**
-- Can occur in any block where both a governance tally happens AND delegations change validator set composition
-- More impactful for contentious proposals with close vote margins
-- While transaction inclusion timing introduces probabilistic elements, the predictability of proposal end times enables targeted attacks
+Moderate to high likelihood in active chains because:
+- Governance may legitimately need to reschedule upgrades due to discovered issues or timing conflicts
+- Multiple upgrade proposals could be under consideration simultaneously
+- Emergency situations may require rapid governance decisions
+- No warning is provided that the same upgrade name is being reused
+- The code explicitly allows overwriting [4](#0-3) 
 
-**Evidence of Developer Awareness:**
-Test files explicitly call `staking.EndBlocker` after delegations before performing tallies [9](#0-8)  and [10](#0-9) , demonstrating that developers understand the need to update validator statuses before tallying. However, the production module execution order does not implement this safeguard.
+The likelihood is significant because the action (rescheduling an upgrade with the same name) is a reasonable governance operation, but the consequence (total network shutdown) far exceeds the intended authority and can occur inadvertently.
 
 ## Recommendation
 
-Ensure governance tally uses a consistent validator set snapshot by implementing one of these options:
+Add validation in `ScheduleUpgrade` to prevent reusing pending upgrade names at different heights:
 
-**Option A (Recommended):** Modify the governance EndBlocker to call staking's `ApplyAndReturnValidatorSetUpdates` before computing tallies. This ensures validator statuses reflect current power rankings with minimal side effects.
+```go
+// After the GetDoneHeight check at line 190, add:
+if oldPlan, found := k.GetUpgradePlan(ctx); found {
+    if oldPlan.Name == plan.Name && oldPlan.Height != plan.Height {
+        return sdkerrors.Wrapf(
+            sdkerrors.ErrInvalidRequest, 
+            "upgrade with name %s is already scheduled for height %d, cannot reschedule to height %d with the same name",
+            plan.Name, oldPlan.Height, plan.Height,
+        )
+    }
+}
+```
 
-**Option B:** Reorder module EndBlockers to execute staking before governance by changing the order to `stakingtypes.ModuleName, govtypes.ModuleName` in the module manager configuration.
-
-**Option C:** Modify `IterateBondedValidatorsByPower` to select validators based on power rankings directly (top N validators by current power) rather than filtering by the bonded status field, ensuring consistency with the actual active set.
+This ensures that to reschedule an upgrade, governance must either:
+1. Use a different name (e.g., "v2-revised"), or
+2. First cancel the existing upgrade via `CancelSoftwareUpgradeProposal` [7](#0-6) , then schedule the new one
 
 ## Proof of Concept
 
-**Conceptual Test:** `TestTallyStaleValidatorSet` (to be added to `x/gov/keeper/tally_test.go`)
+**File:** `x/upgrade/abci_test.go`
+
+**Test Function:** `TestDuplicateUpgradeNameCausesNetworkShutdown`
 
 **Setup:**
-1. Initialize chain with maxValidators=2
-2. Create 3 validators: Val1 (100 tokens, bonded, rank 1), Val2 (100 tokens, bonded, rank 2), Val3 (50 tokens, unbonded, rank 3)
-3. Create governance proposal with Val1 voting YES, Val2 voting NO, Val3 voting YES
-4. Set proposal status to voting period end
+1. Initialize test suite at block height 10 using existing `setupTest` function [8](#0-7) 
+2. Schedule upgrade "test-upgrade" at height 15 via governance handler [9](#0-8) 
+3. Simulate validators upgrading by calling `s.keeper.SetUpgradeHandler("test-upgrade", handler)` [5](#0-4) 
+4. Schedule another upgrade with the same name "test-upgrade" at height 20, which overwrites the first plan [10](#0-9) 
 
 **Action:**
-1. In the same context (before staking EndBlocker), delegate 60 tokens to Val3
-2. Verify Val3's power index now shows 110 tokens (should be rank 2, ahead of Val2)
-3. Verify Val3's status is still Unbonded (not yet updated)
-4. Call `keeper.Tally()` directly (simulating governance EndBlocker execution)
+1. Create context at height 15: `newCtx := s.ctx.WithBlockHeight(15)`
+2. Call BeginBlock: `s.module.BeginBlock(newCtx, req)`
 
-**Expected Result (Correct Behavior):**
-- Tally should include Val1 (100 tokens) and Val3 (110 tokens) as the top 2 validators
-- Vote count: 210 YES (Val1 + Val3), 0 NO
-- Proposal passes
+**Result:**
+BeginBlock panics with message "BINARY UPDATED BEFORE TRIGGER! UPGRADE \"test-upgrade\" - in binary but not executed on chain" [3](#0-2) , confirming the network shutdown vulnerability. The panic is triggered when validators have registered a handler for an upgrade that was rescheduled to a later height using the same name.
 
-**Actual Result (Demonstrates Bug):**
-- Tally includes Val1 and Val2 (both have IsBonded()=true), excludes Val3 (IsBonded()=false despite high power)
-- Vote count: 100 YES (Val1), 100 NO (Val2)
-- Proposal outcome is incorrect (tied instead of passing)
+## Notes
 
-This demonstrates that `IterateBondedValidatorsByPower` returns an inconsistent validator set that doesn't match current power rankings when delegations occur in the same block as the tally.
+The vulnerability is valid under the platform acceptance rules because:
+- While governance is a privileged role, rescheduling upgrades is within their intended authority
+- The consequence (total network shutdown) is an unrecoverable security failure that far exceeds the intended scope of the action
+- This can happen inadvertently without malicious intent during legitimate governance operations
+- The impact exactly matches the HIGH severity category: "Network not being able to confirm new transactions (total network shutdown)"
+
+The existing test `TestCanOverwriteScheduleUpgrade` [11](#0-10)  demonstrates that plan overwriting is intentional, but uses different upgrade names. There is no test coverage for the dangerous scenario where validators have already upgraded their binaries before the plan is overwritten with the same name at a different height.
 
 ### Citations
 
-**File:** x/gov/keeper/tally.go (L13-34)
+**File:** x/upgrade/keeper/keeper.go (L67-69)
 ```go
-func (keeper Keeper) Tally(ctx sdk.Context, proposal types.Proposal) (passes bool, burnDeposits bool, tallyResults types.TallyResult) {
-	results := make(map[types.VoteOption]sdk.Dec)
-	results[types.OptionYes] = sdk.ZeroDec()
-	results[types.OptionAbstain] = sdk.ZeroDec()
-	results[types.OptionNo] = sdk.ZeroDec()
-	results[types.OptionNoWithVeto] = sdk.ZeroDec()
-
-	totalVotingPower := sdk.ZeroDec()
-	currValidators := make(map[string]types.ValidatorGovInfo)
-
-	// fetch all the bonded validators, insert them into currValidators
-	keeper.sk.IterateBondedValidatorsByPower(ctx, func(index int64, validator stakingtypes.ValidatorI) (stop bool) {
-		currValidators[validator.GetOperator().String()] = types.NewValidatorGovInfo(
-			validator.GetOperator(),
-			validator.GetBondedTokens(),
-			validator.GetDelegatorShares(),
-			sdk.ZeroDec(),
-			types.WeightedVoteOptions{},
-		)
-
-		return false
-	})
+func (k Keeper) SetUpgradeHandler(name string, upgradeHandler types.UpgradeHandler) {
+	k.upgradeHandlers[name] = upgradeHandler
+}
 ```
 
-**File:** x/gov/keeper/tally.go (L99-99)
+**File:** x/upgrade/keeper/keeper.go (L172-174)
 ```go
-	percentVoting := totalVotingPower.Quo(keeper.sk.TotalBondedTokens(ctx).ToDec())
+// ScheduleUpgrade schedules an upgrade based on the specified plan.
+// If there is another Plan already scheduled, it will overwrite it
+// (implicitly cancelling the current plan)
 ```
 
-**File:** x/staking/keeper/alias_functions.go (L33-53)
+**File:** x/upgrade/keeper/keeper.go (L188-190)
 ```go
-func (k Keeper) IterateBondedValidatorsByPower(ctx sdk.Context, fn func(index int64, validator types.ValidatorI) (stop bool)) {
-	store := ctx.KVStore(k.storeKey)
-	maxValidators := k.MaxValidators(ctx)
-
-	iterator := sdk.KVStoreReversePrefixIterator(store, types.ValidatorsByPowerIndexKey)
-	defer iterator.Close()
-
-	i := int64(0)
-	for ; iterator.Valid() && i < int64(maxValidators); iterator.Next() {
-		address := iterator.Value()
-		validator := k.mustGetValidator(ctx, address)
-
-		if validator.IsBonded() {
-			stop := fn(i, validator) // XXX is this safe will the validator unexposed fields be able to get written to?
-			if stop {
-				break
-			}
-			i++
-		}
+	if k.GetDoneHeight(ctx, plan.Name) != 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "upgrade with name %s has already been completed", plan.Name)
 	}
+```
+
+**File:** x/upgrade/keeper/keeper.go (L195-201)
+```go
+	oldPlan, found := k.GetUpgradePlan(ctx)
+	if found {
+		k.ClearIBCState(ctx, oldPlan.Height)
+	}
+
+	bz := k.cdc.MustMarshal(&plan)
+	store.Set(types.PlanKey(), bz)
+```
+
+**File:** x/upgrade/abci.go (L93-96)
+```go
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
+```
+
+**File:** x/upgrade/types/plan.go (L39-43)
+```go
+func (p Plan) ShouldExecute(ctx sdk.Context) bool {
+	if p.Height > 0 {
+		return p.Height <= ctx.BlockHeight()
+	}
+	return false
+```
+
+**File:** x/upgrade/handler.go (L29-31)
+```go
+func handleSoftwareUpgradeProposal(ctx sdk.Context, k keeper.Keeper, p *types.SoftwareUpgradeProposal) error {
+	return k.ScheduleUpgrade(ctx, p.Plan)
 }
 ```
 
-**File:** simapp/app.go (L372-373)
+**File:** x/upgrade/handler.go (L33-35)
 ```go
-	app.mm.SetOrderEndBlockers(
-		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
+func handleCancelSoftwareUpgradeProposal(ctx sdk.Context, k keeper.Keeper, _ *types.CancelSoftwareUpgradeProposal) error {
+	k.ClearUpgradePlan(ctx)
+	return nil
 ```
 
-**File:** x/staking/keeper/validator.go (L98-106)
+**File:** x/upgrade/abci_test.go (L42-64)
 ```go
-func (k Keeper) AddValidatorTokensAndShares(ctx sdk.Context, validator types.Validator,
-	tokensToAdd sdk.Int) (valOut types.Validator, addedShares sdk.Dec) {
-	k.DeleteValidatorByPowerIndex(ctx, validator)
-	validator, addedShares = validator.AddTokensFromDel(tokensToAdd)
-	k.SetValidator(ctx, validator)
-	k.SetValidatorByPowerIndex(ctx, validator)
+func setupTest(height int64, skip map[int64]bool) TestSuite {
+	db := dbm.NewMemDB()
+	app := simapp.NewSimApp(log.NewNopLogger(), db, nil, true, skip, simapp.DefaultNodeHome, 0, nil, simapp.MakeTestEncodingConfig(), &simapp.EmptyAppOptions{})
+	genesisState := simapp.NewDefaultGenesisState(app.AppCodec())
+	stateBytes, err := json.MarshalIndent(genesisState, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	app.InitChain(
+		context.Background(), &abci.RequestInitChain{
+			Validators:    []abci.ValidatorUpdate{},
+			AppStateBytes: stateBytes,
+		},
+	)
 
-	return validator, addedShares
+	s.keeper = app.UpgradeKeeper
+	s.ctx = app.BaseApp.NewContext(false, tmproto.Header{Height: height, Time: time.Now()})
+
+	s.module = upgrade.NewAppModule(s.keeper)
+	s.querier = s.module.LegacyQuerierHandler(app.LegacyAmino())
+	s.handler = upgrade.NewSoftwareUpgradeProposalHandler(s.keeper)
+	return s
 }
 ```
 
-**File:** x/staking/keeper/val_state_change.go (L143-161)
+**File:** x/upgrade/abci_test.go (L90-99)
 ```go
-		// apply the appropriate state change if necessary
-		switch {
-		case validator.IsUnbonded():
-			validator, err = k.unbondedToBonded(ctx, validator)
-			if err != nil {
-				return
-			}
-			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
-		case validator.IsUnbonding():
-			validator, err = k.unbondingToBonded(ctx, validator)
-			if err != nil {
-				return
-			}
-			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
-		case validator.IsBonded():
-			// no state change
-		default:
-			panic("unexpected validator status")
-		}
-```
+func TestCanOverwriteScheduleUpgrade(t *testing.T) {
+	s := setupTest(10, map[int64]bool{})
+	t.Log("Can overwrite plan")
+	err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "bad_test", Height: s.ctx.BlockHeight() + 10}})
+	require.NoError(t, err)
+	err = s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "test", Height: s.ctx.BlockHeight() + 1}})
+	require.NoError(t, err)
 
-**File:** x/gov/abci.go (L51-51)
-```go
-		passes, burnDeposits, tallyResults := keeper.Tally(ctx, proposal)
-```
-
-**File:** x/gov/keeper/tally_test.go (L281-281)
-```go
-	_ = staking.EndBlocker(ctx, app.StakingKeeper)
-```
-
-**File:** x/gov/keeper/tally_test.go (L317-317)
-```go
-	_ = staking.EndBlocker(ctx, app.StakingKeeper)
+	VerifyDoUpgrade(t)
+}
 ```

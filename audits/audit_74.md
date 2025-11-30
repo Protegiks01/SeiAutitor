@@ -1,248 +1,190 @@
 # Audit Report
 
 ## Title
-MsgExec Self-Execution Bypasses ValidateBasic Enabling Governance Vote Weight Manipulation
+Stale Liveness Tracking Data Persists After Validator Removal Causing Unfair Jailing on Re-Bonding
 
 ## Summary
-The authz module's `MsgExec` message does not validate inner messages during stateless validation, and the "implicit accept" code path for self-execution skips authorization checks. This allows any voter to submit `MsgVoteWeighted` with invalid total weights (≠ 1.0) through `MsgExec`, amplifying their effective voting power during governance tallying.
+The slashing module's `AfterValidatorRemoved` hook fails to clean up `ValidatorSigningInfo` and `ValidatorMissedBlockArray` state when a validator is removed. When a new validator is later created with the same consensus address, it inherits stale liveness tracking data from the previous validator, resulting in premature jailing based on accumulated missed blocks from a prior validator lifecycle.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
+- **location**: `x/slashing/keeper/hooks.go` lines 41-43 [1](#0-0) 
 
-**Intended logic:** All transaction messages should pass through `ValidateBasic()` during `CheckTx` to ensure stateless validation. For `MsgVoteWeighted`, this includes verifying total weight equals exactly 1.0 and no duplicate options exist. [5](#0-4) 
+- **intended logic**: When a validator is completely removed via `RemoveValidator`, all associated slashing state should be cleaned up, including `ValidatorSigningInfo` and `ValidatorMissedBlockArray`. This ensures that if the same consensus address is later used to create a new validator, it starts with fresh liveness tracking (MissedBlocksCounter=0, fresh StartHeight, empty missed blocks array).
 
-**Actual logic:** When `MsgExec` contains inner messages, `MsgExec.ValidateBasic()` only validates the grantee address and messages array existence - it does NOT call `ValidateBasic()` on inner messages. During execution in `DispatchActions()`, when granter equals grantee (self-execution), the code "implicitly accepts" and skips authorization checks, proceeding directly to message execution. The governance `AddVote()` handler only validates individual option validity via `ValidWeightedVoteOption()`, not total weight sum or duplicates. [6](#0-5) 
+- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation [1](#0-0) , but does NOT delete the `ValidatorSigningInfo` (stored at `ValidatorSigningInfoKey(address)`) [2](#0-1)  or the `ValidatorMissedBlockArray` (stored at `ValidatorMissedBlockBitArrayKey(address)`) [3](#0-2) . When `AfterValidatorBonded` is triggered for a validator with the same consensus address, it checks if signing info exists and only creates new info if not found [4](#0-3) . Since the old signing info persists, the new validator inherits the stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
 
-**Exploitation path:**
-1. Attacker constructs `MsgVoteWeighted` with invalid weights (e.g., YES: 0.8, NO: 0.7, total: 1.5)
-2. Attacker wraps this in `MsgExec` where `Grantee` = their own address and inner `Voter` = their own address
-3. Transaction passes `CheckTx` because `MsgExec.ValidateBasic()` doesn't validate inner messages
-4. During `DeliverTx`, `DispatchActions()` extracts granter from inner message's signer (voter address), compares with grantee (same address), and "implicitly accepts" without authorization or validation checks
-5. The `VoteWeighted` handler executes without calling `ValidateBasic()`, calling `AddVote()` directly
-6. Invalid vote is stored with total weight > 1.0
-7. During tally, voting power is multiplied by each option's weight, amplifying effective voting power
+- **exploitation path**:
+  1. Validator accumulates missed blocks during normal operation
+  2. All delegations are removed, triggering unbonding
+  3. Once unbonding completes and `DelegatorShares.IsZero()`, `RemoveValidator` is called [5](#0-4) 
+  4. `RemoveValidator` deletes the `ValidatorByConsAddrKey` index [6](#0-5) 
+  5. `AfterValidatorRemoved` hook executes, deleting only the pubkey relation [1](#0-0) 
+  6. Later, same consensus address creates new validator, passing the `GetValidatorByConsAddr` check [7](#0-6)  (check passes because the index was deleted)
+  7. New validator bonds, triggering `AfterValidatorBonded` [4](#0-3) 
+  8. Since signing info exists, no new info is created - validator inherits stale `MissedBlocksCounter`
+  9. When liveness is checked, the inherited counter causes premature jailing [8](#0-7) 
 
-**Security guarantee broken:** The validation invariant that all messages must pass `ValidateBasic()` before execution is violated. This breaks the governance integrity assumption that each voter's weight distribution must sum to exactly 1.0.
+- **security guarantee broken**: The protocol invariant that each validator lifecycle should have independent liveness tracking is violated. Validators reusing consensus addresses do not start with a clean slate, inheriting historical downtime data from a previous, removed validator.
 
 ## Impact Explanation
 
-An attacker can manipulate their effective voting power by submitting votes with total weight > 1.0. For example, with total weight = 1.5, a voter with 10% of staking power effectively casts 15% of the vote weight. During tally, the code directly multiplies voting power by option weights without validation: [7](#0-6) [8](#0-7) 
+This vulnerability results in validators being jailed prematurely when they reuse consensus keys after full unbonding. The impact includes:
 
-This can swing close proposal outcomes, allowing minority stakeholders to pass or reject proposals against the true will of the majority. While this doesn't directly steal funds, it corrupts the governance process which controls critical protocol operations including parameter changes, community pool spending, and protocol upgrades.
+- **Unfair jailing**: Validators are jailed after missing fewer blocks than protocol parameters specify due to inherited counters
+- **Loss of staking rewards**: Jailed validators cannot earn commission or staking rewards during the jail period
+- **Network participation disruption**: Validators are unexpectedly removed from the active set
+- **Protocol inconsistency**: The slashing mechanism behaves unpredictably, violating validator expectations
+
+With default sei-cosmos parameters (`SlashFractionDowntime=0%`), no tokens are directly slashed, but chains may configure non-zero values resulting in actual token loss. This qualifies as **"A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk"** - a Medium severity issue.
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any user with voting power (staked tokens or delegations).
+This vulnerability can be triggered through legitimate validator operations without malicious intent:
 
-**Conditions required:** 
-- An active governance proposal in voting period
-- Single transaction submission containing `MsgExec` with invalid inner `MsgVoteWeighted`
+- **Operational scenario**: Validators performing infrastructure maintenance may fully unbond, then later rebond with the same consensus key for operational simplicity
+- **Prerequisite conditions**: Requires prior missed blocks (normal during network issues) followed by full unbonding and re-creation
+- **No special privileges**: Can occur through standard validator operations accessible to any validator operator
 
-**Frequency:** Can be exploited during any proposal's voting period. No special setup, timing requirements, or authorization grants needed - the attacker simply submits `MsgExec` executing their own vote with the grantee field set to their own address. The inner message's voter field is also set to their address, causing the granter == grantee condition in `DispatchActions()` to skip authorization checks.
+While not the most common operational path, this represents a realistic edge case affecting validators who cycle through the complete lifecycle of bonding → downtime accumulation → full unbonding → re-bonding with the same consensus key.
 
 ## Recommendation
 
-Add validation of inner messages in `MsgExec.ValidateBasic()`:
+Modify the `AfterValidatorRemoved` hook in the slashing keeper to clean up all validator-related slashing state:
 
 ```go
-func (msg MsgExec) ValidateBasic() error {
-    _, err := sdk.AccAddressFromBech32(msg.Grantee)
-    if err != nil {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
-    }
-
-    if len(msg.Msgs) == 0 {
-        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
-    }
-
-    // Validate inner messages
-    msgs, err := msg.GetMessages()
-    if err != nil {
-        return err
-    }
-    
-    for _, innerMsg := range msgs {
-        if err := innerMsg.ValidateBasic(); err != nil {
-            return sdkerrors.Wrapf(err, "invalid inner message")
-        }
-    }
-
-    return nil
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+    // Clean up signing info
+    store := ctx.KVStore(k.storeKey)
+    store.Delete(types.ValidatorSigningInfoKey(address))
+    // Clean up missed blocks array  
+    k.ClearValidatorMissedBlockBitArray(ctx, address)
 }
 ```
 
-This ensures all messages undergo stateless validation regardless of how they are submitted, maintaining the security invariant.
+This ensures complete state cleanup when a validator is removed, allowing fresh liveness tracking if the consensus address is subsequently reused.
 
 ## Proof of Concept
 
-**Test scenario:**
-1. **Setup:** Create a governance proposal in voting period and a voter account with voting power
-2. **Action:** Submit `MsgExec` with `Grantee` = voter address, containing `MsgVoteWeighted` with `Voter` = same address and invalid weights (total > 1.0)
-3. **Result:** Transaction succeeds, invalid vote is stored, and during tally the voter's power is multiplied by the inflated weight sum
+**File**: `x/slashing/keeper/keeper_test.go` (new test to add)  
+**Function**: `TestValidatorRemovalClearsMissedBlocks`
 
-The vulnerability can be reproduced by:
-- Creating a `MsgVoteWeighted` with options [YES: 0.8, NO: 0.7] (total: 1.5)
-- Verifying it fails `ValidateBasic()` when submitted directly
-- Wrapping it in `MsgExec` where `grantee` = voter address
-- Observing that `MsgExec.ValidateBasic()` passes
-- Executing and confirming the vote is stored with total weight 1.5
-- During tally, confirming the voter's power is multiplied by 1.5x instead of 1.0
+**Setup**:
+1. Initialize simapp with slashing parameters (SignedBlocksWindow=1000, MinSignedPerWindow=0.5)
+2. Create validator with consensus pubkey and delegate sufficient tokens
+3. Execute EndBlocker to activate validator in the validator set
+
+**Action**:
+1. Simulate 1000 blocks where validator signs correctly (establish baseline)
+2. Simulate 200 blocks where validator does NOT sign, accumulating MissedBlocksCounter=200
+3. Verify signing info shows MissedBlocksCounter=200 via `GetValidatorSigningInfo`
+4. Undelegate all tokens, complete unbonding period, triggering `RemoveValidator`
+5. Verify validator is removed from state via `GetValidator` (returns not found)
+6. Create new validator with the SAME consensus pubkey (should pass `GetValidatorByConsAddr` check since index was deleted)
+7. Execute EndBlocker to bond the new validator
+
+**Result**:
+Query signing info for the consensus address - it incorrectly shows MissedBlocksCounter=200 (inherited from the removed validator) instead of 0, demonstrating the bug. Subsequently, when the new validator misses 301 additional blocks, it gets jailed at a total of 501 missed blocks, whereas a fresh validator should only be jailed after missing 501 blocks from scratch (demonstrating the unfair premature jailing).
 
 ## Notes
 
-This vulnerability qualifies as **Medium severity** under the category "A bug in the network code that results in unintended behavior" as it allows manipulation of governance voting outcomes, which is a critical protocol mechanism. While there is no direct fund loss from the vote manipulation itself, governance controls protocol parameters, upgrades, and community pool spending, making this a significant security issue.
+The vulnerability is confirmed through code analysis showing that:
+1. `AfterValidatorRemoved` only calls `deleteAddrPubkeyRelation` [9](#0-8) 
+2. There is a `ClearValidatorMissedBlockBitArray` function available [10](#0-9)  but it's only used during slashing/jailing [11](#0-10) , not during validator removal
+3. No deletion function exists for `ValidatorSigningInfo` and it's not deleted during removal
+
+This confirms the incomplete state cleanup and validates the security claim.
 
 ### Citations
 
-**File:** x/authz/msgs.go (L221-232)
+**File:** x/slashing/keeper/hooks.go (L12-26)
 ```go
-func (msg MsgExec) ValidateBasic() error {
-	_, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
 	}
-
-	if len(msg.Msgs) == 0 {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
-	}
-
-	return nil
 }
 ```
 
-**File:** x/authz/keeper/keeper.go (L87-111)
+**File:** x/slashing/keeper/hooks.go (L41-43)
 ```go
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
-			}
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
-
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
-		}
-```
-
-**File:** x/gov/keeper/vote.go (L21-25)
-```go
-	for _, option := range options {
-		if !types.ValidWeightedVoteOption(option) {
-			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
-		}
-	}
-```
-
-**File:** x/gov/keeper/msg_server.go (L93-121)
-```go
-func (k msgServer) VoteWeighted(goCtx context.Context, msg *types.MsgVoteWeighted) (*types.MsgVoteWeightedResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	accAddr, accErr := sdk.AccAddressFromBech32(msg.Voter)
-	if accErr != nil {
-		return nil, accErr
-	}
-	err := k.Keeper.AddVote(ctx, msg.ProposalId, accAddr, msg.Options)
-	if err != nil {
-		return nil, err
-	}
-
-	defer telemetry.IncrCounterWithLabels(
-		[]string{types.ModuleName, "vote"},
-		1,
-		[]metrics.Label{
-			telemetry.NewLabel("proposal_id", strconv.Itoa(int(msg.ProposalId))),
-		},
-	)
-
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			sdk.EventTypeMessage,
-			sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
-			sdk.NewAttribute(sdk.AttributeKeySender, msg.Voter),
-		),
-	)
-
-	return &types.MsgVoteWeightedResponse{}, nil
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
 }
 ```
 
-**File:** x/gov/types/msgs.go (L243-274)
+**File:** x/slashing/types/keys.go (L38-40)
 ```go
-func (msg MsgVoteWeighted) ValidateBasic() error {
-	if msg.Voter == "" {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, msg.Voter)
-	}
-
-	if len(msg.Options) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, WeightedVoteOptions(msg.Options).String())
-	}
-
-	totalWeight := sdk.NewDec(0)
-	usedOptions := make(map[VoteOption]bool)
-	for _, option := range msg.Options {
-		if !ValidWeightedVoteOption(option) {
-			return sdkerrors.Wrap(ErrInvalidVote, option.String())
-		}
-		totalWeight = totalWeight.Add(option.Weight)
-		if usedOptions[option.Option] {
-			return sdkerrors.Wrap(ErrInvalidVote, "Duplicated vote option")
-		}
-		usedOptions[option.Option] = true
-	}
-
-	if totalWeight.GT(sdk.NewDec(1)) {
-		return sdkerrors.Wrap(ErrInvalidVote, "Total weight overflow 1.00")
-	}
-
-	if totalWeight.LT(sdk.NewDec(1)) {
-		return sdkerrors.Wrap(ErrInvalidVote, "Total weight lower than 1.00")
-	}
-
-	return nil
+func ValidatorSigningInfoKey(v sdk.ConsAddress) []byte {
+	return append(ValidatorSigningInfoKeyPrefix, address.MustLengthPrefix(v.Bytes())...)
 }
 ```
 
-**File:** x/gov/types/vote.go (L80-85)
+**File:** x/slashing/types/keys.go (L52-54)
 ```go
-func ValidWeightedVoteOption(option WeightedVoteOption) bool {
-	if !option.Weight.IsPositive() || option.Weight.GT(sdk.NewDec(1)) {
-		return false
-	}
-	return ValidVoteOption(option.Option)
+func ValidatorMissedBlockBitArrayKey(v sdk.ConsAddress) []byte {
+	return append(ValidatorMissedBlockBitArrayKeyPrefix, address.MustLengthPrefix(v.Bytes())...)
 }
 ```
 
-**File:** x/gov/keeper/tally.go (L59-62)
+**File:** x/staking/keeper/delegation.go (L789-792)
 ```go
-				for _, option := range vote.Options {
-					subPower := votingPower.Mul(option.Weight)
-					results[option.Option] = results[option.Option].Add(subPower)
-				}
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
+	}
 ```
 
-**File:** x/gov/keeper/tally.go (L82-85)
+**File:** x/staking/keeper/validator.go (L176-176)
 ```go
-		for _, option := range val.Vote {
-			subPower := votingPower.Mul(option.Weight)
-			results[option.Option] = results[option.Option].Add(subPower)
-		}
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+```
+
+**File:** x/staking/keeper/msg_server.go (L52-54)
+```go
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
+	}
+```
+
+**File:** x/slashing/keeper/infractions.go (L96-96)
+```go
+	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+```
+
+**File:** x/slashing/keeper/keeper.go (L94-97)
+```go
+func (k Keeper) deleteAddrPubkeyRelation(ctx sdk.Context, addr cryptotypes.Address) {
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.AddrPubkeyRelationKey(addr))
+}
+```
+
+**File:** x/slashing/keeper/signing_info.go (L168-171)
+```go
+func (k Keeper) ClearValidatorMissedBlockBitArray(ctx sdk.Context, address sdk.ConsAddress) {
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
+}
+```
+
+**File:** x/slashing/abci.go (L58-60)
+```go
+		if writeInfo.ShouldSlash {
+			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
+			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
 ```
