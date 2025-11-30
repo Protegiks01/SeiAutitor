@@ -1,222 +1,285 @@
 # Audit Report
 
 ## Title
-Goroutine Leak in validateIterator Due to Blocking Channel Send After Abort
+Redelegation Slashing Accounting Mismatch Due to Exchange Rate Changes
 
 ## Summary
-The `validateIterator` function spawns a goroutine that permanently leaks when validation encounters multiple estimate values during iteration. The goroutine uses blocking channel sends without cancellation, causing it to hang indefinitely after the main function returns, leading to progressive resource exhaustion.
+The `SlashRedelegation` function contains a critical accounting vulnerability where it calculates the slash amount based on the original token balance (`InitialBalance`) but actually burns fewer tokens when converting shares at the destination validator's current (potentially deteriorated) exchange rate. The function returns the theoretical slash amount rather than the actual burned amount, causing `remainingSlashAmount` to be over-reduced and resulting in systematic under-slashing of validators.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary: [1](#0-0) 
-- Secondary: [2](#0-1) 
-- Trigger: [3](#0-2)  and [4](#0-3) 
+**Location:** `x/staking/keeper/slash.go`, function `SlashRedelegation` (lines 219-296) [1](#0-0) 
 
-**Intended Logic:**
-The validation goroutine should check if keys observed during original iteration match those during replay. When an estimate is encountered, it signals abort via `abortChannel`, the main function returns `false`, and the goroutine should terminate cleanly.
+**Intended logic:** When slashing a validator with active redelegations, the protocol should burn exactly `slashFactor * InitialBalance` tokens from each redelegation entry, where `InitialBalance` represents the tokens at stake during the infraction. The total slashed should equal `slashFactor * power_at_infraction`.
 
-**Actual Logic:**
-The goroutine performs a **blocking send** to `abortChannel` when encountering estimates [2](#0-1) . The channel has buffer size 1 [5](#0-4) . When multiple estimates exist:
+**Actual logic:** The function performs the following steps:
+1. Line 238-240: Calculates `slashAmount = slashFactor * entry.InitialBalance` and adds to `totalSlashAmount`
+2. Line 243: Calculates `sharesToUnbond = slashFactor * entry.SharesDst` (using shares stored at redelegation time)
+3. Line 265: Calls `k.Unbond(sharesToUnbond)` which converts shares to tokens using the destination validator's **current** exchange rate
+4. Lines 279-281: The actual `tokensToBurn` (potentially less than `slashAmount`) is accumulated for burning
+5. Line 295: Returns `totalSlashAmount` instead of the sum of actual `tokensToBurn` values
 
-1. First estimate triggers blocking send (succeeds, buffer full)
-2. Goroutine continues execution (send didn't block)
-3. Main function receives from channel and returns [6](#0-5) 
-4. Goroutine encounters second estimate
-5. Second blocking send attempts but channel buffer is full
-6. No receiver exists anymore (main returned)
-7. Goroutine blocks forever on channel send
+The exchange rate conversion occurs in `validator.TokensFromShares`: [2](#0-1) 
 
-This differs from the non-blocking pattern used elsewhere [7](#0-6) , where a `select` with `default` prevents blocking.
+When the destination validator's exchange rate deteriorates between redelegation and slashing, `tokensToBurn < slashAmount`. The main `Slash` function then reduces `remainingSlashAmount` by the full `totalSlashAmount`: [3](#0-2) 
 
-**Exploitation Path:**
-1. Normal transaction execution with OCC enabled
-2. Multiple concurrent transactions create estimate values for overlapping keys
-3. Subsequent transaction performs iteration over range with these keys
-4. `ValidateTransactionState` called → triggers `validateIterator` [8](#0-7) 
-5. Validation goroutine iterates using merge iterator [9](#0-8) 
-6. `skipUntilExistsOrInvalid()` calls `cache.Value()` to check deleted items [3](#0-2) 
-7. First estimate encountered, sends to channel
-8. Before main receives, second estimate encountered
-9. Second send blocks permanently
-10. Goroutine leaked, consuming 2-8KB stack + heap allocations
+This causes the validator to be slashed for `remainingSlashAmount = (target_slash - totalSlashAmount)` instead of `(target_slash - actual_tokens_burned)`, resulting in under-slashing.
 
-**Security Guarantee Broken:**
-Resource management invariant violated - goroutines must not leak and must have bounded lifecycle with proper cancellation mechanisms.
+**Exploitation path:**
+1. Validator A commits an infraction at height H (evidence not yet submitted)
+2. User redelegates from A to Validator B using standard redelegation transaction
+3. RedelegationEntry is created with `InitialBalance` (original tokens) and `SharesDst` (shares at B's current rate): [4](#0-3) 
+4. Validator B's exchange rate deteriorates (e.g., B gets slashed independently)
+5. Evidence of A's infraction is submitted and `Slash` is called
+6. `SlashRedelegation` calculates theoretical slash but burns fewer actual tokens
+7. Validator A is under-slashed by the difference
+
+**Security guarantee broken:** The protocol's slashing invariant `total_tokens_burned = slashFactor * power_at_infraction` is violated. The actual penalty becomes dependent on the destination validator's health rather than solely on infraction severity.
 
 ## Impact Explanation
 
-This vulnerability causes progressive resource exhaustion on validator nodes:
+This vulnerability systematically undermines the Proof-of-Stake network's economic security model:
 
-- **Memory**: Each leaked goroutine consumes 2-8KB of stack space plus heap allocations for iterator structures
-- **Goroutine Count**: Can accumulate hundreds to thousands over hours of operation
-- **Performance**: Increased memory pressure degrades overall node operation
-- **Stability**: Can cause node crashes when resource limits reached
+1. **Systematic Under-Slashing:** Whenever destination validators have deteriorating exchange rates (common due to slashing, validator operations, or rounding), the actual slashing is less than intended. The discrepancy can be substantial - with a 50% exchange rate deterioration, up to 50% of the slashing penalty can be avoided.
 
-With frequent validations encountering multiple estimates (common during high transaction throughput with overlapping read/write sets), resource consumption can easily exceed 30% increase over 24 hours, potentially causing node instability or crashes.
+2. **Economic Security Weakening:** Slashing serves as the primary deterrent against validator misbehavior. Reduced actual penalties weaken this deterrent mechanism, potentially encouraging infractions since the expected cost is lower than designed.
 
-This directly matches the Medium severity impact category: **"Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."**
+3. **Accounting Invariant Violation:** The protocol's fundamental assumption that slashing removes a deterministic amount based on infraction severity is broken. Instead, the actual penalty varies based on factors unrelated to the infraction (destination validator performance).
+
+4. **Potential Gaming:** While the issue occurs naturally, sophisticated actors monitoring validator infractions could deliberately redelegate to validators with declining exchange rates to minimize their slashing exposure, creating "slashing havens."
+
+The impact fits the Medium severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." While this doesn't constitute direct fund theft, it represents a failure of the protocol's core security mechanism.
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- Standard parallel transaction execution with OCC enabled (normal operation)
-- Transactions that iterate over key ranges (common operation)
-- Multiple keys with estimate values from concurrent transactions (frequent in high-contention scenarios)
+**High likelihood:**
 
-**Frequency:**
-Can occur multiple times per block during:
-- High transaction volume periods
-- Concurrent transactions accessing overlapping keys
-- Any scenario where OCC scheduler creates estimates for unfinished transactions
+1. **Common triggers:** Validator infractions (downtime, double-signing) occur regularly in PoS networks
+2. **Natural exchange rate fluctuations:** Exchange rates change frequently due to slashing events, validator operations, or precision losses
+3. **Wide redelegation usage:** Redelegation is a core feature allowing instant validator switching, widely used by delegators
+4. **Extended vulnerability window:** The unbonding period (typically 21 days) provides ample time for exchange rate changes
 
-**Who Can Trigger:**
-Any network participant submitting normal transactions - no special privileges required.
+**No special requirements:**
+- Any delegator can perform redelegations (no special privileges)
+- The bug causes systematic under-slashing even without intentional exploitation
+- Occurs through normal protocol operations
 
-The vulnerability triggers during normal validation processes, making it highly likely in production environments without intentional attacks. The race condition is deterministic when goroutine iteration is fast relative to main function processing.
+The vulnerability affects the fundamental slashing mechanism that underpins network security and can be triggered through standard user actions.
 
 ## Recommendation
 
-Implement context-based cancellation for the validation goroutine:
+Modify `SlashRedelegation` to calculate the target token amount first, then convert to shares at the current exchange rate:
 
-**Option 1 (Preferred):** Add context with cancellation to ensure goroutine terminates when main function returns.
+```go
+// Calculate target tokens to burn based on original stake
+slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+tokensToBurn := slashAmountDec.TruncateInt()
 
-**Option 2:** Change the blocking send in `validationIterator.Value()` to non-blocking using `select` with `default` case, matching the pattern used in `VersionIndexedStore.WriteAbort()`.
+// Get destination validator
+dstValidator, found := k.GetValidator(ctx, valDstAddr)
+if !found {
+    panic("destination validator not found")
+}
 
-**Option 3:** Add a done channel that main function closes upon return, and check this channel in the goroutine's iteration loop.
+// Convert target token amount to shares at CURRENT exchange rate
+sharesToUnbond, err := dstValidator.SharesFromTokens(tokensToBurn)
+if err != nil {
+    continue // Handle edge case where validator has no tokens
+}
+
+// Cap at available delegation shares
+delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
+if !found {
+    continue
+}
+if sharesToUnbond.GT(delegation.Shares) {
+    sharesToUnbond = delegation.Shares
+    // Recalculate actual tokens that can be burned
+    tokensToBurn = dstValidator.TokensFromShares(sharesToUnbond).TruncateInt()
+}
+
+// Unbond the calculated shares
+actualTokens, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
+// actualTokens should equal tokensToBurn
+totalSlashAmount = totalSlashAmount.Add(actualTokens)
+```
+
+The key principle: Calculate the token amount to burn first (based on `InitialBalance`), then convert to shares at the current rate, ensuring the return value matches actual tokens burned.
 
 ## Proof of Concept
 
-**Test Location:** `store/multiversion/store_test.go`
+**Conceptual scenario:**
 
 **Setup:**
-1. Create parent KVStore with keys: key1, key2, key3
-2. Initialize multiversion store
-3. Set estimates at index 1 (key1) and index 2 (key2)
-4. Create VersionIndexedStore for index 3
-5. Perform iteration covering keys with estimates
-6. Register iteration set via `WriteToMultiVersionStore()`
+1. Create validators A (source) and B (destination) with 1:1 exchange rates
+2. User has 100 tokens delegated to A
+3. Validator B gets independently slashed by 50%, reducing exchange rate to 0.5:1 (100 shares now worth 50 tokens)
+4. User redelegates 100 tokens from A to B at this poor exchange rate
+   - Receives 200 shares for 100 tokens (at 0.5:1 rate)
+   - `RedelegationEntry`: `InitialBalance=100`, `SharesDst=200`
 
 **Action:**
-1. Count goroutines before: `numBefore := runtime.NumGoroutine()`
-2. Call `mvs.ValidateTransactionState(3)`
-3. Validation encounters first estimate → sends to channel
-4. Main function receives and returns false
-5. Goroutine continues, encounters second estimate → blocks forever
+1. Validator A is slashed for an infraction with 50% slash factor (committed before redelegation)
+2. `SlashRedelegation` executes:
+   - Calculates: `totalSlashAmount = 0.5 * 100 = 50` tokens
+   - Calculates: `sharesToUnbond = 0.5 * 200 = 100` shares
+   - Unbonds 100 shares at B's current rate: `100 * 0.5 = 50` tokens (matches in this case)
 
-**Result:**
-- Validation returns `false` (correct)
-- Goroutine count increases: `numAfter > numBefore`
-- Even after GC and delay, goroutine count doesn't decrease
-- Confirms permanent goroutine leak
+**Result if B deteriorates further to 0.33:1 before slashing:**
+1. B now has rate 0.33:1 (66 tokens for 200 shares)
+2. Unbonding 100 shares yields: `100 * 0.33 = 33` tokens
+3. But `totalSlashAmount` reports 50 tokens
+4. `remainingSlashAmount` reduced by 50, but only 33 actually burned
+5. Validator A slashed for (target - 50) instead of (target - 33)
+6. **Total under-slash = 17 tokens (34% of intended redelegation slash)**
 
-The blocking occurs at the exact line where `validationIterator.Value()` attempts the second send without checking if a receiver still exists.
+**Verification points:**
+- Monitor bonded pool balance decrease vs reported slash amounts
+- Compare `remainingSlashAmount` reduction to actual tokens burned
+- Verify total slashed < `slashFactor * power_at_infraction`
 
 ## Notes
 
-The vulnerability is confirmed by comparing the blocking send pattern in validation [10](#0-9)  with the non-blocking pattern used in normal execution [11](#0-10) . The validation code lacks the protective `select` with `default` case, making it susceptible to permanent blocking when the receiver has already stopped listening.
+The vulnerability stems from storing `SharesDst` as a fixed value at redelegation time, then using it for slash calculations when the exchange rate may have changed. The `InitialBalance` correctly captures original tokens, but the actual burning uses share-based calculations with a potentially stale exchange rate relationship. This creates a systematic accounting mismatch whenever destination validator exchange rates deteriorate - a common occurrence in PoS networks.
 
 ### Citations
 
-**File:** store/multiversion/store.go (L262-318)
+**File:** x/staking/keeper/slash.go (L93-107)
 ```go
-func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
-	// collect items from multiversion store
-	sortedItems := s.CollectIteratorItems(index)
-	// add the iterationtracker writeset keys to the sorted items
-	for key := range tracker.writeset {
-		sortedItems.Set([]byte(key), []byte{})
-	}
-	validChannel := make(chan bool, 1)
-	abortChannel := make(chan occtypes.Abort, 1)
+		// Iterate through redelegations from slashed source validator
+		redelegations := k.GetRedelegationsFromSrcValidator(ctx, operatorAddress)
+		for _, redelegation := range redelegations {
+			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
+			if amountSlashed.IsZero() {
+				continue
+			}
 
-	// listen for abort while iterating
-	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
-		var parentIter types.Iterator
-		expectedKeys := iterationTracker.iteratedKeys
-		foundKeys := 0
-		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
-		if iterationTracker.ascending {
-			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
-		} else {
-			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
 		}
-		// create a new MVSMergeiterator
-		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
-		defer mergeIterator.Close()
-		for ; mergeIterator.Valid(); mergeIterator.Next() {
-			if (len(expectedKeys) - foundKeys) == 0 {
-				// if we have no more expected keys, then the iterator is invalid
-				returnChan <- false
-				return
-			}
-			key := mergeIterator.Key()
-			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
-			if _, ok := expectedKeys[string(key)]; !ok {
-				// if key isn't found
-				returnChan <- false
-				return
-			}
-			// remove from expected keys
-			foundKeys += 1
-			// delete(expectedKeys, string(key))
-
-			// if our iterator key was the early stop, then we can break
-			if bytes.Equal(key, iterationTracker.earlyStopKey) {
-				break
-			}
-		}
-		// return whether we found the exact number of expected keys
-		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
-	}(tracker, sortedItems, validChannel, abortChannel)
-	select {
-	case <-abortChannel:
-		// if we get an abort, then we know that the iterator is invalid
-		return false
-	case valid := <-validChannel:
-		return valid
 	}
+
+	// cannot decrease balance below zero
+	tokensToBurn := sdk.MinInt(remainingSlashAmount, validator.Tokens)
+	tokensToBurn = sdk.MaxInt(tokensToBurn, sdk.ZeroInt()) // defensive.
+```
+
+**File:** x/staking/keeper/slash.go (L219-296)
+```go
+func (k Keeper) SlashRedelegation(ctx sdk.Context, srcValidator types.Validator, redelegation types.Redelegation,
+	infractionHeight int64, slashFactor sdk.Dec) (totalSlashAmount sdk.Int) {
+	now := ctx.BlockHeader().Time
+	totalSlashAmount = sdk.ZeroInt()
+	bondedBurnedAmount, notBondedBurnedAmount := sdk.ZeroInt(), sdk.ZeroInt()
+
+	// perform slashing on all entries within the redelegation
+	for _, entry := range redelegation.Entries {
+		// If redelegation started before this height, stake didn't contribute to infraction
+		if entry.CreationHeight < infractionHeight {
+			continue
+		}
+
+		if entry.IsMature(now) {
+			// Redelegation no longer eligible for slashing, skip it
+			continue
+		}
+
+		// Calculate slash amount proportional to stake contributing to infraction
+		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+		slashAmount := slashAmountDec.TruncateInt()
+		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+
+		// Unbond from target validator
+		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
+		if sharesToUnbond.IsZero() {
+			continue
+		}
+
+		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
+		if err != nil {
+			panic(err)
+		}
+
+		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
+
+		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
+		if !found {
+			// If deleted, delegation has zero shares, and we can't unbond any more
+			continue
+		}
+
+		if sharesToUnbond.GT(delegation.Shares) {
+			sharesToUnbond = delegation.Shares
+		}
+
+		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
+		if err != nil {
+			panic(fmt.Errorf("error unbonding delegator: %v", err))
+		}
+
+		dstValidator, found := k.GetValidator(ctx, valDstAddr)
+		if !found {
+			panic("destination validator not found")
+		}
+
+		// tokens of a redelegation currently live in the destination validator
+		// therefor we must burn tokens from the destination-validator's bonding status
+		switch {
+		case dstValidator.IsBonded():
+			bondedBurnedAmount = bondedBurnedAmount.Add(tokensToBurn)
+		case dstValidator.IsUnbonded() || dstValidator.IsUnbonding():
+			notBondedBurnedAmount = notBondedBurnedAmount.Add(tokensToBurn)
+		default:
+			panic("unknown validator status")
+		}
+	}
+
+	if err := k.burnBondedTokens(ctx, bondedBurnedAmount); err != nil {
+		panic(err)
+	}
+
+	if err := k.burnNotBondedTokens(ctx, notBondedBurnedAmount); err != nil {
+		panic(err)
+	}
+
+	return totalSlashAmount
 }
 ```
 
-**File:** store/multiversion/store.go (L388-396)
+**File:** x/staking/types/validator.go (L304-306)
 ```go
-func (s *Store) ValidateTransactionState(index int) (bool, []int) {
-	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
-
-	// TODO: can we parallelize for all iterators?
-	iteratorValid := s.checkIteratorAtIndex(index)
-
-	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
-
-	return iteratorValid && readsetValid, conflictIndices
+func (v Validator) TokensFromShares(shares sdk.Dec) sdk.Dec {
+	return (shares.MulInt(v.Tokens)).Quo(v.DelegatorShares)
+}
 ```
 
-**File:** store/multiversion/memiterator.go (L115-116)
+**File:** x/staking/keeper/delegation.go (L936-960)
 ```go
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-```
-
-**File:** store/multiversion/mergeiterator.go (L241-241)
-```go
-			valueC := iter.cache.Value()
-```
-
-**File:** store/multiversion/mergeiterator.go (L253-253)
-```go
-			valueC := iter.cache.Value()
-```
-
-**File:** store/multiversion/mvkv.go (L127-132)
-```go
-func (store *VersionIndexedStore) WriteAbort(abort scheduler.Abort) {
-	select {
-	case store.abortChannel <- abort:
-	default:
-		fmt.Println("WARN: abort channel full, discarding val")
+	returnAmount, err := k.Unbond(ctx, delAddr, valSrcAddr, sharesAmount)
+	if err != nil {
+		return time.Time{}, err
 	}
+
+	if returnAmount.IsZero() {
+		return time.Time{}, types.ErrTinyRedelegationAmount
+	}
+
+	sharesCreated, err := k.Delegate(ctx, delAddr, returnAmount, srcValidator.GetStatus(), dstValidator, false)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	// create the unbonding delegation
+	completionTime, height, completeNow := k.getBeginInfo(ctx, valSrcAddr)
+
+	if completeNow { // no need to create the redelegation object
+		return completionTime, nil
+	}
+
+	red := k.SetRedelegationEntry(
+		ctx, delAddr, valSrcAddr, valDstAddr,
+		height, completionTime, returnAmount, sharesAmount, sharesCreated,
+	)
 ```

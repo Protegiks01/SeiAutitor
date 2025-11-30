@@ -1,166 +1,300 @@
 # Audit Report
 
 ## Title
-EVM Transaction State Persistence Despite Revert Error
+Missing Duplicate Validator Validation in Genesis Transaction Collection Causes Total Network Shutdown
 
 ## Summary
-The baseapp transaction processing code commits state changes for EVM transactions that revert, violating EVM atomicity guarantees. When `runTx` checks whether to commit state via `msCache.Write()`, it only verifies `err == nil` without checking `result.EvmError`, while hook execution correctly checks both conditions. This inconsistency allows reverted EVM transactions to persist state modifications while being marked as failed.
+The `CollectTxs` function in the genutil module fails to validate for duplicate validator operator addresses or consensus public keys when collecting genesis transactions. This allows duplicate validators to be included in genesis.json, causing all network nodes to panic during chain initialization and preventing the blockchain from starting.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary issue: `baseapp/baseapp.go`, lines 1015-1017 in `runTx` function
-- Secondary issue: `baseapp/baseapp.go`, line 1149 in `runMsgs` function  
-- Related handling: `baseapp/abci.go`, lines 329-333 in `DeliverTx` function [1](#0-0) 
+**Location:** `x/genutil/collect.go` (lines 101-178), `x/genutil/gentx.go` (lines 113-116), `x/staking/keeper/msg_server.go` (lines 43-44, 52-54) [1](#0-0) 
 
-**Intended Logic:**
-According to EVM semantics and the code comment at lines 280-281 of `baseapp/abci.go`, state should only persist if all messages execute successfully. For EVM transactions that revert, all state changes should be rolled back atomically, with only gas consumption persisting. [2](#0-1) 
+**Intended Logic:** 
+During genesis ceremony, the `collect-gentxs` command should validate all genesis transactions comprehensively to ensure they can be successfully applied during chain initialization. This includes checking that no two validators share the same operator address or consensus public key, as validators must be uniquely identifiable. Invalid genesis transactions should be rejected during collection with proper error messages before being committed to genesis.json.
 
-**Actual Logic:**
-The codebase exhibits an inconsistency in how it handles EVM errors:
-
-1. In `runMsgs`, message handlers can return `err = nil` with `msgResult.EvmError` populated when EVM execution reverts
-2. At line 1149, `msgMsCache.Write()` commits message state changes without checking `EvmError`
-3. `runMsgs` returns with `result.EvmError` set and `err = nil`
-4. In `runTx` at line 1015-1016, the condition checks only `err == nil` before calling `msCache.Write()`, committing all cached state to delivery state
-5. At line 1027, hooks correctly check BOTH `err == nil` AND `result.EvmError == ""` before execution
-6. In `DeliverTx` at lines 329-333, transactions with `result.EvmError != ""` are marked as failed [3](#0-2) [4](#0-3) [5](#0-4) 
+**Actual Logic:** 
+The `CollectTxs` function only validates account balances and account existence. After extracting each `MsgCreateValidator` message at line 139, the function never maintains tracking maps for validator addresses or consensus public keys to detect duplicates across multiple gentx files. The function simply appends all gentxs to the result set without duplicate checking. [2](#0-1) 
 
 **Exploitation Path:**
-1. User submits an EVM transaction that performs state modifications (storage writes, balance changes)
-2. The EVM message handler executes, applying state changes to the message cache
-3. The transaction reverts (via REVERT opcode or error condition)
-4. Handler returns `err = nil` with `result.EvmError` populated
-5. `msgMsCache.Write()` commits state to parent cache (line 1149)
-6. `msCache.Write()` commits all changes to delivery state (line 1016)
-7. Transaction is marked as failed in ABCI response (lines 329-333)
-8. State modifications persist despite transaction failure
+1. During genesis ceremony, multiple validators independently generate gentx files
+2. A malicious genesis participant or configuration error causes a gentx to use the same validator operator address OR consensus public key as another validator
+3. Genesis coordinator runs `collect-gentxs` which calls `CollectTxs`
+4. `CollectTxs` validates both gentxs successfully (only checking account balances)
+5. Both duplicate gentxs are included in the final genesis.json file
+6. All validators download genesis.json and attempt to start their nodes
+7. During `InitChain` ABCI call, the chain initialization proceeds via `app.initChainer`
+8. The genutil module's `InitGenesis` function invokes `DeliverGenTxs` to process genesis transactions
+9. First gentx successfully creates the validator
+10. Second gentx (duplicate) attempts to create the validator, but the staking handler detects the duplicate and returns `ErrValidatorOwnerExists` or `ErrValidatorPubKeyExists` [3](#0-2) 
 
-**Security Guarantee Broken:**
-EVM atomicity invariant - reverted transactions should have ALL state changes rolled back. The codebase breaks this by committing state for transactions marked as failed, creating a mismatch between transaction status and actual state modifications.
+11. In `DeliverGenTxs`, the error result causes an immediate panic [4](#0-3) 
+
+12. The panic propagates through the InitChain call stack with no recovery mechanism [5](#0-4) 
+
+13. All nodes crash during initialization - complete network shutdown
+
+**Security Guarantee Broken:** 
+The network availability guarantee is violated. A single malicious or misconfigured genesis participant can prevent the entire network from ever becoming operational, constituting a denial-of-service vulnerability at the genesis level that exceeds their intended authority.
 
 ## Impact Explanation
 
-This vulnerability results in unintended smart contract behavior where EVM transactions marked as failed can still modify blockchain state. The impact includes:
+**Affected Systems:**
+All network nodes fail to complete chain initialization. The blockchain cannot start, meaning:
+- No blocks can be produced
+- No transactions can be processed  
+- No consensus rounds can occur
+- The network remains completely non-operational
 
-- **Smart contract security assumptions violated**: Contracts using revert for access control or state protection would have their state modified even when access is denied
-- **State inconsistency**: The blockchain state differs from what clients expect based on transaction receipts showing "failed" status
-- **Broken atomicity**: Fundamental EVM execution guarantee that "all or nothing" state changes are enforced is violated
+**Severity Justification:**
+This represents a total network shutdown scenario where:
+- The chain is prevented from ever becoming operational
+- 100% of network nodes fail simultaneously
+- Failure occurs before any normal consensus or transaction processing begins
+- No self-recovery mechanism exists
+- Manual remediation is required: identifying the problematic gentx, removing it from genesis.json, regenerating the genesis file, redistributing to all validators, and coordinating a restart
 
-This fits the impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity).
-
-The vulnerability is demonstrated by the explicit inconsistency in the code - hooks check for `EvmError` (line 1027) but state writes do not (lines 1016 and 1149), showing that the pattern of `err = nil` with `EvmError != ""` is expected and supported by the architecture. [6](#0-5) [7](#0-6) 
+This matches the specified Medium severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any user can submit EVM transactions (no special privileges required)
-- EVM message handlers return `err = nil` with `result.EvmError` when reverts occur
-- The existence of the hook check at line 1027 that explicitly handles `(!ctx.IsEVM() || result.EvmError == "")` is strong evidence this pattern is expected in the architecture
+**Who can trigger it:**
+Any participant in the genesis ceremony who submits a gentx. While this is a privileged role, the vulnerability qualifies under the exception rule because even a trusted role can inadvertently trigger an unrecoverable security failure that exceeds their intended authority.
 
-**Frequency:**
-This would occur on every EVM transaction that reverts, which are common in EVM execution:
-- Failed token transfers
-- Access control violations  
-- Require statement failures
-- Explicit revert calls
-- Out-of-gas conditions handled at EVM level
+**Realistic Scenarios:**
+1. **Accidental triggers:**
+   - Key generation software bugs producing duplicate keys
+   - Configuration file copy-paste errors  
+   - Manual setup mistakes in multi-validator environments
+   - Backup/restore operations using outdated configurations
 
-The inconsistency between hook execution (which checks `EvmError`) and state commits (which don't) indicates this is an oversight rather than intentional design.
+2. **Malicious triggers:**
+   - Disgruntled genesis participant intentionally submitting duplicate validator
+   - Contentious fork scenario where participant wants to sabotage launch
+   - Compromised genesis participant's system
+
+3. **High-probability contexts:**
+   - Public/permissionless chain launches with many genesis validators
+   - Testnets where validator vetting is less rigorous
+   - Chains with decentralized genesis ceremony processes
+
+**Likelihood Assessment:**
+Once genesis.json contains duplicate validators, the attack succeeds with 100% reliability - every single node will fail to start. The impact (total network shutdown) vastly exceeds the intended authority of a genesis participant, who should only be able to control their own validator submission, not prevent the entire network from launching.
 
 ## Recommendation
 
-Modify the state write condition in `runTx` to check for EVM errors before committing state, consistent with the hook execution pattern:
+Implement duplicate validator validation in the `CollectTxs` function:
 
-```go
-// In baseapp/baseapp.go, replace lines 1015-1017:
-if err == nil && (!ctx.IsEVM() || result.EvmError == "") && mode == runTxModeDeliver {
-    msCache.Write()
-}
-```
+1. **Before the gentx processing loop** (before line 101), initialize tracking maps:
+   ```go
+   seenValidatorAddrs := make(map[string]bool)
+   seenConsensusPubKeys := make(map[string]bool)
+   ```
 
-Similarly, consider applying the same check in `runMsgs` at line 1149 before `msgMsCache.Write()` to maintain consistency at the message level.
+2. **During the loop** (after extracting `MsgCreateValidator` at line 139):
+   - Check if `msg.ValidatorAddress` already exists in `seenValidatorAddrs`
+   - Extract the consensus public key from `msg.Pubkey` and check if it exists in `seenConsensusPubKeys`
+   - Return a descriptive error if either duplicate is detected
+   - Add both to their respective maps after validation passes
 
-This ensures:
-1. Non-EVM transactions continue normal behavior (write on `err == nil`)
-2. EVM transactions only commit state when both `err == nil` AND `result.EvmError == ""`  
-3. Logic is consistent with hook execution check at line 1027
-4. EVM atomicity guarantees are preserved
+3. **Error message format:**
+   ```go
+   return appGenTxs, persistentPeers, fmt.Errorf(
+       "duplicate validator detected in gentx %s: validator address %s already exists",
+       fo.Name(), msg.ValidatorAddress)
+   ```
+
+This ensures duplicate validators are caught during the collection phase (where they fail gracefully with an error message) rather than during chain initialization (where they cause a panic and total network failure).
+
+Additionally, consider enhancing the `ValidateGenesis` function to perform similar checks as a secondary validation layer. [6](#0-5) 
 
 ## Proof of Concept
 
-**File:** `baseapp/deliver_tx_test.go` (test to be added)
+While no executable test is provided in the claim, the vulnerability can be reproduced with the following test structure in `x/genutil/gentx_test.go`:
 
 **Setup:**
-1. Create BaseApp with test EVM message handler that writes to store then returns `err = nil` with `result.EvmError = "execution reverted"`
-2. Initialize chain and delivery state
+1. Create test application context with simapp
+2. Fund two different accounts (addr1, addr2) with sufficient token balances
+3. Create two `MsgCreateValidator` messages:
+   - First: uses addr1 as delegator, valAddr1 as operator, pubkey1 as consensus key
+   - Second: uses addr2 as delegator, valAddr1 as operator (duplicate), pubkey2 as consensus key
+4. Encode both messages as properly signed genesis transactions
+5. Create a genesis state containing both gentxs
 
 **Action:**
-1. Create transaction with EVM context (`ctx.WithIsEVM(true)`)
-2. Call `DeliverTx` with this transaction
-3. Handler writes value to store, then returns with `EvmError` set
+```go
+validators, err := genutil.DeliverGenTxs(
+    ctx, 
+    genesisState.GenTxs, 
+    app.StakingKeeper, 
+    app.BaseApp.DeliverTx,
+    encodingConfig.TxConfig,
+)
+```
 
-**Result:**
-- Transaction response shows `IsOK() == false` (marked as failed)
-- Response contains `EvmTxInfo.VmError` with revert reason
-- **Bug**: Store contains the value written by handler, despite transaction being marked as failed
-- **Expected**: Store should NOT contain the value, as state should be rolled back for reverted EVM transactions
+**Expected Result:**
+The function panics when processing the second gentx because:
+1. First gentx successfully creates validator with valAddr1
+2. Second gentx attempts to create validator with same valAddr1
+3. `CreateValidator` handler returns `ErrValidatorOwnerExists`
+4. `DeliverGenTxs` executes `panic(res.Log)` at line 115
 
-The inconsistency is demonstrated by comparing line 1027 (hooks check `EvmError`) with line 1016 (state write doesn't check `EvmError`).
+The test should use `require.Panics()` to verify the panic occurs, confirming that duplicate validators in genesis transactions cause total initialization failure.
+
+**Alternative PoC** (testing duplicate consensus pubkey):
+Repeat the above but use the same consensus pubkey (pubkey1) in both `MsgCreateValidator` messages while keeping different operator addresses. This triggers `ErrValidatorPubKeyExists` with the same panic result.
 
 ## Notes
 
-The vulnerability assessment is based on the clear code inconsistency where hook execution properly checks `result.EvmError` but state writes do not. The infrastructure for handling EVM errors (`EvmError` field, error wrapping, context flags) is extensively present throughout the codebase, indicating this is an expected execution pattern. While the actual EVM message handlers are in a separate repository (likely sei-chain), the sei-cosmos SDK fork has been specifically designed to support the pattern where handlers return `err = nil` with `result.EvmError` set, as evidenced by the explicit conditional logic for EVM transactions in hook processing.
+The vulnerability exists due to validation being improperly split across two phases:
+
+1. **Collection phase** (`CollectTxs`) - Only validates account balances and account existence, missing validator uniqueness checks
+2. **Delivery phase** (`DeliverGenTxs`) - Validates validator uniqueness through the staking handler, but uses panic for failure handling
+
+This architectural gap allows malicious gentxs to pass initial validation but trigger unrecoverable panics during deployment. The proper solution is to move validator uniqueness validation to the collection phase where errors can be returned gracefully, preventing problematic genesis files from being created in the first place.
+
+The TODO comment at line 138 of collect.go ("TODO abstract out staking message validation back to staking") suggests the developers recognized that staking validation is incomplete in the current implementation.
 
 ### Citations
 
-**File:** baseapp/baseapp.go (L1015-1017)
+**File:** x/genutil/collect.go (L101-178)
 ```go
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
+	for _, fo := range fos {
+		if fo.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(fo.Name(), ".json") {
+			continue
+		}
+
+		// get the genTx
+		jsonRawTx, err := ioutil.ReadFile(filepath.Join(genTxsDir, fo.Name()))
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		var genTx sdk.Tx
+		if genTx, err = txJSONDecoder(jsonRawTx); err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		appGenTxs = append(appGenTxs, genTx)
+
+		// the memo flag is used to store
+		// the ip and node-id, for example this may be:
+		// "528fd3df22b31f4969b05652bfe8f0fe921321d5@192.168.2.37:26656"
+
+		memoTx, ok := genTx.(sdk.TxWithMemo)
+		if !ok {
+			return appGenTxs, persistentPeers, fmt.Errorf("expected TxWithMemo, got %T", genTx)
+		}
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
+		}
+
+		// genesis transactions must be single-message
+		msgs := genTx.GetMsgs()
+
+		// TODO abstract out staking message validation back to staking
+		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
+
+		// validate delegator and validator addresses and funds against the accounts in the state
+		delAddr := msg.DelegatorAddress
+		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
+
+		delBal, delOk := balancesMap[delAddr]
+		if !delOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
+			}
+
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
+		}
+
+		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
+		if !valOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
+			}
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
+		}
+
+		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
+			return appGenTxs, persistentPeers, fmt.Errorf(
+				"insufficient fund for delegation %v: %v < %v",
+				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
+			)
+		}
+
+		// exclude itself from persistent peers
+		if msg.Description.Moniker != moniker {
+			addressesIPs = append(addressesIPs, nodeAddrIP)
+		}
 	}
 ```
 
-**File:** baseapp/baseapp.go (L1027-1027)
+**File:** x/staking/keeper/msg_server.go (L42-54)
 ```go
-	if err == nil && (!ctx.IsEVM() || result.EvmError == "") {
+	// check to see if the pubkey or sender has been registered before
+	if _, found := k.GetValidator(ctx, valAddr); found {
+		return nil, types.ErrValidatorOwnerExists
+	}
+
+	pk, ok := msg.Pubkey.GetCachedValue().(cryptotypes.PubKey)
+	if !ok {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "Expecting cryptotypes.PubKey, got %T", pk)
+	}
+
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
+	}
 ```
 
-**File:** baseapp/baseapp.go (L1149-1153)
+**File:** x/genutil/gentx.go (L113-116)
 ```go
-		msgMsCache.Write()
-
-		if msgResult.EvmError != "" {
-			evmError = msgResult.EvmError
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
 		}
 ```
 
-**File:** baseapp/abci.go (L280-281)
+**File:** baseapp/abci.go (L73-73)
 ```go
-// State only gets persisted if all messages are valid and get executed successfully.
-// Otherwise, the ResponseDeliverTx will contain relevant error information.
+	resp := app.initChainer(app.deliverState.ctx, *req)
 ```
 
-**File:** baseapp/abci.go (L329-333)
+**File:** x/genutil/types/genesis_state.go (L98-120)
 ```go
-		if result.EvmError != "" {
-			evmErr := sdkerrors.Wrap(sdkerrors.ErrEVMVMError, result.EvmError)
-			res.Codespace, res.Code, res.Log = sdkerrors.ABCIInfo(evmErr, app.trace)
-			resultStr = "failed"
-			return
-```
+// ValidateGenesis validates GenTx transactions
+func ValidateGenesis(genesisState *GenesisState, txJSONDecoder sdk.TxDecoder) error {
+	for i, genTx := range genesisState.GenTxs {
+		var tx sdk.Tx
+		tx, err := txJSONDecoder(genTx)
+		if err != nil {
+			return err
+		}
 
-**File:** proto/cosmos/base/abci/v1beta1/abci.proto (L106-107)
-```text
-  // EVM VM error during execution
-  string evmError = 4;
-```
+		msgs := tx.GetMsgs()
+		if len(msgs) != 1 {
+			return errors.New(
+				"must provide genesis Tx with exactly 1 CreateValidator message")
+		}
 
-**File:** types/errors/errors.go (L159-160)
-```go
-	// ErrEVMVMError defines an error for an evm vm error (eg. revert)
-	ErrEVMVMError = Register(RootCodespace, 45, "evm reverted")
+		// TODO: abstract back to staking
+		if _, ok := msgs[0].(*stakingtypes.MsgCreateValidator); !ok {
+			return fmt.Errorf(
+				"genesis transaction %v does not contain a MsgCreateValidator", i)
+		}
+	}
+	return nil
+}
 ```

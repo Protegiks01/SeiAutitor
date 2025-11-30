@@ -1,239 +1,270 @@
+After thorough investigation of the sei-cosmos codebase, I can confirm this claim presents a **valid vulnerability**. Let me provide my detailed validation:
+
+## Technical Flow Verification
+
+I have traced and confirmed each step of the execution path:
+
+**Step 1 - Validator Removal:** [1](#0-0) 
+When `RemoveValidator` is called, it deletes the `ValidatorByConsAddrKey` index. [2](#0-1) 
+It then calls the `AfterValidatorRemoved` hook.
+
+**Step 2 - Incomplete Cleanup:** [3](#0-2) 
+The `AfterValidatorRemoved` hook only deletes the address-pubkey relation. It does NOT delete `ValidatorSigningInfo` or `ValidatorMissedBlockArray`.
+
+**Step 3 - Consensus Key Reuse Allowed:** [4](#0-3) 
+When creating a new validator, the system checks if a validator with that consensus key exists using `GetValidatorByConsAddr`. [5](#0-4) 
+Since `GetValidatorByConsAddr` uses the `ValidatorByConsAddrKey` index that was deleted in step 1, the check passes and a new validator can be created with the same consensus key.
+
+**Step 4 - State Inheritance:** [6](#0-5) 
+When the new validator bonds, `AfterValidatorBonded` checks if signing info exists. It only creates new signing info if NOT found. Since the old signing info was never deleted, it's reused with its stale `MissedBlocksCounter`.
+
+**Step 5 - Unfair Slashing:** [7](#0-6) 
+The slashing logic uses the inherited `MissedBlocksCounter` to determine if a validator should be slashed, causing premature slashing.
+
+**Step 6 - Removal Trigger:** [8](#0-7) 
+This entire flow can be triggered when a validator's delegator shares reach zero and the validator is unbonded.
+
+## Confirmation of Missing Cleanup [9](#0-8) 
+While there are functions to SET validator signing info, my grep search confirmed there is NO function to DELETE `ValidatorSigningInfo` when a validator is removed. [10](#0-9) 
+The only cleanup function `ClearValidatorMissedBlockBitArray` exists but is only called when validators are slashed/jailed, NOT when they are removed.
+
+## Comparison with Other Modules [11](#0-10) 
+The distribution module's `AfterValidatorRemoved` hook demonstrates proper cleanup, deleting outstanding rewards, commission, slash events, and historical/current rewards. The slashing module fails to follow this pattern.
+
+## Documentation Review [12](#0-11) 
+The specification only mentions that `AfterValidatorRemoved` "removes a validator's consensus key" but does NOT mention cleaning up signing info or missed block data, indicating incomplete design rather than intentional behavior.
+
+---
+
 # Audit Report
 
 ## Title
-Array Index Out of Bounds Panic in Multisignature Gas Consumption Causing Network-Wide Denial of Service
+Stale Liveness Tracking State Persists After Validator Removal Causing Unfair Slashing on Consensus Key Reuse
 
 ## Summary
-The `ConsumeMultisignatureVerificationGas` function in the ante handler chain accesses array elements without bounds checking, allowing an attacker to craft a malformed multisignature transaction that causes all validator nodes to panic and crash simultaneously, resulting in total network shutdown. [1](#0-0) 
+When a validator is removed from the validator set, the slashing module's `AfterValidatorRemoved` hook fails to delete `ValidatorSigningInfo` and `ValidatorMissedBlockArray`. If the same consensus address later creates a new validator, the stale liveness tracking data persists, causing the new validator to inherit the previous validator's `MissedBlocksCounter` and face premature downtime slashing.
 
 ## Impact
 Medium
 
 ## Finding Description
-
-**Location:** 
-- File: `x/auth/ante/sigverify.go`
-- Function: `ConsumeMultisignatureVerificationGas`
-- Lines: 459-460 (array access without bounds checking)
-
-**Intended Logic:**
-The function should safely consume gas for each signature in a multisignature transaction by iterating through valid indices only. Array bounds should be validated before any indexing operations to prevent panics.
-
-**Actual Logic:**
-The function iterates based on `size := sig.BitArray.Count()` and directly accesses:
-- `pubkey.GetPubKeys()[i]` at line 459 without verifying `i < len(pubkey.GetPubKeys())`
-- `sig.Signatures[sigIndex]` at line 460 without verifying `sigIndex < len(sig.Signatures)`
-
-The necessary validation exists in `VerifyMultisignature` but executes in `SigVerificationDecorator`, which runs AFTER `SigGasConsumeDecorator` in the ante handler chain. [2](#0-1) 
-
-**Exploitation Path:**
-
-1. Attacker creates a transaction with a multisig account containing N pubkeys (e.g., N=2)
-
-2. Attacker crafts malformed `MultiSignatureData` by manipulating the protobuf message to contain:
-   - A `CompactBitArray` with `Count()` returning M where M > N (e.g., M=10)
-   - Bit(s) set at indices beyond N-1 (e.g., index 5)
-   - Any signatures array [3](#0-2) 
-
-3. Transaction flows through ante handler chain in this order:
-   - `SetPubKeyDecorator` (line 55)
-   - `ValidateSigCountDecorator` (line 56)
-   - **`SigGasConsumeDecorator` (line 57)** ← Panics here
-   - `SigVerificationDecorator` (line 58) ← Never reached [4](#0-3) 
-
-4. When loop executes with `i` from 0 to M-1:
-   - When `i >= N` and `BitArray.GetIndex(i)` returns true
-   - Accessing `pubkey.GetPubKeys()[i]` triggers index out of bounds panic
-   - Validator node crashes immediately
-
-**Security Guarantee Broken:**
-Memory safety invariant is violated - array accesses must be bounds-checked. The system assumes validation occurs before gas consumption, but the ante handler ordering breaks this assumption.
+- **location**: `x/slashing/keeper/hooks.go:40-43` (AfterValidatorRemoved function)
+- **intended logic**: When a validator is completely removed from the validator set (all delegations unbonded), all associated slashing state should be cleaned up. If the same consensus address later creates a new validator, it should start with fresh liveness tracking: `MissedBlocksCounter=0`, fresh `StartHeight`, and an empty missed blocks array.
+- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation but does NOT delete the `ValidatorSigningInfo` or `ValidatorMissedBlockArray`. These persist in storage keyed by consensus address. When a new validator with the same consensus address bonds, `AfterValidatorBonded` checks if signing info exists and only creates new info if not found. Since the old signing info persists, the new validator inherits the stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
+- **exploitation path**: 
+  1. Validator accumulates missed blocks during operation (e.g., 200 out of 1000-block window, below slashing threshold of 501)
+  2. Validator's operator unbonds all delegations, causing `DelegatorShares` to reach zero
+  3. `RemoveValidator` is called, deleting the `ValidatorByConsAddrKey` index but leaving signing info intact
+  4. Later, the same consensus key creates a new validator (passes the `GetValidatorByConsAddr` check since the index was deleted)
+  5. New validator bonds, triggering `AfterValidatorBonded` which finds existing signing info and reuses it
+  6. New validator inherits `MissedBlocksCounter=200` from previous lifecycle
+  7. If new validator misses 301 additional blocks, it reaches 501 total and gets slashed/jailed, whereas a fresh validator would need to miss 501 blocks from the start
+- **security guarantee broken**: The protocol invariant that each validator lifecycle has independent liveness tracking is violated. Validators cannot rely on getting a clean slate when creating a new validator with an existing consensus key after full unbonding.
 
 ## Impact Explanation
-
-**Affected Components:**
-- All validator nodes processing transactions
-- Network consensus mechanism
-- Block production and transaction finality
-
-**Severity:**
-A single malformed transaction broadcast to the network causes ALL validator nodes to simultaneously panic and crash during transaction processing in the mempool/ante handler stage. This results in:
-
-- Complete network shutdown - no new blocks can be produced
-- Total loss of network availability
-- Requires coordinated manual intervention to restart all validator nodes
-- Attacker can maintain persistent denial of service by repeatedly broadcasting malformed transactions
-- No recovery mechanism without manual intervention
-
-This constitutes a critical availability vulnerability classified as "Network not being able to confirm new transactions (total network shutdown)" per the severity criteria.
+Validators who reuse consensus keys after complete unbonding and removal inherit stale missed block counters from their previous lifecycle. This causes them to be slashed and jailed after missing significantly fewer blocks than the configured `SignedBlocksWindow - MinSignedPerWindow` threshold. With default parameters (window=1000, min=500), a validator with inherited `MissedBlocksCounter=200` would be slashed after missing only 301 new blocks instead of 501, a 40% reduction in the downtime tolerance. This results in:
+- Unfair economic penalties through slashing (loss of validator stake based on `SlashFractionDowntime` parameter, typically 0.01%-1%)
+- Validators being incorrectly jailed and removed from the active set, losing block rewards and commission
+- Undermined fairness of the slashing mechanism, as validators with reused keys are treated differently than fresh validators
+- Potential operational disruption and discouragement of validator participation
 
 ## Likelihood Explanation
+This vulnerability can be triggered through normal validator operations without any malicious intent:
+- Validators performing infrastructure maintenance or upgrades who fully unbond temporarily
+- Validators who reuse existing consensus keys for operational simplicity (common practice to avoid key management complexity)
+- Any validator operator who accumulates some missed blocks (normal during network issues or node problems) before complete unbonding
 
-**Who Can Trigger:**
-Any network participant can execute this attack. No special privileges, validator status, staking requirements, or permissions are needed.
-
-**Conditions Required:**
-- Attacker constructs a multisig transaction with malformed `MultiSignatureData`
-- Transaction must only pass basic protobuf decoding (no semantic validation required)
-- No other prerequisites
-
-**Frequency:**
-- Can be exploited immediately upon discovery
-- Single transaction affects all validators simultaneously
-- Attack can be repeated indefinitely to maintain network shutdown
-- High probability of exploitation given:
-  - Zero barrier to entry
-  - Trivial to construct malformed protobuf messages
-  - Deterministic outcome
+While complete unbonding followed by recreation with the same consensus key is not a frequent operation, it is a legitimate use case. The conditions required are all standard validator lifecycle operations, making this a realistic edge case that affects the protocol's fairness guarantees.
 
 ## Recommendation
-
-Add bounds validation in `ConsumeMultisignatureVerificationGas` before the indexing loop:
+Modify the `AfterValidatorRemoved` hook in `x/slashing/keeper/hooks.go` to properly clean up all validator-related slashing state:
 
 ```go
-func ConsumeMultisignatureVerificationGas(
-    meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-    params types.Params, accSeq uint64,
-) error {
-    size := sig.BitArray.Count()
-    pubKeys := pubkey.GetPubKeys()
-    
-    // Validate array bounds before accessing
-    if len(pubKeys) != size {
-        return fmt.Errorf("bit array size %d does not match pubkey count %d", size, len(pubKeys))
-    }
-    
-    numSetBits := sig.BitArray.NumTrueBitsBefore(size)
-    if len(sig.Signatures) != numSetBits {
-        return fmt.Errorf("signature count %d does not match set bits %d", len(sig.Signatures), numSetBits)
-    }
-    
-    sigIndex := 0
-    for i := 0; i < size; i++ {
-        // ... existing logic
-    }
-    return nil
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+    // Clean up signing info
+    store := ctx.KVStore(k.storeKey)
+    store.Delete(types.ValidatorSigningInfoKey(address))
+    // Clean up missed blocks array
+    k.ClearValidatorMissedBlockBitArray(ctx, address)
 }
 ```
 
-Alternative: Reorder the ante handler chain to execute `SigVerificationDecorator` before `SigGasConsumeDecorator`, though this may affect gas accounting semantics.
+This ensures that when a validator is removed, all liveness tracking data is cleared, allowing a fresh start if the consensus address is later reused.
 
 ## Proof of Concept
+**Test Location**: `x/slashing/keeper/keeper_test.go` (new test to add)
+**Function**: `TestValidatorRemovalClearsMissedBlocks`
 
-**Test File:** `x/auth/ante/sigverify_test.go`
+**Setup**:
+1. Initialize test chain with slashing parameters (`SignedBlocksWindow=1000`, `MinSignedPerWindow=500`)
+2. Create and bond validator A with a specific consensus pubkey
+3. Simulate 200 blocks where validator does NOT sign (accumulate `MissedBlocksCounter=200`)
+4. Verify signing info exists with `MissedBlocksCounter=200`
 
-**Setup:**
-1. Create a multisig public key with 2 sub-keys using `kmultisig.NewLegacyAminoPubKey(2, pubkeys)`
-2. Create a `CompactBitArray` with size 10 (larger than the 2 pubkeys)
-3. Set bit at index 5 (beyond the pubkey array bounds)
-4. Construct `MultiSignatureData` with this malformed BitArray
+**Action**:
+1. Unbond all delegations from validator A
+2. Complete unbonding period and verify validator is removed from state
+3. Verify `GetValidatorByConsAddr` returns not found (index deleted)
+4. Create new validator B with the SAME consensus pubkey as validator A
+5. Bond the new validator
 
-**Action:**
-Call `ConsumeMultisignatureVerificationGas` with the malformed signature data:
-```go
-params := types.DefaultParams()
-meter := sdk.NewInfiniteGasMeter(1, 1)
-ante.ConsumeMultisignatureVerificationGas(meter, malformedSig, multisigPubKey, params, 0)
-```
-
-**Result:**
-Function panics with "index out of range" error when attempting to access `pubkey.GetPubKeys()[5]` on line 459, since the pubkey array only contains 2 elements. This demonstrates that any attacker can crash validator nodes by broadcasting such a transaction.
+**Result**:
+Query signing info for the consensus address - it incorrectly shows `MissedBlocksCounter=200` (inherited from removed validator A) instead of `MissedBlocksCounter=0` for a fresh validator. This proves the bug exists and demonstrates that the new validator starts with stale liveness tracking state, leading to premature slashing if it misses additional blocks.
 
 ## Notes
 
-The vulnerability exists because the system relies on defense-in-depth with validation in `VerifyMultisignature`, but the ante handler chain processes gas consumption before signature verification. The `CompactBitArray.Count()` method returns a value based on protobuf fields that can be arbitrarily set by an attacker, with no semantic validation against the actual multisig pubkey count until after the vulnerable code executes.
+This vulnerability fits the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." While the wording mentions "smart contract behavior," it applies to Layer 1 blockchain protocol behavior in Cosmos SDK. The bug results in unintended slashing behavior with limited fund impact (bounded by SlashFractionDowntime parameter and the edge case nature of the scenario). The core issue is the violation of protocol invariants regarding independent validator lifecycle tracking, with slashing as a consequence rather than the primary bug.
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L445-470)
+**File:** x/staking/keeper/validator.go (L36-45)
 ```go
-// ConsumeMultisignatureVerificationGas consumes gas from a GasMeter for verifying a multisig pubkey signature
-func ConsumeMultisignatureVerificationGas(
-	meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-	params types.Params, accSeq uint64,
-) error {
+func (k Keeper) GetValidatorByConsAddr(ctx sdk.Context, consAddr sdk.ConsAddress) (validator types.Validator, found bool) {
+	store := ctx.KVStore(k.storeKey)
 
-	size := sig.BitArray.Count()
-	sigIndex := 0
-
-	for i := 0; i < size; i++ {
-		if !sig.BitArray.GetIndex(i) {
-			continue
-		}
-		sigV2 := signing.SignatureV2{
-			PubKey:   pubkey.GetPubKeys()[i],
-			Data:     sig.Signatures[sigIndex],
-			Sequence: accSeq,
-		}
-		err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
-		if err != nil {
-			return err
-		}
-		sigIndex++
+	opAddr := store.Get(types.GetValidatorByConsAddrKey(consAddr))
+	if opAddr == nil {
+		return validator, false
 	}
 
-	return nil
+	return k.GetValidator(ctx, opAddr)
+}
 ```
 
-**File:** crypto/keys/multisig/multisig.go (L50-66)
+**File:** x/staking/keeper/validator.go (L176-176)
 ```go
-func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
-	bitarray := sig.BitArray
-	sigs := sig.Signatures
-	size := bitarray.Count()
-	pubKeys := m.GetPubKeys()
-	// ensure bit array is the correct size
-	if len(pubKeys) != size {
-		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+```
+
+**File:** x/staking/keeper/validator.go (L180-180)
+```go
+	k.AfterValidatorRemoved(ctx, valConsAddr, validator.GetOperator())
+```
+
+**File:** x/slashing/keeper/hooks.go (L12-26)
+```go
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
 	}
-	// ensure size of signature list
-	if len(sigs) < int(m.Threshold) || len(sigs) > size {
-		return fmt.Errorf("signature size is incorrect %d", len(sigs))
-	}
-	// ensure at least k signatures are set
-	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
-		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
+}
+```
+
+**File:** x/slashing/keeper/hooks.go (L40-43)
+```go
+// AfterValidatorRemoved deletes the address-pubkey relation when a validator is removed,
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+}
+```
+
+**File:** x/staking/keeper/msg_server.go (L52-54)
+```go
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
 	}
 ```
 
-**File:** x/auth/tx/sigs.go (L66-85)
+**File:** x/slashing/keeper/infractions.go (L96-96)
 ```go
-	case *tx.ModeInfo_Multi_:
-		multi := modeInfo.Multi
+	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+```
 
-		sigs, err := decodeMultisignatures(sig)
-		if err != nil {
-			return nil, err
-		}
+**File:** x/staking/keeper/delegation.go (L789-792)
+```go
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
+	}
+```
 
-		sigv2s := make([]signing.SignatureData, len(sigs))
-		for i, mi := range multi.ModeInfos {
-			sigv2s[i], err = ModeInfoAndSigToSignatureData(mi, sigs[i])
-			if err != nil {
-				return nil, err
+**File:** x/slashing/keeper/signing_info.go (L34-38)
+```go
+func (k Keeper) SetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress, info types.ValidatorSigningInfo) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&info)
+	store.Set(types.ValidatorSigningInfoKey(address), bz)
+}
+```
+
+**File:** x/slashing/keeper/signing_info.go (L168-171)
+```go
+func (k Keeper) ClearValidatorMissedBlockBitArray(ctx sdk.Context, address sdk.ConsAddress) {
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
+}
+```
+
+**File:** x/distribution/keeper/hooks.go (L25-76)
+```go
+// AfterValidatorRemoved performs clean up after a validator is removed
+func (h Hooks) AfterValidatorRemoved(ctx sdk.Context, _ sdk.ConsAddress, valAddr sdk.ValAddress) {
+	// fetch outstanding
+	outstanding := h.k.GetValidatorOutstandingRewardsCoins(ctx, valAddr)
+
+	// force-withdraw commission
+	commission := h.k.GetValidatorAccumulatedCommission(ctx, valAddr).Commission
+	if !commission.IsZero() {
+		// subtract from outstanding
+		outstanding = outstanding.Sub(commission)
+
+		// split into integral & remainder
+		coins, remainder := commission.TruncateDecimal()
+
+		// remainder to community pool
+		feePool := h.k.GetFeePool(ctx)
+		feePool.CommunityPool = feePool.CommunityPool.Add(remainder...)
+		h.k.SetFeePool(ctx, feePool)
+
+		// add to validator account
+		if !coins.IsZero() {
+			accAddr := sdk.AccAddress(valAddr)
+			withdrawAddr := h.k.GetDelegatorWithdrawAddr(ctx, accAddr)
+
+			if err := h.k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, withdrawAddr, coins); err != nil {
+				panic(err)
 			}
 		}
+	}
 
-		return &signing.MultiSignatureData{
-			BitArray:   multi.Bitarray,
-			Signatures: sigv2s,
-		}, nil
+	// Add outstanding to community pool
+	// The validator is removed only after it has no more delegations.
+	// This operation sends only the remaining dust to the community pool.
+	feePool := h.k.GetFeePool(ctx)
+	feePool.CommunityPool = feePool.CommunityPool.Add(outstanding...)
+	h.k.SetFeePool(ctx, feePool)
+
+	// delete outstanding
+	h.k.DeleteValidatorOutstandingRewards(ctx, valAddr)
+
+	// remove commission record
+	h.k.DeleteValidatorAccumulatedCommission(ctx, valAddr)
+
+	// clear slashes
+	h.k.DeleteValidatorSlashEvents(ctx, valAddr)
+
+	// clear historical rewards
+	h.k.DeleteValidatorHistoricalRewards(ctx, valAddr)
+
+	// clear current rewards
+	h.k.DeleteValidatorCurrentRewards(ctx, valAddr)
+}
 ```
 
-**File:** x/auth/ante/ante.go (L47-60)
-```go
-	anteDecorators := []sdk.AnteFullDecorator{
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
-		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
-		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-		NewIncrementSequenceDecorator(options.AccountKeeper),
-	}
+**File:** x/slashing/spec/05_hooks.md (L15-17)
+```markdown
++ `AfterValidatorBonded` creates a `ValidatorSigningInfo` instance as described in the following section.
++ `AfterValidatorCreated` stores a validator's consensus key.
++ `AfterValidatorRemoved` removes a validator's consensus key.
 ```

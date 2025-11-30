@@ -1,278 +1,295 @@
-After thoroughly analyzing this security claim by examining the codebase, I can confirm this is a **valid vulnerability**.
-
 # Audit Report
 
 ## Title
-Future-Height Evidence Bypasses Validation and Causes Network Halt via Panic in Slash Function
+MsgGrantAllowance Bypasses Bech32 Address Validation Enabling Fee-Free Resource Consumption
 
 ## Summary
-The evidence module fails to validate that evidence is not from a future block height. When evidence with `infractionHeight > currentHeight` is processed during BeginBlock, it bypasses age validation due to a logic flaw, then causes the staking module's `Slash` function to panic, resulting in complete network shutdown.
+The `MsgGrantAllowance.ValidateBasic()` method in the feegrant module fails to validate Bech32 address format, allowing transactions with malformed addresses to pass initial validation and consume node resources during ante handler execution without paying fees.
 
 ## Impact
-High
+Low
 
 ## Finding Description
 
-**Location**: 
-- `x/evidence/keeper/infraction.go` lines 43-64 (age validation)
-- `x/evidence/keeper/infraction.go` lines 95-112 (distribution height calculation and slash call)
-- `x/staking/keeper/slash.go` lines 67-71 (panic on future height)
-- `x/evidence/abci.go` lines 16-30 (entry point) [1](#0-0) 
+**Location:**
+- Module: `x/feegrant`
+- File: `x/feegrant/msgs.go`
+- Functions: `MsgGrantAllowance.ValidateBasic()` and `MsgGrantAllowance.GetSigners()`
 
-**Intended Logic**: 
-The `HandleEquivocationEvidence` function should reject evidence that is either too old (beyond `MaxAgeDuration` and `MaxAgeNumBlocks`) or from future block heights. Evidence should only describe past misbehavior. The staking module's CONTRACT explicitly requires this at lines 22-23 of slash.go. [2](#0-1) 
+**Intended Logic:**
+The `ValidateBasic()` method should perform comprehensive stateless validation to reject invalid messages early in the transaction pipeline, before resource-intensive operations. This defense-in-depth mechanism prevents malformed transactions from consuming node resources without payment. [1](#0-0) 
 
-**Actual Logic**: 
-When `infractionHeight > currentHeight`, the calculation `ageBlocks := ctx.BlockHeader().Height - infractionHeight` produces a negative value. The validation condition uses AND logic: `ageDuration > MaxAgeDuration && ageBlocks > MaxAgeNumBlocks`. Since a negative `ageBlocks` can never be greater than a positive `MaxAgeNumBlocks`, the condition evaluates to false, and the evidence is incorrectly accepted.
+**Actual Logic:**
+The current implementation only validates that addresses are non-empty strings and different from each other. It does NOT validate Bech32 address format, unlike other modules such as bank and authz: [2](#0-1) [3](#0-2) 
 
-**Exploitation Path**:
-1. Evidence with future height enters via `BeginBlocker` from Tendermint's `ByzantineValidators` [3](#0-2) 
+**Exploitation Path:**
 
-2. Evidence is converted without height validation [4](#0-3) 
+1. Attacker submits `MsgGrantAllowance` transaction with invalid Bech32 addresses (e.g., "invalid-granter" and "invalid-grantee")
+2. Transaction enters CheckTx processing pipeline
+3. `validateBasicTxMsgs()` calls `ValidateBasic()` which incorrectly passes [4](#0-3) 
+4. Ante handler chain executes on a cached context [5](#0-4) 
+5. Multiple decorators execute in order, including `DeductFeeDecorator` which deducts fees into the cache [6](#0-5) 
+6. `SetPubKeyDecorator` executes and calls `sigTx.GetSigners()` [7](#0-6) 
+7. This calls each message's `GetSigners()` which calls `sdk.AccAddressFromBech32()` and panics on invalid Bech32 [8](#0-7) [9](#0-8) 
+8. Panic is recovered, ante handler returns error, but cached context is never committed [10](#0-9) 
+9. No fees are charged (cache write is skipped) despite consuming resources through 6-7 ante decorators [11](#0-10) 
 
-3. Age validation fails to reject due to negative `ageBlocks` issue
-
-4. `distributionHeight` is calculated as `infractionHeight - sdk.ValidatorUpdateDelay` [5](#0-4) 
-
-5. Since `ValidatorUpdateDelay = 1`, if `infractionHeight` is future, `distributionHeight` is also future [6](#0-5) 
-
-6. The slashing keeper passes `distributionHeight` as `infractionHeight` to staking keeper [7](#0-6) 
-
-7. The staking keeper's Slash function panics when `infractionHeight > ctx.BlockHeight()` [8](#0-7) 
-
-8. Panic propagates through BeginBlock, crashing all nodes
-
-**Security Guarantee Broken**: 
-This violates the consensus invariant that evidence must describe past behavior and the explicit CONTRACT requirement in slash.go that "Infraction was committed at the current height or at a past height, not at a height in the future". The panic during BeginBlock causes unrecoverable node failure.
+**Security Guarantee Broken:**
+The defense-in-depth principle is violated. The system design expects `ValidateBasic()` to catch obviously invalid inputs before expensive processing. This vulnerability allows attackers to bypass this guard, consuming node resources without payment.
 
 ## Impact Explanation
 
-When future-height evidence is processed during BeginBlock, all network nodes executing that block will panic simultaneously, resulting in:
-- **Complete network shutdown** - no new blocks can be produced
-- All nodes crash and cannot recover without removing the malicious evidence
-- Requires emergency intervention (coordinated restart or potential hard fork) to restore operation
-- No transactions can be confirmed during the outage
-- Consensus is completely halted
+This vulnerability enables attackers to submit transactions that consume node resources during CheckTx processing without paying fees. The attack causes network processing nodes to process transactions from the mempool beyond the designed validation parameters.
 
-This matches the High severity impact: "Network not being able to confirm new transactions (total network shutdown)".
+**Specific consequences:**
+1. **Fee bypass**: Transactions consume CPU cycles through multiple ante decorators but pay zero fees due to cache rollback
+2. **Resource asymmetry**: Processing cost to nodes exceeds normal invalid transactions that fail at ValidateBasic
+3. **Mempool pollution**: Invalid transactions occupy CheckTx processing capacity that should handle valid transactions
+4. **Difficult detection**: Transactions appear syntactically valid initially, potentially evading simple rate limiting
+
+The impact qualifies as **Low severity** under the specified criteria: "Causing network processing nodes to process transactions from the mempool beyond set parameters" - transactions with invalid addresses should be rejected at ValidateBasic but instead are processed through the full ante handler chain.
 
 ## Likelihood Explanation
 
-While this requires evidence with future height to enter via Tendermint's consensus layer, the application code demonstrates defensive programming patterns are expected. The codebase shows the application is designed to handle potentially malformed input from Tendermint: [9](#0-8) 
+**Trigger Conditions:**
+- Any unprivileged actor can trigger by submitting transactions via standard RPC endpoints
+- No special permissions, tokens, or stake required
+- No authentication needed beyond standard transaction submission
+- Trivially exploitable with standard transaction construction tools
 
-The comment explicitly states they handle potentially bad evidence from Tendermint and the simulator, indicating defense-in-depth is an expected design pattern.
+**Frequency:**
+- Immediately exploitable in current codebase
+- Can be repeated continuously
+- Each malformed transaction consumes resources until rejected in ante handler
+- Attack sustainability limited only by node rate limiting (which may be ineffective since transactions appear valid initially)
 
-**Triggering Conditions**:
-- A bug in Tendermint's evidence detection/reporting logic
-- A modified or compromised consensus client
-- Network message manipulation during evidence propagation
-
-**Frequency**: While unlikely under normal operation, if triggered, the impact is immediate and affects 100% of network nodes. This represents a critical defense-in-depth failure where the application must validate all external inputs, even from the consensus layer.
+**Realistic Exploitation:**
+This is highly likely to be exploited because:
+1. Simple to execute - construct MsgGrantAllowance with arbitrary string addresses
+2. Zero cost to attacker (no fees charged)
+3. Difficult for nodes to distinguish from legitimate traffic without full validation
+4. No blockchain state or special conditions required
 
 ## Recommendation
 
-Add explicit validation to reject future-height evidence before processing in `x/evidence/keeper/infraction.go`:
+Add Bech32 address validation to `MsgGrantAllowance.ValidateBasic()` to align with the validation pattern used in bank and authz modules:
 
 ```go
-// After line 44, add:
-if infractionHeight > ctx.BlockHeader().Height {
-    logger.Info(
-        "ignored equivocation; evidence from future height",
-        "validator", consAddr,
-        "infraction_height", infractionHeight,
-        "current_height", ctx.BlockHeader().Height,
-    )
-    return
+func (msg MsgGrantAllowance) ValidateBasic() error {
+    // Validate granter address format
+    _, err := sdk.AccAddressFromBech32(msg.Granter)
+    if err != nil {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid granter address (%s)", err)
+    }
+    
+    // Validate grantee address format
+    _, err = sdk.AccAddressFromBech32(msg.Grantee)
+    if err != nil {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid grantee address (%s)", err)
+    }
+    
+    // Existing validation
+    if msg.Grantee == msg.Granter {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "cannot self-grant fee authorization")
+    }
+
+    allowance, err := msg.GetFeeAllowanceI()
+    if err != nil {
+        return err
+    }
+
+    return allowance.ValidateBasic()
 }
 ```
 
-Additionally, fix the age validation logic to properly handle negative values:
-
-```go
-// Replace line 53 with:
-if ageBlocks < 0 || (ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks) {
-```
+The same fix should be applied to `MsgRevokeAllowance.ValidateBasic()` [12](#0-11) 
 
 ## Proof of Concept
 
-**File**: `x/evidence/keeper/infraction_test.go`
+**Test demonstrating the vulnerability (add to x/feegrant/msgs_test.go):**
 
-**Setup**:
-1. Initialize context at block height 100
-2. Create validator with signing info
-3. Set standard consensus parameters
+**Setup**: Create a MsgGrantAllowance with invalid Bech32 addresses (non-empty, different, but malformed strings like "invalid-granter-address" and "invalid-grantee-address")
 
-**Action**:
-Create evidence with `Height = 200` (future) and `Time` in the past (to bypass time check), then call `HandleEquivocationEvidence`
+**Action**: Call ValidateBasic() on the message with invalid addresses
 
-**Result**:
-The function panics with message: "impossible attempt to slash future infraction at height 199 but we are at height 100"
+**Result**: 
+- ValidateBasic() incorrectly passes (demonstrates vulnerability)
+- GetSigners() panics when called (would occur in ante handler)
+- Contrast with bank module's MsgSend which properly rejects invalid addresses in ValidateBasic()
 
-The test confirms:
-- `ageBlocks = 100 - 200 = -100` (negative)
-- Validation check `ageBlocks > MaxAgeNumBlocks` evaluates to false (since -100 is not > positive value)
-- Evidence proceeds to slashing
-- `distributionHeight = 200 - 1 = 199` (still future)
-- Slash function panics on future `infractionHeight`
+This demonstrates that the feegrant module has weaker validation than other modules, creating an exploitable gap where transactions bypass defense-in-depth checks and consume resources without paying fees.
 
 ## Notes
 
-This vulnerability requires Tendermint to send malformed evidence, but the application layer must defensively validate all inputs per the defense-in-depth security principle. The code comments and the explicit CONTRACT in slash.go indicate this validation is required but missing. The severity is High because the impact is total network shutdown affecting all nodes simultaneously.
+This vulnerability exists due to inconsistent validation patterns across cosmos-sdk modules. The feegrant module uses weaker validation than bank and authz modules, creating an exploitable gap in the defense-in-depth security model.
+
+The fix is straightforward and follows established patterns from other modules. While the per-transaction overhead is relatively small, the zero-cost nature of the attack (no fees charged) makes it a viable vector for resource exhaustion attacks against network nodes. The vulnerability meets the Low severity criteria by allowing transactions to be processed beyond the set ValidateBasic() parameters that are designed to reject invalid transactions early.
 
 ### Citations
 
-**File:** x/evidence/keeper/infraction.go (L29-40)
+**File:** x/feegrant/msgs.go (L40-57)
 ```go
-	if _, err := k.slashingKeeper.GetPubkey(ctx, consAddr.Bytes()); err != nil {
-		// Ignore evidence that cannot be handled.
-		//
-		// NOTE: We used to panic with:
-		// `panic(fmt.Sprintf("Validator consensus-address %v not found", consAddr))`,
-		// but this couples the expectations of the app to both Tendermint and
-		// the simulator.  Both are expected to provide the full range of
-		// allowable but none of the disallowed evidence types.  Instead of
-		// getting this coordination right, it is easier to relax the
-		// constraints and ignore evidence that cannot be handled.
-		return
+func (msg MsgGrantAllowance) ValidateBasic() error {
+	if msg.Granter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing granter address")
 	}
-```
-
-**File:** x/evidence/keeper/infraction.go (L43-64)
-```go
-	infractionHeight := evidence.GetHeight()
-	infractionTime := evidence.GetTime()
-	ageDuration := ctx.BlockHeader().Time.Sub(infractionTime)
-	ageBlocks := ctx.BlockHeader().Height - infractionHeight
-
-	// Reject evidence if the double-sign is too old. Evidence is considered stale
-	// if the difference in time and number of blocks is greater than the allowed
-	// parameters defined.
-	cp := ctx.ConsensusParams()
-	if cp != nil && cp.Evidence != nil {
-		if ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks {
-			logger.Info(
-				"ignored equivocation; evidence too old",
-				"validator", consAddr,
-				"infraction_height", infractionHeight,
-				"max_age_num_blocks", cp.Evidence.MaxAgeNumBlocks,
-				"infraction_time", infractionTime,
-				"max_age_duration", cp.Evidence.MaxAgeDuration,
-			)
-			return
-		}
+	if msg.Grantee == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing grantee address")
 	}
-```
-
-**File:** x/evidence/keeper/infraction.go (L95-112)
-```go
-	// We need to retrieve the stake distribution which signed the block, so we
-	// subtract ValidatorUpdateDelay from the evidence height.
-	// Note, that this *can* result in a negative "distributionHeight", up to
-	// -ValidatorUpdateDelay, i.e. at the end of the
-	// pre-genesis block (none) = at the beginning of the genesis block.
-	// That's fine since this is just used to filter unbonding delegations & redelegations.
-	distributionHeight := infractionHeight - sdk.ValidatorUpdateDelay
-
-	// Slash validator. The `power` is the int64 power of the validator as provided
-	// to/by Tendermint. This value is validator.Tokens as sent to Tendermint via
-	// ABCI, and now received as evidence. The fraction is passed in to separately
-	// to slash unbonding and rebonding delegations.
-	k.slashingKeeper.Slash(
-		ctx,
-		consAddr,
-		k.slashingKeeper.SlashFractionDoubleSign(ctx),
-		evidence.GetValidatorPower(), distributionHeight,
-	)
-```
-
-**File:** x/staking/keeper/slash.go (L14-23)
-```go
-// CONTRACT:
-//    slashFactor is non-negative
-// CONTRACT:
-//    Infraction was committed equal to or less than an unbonding period in the past,
-//    so all unbonding delegations and redelegations from that height are stored
-// CONTRACT:
-//    Slash will not slash unbonded validators (for the above reason)
-// CONTRACT:
-//    Infraction was committed at the current height or at a past height,
-//    not at a height in the future
-```
-
-**File:** x/staking/keeper/slash.go (L67-71)
-```go
-	case infractionHeight > ctx.BlockHeight():
-		// Can't slash infractions in the future
-		panic(fmt.Sprintf(
-			"impossible attempt to slash future infraction at height %d but we are at height %d",
-			infractionHeight, ctx.BlockHeight()))
-```
-
-**File:** x/evidence/abci.go (L16-30)
-```go
-func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
-
-	for _, tmEvidence := range req.ByzantineValidators {
-		switch tmEvidence.Type {
-		// It's still ongoing discussion how should we treat and slash attacks with
-		// premeditation. So for now we agree to treat them in the same way.
-		case abci.MisbehaviorType_DUPLICATE_VOTE, abci.MisbehaviorType_LIGHT_CLIENT_ATTACK:
-			evidence := types.FromABCIEvidence(tmEvidence)
-			k.HandleEquivocationEvidence(ctx, evidence.(*types.Equivocation))
-
-		default:
-			k.Logger(ctx).Error(fmt.Sprintf("ignored unknown evidence type: %s", tmEvidence.Type))
-		}
+	if msg.Grantee == msg.Granter {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "cannot self-grant fee authorization")
 	}
+
+	allowance, err := msg.GetFeeAllowanceI()
+	if err != nil {
+		return err
+	}
+
+	return allowance.ValidateBasic()
+}
 ```
 
-**File:** x/evidence/types/evidence.go (L91-104)
+**File:** x/feegrant/msgs.go (L60-66)
 ```go
-func FromABCIEvidence(e abci.Evidence) exported.Evidence {
-	bech32PrefixConsAddr := sdk.GetConfig().GetBech32ConsensusAddrPrefix()
-	consAddr, err := sdk.Bech32ifyAddressBytes(bech32PrefixConsAddr, e.Validator.Address)
+func (msg MsgGrantAllowance) GetSigners() []sdk.AccAddress {
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
 	if err != nil {
 		panic(err)
 	}
+	return []sdk.AccAddress{granter}
+}
+```
 
-	return &Equivocation{
-		Height:           e.Height,
-		Power:            e.Validator.Power,
-		ConsensusAddress: consAddr,
-		Time:             e.Time,
+**File:** x/feegrant/msgs.go (L107-119)
+```go
+func (msg MsgRevokeAllowance) ValidateBasic() error {
+	if msg.Granter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing granter address")
 	}
+	if msg.Grantee == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "missing grantee address")
+	}
+	if msg.Grantee == msg.Granter {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "addresses must be different")
+	}
+
+	return nil
 }
 ```
 
-**File:** types/staking.go (L17-26)
+**File:** x/bank/types/msgs.go (L29-38)
 ```go
-	// Delay, in blocks, between when validator updates are returned to the
-	// consensus-engine and when they are applied. For example, if
-	// ValidatorUpdateDelay is set to X, and if a validator set update is
-	// returned with new validators at the end of block 10, then the new
-	// validators are expected to sign blocks beginning at block 11+X.
-	//
-	// This value is constant as this should not change without a hard fork.
-	// For Tendermint this should be set to 1 block, for more details see:
-	// https://tendermint.com/docs/spec/abci/apps.html#endblock
-	ValidatorUpdateDelay int64 = 1
+func (msg MsgSend) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.FromAddress)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid sender address (%s)", err)
+	}
+
+	_, err = sdk.AccAddressFromBech32(msg.ToAddress)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid recipient address (%s)", err)
+	}
 ```
 
-**File:** x/slashing/keeper/keeper.go (L66-79)
+**File:** x/authz/msgs.go (L54-68)
 ```go
-// Slash attempts to slash a validator. The slash is delegated to the staking
-// module to make the necessary validator changes.
-func (k Keeper) Slash(ctx sdk.Context, consAddr sdk.ConsAddress, fraction sdk.Dec, power, distributionHeight int64) {
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			types.EventTypeSlash,
-			sdk.NewAttribute(types.AttributeKeyAddress, consAddr.String()),
-			sdk.NewAttribute(types.AttributeKeyPower, fmt.Sprintf("%d", power)),
-			sdk.NewAttribute(types.AttributeKeyReason, types.AttributeValueDoubleSign),
-		),
-	)
-	telemetry.IncrValidatorSlashedCounter(consAddr.String(), types.AttributeValueDoubleSign)
-	k.sk.Slash(ctx, consAddr, distributionHeight, power, fraction)
+func (msg MsgGrant) ValidateBasic() error {
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
+	}
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
+	}
+
+	if granter.Equals(grantee) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be same")
+	}
+	return msg.Grant.ValidateBasic()
 }
+```
+
+**File:** baseapp/baseapp.go (L904-915)
+```go
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
+		}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
+```
+
+**File:** baseapp/baseapp.go (L923-925)
+```go
+	if err := validateBasicTxMsgs(msgs); err != nil {
+		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
+	}
+```
+
+**File:** baseapp/baseapp.go (L945-947)
+```go
+		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
+		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
+		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
+```
+
+**File:** baseapp/baseapp.go (L998-998)
+```go
+		msCache.Write()
+```
+
+**File:** x/auth/ante/ante.go (L47-60)
+```go
+	anteDecorators := []sdk.AnteFullDecorator{
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
+		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
+		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
+		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+		NewIncrementSequenceDecorator(options.AccountKeeper),
+	}
+```
+
+**File:** x/auth/ante/sigverify.go (L59-69)
+```go
+func (spkd SetPubKeyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+	sigTx, ok := tx.(authsigning.SigVerifiableTx)
+	if !ok {
+		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
+	}
+
+	pubkeys, err := sigTx.GetPubKeys()
+	if err != nil {
+		return ctx, err
+	}
+	signers := sigTx.GetSigners()
+```
+
+**File:** types/tx/types.go (L111-122)
+```go
+func (t *Tx) GetSigners() []sdk.AccAddress {
+	var signers []sdk.AccAddress
+	seen := map[string]bool{}
+
+	for _, msg := range t.GetMsgs() {
+		for _, addr := range msg.GetSigners() {
+			if !seen[addr.String()] {
+				signers = append(signers, addr)
+				seen[addr.String()] = true
+			}
+		}
+	}
 ```

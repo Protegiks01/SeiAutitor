@@ -1,265 +1,255 @@
 # Audit Report
 
 ## Title
-Unbounded Memory Allocation and Computation in BeginBlocker via SignedBlocksWindow Governance Parameter
+Access Operation Validation Failures Not Checked During Scheduler Validation Leading to State Corruption
 
 ## Summary
-The `SignedBlocksWindow` parameter validation lacks an upper bound check, allowing governance to set arbitrarily large values that cause catastrophic memory allocation and network shutdown. When a large value is set (e.g., 10^10 or higher), BeginBlocker attempts to allocate massive boolean arrays for each validator concurrently, causing all nodes to crash and requiring a hard fork to recover.
+The concurrent transaction scheduler in `tasks/scheduler.go` validates transactions only for OCC (Optimistic Concurrency Control) conflicts but fails to check transaction response codes. This allows transactions that fail access operation validation (or any validation that returns an error) to have their state changes permanently committed to the blockchain, violating the fundamental invariant that failed transactions should not modify state.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
 **Location:**
-- Validation: `x/slashing/types/params.go`, `validateSignedBlocksWindow` function [1](#0-0) 
+- Primary vulnerability: `tasks/scheduler.go`, `shouldRerun` method (lines 354-390)
+- Unconditional write persistence: `tasks/scheduler.go`, line 576 (`WriteToMultiVersionStore`)
+- Final state commitment: `tasks/scheduler.go`, line 345 (`WriteLatestToStore`) [1](#0-0) [2](#0-1) [3](#0-2) 
 
-- Memory allocation: `x/slashing/keeper/signing_info.go`, `ParseBitGroupsToBoolArray` function [2](#0-1) 
+**Intended logic:**
+Only transactions that complete successfully should have their state changes committed to the blockchain. In normal sequential execution, when a transaction fails validation and returns an error, the cached state changes are not written to the parent store. [4](#0-3) 
 
-- Vulnerable execution: `x/slashing/keeper/infractions.go`, `ResizeMissedBlockArray` function [3](#0-2) 
+**Actual logic:**
+In the OCC concurrent execution path:
+1. Transactions execute and can fail access operation validation, returning an error with non-zero response code
+2. `WriteToMultiVersionStore()` is called unconditionally after execution (line 576), persisting all writes regardless of the response code
+3. The `shouldRerun` method (lines 354-390) only checks for OCC conflicts via `findConflicts` and never examines `task.Response.Code`
+4. If no OCC conflicts are detected, the transaction is marked as "validated" (line 379)
+5. `WriteLatestToStore()` (line 345) commits all "validated" transactions' writes to the blockchain state, including those from failed transactions [5](#0-4) 
 
-- Trigger point: `x/slashing/abci.go`, BeginBlocker processing validators concurrently [4](#0-3) 
+**Exploitation path:**
+1. A transaction T1 is submitted with incorrect access operation declarations (due to bugs in mappings or malicious WASM contracts)
+2. T1 executes and makes state modifications via the VersionIndexedStore
+3. Access operation validation fails during execution, returning an error response with non-zero code
+4. `WriteToMultiVersionStore()` persists T1's writes to the multiversion store (line 576)
+5. The scheduler's `shouldRerun(T1)` checks only for OCC conflicts via `findConflicts` (lines 365)
+6. If no OCC conflicts are detected, T1 is marked as "validated" (line 379)
+7. `WriteLatestToStore()` commits T1's writes to the blockchain state despite the validation failure (line 345)
+8. Subsequent transactions reading this state execute with corrupted data
 
-**Intended Logic:**
-The `SignedBlocksWindow` parameter should define a reasonable sliding window for tracking validator liveness (default 108,000 blocks ≈ 12 hours). The validation function should enforce safe operational bounds to prevent resource exhaustion.
-
-**Actual Logic:**
-The validation only checks if the value is positive (`v > 0`) with no upper bound. When governance sets an extremely large value:
-
-1. Governance proposal passes because validation only checks `v > 0` [5](#0-4) [6](#0-5) 
-
-2. At the next block, BeginBlocker processes all validators concurrently in goroutines
-
-3. For each validator, if window size changed, `ResizeMissedBlockArray` is called [7](#0-6) 
-
-4. This function calls `ParseBitGroupsToBoolArray` allocating `make([]bool, window)` and iterating 0 to window
-
-5. A second allocation `make([]bool, window)` occurs for the new array
-
-6. With 100 validators and window=10^10, this requires ~2 TB total memory allocation and causes OOM crashes
-
-**Exploitation Path:**
-1. Submit governance proposal to change `SignedBlocksWindow` to large value (e.g., 10^10)
-2. Proposal passes validation (only checks positive)
-3. Proposal executes, parameter updated
-4. Next block triggers BeginBlocker
-5. All validators' missed block arrays resized concurrently
-6. Massive memory allocation (2 arrays × window size × number of validators)
-7. All nodes crash from OOM or hang in computational loops
-8. Network shutdown - no blocks can be produced
-
-**Security Guarantee Broken:**
-The system fails to enforce resource bounds on governance parameters, allowing governance to inadvertently cause catastrophic network failure requiring a hard fork to recover - exceeding governance's intended authority to tune operational parameters.
+**Security guarantee broken:**
+The fundamental blockchain invariant that failed transactions do not modify state is violated. The scheduler bypasses response code validation, allowing invalid transactions to corrupt blockchain state.
 
 ## Impact Explanation
 
-**Affected Components:**
-- All validator nodes
-- Block production and consensus
-- Network liveness and availability
+This vulnerability results in permanent state corruption with cascading effects:
 
-**Severity:**
-With `SignedBlocksWindow = 10^10` (10 billion) and 100 validators:
-- Memory requirement: 100 validators × 20 GB per validator = 2 TB total
-- All nodes experience immediate OOM crashes or multi-hour processing times
-- Network completely halts - cannot produce new blocks
-- Requires hard fork to recover (malicious parameter persists in chain state)
+1. **State Corruption**: Transactions that fail access operation validation have their writes permanently committed to blockchain state despite returning error codes
+2. **Cascading Effects**: Valid transactions reading corrupted state will execute with incorrect data, propagating corruption throughout the blockchain
+3. **Smart Contract Integrity**: Smart contracts relying on accurate state will produce incorrect results
+4. **Difficult Detection**: Failed transactions appear "validated" by the scheduler, making corruption subtle and hard to detect
 
-This represents total network shutdown, matching the HIGH severity impact: "Network not being able to confirm new transactions (total network shutdown)"
+This matches the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**Trigger Mechanism:**
-Requires governance proposal approval, which is a privileged mechanism. However, this vulnerability meets the exception criteria for privileged access because:
+**Who can trigger:**
+Any user submitting transactions can trigger this when:
+- Access operation dependency mappings contain bugs
+- WASM contracts have incorrect dependency declarations  
+- The dynamic dependency generator has bugs
 
-1. **Inadvertent Trigger**: Realistic accidental scenarios include:
-   - Typo: Intending "1000000" (1 million) but typing "1000000000" (1 billion) - just 3 extra zeros
-   - Miscalculation: Attempting to set window to 1 year in seconds without dividing by block time
-   - Copy-paste error: Using wrong value from documentation
+**Conditions required:**
+- Transaction must have incomplete/incorrect access operation declarations
+- Transaction must fail `ValidateAccessOperations` during execution
+- The multiversion store OCC validation (`findConflicts`) must not detect a conflict
+- Concurrent transaction execution must be enabled (OCC mode)
 
-2. **No Safeguards**: Unlike other parameters in the same file, `SignedBlocksWindow` lacks upper bound validation (contrast with `validateMinSignedPerWindow`, `validateSlashFractionDoubleSign`, `validateSlashFractionDowntime` which all check `v.GT(sdk.OneDec())`), suggesting this is an oversight rather than intentional design.
-
-3. **Unrecoverable Impact**: Once executed, the malicious parameter persists in chain state and requires a hard fork to fix - exceeding governance's intended authority to tune parameters.
-
-4. **Beyond Intended Authority**: Governance should adjust operational parameters, not permanently brick the entire network. This catastrophic failure mode is beyond what governance should reasonably be able to cause.
-
-The likelihood is moderate because while it requires governance approval, the lack of validation makes accidental misconfiguration realistic and the consequences are catastrophic and unrecoverable.
+**Frequency:**
+- Can occur during normal block production if access operation mappings have bugs
+- More likely with complex WASM contracts where dependency tracking is difficult
+- Given the complexity of maintaining accurate access operation declarations for all message types, bugs in declarations are reasonably probable [6](#0-5) 
 
 ## Recommendation
 
-Add upper bound validation to `validateSignedBlocksWindow` consistent with other parameter validations:
+Modify the `shouldRerun` method in `tasks/scheduler.go` to check the transaction's response code before marking it as validated:
 
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-    v, ok := i.(int64)
-    if !ok {
-        return fmt.Errorf("invalid parameter type: %T", i)
+case statusExecuted, statusValidated:
+    // Check if response has an error code
+    if task.Response != nil && task.Response.Code != 0 {
+        s.invalidateTask(task)
+        task.Reset()
+        task.Increment()
+        return true
     }
-
-    if v <= 0 {
-        return fmt.Errorf("signed blocks window must be positive: %d", v)
+    
+    // Existing OCC conflict check
+    if valid, conflicts := s.findConflicts(task); !valid {
+        // ... existing logic
     }
-
-    // Add maximum bound to prevent resource exhaustion
-    // Maximum based on operational requirements: ~1.5 years at 0.4s blocks
-    const maxSignedBlocksWindow = int64(100_000_000)
-    if v > maxSignedBlocksWindow {
-        return fmt.Errorf("signed blocks window too large (max %d): %d", 
-            maxSignedBlocksWindow, v)
-    }
-
-    return nil
-}
 ```
 
-This prevents arbitrarily large values while maintaining backward compatibility (current default 108,000 is well below limit).
+Alternatively, modify `executeTask` to conditionally call `WriteToMultiVersionStore()` only for successful transactions:
+
+```go
+if resp.Code == 0 {
+    for _, v := range task.VersionStores {
+        v.WriteToMultiVersionStore()
+    }
+} else {
+    for _, v := range task.VersionStores {
+        v.WriteEstimatesToMultiVersionStore()
+    }
+}
+```
 
 ## Proof of Concept
 
-**File:** `x/slashing/keeper/infractions_test.go`
+**Conceptual PoC flow** (implementable in `tasks/scheduler_test.go`):
 
 **Setup:**
-- Initialize simapp with validator
-- Set initial `SignedBlocksWindow` to reasonable value (100)
-- Create signing info by processing first block via BeginBlocker
+1. Initialize test context with KV store and MsgValidator
+2. Create a deliverTx function that fails validation and returns a response with Code=1
+3. Create two transactions where T1 writes to the store but returns error code, T2 reads correctly
 
 **Action:**
-- Set `SignedBlocksWindow` to large value (e.g., 10^9 for demonstration, 10^12 for actual attack)
-- Process next block via BeginBlocker
-- This triggers `ResizeMissedBlockArray` for all validators
-- Each validator attempts to allocate 2 arrays of size `window`
+1. Execute both transactions via the scheduler
+2. T1 executes, modifies state, and returns error response (Code != 0)
+3. `WriteToMultiVersionStore()` persists T1's writes unconditionally
+4. Scheduler validates both transactions using only OCC conflict detection
+5. No OCC conflicts detected, so both marked as "validated"
+6. `WriteLatestToStore()` commits both transactions' writes
 
 **Result:**
-- With window=10^9: Allocates ~2 GB per validator, visible performance degradation
-- With window=10^10: Allocates ~20 GB per validator, OOM on most systems  
-- With window=10^12: Allocates ~2 TB per validator, immediate catastrophic failure
-- Network cannot produce blocks, requires hard fork to recover
+- T1's response has error code (validation failed)
+- Despite the error, T1's write to the store is persisted in the blockchain state
+- This demonstrates that the scheduler's validation logic only checks OCC conflicts and does not verify response codes
 
-The provided PoC demonstrates the vulnerability by showing the code path from governance parameter change through BeginBlocker to the unbounded memory allocation that causes network shutdown.
+The vulnerability is confirmed through code analysis showing that `shouldRerun` never checks `task.Response.Code`, allowing failed transactions to have their writes committed via `WriteLatestToStore()`.
 
 ## Notes
 
-This vulnerability is particularly concerning because:
+The vulnerability is validated through comprehensive code analysis:
 
-1. **Design Inconsistency**: Other validation functions in `x/slashing/types/params.go` have upper bounds, suggesting this omission is an oversight
-2. **Realistic Accidental Scenario**: Does not require malicious intent - simple typos in governance proposals could trigger it
-3. **Catastrophic Recovery Cost**: Requires hard fork with significant coordination cost
-4. **Zero Safeguards**: No warnings, rate limits, or graceful degradation
+1. In normal sequential execution at [4](#0-3) , failed transactions do not commit state changes
+2. In OCC concurrent execution, this invariant is broken because the scheduler never validates response codes
+3. Access operation validation failures return errors at [5](#0-4) , which are converted to non-zero response codes
+4. However, the scheduler unconditionally persists writes and only checks OCC conflicts, not response codes
+
+This breaks the access control system's security model, which relies on accurate resource access declarations to enable safe concurrent execution.
 
 ### Citations
 
-**File:** x/slashing/types/params.go (L72-83)
+**File:** tasks/scheduler.go (L344-346)
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-	v, ok := i.(int64)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v <= 0 {
-		return fmt.Errorf("signed blocks window must be positive: %d", v)
-	}
-
-	return nil
-}
-```
-
-**File:** x/slashing/keeper/signing_info.go (L109-116)
-```go
-func (k Keeper) ParseBitGroupsToBoolArray(bitGroups []uint64, window int64) []bool {
-	boolArray := make([]bool, window)
-
-	for i := int64(0); i < window; i++ {
-		boolArray[i] = k.GetBooleanFromBitGroups(bitGroups, i)
-	}
-	return boolArray
-}
-```
-
-**File:** x/slashing/keeper/infractions.go (L52-54)
-```go
-	if found && missedInfo.WindowSize != window {
-		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
+	for _, mv := range s.multiVersionStores {
+		mv.WriteLatestToStore()
 	}
 ```
 
-**File:** x/slashing/keeper/infractions.go (L157-169)
+**File:** tasks/scheduler.go (L354-390)
 ```go
-func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
-	// we need to resize the missed block array AND update the signing info accordingly
-	switch {
-	case missedInfo.WindowSize < window:
-		// missed block array too short, lets expand it
-		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
-		newArray := make([]bool, window)
-		copy(newArray[0:index], boolArray[0:index])
-		if index+1 < missedInfo.WindowSize {
-			// insert `0`s corresponding to the difference between the new window size and old window size
-			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
-		}
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
-```
+func (s *scheduler) shouldRerun(task *deliverTxTask) bool {
+	switch task.Status {
 
-**File:** x/slashing/abci.go (L36-50)
-```go
-	for i, _ := range allVotes {
-		wg.Add(1)
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
+	case statusAborted, statusPending:
+		return true
+
+	// validated tasks can become unvalidated if an earlier re-run task now conflicts
+	case statusExecuted, statusValidated:
+		// With the current scheduler, we won't actually get to this step if a previous task has already been determined to be invalid,
+		// since we choose to fail fast and mark the subsequent tasks as invalid as well.
+		// TODO: in a future async scheduler that no longer exhaustively validates in order, we may need to carefully handle the `valid=true` with conflicts case
+		if valid, conflicts := s.findConflicts(task); !valid {
+			s.invalidateTask(task)
+			task.AppendDependencies(conflicts)
+
+			// if the conflicts are now validated, then rerun this task
+			if dependenciesValidated(s.allTasksMap, task.Dependencies) {
+				return true
+			} else {
+				// otherwise, wait for completion
+				task.SetStatus(statusWaiting)
+				return false
 			}
-		}(i)
+		} else if len(conflicts) == 0 {
+			// mark as validated, which will avoid re-validating unless a lower-index re-validates
+			task.SetStatus(statusValidated)
+			return false
+		}
+		// conflicts and valid, so it'll validate next time
+		return false
+
+	case statusWaiting:
+		// if conflicts are done, then this task is ready to run again
+		return dependenciesValidated(s.allTasksMap, task.Dependencies)
+	}
+	panic("unexpected status: " + task.Status)
+}
+```
+
+**File:** tasks/scheduler.go (L571-577)
+```go
+	task.SetStatus(statusExecuted)
+	task.Response = &resp
+
+	// write from version store to multiversion stores
+	for _, v := range task.VersionStores {
+		v.WriteToMultiVersionStore()
 	}
 ```
 
-**File:** x/params/proposal_handler.go (L26-39)
+**File:** baseapp/baseapp.go (L978-992)
 ```go
-func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
-	for _, c := range p.Changes {
-		ss, ok := k.GetSubspace(c.Subspace)
-		if !ok {
-			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
-		}
+		// Dont need to validate in checkTx mode
+		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
+			storeAccessOpEvents := msCache.GetEvents()
+			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
 
-		k.Logger(ctx).Info(
-			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
-		)
-
-		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
-			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
-		}
+			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
+			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+			if len(missingAccessOps) != 0 {
+				for op := range missingAccessOps {
+					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
+					op.EmitValidationFailMetrics()
+				}
+				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
+				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
+			}
 ```
 
-**File:** x/params/types/subspace.go (L196-218)
+**File:** baseapp/baseapp.go (L1015-1017)
 ```go
-func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
-	attr, ok := s.table.m[string(key)]
-	if !ok {
-		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
+	}
+```
+
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-55)
+```go
+func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
+	lastAccessOp := accessOps[len(accessOps)-1]
+	if lastAccessOp != *CommitAccessOp() {
+		return ErrNoCommitAccessOp
+	}
+	for _, accessOp := range accessOps {
+		err := ValidateAccessOp(accessOp)
+		if err != nil {
+			return err
+		}
 	}
 
-	ty := attr.ty
-	dest := reflect.New(ty).Interface()
-	s.GetIfExists(ctx, key, dest)
-
-	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
-		return err
-	}
-
-	// destValue contains the dereferenced value of dest so validation function do
-	// not have to operate on pointers.
-	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
-	if err := s.Validate(ctx, key, destValue); err != nil {
-		return err
-	}
-
-	s.Set(ctx, key, dest)
 	return nil
+}
+
+func ValidateAccessOp(accessOp acltypes.AccessOperation) error {
+	if accessOp.IdentifierTemplate == "" {
+		return ErrEmptyIdentifierString
+	}
+	if accessOp.ResourceType.HasChildren() && accessOp.IdentifierTemplate != "*" {
+		return ErrNonLeafResourceTypeWithIdentifier
+	}
+	return nil
+}
 ```

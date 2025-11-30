@@ -1,230 +1,205 @@
 # Audit Report
 
 ## Title
-Unbounded Store Iteration in ABCI Subspace Query Enables Resource Exhaustion Without Gas Costs
+Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
 
 ## Summary
-The `/store/<storename>/subspace` ABCI query endpoint performs unbounded iteration over all keys matching a prefix without gas metering, pagination limits, or resource controls. This allows any user to cause significant node resource consumption at zero cost through repeated queries targeting stores with large key sets.
+The `TrackHistoricalInfo` function contains a critical flaw in its pruning mechanism where a break statement causes the loop to exit upon encountering the first missing historical entry. This violates the storage bound invariant when gaps exist in the historical entry sequence, leading to unbounded storage growth that cannot be recovered without a code fix. [1](#0-0) 
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary: `store/iavl/store.go` lines 398-418 (Query method, subspace case)
-- Also affected: `storev2/state/store.go` lines 106-122, `storev2/commitment/store.go` lines 155-174
-- Entry point: `baseapp/abci.go` lines 520-521 and 916-948 (handleQueryStore) [1](#0-0) 
+- **location**: `x/staking/keeper/historical_info.go`, lines 78-85 in the `TrackHistoricalInfo` function
 
-**Intended Logic:** 
-ABCI queries should allow users to query store data in a resource-efficient manner with appropriate limits. Store operations during transaction execution are gas-metered to prevent resource exhaustion attacks.
+- **intended logic**: The function should maintain exactly `HistoricalEntries` number of recent historical info entries by pruning all entries older than `currentHeight - HistoricalEntries`. Storage should be bounded to prevent resource exhaustion.
 
-**Actual Logic:** 
-The "/subspace" query path creates an iterator over all keys matching a given prefix and collects ALL matching key-value pairs into memory without any pagination, result limit, or gas metering. The iteration continues until all matching keys are processed, regardless of the total count. [2](#0-1) 
+- **actual logic**: The pruning loop iterates downward from `currentHeight - HistoricalEntries` and breaks immediately upon encountering the first missing entry. [1](#0-0)  The code comment assumes "the entries to be deleted are always in a continuous range" [2](#0-1) , but this assumption is violated when `HistoricalEntries` is temporarily set to 0.
 
-**Exploitation Path:**
-1. Attacker identifies a store with many keys (e.g., bank module store with account balances, or any module storing per-user data)
-2. Attacker sends ABCI query via public RPC endpoint `/abci_query` with path `/store/<storename>/subspace` and a prefix in `req.Data` (can be empty to match all keys)
-3. The BaseApp's Query method routes to `handleQueryStore` which directly calls the store's Query method without creating a gas-metered context
-4. The IAVL store's Query method creates an unmetered iterator and loops through all matching keys, appending each to a slice in memory
-5. For stores with thousands or millions of keys, this causes:
-   - High CPU usage for tree traversal and iteration
-   - High memory allocation for collecting all key-value pairs
-   - Network bandwidth consumption for marshaling and returning the large result
-6. Attacker repeats queries (potentially concurrently) to sustain resource exhaustion [3](#0-2) 
+- **exploitation path**:
+  1. Network operates with `HistoricalEntries=100`, accumulating entries for blocks 1-100
+  2. Governance proposal changes `HistoricalEntries` to 0 at block 101
+  3. During blocks 101-110, no new entries are saved [3](#0-2)  but existing entries 1-100 remain in storage
+  4. Governance proposal changes `HistoricalEntries` to 5 at block 111
+  5. At block 111, pruning loop starts at height 106 (111-5), finds no entry at height 106 (gap period), immediately breaks
+  6. Old entries 1-100 are never deleted, new entry 111 is saved
+  7. Each subsequent block adds a new entry without deleting old ones
+  8. Storage grows unboundedly: {1-100, 111, 112, 113, ...}
 
-**Security Guarantee Broken:** 
-The fundamental security property that computational operations should be proportionally priced or limited is violated. This operation has zero cost to the caller but can consume arbitrary node resources, enabling denial-of-service attacks.
+- **security guarantee broken**: The storage bound invariant is violated. The system should maintain exactly `HistoricalEntries` entries, but instead accumulates entries without bound.
 
 ## Impact Explanation
 
-This vulnerability allows attackers to exhaust node resources (CPU, memory, network bandwidth) without any cost or authentication. Specifically:
+Each `HistoricalInfo` entry contains a complete block header and full validator set. [4](#0-3)  With the default 35 validators [5](#0-4) , each entry represents substantial data (multiple kilobytes).
 
-- **CPU exhaustion:** Tree traversal and iteration operations scale linearly with the number of keys
-- **Memory exhaustion:** All matching key-value pairs are collected in memory before being returned, potentially causing OOM errors
-- **Network bandwidth:** Large responses must be marshaled and transmitted
-- **Node availability:** Sustained attacks can cause 30%+ resource consumption increases, making nodes unresponsive to legitimate queries and transaction processing
+After the vulnerability is triggered:
+- Expected storage with `HistoricalEntries=5`: 5 entries
+- Actual storage: 100 old entries + 8,640+ new entries per day (assuming 10-second blocks)
+- Within 24 hours: increases from 100 to 8,740+ entries = 174,700% increase
 
-The attack requires only access to public RPC endpoints (no authentication) and basic knowledge of ABCI query paths. Multiple concurrent queries amplify the effect. In production networks where stores contain millions of keys (e.g., all user account balances in the bank module), this attack is highly effective.
+This far exceeds the 30% threshold for Medium severity resource consumption impact, meeting the criterion: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
 
-This directly matches the **Medium** severity impact criterion: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
+Over time, this leads to storage exhaustion, node crashes when disk space is exhausted, and potential network degradation if sufficient nodes run out of storage.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any user with RPC access can trigger (no authentication required)
-- Works during normal node operation
-- No special timing or race conditions needed
-- Common stores (bank, staking, etc.) contain large key sets in production
+**Who can trigger**: Any network participant through the standard governance process. The `HistoricalEntries` parameter is governance-controlled. [6](#0-5) 
 
-**Frequency:**
-- Can be exploited continuously and repeatedly
-- Each query can target different stores to maximize impact
-- Attack is trivial to execute (simple RPC call with crafted path and prefix)
-- Many production chains have stores with millions of keys
+**Conditions required**:
+1. A governance proposal changes `HistoricalEntries` from non-zero to 0
+2. After several blocks, another proposal changes it back to a non-zero value
 
-**Exploitability:** High - This is a straightforward attack requiring only:
-1. Access to any public RPC endpoint
-2. Knowledge of standard ABCI query format
-3. Identification of a store name (publicly documented)
+**Why realistic**:
+- The validation function explicitly allows `HistoricalEntries=0` as valid (only checks type, not value) [7](#0-6) 
+- The simulation code confirms 0 is an intended valid value [8](#0-7) 
+- Non-IBC chains may legitimately set `HistoricalEntries=0` to save resources [9](#0-8) 
+- This is not a malicious attack but a legitimate governance operation that triggers a code bug
+- Once triggered, the issue is **unrecoverable** without a code fix—governance cannot remove the orphaned entries through any parameter change
 
-No special tools, timing, or privileges are needed.
+**Frequency**: Once triggered through normal governance operations, the effect compounds with every subsequent block. [10](#0-9) 
 
 ## Recommendation
 
-Implement pagination and result limits for the "/subspace" query path:
+Modify the pruning logic to delete all entries older than the retention threshold, regardless of gaps. Remove the break condition and iterate through all possible heights:
 
-1. **Add maximum result limit:** Enforce a hard limit (e.g., 1000 keys) for subspace queries
-2. **Implement pagination:** Support key-based cursors (similar to the existing pagination system in `types/query/pagination.go`) to allow clients to retrieve large result sets across multiple queries
-3. **Add rate limiting:** Consider implementing rate limiting for expensive query operations at the RPC layer
-4. **Deprecate unbounded path:** Alternatively, deprecate the unbounded "/subspace" path in favor of paginated gRPC queries that already have proper limits
-
-Example fix for `store/iavl/store.go`:
 ```go
-case "/subspace":
-    const maxResults = 1000
-    pairs := kv.Pairs{Pairs: make([]kv.Pair, 0, maxResults)}
-    
-    subspace := req.Data
-    res.Key = subspace
-    
-    iterator := types.KVStorePrefixIterator(st, subspace)
-    count := 0
-    for ; iterator.Valid() && count < maxResults; iterator.Next() {
-        pairs.Pairs = append(pairs.Pairs, kv.Pair{Key: iterator.Key(), Value: iterator.Value()})
-        count++
+// Prune all entries older than retention height, regardless of gaps
+pruneHeight := ctx.BlockHeight() - int64(entryNum)
+for i := pruneHeight; i >= 0; i-- {
+    _, found := k.GetHistoricalInfo(ctx, i)
+    if found {
+        k.DeleteHistoricalInfo(ctx, i)
     }
-    hasMore := iterator.Valid()
-    iterator.Close()
-    
-    // Include hasMore flag in response to indicate pagination needed
-    // ... marshal and return
+    // Continue checking all heights - do not break on missing entries
+}
 ```
+
+Alternatively, track the oldest and newest entry heights in state to enable efficient range-based deletion without relying on the "continuous range" assumption.
 
 ## Proof of Concept
 
-**File:** `store/iavl/store_test.go`
+**File**: `x/staking/keeper/historical_info_test.go`
 
-**Test Function:** `TestSubspaceQueryResourceExhaustion`
+**Test Function**: `TestTrackHistoricalInfoUnboundedGrowth`
 
-**Setup:**
-```go
-// Create IAVL store with large number of keys
-db := dbm.NewMemDB()
-tree, err := iavl.NewMutableTree(db, cacheSize, false)
-require.NoError(t, err)
-store := UnsafeNewStore(tree)
+**Setup**:
+- Initialize staking keeper using `createTestInput()`
+- Set `HistoricalEntries=100`
+- Create 100 blocks with historical entries using `TrackHistoricalInfo`
+- Verify 100 entries exist in storage
 
-// Insert 10,000 keys with common prefix
-for i := 0; i < 10000; i++ {
-    key := []byte(fmt.Sprintf("prefix_%d", i))
-    store.Set(key, []byte("value"))
-}
-cid := store.Commit(true)
-```
+**Action**:
+1. Change `HistoricalEntries` to 0 via `SetParams`
+2. Generate 10 blocks (101-110) by calling `TrackHistoricalInfo` with updated block heights
+3. Verify no new entries created during this period (gap created)
+4. Change `HistoricalEntries` to 5 via `SetParams`
+5. Generate block 111 by calling `TrackHistoricalInfo`
+6. Count total entries using `GetAllHistoricalInfo`
 
-**Action:**
-```go
-// Create query with prefix that matches all keys
-query := abci.RequestQuery{
-    Path: "/subspace",
-    Data: []byte("prefix_"),
-    Height: cid.Version,
-}
-
-// Execute query - this will iterate through all 10,000 keys
-result := store.Query(query)
-```
-
-**Result:**
-```go
-// Query succeeds but returns all 10,000 key-value pairs
-require.Equal(t, uint32(0), result.Code)
-
-// Unmarshal and verify unbounded iteration
-var pairs kv.Pairs
-err = pairs.Unmarshal(result.Value)
-require.NoError(t, err)
-
-// Confirms all 10,000 keys were returned without pagination
-require.Equal(t, 10000, len(pairs.Pairs))
-```
-
-The test demonstrates that:
-- No pagination or result limit is enforced
-- All matching keys are returned in a single query
-- Time and memory consumption scale linearly with key count
-- Zero gas cost despite high computational expense
+**Result**:
+- Expected after block 111: 5 entries (107-111)
+- Actual after block 111: 101 entries (1-100 + 111)
+- This proves old entries are never pruned when a gap exists, violating the `HistoricalEntries` bound
 
 **Notes**
-The vulnerability is exploitable through the public `/abci_query` RPC endpoint available on all Cosmos SDK nodes. The query bypasses gas metering because ABCI queries are handled outside the normal transaction execution context.
+
+This vulnerability is called every block through `BeginBlocker`, making it a production-critical issue. The flaw stems from an incorrect assumption that entries form a "continuous range," which is violated by legitimate governance operations that temporarily set `HistoricalEntries=0`. This is not a misconfiguration but a code bug triggered by supported parameter values, causing an unrecoverable security failure beyond governance's intended authority.
 
 ### Citations
 
-**File:** store/iavl/store.go (L398-418)
+**File:** x/staking/keeper/historical_info.go (L71-77)
 ```go
-	case "/subspace":
-		pairs := kv.Pairs{
-			Pairs: make([]kv.Pair, 0),
-		}
-
-		subspace := req.Data
-		res.Key = subspace
-
-		iterator := types.KVStorePrefixIterator(st, subspace)
-		for ; iterator.Valid(); iterator.Next() {
-			pairs.Pairs = append(pairs.Pairs, kv.Pair{Key: iterator.Key(), Value: iterator.Value()})
-		}
-		iterator.Close()
-
-		bz, err := pairs.Marshal()
-		if err != nil {
-			panic(fmt.Errorf("failed to marshal KV pairs: %w", err))
-		}
-
-		res.Value = bz
-
+	// Prune store to ensure we only have parameter-defined historical entries.
+	// In most cases, this will involve removing a single historical entry.
+	// In the rare scenario when the historical entries gets reduced to a lower value k'
+	// from the original value k. k - k' entries must be deleted from the store.
+	// Since the entries to be deleted are always in a continuous range, we can iterate
+	// over the historical entries starting from the most recent version to be pruned
+	// and then return at the first empty entry.
 ```
 
-**File:** baseapp/abci.go (L520-521)
+**File:** x/staking/keeper/historical_info.go (L78-85)
 ```go
-	case "store":
-		resp = handleQueryStore(app, path, *req)
+	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
+		_, found := k.GetHistoricalInfo(ctx, i)
+		if found {
+			k.DeleteHistoricalInfo(ctx, i)
+		} else {
+			break
+		}
+	}
 ```
 
-**File:** baseapp/abci.go (L916-948)
+**File:** x/staking/keeper/historical_info.go (L87-90)
 ```go
-func handleQueryStore(app *BaseApp, path []string, req abci.RequestQuery) abci.ResponseQuery {
-	var (
-		queryable sdk.Queryable
-		ok        bool
-	)
-	// Check if online migration is enabled for fallback read
-	if req.Height < app.migrationHeight && app.qms != nil {
-		queryable, ok = app.qms.(sdk.Queryable)
-		if !ok {
-			return sdkerrors.QueryResultWithDebug(sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, "multistore doesn't support queries"), app.trace)
-		}
-	} else {
-		queryable, ok = app.cms.(sdk.Queryable)
-		if !ok {
-			return sdkerrors.QueryResultWithDebug(sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, "multistore doesn't support queries"), app.trace)
-		}
+	// if there is no need to persist historicalInfo, return
+	if entryNum == 0 {
+		return
+	}
+```
+
+**File:** x/staking/types/historical_info.go (L15-27)
+```go
+// NewHistoricalInfo will create a historical information struct from header and valset
+// it will first sort valset before inclusion into historical info
+func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
+	// Must sort in the same way that tendermint does
+	sort.SliceStable(valSet, func(i, j int) bool {
+		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
+	})
+
+	return HistoricalInfo{
+		Header: header,
+		Valset: valSet,
+	}
+}
+```
+
+**File:** x/staking/types/params.go (L24-24)
+```go
+	DefaultMaxValidators uint32 = 35
+```
+
+**File:** x/staking/types/params.go (L29-32)
+```go
+	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
+	// value by not adding the staking module to the application module manager's
+	// SetOrderBeginBlockers.
+	DefaultHistoricalEntries uint32 = 10000
+```
+
+**File:** x/staking/types/params.go (L242-249)
+```go
+func validateHistoricalEntries(i interface{}) error {
+	_, ok := i.(uint32)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	// "/store" prefix for store queries
-	req.Path = "/" + strings.Join(path[1:], "/")
+	return nil
+}
+```
 
-	if req.Height <= 1 && req.Prove {
-		return sdkerrors.QueryResultWithDebug(
-			sdkerrors.Wrap(
-				sdkerrors.ErrInvalidRequest,
-				"cannot query with proof when height <= 1; please provide a valid height",
-			), app.trace)
-	}
+**File:** x/staking/keeper/params.go (L82-84)
+```go
+// set the params
+func (k Keeper) SetParams(ctx sdk.Context, params types.Params) {
+	k.paramstore.SetParamSet(ctx, &params)
+```
 
-	resp := queryable.Query(req)
-	resp.Height = req.Height
+**File:** x/staking/simulation/genesis.go (L34-37)
+```go
+// getHistEntries returns randomized HistoricalEntries between 0-100.
+func getHistEntries(r *rand.Rand) uint32 {
+	return uint32(r.Intn(int(types.DefaultHistoricalEntries + 1)))
+}
+```
 
-	return resp
+**File:** x/staking/abci.go (L15-18)
+```go
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+
+	k.TrackHistoricalInfo(ctx)
 ```

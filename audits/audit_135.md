@@ -1,193 +1,288 @@
 # Audit Report
 
 ## Title
-Unbounded Memory Allocation During Transaction Deserialization Allows Denial-of-Service via Large Message Arrays
+Deferred Balance Cache Accumulation Causes Invariant Violation and Chain Halt
 
 ## Summary
-The transaction deserialization process in sei-cosmos does not enforce any limit on the number of messages in a transaction's message array during protobuf unmarshaling. This allows attackers to submit transactions with extremely large message arrays that cause excessive memory allocation before gas consumption or validation occurs, leading to node resource exhaustion.
+The bank module's deferred balance system uses a MemoryStoreKey that persists data across blocks, but `WriteDeferredBalances` is never called in production to clear this cache. This causes deferred balances to accumulate indefinitely across multiple blocks. Eventually, the `TotalSupply` invariant detects that the sum of account balances plus accumulated deferred balances exceeds the actual supply, triggering a panic that halts the entire chain.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:** 
-- `types/tx/tx.pb.go` lines 2162-2165 (unbounded message array allocation)
-- `baseapp/abci.go` line 226 (deserialization entry point)
-- `x/auth/tx/decoder.go` line 45 (TxBody unmarshal)
-- `baseapp/baseapp.go` lines 788-801 (validation with no maximum check) [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
+**Location:**
+- Deferred send implementation: [1](#0-0) 
+- Ante handler fee deduction: [2](#0-1) 
+- Memory store configuration: [3](#0-2) 
+- Invariant check: [4](#0-3) 
+- Crisis module EndBlocker: [5](#0-4) 
 
 **Intended Logic:**
-Transaction deserialization should safely decode transaction bytes into in-memory structures while preventing resource exhaustion attacks. The system expects transaction size limits and gas consumption mechanisms to prevent abuse.
+The deferred balance system was designed to batch balance transfers for efficiency. According to the code comment [6](#0-5) , when `DeferredSendCoinsFromAccountToModule` is called, it should: (1) deduct from sender immediately, (2) store the credit in a temporary cache, and (3) have `WriteDeferredBalances` called "In the EndBlocker" to credit module accounts and clear the cache.
 
 **Actual Logic:**
-During the `TxBody.Unmarshal` process in the generated protobuf code, the unmarshaling loop unconditionally appends a new `&types.Any{}` struct to the `Messages` array for each message field in the wire format, without any limit check on the array length. This allocation happens for every message in the protobuf stream before any protective mechanisms are invoked. [5](#0-4) [6](#0-5) 
-
-The validation function `validateBasicTxMsgs` only checks that at least one message exists (`len(msgs) == 0`), but does not enforce a maximum. Gas consumption only occurs after deserialization in the `ConsumeTxSizeGasDecorator` within the AnteHandler chain. [7](#0-6) 
+The deferred cache uses a MemoryStoreKey [7](#0-6)  which explicitly persists between blocks [8](#0-7)  and performs a no-op on commit [9](#0-8) . However, `WriteDeferredBalances` (which clears the cache [10](#0-9) ) is never called because: (1) simapp doesn't configure a PreCommitHandler [11](#0-10) , (2) the bank module has no EndBlocker implementation, and (3) the cache clear only occurs when `WriteDeferredBalances` is explicitly invoked.
 
 **Exploitation Path:**
-1. Attacker crafts a protobuf transaction containing a large number of minimal messages (e.g., 100,000+ messages with minimal payloads)
-2. Each message in protobuf encoding is compact (type URL reference + minimal value), allowing many messages within reasonable wire size limits
-3. Attacker broadcasts the transaction to network nodes via standard RPC
-4. When nodes receive the transaction through `CheckTx`, they immediately call the transaction decoder
-5. The decoder unmarshals the `TxBody`, which triggers the unbounded allocation loop
-6. For each message, a new `types.Any` struct is allocated (containing string, byte slices, and internal fields), creating memory amplification
-7. Memory is allocated before gas consumption checks or validation can reject the transaction
-8. With multiple such transactions or repeated attempts, nodes experience memory pressure, GC overhead, and potential OOM conditions
+1. Any user submits a transaction that pays fees
+2. The ante handler calls `DeferredSendCoinsFromAccountToModule` [12](#0-11) 
+3. User's balance is deducted [13](#0-12)  and amount stored in deferred cache [14](#0-13) 
+4. Block ends, MemoryStore persists (no clearing occurs)
+5. Next block: more transactions accumulate additional deferred balances in the same cache
+6. Crisis module's EndBlocker runs invariant checks periodically [15](#0-14) 
+7. The `TotalSupply` invariant counts all accumulated deferred balances from multiple blocks [16](#0-15) 
+8. Invariant detects expectedTotal (account_balances + accumulated_deferred) ≠ supply [17](#0-16) 
+9. Invariant failure triggers panic [18](#0-17) 
+10. Chain halts deterministically across all nodes
 
 **Security Guarantee Broken:**
-The DoS protection that should be provided by gas limits and transaction validation is bypassed. Memory allocation occurs in an unbounded manner during deserialization, before any cost-based resource protection mechanisms can intervene.
+The accounting invariant that total supply equals the sum of all account balances plus current in-flight deferred transfers is violated. The system incorrectly accumulates deferred balances from multiple blocks instead of clearing them after each block, causing the invariant to detect an apparent supply mismatch.
 
 ## Impact Explanation
 
-This vulnerability enables a denial-of-service attack affecting network availability and node stability:
+This vulnerability causes a complete network shutdown. When the invariant check runs and detects the accumulated deferred balances causing a supply mismatch, the chain panics and halts. This affects:
+- All network validators cannot produce new blocks
+- All user transactions are permanently blocked
+- The chain requires manual intervention (emergency upgrade or hard fork) to recover
+- During the halt, no funds can move and the network is completely unavailable
 
-- **Affected Components:** All nodes processing transactions through CheckTx (validators, full nodes, RPC nodes) are vulnerable to this attack
-- **Resource Exhaustion:** Nodes experience excessive memory consumption due to memory amplification (compact wire encoding expanding to large in-memory structures), leading to garbage collection pressure and system instability
-- **Service Degradation:** Even without node crashes, the memory allocation overhead and subsequent GC pressure significantly slow transaction processing across the network
-- **Network-Wide Impact:** An attacker can broadcast malicious transactions to multiple nodes simultaneously, affecting a substantial portion of the network
-
-The memory amplification factor is significant: a transaction with 100,000 minimal messages might be ~1MB in wire format but allocate 10+ MB in memory (10x amplification). Each `types.Any` struct requires allocation for string headers, byte slice headers, and actual data, with Go's memory allocator adding additional overhead.
+This is a protocol-level consensus failure that affects every node deterministically at the same block height, making this a critical availability issue qualifying as "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-This vulnerability is highly likely to be exploited:
+**Who Can Trigger:** Any user submitting normal transactions on the network. The issue occurs naturally through regular usage as every fee-paying transaction accumulates deferred balances.
 
-- **Who can trigger it:** Any network participant with the ability to broadcast transactions. No special privileges, accounts with funds, or validator status required.
-- **Required conditions:** The attack works during normal network operation with no special timing, state, or configuration requirements.
-- **Frequency:** An attacker can continuously submit malicious transactions with large message arrays. Each transaction causes memory allocation during deserialization regardless of whether it eventually fails validation or runs out of gas.
-- **Detection difficulty:** Malicious transactions are rejected after deserialization due to gas limits or signature validation, making them appear similar to legitimate failed transactions in logs.
+**Conditions Required:**
+- The bank keeper is initialized with deferred cache support (default in simapp) [3](#0-2) 
+- Transactions that pay fees occur over multiple blocks (normal network activity)
+- Sufficient accumulation of deferred balances to create a detectable invariant violation
+- Invariant checks are enabled and run periodically (controlled by invCheckPeriod)
 
-The attack is practical because protobuf's efficient encoding of repeated fields allows an attacker to create transactions with hundreds of thousands of messages in a wire format small enough to pass initial size checks at the network layer.
+**Frequency:** This will occur deterministically once enough fee-paying transactions accumulate across blocks. The time to failure depends on transaction volume and the invariant check period. Given that every transaction paying fees contributes to the accumulation, this is highly likely to occur in any active network.
 
 ## Recommendation
 
-Implement a maximum message count check early in the transaction processing pipeline:
+Implement a PreCommitHandler in simapp initialization that calls `WriteDeferredBalances` before each block commit:
 
-1. **Add a maximum message count parameter** in the auth module configuration (e.g., `MaxMsgsPerTx = 1000` as a reasonable limit based on typical use cases)
-
-2. **Modify the transaction validation** to check message count before or during deserialization:
-   - Option A: Add validation in `TxBody.Unmarshal` to track and limit message count during unmarshaling
-   - Option B: Add a pre-decoding check in `CheckTx` that parses the protobuf to count messages before full deserialization
-   - Option C: Add validation in `validateBasicTxMsgs` to reject transactions exceeding the limit (this still allows memory allocation but prevents processing)
-
-3. **Implement the check as early as possible** to prevent memory allocation before the limit is enforced. The optimal location is during the unmarshal process itself or immediately before calling the decoder.
-
-Example validation in `validateBasicTxMsgs`:
 ```go
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-    if len(msgs) == 0 {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
-    }
-    if len(msgs) > MaxMsgsPerTx {
-        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "too many messages: %d > %d", len(msgs), MaxMsgsPerTx)
-    }
-    // ... rest of validation
-}
+app.SetPreCommitHandler(func(ctx sdk.Context) error {
+    app.BankKeeper.WriteDeferredBalances(ctx)
+    return nil
+})
 ```
+
+This should be added after the SetFinalizeBlocker call in simapp/app.go (around line 447). The PreCommitHandler executes after state transitions but before commit [19](#0-18) , which is the correct time to flush deferred balances and clear the cache for the next block.
+
+Alternative: Implement an EndBlocker for the bank module that calls `WriteDeferredBalances`, as originally intended by the code comment.
 
 ## Proof of Concept
 
-The vulnerability can be demonstrated with the following test in `baseapp/deliver_tx_test.go`:
+**Setup:**
+1. Initialize simapp with default configuration (bank keeper with deferred cache)
+2. Create test accounts with initial balances
+3. Configure crisis module with invCheckPeriod = 5
 
-**Setup:** Create a transaction with 100,000 minimal messages, each containing minimal data to keep wire size manageable while still creating significant memory allocation.
+**Action:**
+1. Block N: Execute transaction with fee payment
+   - `DeductFees` called → `DeferredSendCoinsFromAccountToModule` executed
+   - User balance deducted, amount stored in deferred cache (MemoryStore)
+2. Call `EndBlock` (no `WriteDeferredBalances` called)
+3. `Commit` occurs (MemoryStore persists, cache NOT cleared)
+4. Block N+1: Execute another transaction with fee payment
+   - Another balance deducted, amount ADDED to existing deferred cache
+5. Repeat for multiple blocks
+6. Block N+5: Crisis module EndBlocker runs TotalSupply invariant
+   - Invariant counts: expectedTotal = account_balances + accumulated_deferred_from_all_blocks
+   - expectedTotal > supply (module accounts never credited)
+   - Invariant returns broken = true
 
-**Action:** Decode the transaction using `auth.DefaultTxDecoder`, which triggers the `TxBody.Unmarshal` process that allocates memory for all messages.
-
-**Result:** Memory measurement shows allocation of 10+ MB for the message array structures before any gas consumption or validation occurs, demonstrating that:
-- No error is returned during unmarshaling despite excessive message count
-- Significant memory allocation occurs unconditionally
-- No protection mechanism prevents this during deserialization
-- The memory is allocated before any cost-based rejection can occur
-
-The test demonstrates the memory amplification effect: compact protobuf encoding (potentially ~1MB) expands to 10+ MB in memory due to struct overhead and Go's allocation patterns.
+**Result:**
+Chain panics with error message from [18](#0-17)  indicating invariant broken, halting all block production.
 
 ## Notes
 
-This vulnerability represents a fundamental issue in the transaction processing pipeline where resource allocation occurs before resource limits are checked. While Tendermint-level configuration may impose transaction byte size limits, these do not prevent the attack due to protobuf's efficient encoding allowing many messages in a small wire format, and the subsequent memory amplification during deserialization.
-
-The attack is practical and requires minimal sophistication—an attacker simply needs to construct a valid protobuf transaction with a large message array and broadcast it through standard network channels. The impact scales with the number of such transactions and the number of nodes processing them, making this a viable vector for network-wide resource exhaustion.
+The vulnerability exists because of a mismatch between the intended design (documented in code comments suggesting EndBlocker usage) and the actual implementation (no mechanism to call `WriteDeferredBalances`). The use of MemoryStoreKey instead of TransientStoreKey [20](#0-19)  compounds the issue by persisting data across blocks. This is a critical implementation gap in the default simapp configuration.
 
 ### Citations
 
-**File:** types/tx/tx.pb.go (L2162-2165)
+**File:** x/bank/keeper/keeper.go (L404-407)
 ```go
-			m.Messages = append(m.Messages, &types.Any{})
-			if err := m.Messages[len(m.Messages)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
 ```
 
-**File:** baseapp/abci.go (L226-226)
+**File:** x/bank/keeper/keeper.go (L408-432)
 ```go
-	tx, err := app.txDecoder(req.Tx)
-```
-
-**File:** x/auth/tx/decoder.go (L45-45)
-```go
-		err = cdc.Unmarshal(raw.BodyBytes, &body)
-```
-
-**File:** baseapp/baseapp.go (L788-801)
-```go
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-	if len(msgs) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
-
-	for _, msg := range msgs {
-		err := msg.ValidateBasic()
-		if err != nil {
-			return err
-		}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
+	}
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 ```
 
-**File:** baseapp/baseapp.go (L921-925)
+**File:** x/bank/keeper/keeper.go (L480-481)
 ```go
-	msgs := tx.GetMsgs()
-
-	if err := validateBasicTxMsgs(msgs); err != nil {
-		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
-	}
+	// clear deferred cache
+	k.deferredCache.Clear(ctx)
 ```
 
-**File:** baseapp/baseapp.go (L927-947)
+**File:** x/auth/ante/fee.go (L203-214)
 ```go
-	if app.anteHandler != nil {
-		var anteSpan trace.Span
-		if app.TracingEnabled {
-			// trace AnteHandler
-			_, anteSpan = app.TracingInfo.StartWithContext("AnteHandler", ctx.TraceSpanContext())
-			defer anteSpan.End()
+func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+	}
+
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
+	}
+
+	return nil
+}
+```
+
+**File:** simapp/app.go (L230-230)
+```go
+	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** simapp/app.go (L442-447)
+```go
+	app.SetAnteHandler(anteHandler)
+	app.SetAnteDepGenerator(anteDepGenerator)
+	app.SetEndBlocker(app.EndBlocker)
+	app.SetPrepareProposalHandler(app.PrepareProposalHandler)
+	app.SetProcessProposalHandler(app.ProcessProposalHandler)
+	app.SetFinalizeBlocker(app.FinalizeBlocker)
+```
+
+**File:** x/bank/keeper/invariants.go (L59-104)
+```go
+func TotalSupply(k Keeper) sdk.Invariant {
+	return func(ctx sdk.Context) (string, bool) {
+		expectedTotal := sdk.Coins{}
+		weiTotal := sdk.NewInt(0)
+		supply, _, err := k.GetPaginatedTotalSupply(ctx, &query.PageRequest{Limit: query.MaxLimit})
+
+		if err != nil {
+			return sdk.FormatInvariant(types.ModuleName, "query supply",
+				fmt.Sprintf("error querying total supply %v", err)), false
 		}
-		var (
-			anteCtx sdk.Context
-			msCache sdk.CacheMultiStore
-		)
-		// Branch context before AnteHandler call in case it aborts.
-		// This is required for both CheckTx and DeliverTx.
-		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2772
-		//
-		// NOTE: Alternatively, we could require that AnteHandler ensures that
-		// writes do not happen if aborted/failed.  This may have some
-		// performance benefits, but it'll be more difficult to get right.
-		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
-		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
+
+		k.IterateAllBalances(ctx, func(_ sdk.AccAddress, balance sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(balance)
+			return false
+		})
+		// also iterate over deferred balances
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
+			return false
+		})
+		k.IterateAllWeiBalances(ctx, func(addr sdk.AccAddress, balance sdk.Int) bool {
+			weiTotal = weiTotal.Add(balance)
+			return false
+		})
+		weiInUsei, weiRemainder := SplitUseiWeiAmount(weiTotal)
+		if !weiRemainder.IsZero() {
+			return sdk.FormatInvariant(types.ModuleName, "total supply",
+				fmt.Sprintf(
+					"\twei remainder: %v\n",
+					weiRemainder)), true
+		}
+		baseDenom, err := sdk.GetBaseDenom()
+		if err == nil {
+			expectedTotal = expectedTotal.Add(sdk.NewCoin(baseDenom, weiInUsei))
+		} else if !weiInUsei.IsZero() {
+			return sdk.FormatInvariant(types.ModuleName, "total supply", "non-zero wei balance without base denom"), true
+		}
+
+		broken := !expectedTotal.IsEqual(supply)
+
+		return sdk.FormatInvariant(types.ModuleName, "total supply",
+			fmt.Sprintf(
+				"\tsum of accounts coins: %v\n"+
+					"\tsupply.Total:          %v\n",
+				expectedTotal, supply)), broken
+	}
 ```
 
-**File:** x/auth/ante/basic.go (L109-116)
+**File:** x/crisis/abci.go (L13-21)
 ```go
-func (cgts ConsumeTxSizeGasDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
-	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
-	}
-	params := cgts.ak.GetParams(ctx)
+func EndBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyEndBlocker)
 
-	ctx.GasMeter().ConsumeGas(params.TxSizeCostPerByte*sdk.Gas(len(ctx.TxBytes())), "txSize")
+	if k.InvCheckPeriod() == 0 || ctx.BlockHeight()%int64(k.InvCheckPeriod()) != 0 {
+		// skip running the invariant check
+		return
+	}
+	k.AssertInvariants(ctx)
+}
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** store/mem/store.go (L54-55)
+```go
+// Commit performs a no-op as entries are persistent between commitments.
+func (s *Store) Commit(_ bool) (id types.CommitID) { return }
+```
+
+**File:** x/crisis/keeper/keeper.go (L83-85)
+```go
+			panic(fmt.Errorf("invariant broken: %s\n"+
+				"\tCRITICAL please submit the following transaction:\n"+
+				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
+```
+
+**File:** baseapp/abci.go (L379-383)
+```go
+	if app.preCommitHandler != nil {
+		if err := app.preCommitHandler(app.stateToCommit.ctx); err != nil {
+			panic(fmt.Errorf("error when executing commit handler: %s", err))
+		}
+	}
+```
+
+**File:** store/transient/store.go (L24-28)
+```go
+// Commit cleans up Store.
+func (ts *Store) Commit(_ bool) (id types.CommitID) {
+	ts.Store = dbadapter.Store{DB: dbm.NewMemDB()}
+	return
+}
 ```

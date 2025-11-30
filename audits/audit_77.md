@@ -1,210 +1,283 @@
 # Audit Report
 
 ## Title
-Historical Validator Sets Store Modified Validator State Due to Module Execution Ordering
+Nested MsgExec Authorization Bypass Allows Unauthorized Message Execution
 
 ## Summary
-The staking module's `TrackHistoricalInfo` function stores validator data with post-slashing modifications when validators are slashed during BeginBlock. Due to module execution ordering, slashing occurs before historical info tracking, causing `GetLastValidators` to retrieve validators with already-modified token balances and jailed status rather than their state when they validated the block. This violates the documented specification that HistoricalInfo should contain "the Validators that committed the current block" and affects IBC light client consensus state verification. [1](#0-0) 
+A critical vulnerability in the x/authz module allows a grantee with `GenericAuthorization` for `MsgExec` to bypass authorization checks and execute arbitrary message types on behalf of the granter. By nesting `MsgExec` messages, an attacker exploits the implicit accept logic to execute unauthorized actions, resulting in direct loss of funds.
 
 ## Impact
-Medium
+**High** - Direct loss of funds
 
 ## Finding Description
 
-**location:** 
-- Primary issue: `x/staking/keeper/validator.go` in `GetLastValidators` function (line 323)
-- Module ordering: `simapp/app.go` (line 366)
-- Slashing execution: `x/slashing/keeper/infractions.go` in `SlashJailAndUpdateSigningInfo` (lines 140-141) [2](#0-1) [3](#0-2) 
+**Location:** [1](#0-0) [2](#0-1) 
 
-**intended logic:** 
-According to the staking module specification, HistoricalInfo should persist "the Validators that committed the current block" at each BeginBlock. This means storing the validator set with the exact token balances and status they had when signing the block. The `LastValidatorPowerKey` index stores validator addresses from the previous block's EndBlock, representing the active consensus set. [4](#0-3) 
+**Intended logic:** 
+The authorization system is designed to enforce fine-grained access control where a granter explicitly authorizes a grantee to execute specific message types on their behalf. The `DispatchActions` function verifies authorization when the message signer differs from the executing grantee. The implicit accept logic (lines 87-89 in keeper.go) is intended to allow users to execute their own messages without requiring self-authorization.
 
-**actual logic:** 
-The execution flow is:
+**Actual logic:** 
+The vulnerability arises from three interacting behaviors:
+1. `MsgExec.GetSigners()` returns the `grantee` field of the MsgExec message [2](#0-1) , not the actual transaction signer
+2. When `DispatchActions` processes a nested `MsgExec`, it uses `msg.GetSigners()[0]` as the "granter" [3](#0-2) 
+3. An attacker can set the inner MsgExec's grantee to the victim's address, causing subsequent messages to bypass authorization via the implicit accept path (granter == grantee) [4](#0-3) 
 
-1. At block N's BeginBlock, slashing module executes first (per module order configuration)
-2. `SlashJailAndUpdateSigningInfo` modifies validator state by calling `k.sk.Slash()` and `k.sk.Jail()`
-3. `Slash` reduces validator tokens via `RemoveValidatorTokens`, which calls `SetValidator` to persist changes
-4. `Jail` sets `validator.Jailed = true` and persists via `SetValidator` [5](#0-4) [6](#0-5) [7](#0-6) 
+**Exploitation path:**
+1. Alice grants Bob `GenericAuthorization` for `/cosmos.authz.v1beta1.MsgExec` [5](#0-4) 
+2. Bob constructs a transaction with nested MsgExec messages:
+   - Outer `MsgExec`: grantee=Bob, msgs=[inner_MsgExec]
+   - Inner `MsgExec`: grantee=Alice, msgs=[MsgSend(from=Alice, to=Bob)]
+3. Bob signs and submits the transaction
+4. Outer MsgExec executes via `Keeper.Exec()` [6](#0-5)  calling `DispatchActions(ctx, Bob, [inner_MsgExec])`
+   - inner_MsgExec.GetSigners() returns [Alice]
+   - Authorization check: Does Bob have MsgExec authorization from Alice? YES [7](#0-6) 
+   - `GenericAuthorization.Accept()` returns true [8](#0-7) 
+   - Inner MsgExec handler is invoked
+5. Inner MsgExec executes: `DispatchActions(ctx, Alice, [MsgSend])`
+   - MsgSend.GetSigners() returns [Alice]
+   - Check: Alice == Alice? YES → Implicit accept triggered [4](#0-3) 
+   - NO authorization check performed
+   - MsgSend executes, transferring Alice's funds to Bob
 
-5. Then staking BeginBlocker calls `TrackHistoricalInfo`
-6. `TrackHistoricalInfo` calls `GetLastValidators` to retrieve the validator set
-7. `GetLastValidators` iterates through `LastValidatorPowerKey` addresses and calls `mustGetValidator(ctx, address)` for each
-8. `mustGetValidator` fetches the CURRENT validator object from storage, which now contains post-slash modifications [8](#0-7) [9](#0-8) 
-
-**exploitation path:** 
-This occurs automatically during normal protocol operation:
-1. A validator misses sufficient blocks to exceed downtime threshold
-2. During block N's BeginBlock, slashing module slashes and jails the validator
-3. Staking module then stores HistoricalInfo at height N with the validator's post-slash state (reduced tokens, Jailed=true)
-4. The stored historical data misrepresents the actual validator set that validated block N
-
-**security guarantee broken:** 
-The specification states that `LastValidatorsPower` "remains constant during a block" and HistoricalInfo should contain validators "that committed the current block". This invariant is violated because the stored validator state reflects modifications made during the same block's BeginBlock, not the state when the block was validated. [10](#0-9) 
+**Security guarantee broken:** 
+The authorization invariant that a grantee can only execute message types explicitly authorized by the granter is violated. The system's fundamental security property of fine-grained access control is completely bypassed.
 
 ## Impact Explanation
 
-This bug affects IBC light client verification. According to IBC integration documentation, "The historical info is required to introspect the past historical info at any given height in order to verify the light client ConsensusState during the connection handshake." [11](#0-10) 
+This vulnerability enables direct theft of funds and complete account takeover. An attacker with only `MsgExec` authorization can:
 
-Since validator voting power is calculated from tokens, incorrect token amounts in HistoricalInfo mean incorrect consensus power values. This creates a divergence between stored consensus state and the actual validator set that signed blocks, which IBC relies upon for cross-chain security. [12](#0-11) 
+- **Drain all funds**: Execute `MsgSend` to transfer the victim's entire balance
+- **Modify staking positions**: Delegate, undelegate, or redelegate tokens
+- **Cast governance votes**: Vote on proposals on behalf of the victim
+- **Execute any message type**: The bypass works for all message types in the system
 
-The incorrect data is permanently stored on-chain. While this doesn't directly cause fund loss, it corrupts critical consensus metadata used for inter-blockchain communication, potentially causing IBC connection verification failures or creating security vulnerabilities in cross-chain verification.
+The impact is severe because users might grant `MsgExec` authorization believing it provides limited delegation capability for nested authorization workflows, without realizing it grants complete account control. All funds controlled by accounts that have granted `GenericAuthorization` for `MsgExec` are at immediate risk.
 
 ## Likelihood Explanation
 
-This vulnerability is triggered automatically by the protocol whenever a validator is slashed for downtime during BeginBlock. No attacker action is required - it occurs during normal validator slashing operations.
+**Who can trigger:** Any user who receives `GenericAuthorization` for `MsgExec` from another account.
 
-Required conditions: A validator must miss enough blocks to exceed the downtime threshold (typically ~9,500 out of 10,000 blocks in a sliding window). This is a common occurrence in blockchain networks due to node issues, network problems, or maintenance. Given that validator downtime is relatively common in large validator sets, this bug likely affects multiple historical entries already stored on active chains.
+**Conditions required:**
+- The granter must grant authorization for `/cosmos.authz.v1beta1.MsgExec` to the attacker
+- This is the ONLY authorization required - no authorization for the actual message types being executed is needed
+
+**Frequency:** 
+- Exploitable immediately after receiving the authorization
+- Works during normal network operation
+- No special timing, state conditions, or coordination required
+- No privileged access needed
+- Highly likely to be exploited if users grant MsgExec authorization for legitimate use cases
+
+The vulnerability is particularly dangerous because granting `MsgExec` authorization might appear reasonable for advanced authorization workflows involving nested delegations, making it likely that users would grant this authorization without understanding the security implications.
 
 ## Recommendation
 
-Modify `GetLastValidators` to retrieve validator snapshots from when `LastValidatorPowerKey` was set, rather than fetching current validator state. Recommended approach:
+**Option 1 (Recommended):** Prevent granting authorization for `MsgExec` by adding validation in the `Grant` method [9](#0-8) :
 
-1. Create separate storage for validator snapshots indexed by height
-2. When `SetLastValidatorPower` is called during EndBlock, also store a complete validator snapshot
-3. Modify `GetLastValidators` to retrieve these snapshots instead of calling `mustGetValidator`
+```go
+if t == sdk.MsgTypeURL(&authz.MsgExec{}) {
+    return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "cannot grant authorization for MsgExec")
+}
+```
 
-Alternative: Change module execution order to run staking BeginBlocker before slashing BeginBlocker, though this may have implications for fee distribution (as noted in the comment at simapp/app.go:360-362). [13](#0-12) 
+**Option 2:** Track execution depth and disable implicit accept for nested executions by passing a context flag through `DispatchActions` to indicate when execution is within a MsgExec.
+
+**Option 3:** Modify the implicit accept logic to check the actual transaction signer rather than using the result from `GetSigners()`.
+
+Option 1 is the simplest and safest fix, as nested MsgExec creates complex authorization chains that are inherently difficult to reason about securely.
 
 ## Proof of Concept
 
-The vulnerability can be demonstrated by adding a test to `x/staking/keeper/historical_info_test.go`:
+**File:** `x/authz/keeper/keeper_test.go`
 
-**setup:** 
-- Create a bonded validator with specific token amount
-- Set validator in `LastValidatorPowerKey` to simulate it being active in previous block
-- Set block context at height 10
+**Setup:**
+- Initialize test accounts (Alice as victim/granter, Bob as attacker/grantee) using `simapp.AddTestAddrsIncremental`
+- Fund Alice's account with 10,000 tokens using `simapp.FundAccount` [10](#0-9) 
+- Alice grants Bob `GenericAuthorization` for `MsgExec` via `app.AuthzKeeper.SaveGrant`
+- Verify Alice has NOT granted Bob `SendAuthorization` via `app.AuthzKeeper.GetCleanAuthorization`
 
-**action:** 
-- Execute slashing operations (Slash + Jail) that modify validator tokens and status
-- Call `TrackHistoricalInfo` (simulating staking BeginBlocker)
+**Action:**
+- Bob constructs nested MsgExec using `authz.NewMsgExec` [11](#0-10) :
+  - Outer: `authz.NewMsgExec(bobAddr, [inner_MsgExec])`
+  - Inner: `authz.NewMsgExec(aliceAddr, [MsgSend])`
+  - Innermost: `banktypes.MsgSend{FromAddress: aliceAddr, ToAddress: bobAddr, Amount: 10000 tokens}`
+- Call `app.AuthzKeeper.DispatchActions(ctx, bobAddr, [inner_MsgExec])` [12](#0-11) 
 
-**result:** 
-- Retrieve stored `HistoricalInfo` at height 10
-- Verify that stored validator has REDUCED tokens (post-slash) instead of original tokens
-- Verify that stored validator shows `Jailed=true` instead of original `Jailed=false`
-- This demonstrates HistoricalInfo contains modified validator state, violating the specification
+**Result:**
+- The call succeeds (when it should fail due to lack of SendAuthorization)
+- Alice's balance is drained to zero
+- Bob receives all 10,000 tokens
+- This occurs despite Alice never granting Bob authorization for `MsgSend`
 
-The test proves that due to module execution ordering, HistoricalInfo stores post-modification validator state rather than the state validators had when they committed the block, as specified in the documentation.
+The PoC demonstrates complete authorization bypass, enabling arbitrary message execution and direct fund theft with only `MsgExec` authorization.
+
+## Notes
+
+The vulnerability fundamentally breaks the x/authz module's security model by allowing a single authorization grant to effectively grant unlimited account access. The interaction between `MsgExec.GetSigners()` returning the grantee field [2](#0-1)  and the implicit accept logic [4](#0-3)  creates an authorization bypass that undermines the entire purpose of the authorization system. No existing protections against this attack pattern were found in the codebase.
 
 ### Citations
 
-**File:** x/staking/spec/01_state.md (L13-14)
-```markdown
-LastTotalPower tracks the total amounts of bonded tokens recorded during the previous end block.
-Store entries prefixed with "Last" must remain unchanged until EndBlock.
-```
-
-**File:** x/staking/spec/01_state.md (L72-74)
-```markdown
-`LastValidatorsPower` is a special index that provides a historical list of the
-last-block's bonded validators. This index remains constant during a block but
-is updated during the validator set update process which takes place in [`EndBlock`](./05_end_block.md).
-```
-
-**File:** x/staking/spec/01_state.md (L213-215)
-```markdown
-At each BeginBlock, the staking keeper will persist the current Header and the Validators that committed
-the current block in a `HistoricalInfo` object. The Validators are sorted on their address to ensure that
-they are in a determisnistic order.
-```
-
-**File:** simapp/app.go (L360-363)
+**File:** x/authz/keeper/keeper.go (L76-139)
 ```go
-	// During begin block slashing happens after distr.BeginBlocker so that
-	// there is nothing left over in the validator fee pool, so as to keep the
-	// CanWithdrawInvariant invariant.
-	// NOTE: staking module is required if HistoricalEntries param > 0
-```
+func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
+	results := make([][]byte, len(msgs))
 
-**File:** simapp/app.go (L365-367)
-```go
-	app.mm.SetOrderBeginBlockers(
-		upgradetypes.ModuleName, capabilitytypes.ModuleName, minttypes.ModuleName, distrtypes.ModuleName, slashingtypes.ModuleName,
-		evidencetypes.ModuleName, stakingtypes.ModuleName,
-```
-
-**File:** x/staking/keeper/validator.go (L120-127)
-```go
-func (k Keeper) RemoveValidatorTokens(ctx sdk.Context,
-	validator types.Validator, tokensToRemove sdk.Int) types.Validator {
-	k.DeleteValidatorByPowerIndex(ctx, validator)
-	validator = validator.RemoveTokens(tokensToRemove)
-	k.SetValidator(ctx, validator)
-	k.SetValidatorByPowerIndex(ctx, validator)
-
-	return validator
-```
-
-**File:** x/staking/keeper/validator.go (L305-330)
-```go
-func (k Keeper) GetLastValidators(ctx sdk.Context) (validators []types.Validator) {
-	store := ctx.KVStore(k.storeKey)
-
-	// add the actual validator power sorted store
-	maxValidators := k.MaxValidators(ctx)
-	validators = make([]types.Validator, maxValidators)
-
-	iterator := sdk.KVStorePrefixIterator(store, types.LastValidatorPowerKey)
-	defer iterator.Close()
-
-	i := 0
-	for ; iterator.Valid(); iterator.Next() {
-		// sanity check
-		if i >= int(maxValidators) {
-			panic("more validators than maxValidators found")
+	for i, msg := range msgs {
+		signers := msg.GetSigners()
+		if len(signers) != 1 {
+			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
 		}
 
-		address := types.AddressFromLastValidatorPowerKey(iterator.Key())
-		validator := k.mustGetValidator(ctx, address)
+		granter := signers[0]
 
-		validators[i] = validator
-		i++
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
+
+		handler := k.router.Handler(msg)
+		if handler == nil {
+			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
+		}
+
+		msgResp, err := handler(ctx, msg)
+		if err != nil {
+			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
+		}
+
+		results[i] = msgResp.Data
+
+		// emit the events from the dispatched actions
+		events := msgResp.Events
+		sdkEvents := make([]sdk.Event, 0, len(events))
+		for _, event := range events {
+			e := event
+			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
+
+			sdkEvents = append(sdkEvents, sdk.Event(e))
+		}
+
+		ctx.EventManager().EmitEvents(sdkEvents)
 	}
 
-	return validators[:i] // trim
+	return results, nil
 }
 ```
 
-**File:** x/slashing/keeper/infractions.go (L140-141)
+**File:** x/authz/msgs.go (L180-195)
 ```go
-	k.sk.Slash(ctx, consAddr, slashInfo.distributionHeight, slashInfo.power, k.SlashFractionDowntime(ctx))
-	k.sk.Jail(ctx, consAddr)
-```
+func NewMsgExec(grantee sdk.AccAddress, msgs []sdk.Msg) MsgExec {
+	msgsAny := make([]*cdctypes.Any, len(msgs))
+	for i, msg := range msgs {
+		any, err := cdctypes.NewAnyWithValue(msg)
+		if err != nil {
+			panic(err)
+		}
 
-**File:** x/staking/keeper/val_state_change.go (L265-266)
-```go
-	validator.Jailed = true
-	k.SetValidator(ctx, validator)
-```
+		msgsAny[i] = any
+	}
 
-**File:** x/staking/abci.go (L15-18)
-```go
-func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
-
-	k.TrackHistoricalInfo(ctx)
-```
-
-**File:** x/staking/keeper/historical_info.go (L93-94)
-```go
-	lastVals := k.GetLastValidators(ctx)
-	historicalEntry := types.NewHistoricalInfo(ctx.BlockHeader(), lastVals, k.PowerReduction(ctx))
-```
-
-**File:** docs/ibc/integration.md (L200-204)
-```markdown
-One addition from IBC is the concept of `HistoricalEntries` which are stored on the staking module.
-Each entry contains the historical information for the `Header` and `ValidatorSet` of this chain which is stored
-at each height during the `BeginBlock` call. The historical info is required to introspect the
-past historical info at any given height in order to verify the light client `ConsensusState` during the
-connection handhake.
-```
-
-**File:** x/staking/types/validator.go (L358-361)
-```go
-// PotentialConsensusPower returns the potential consensus-engine power.
-func (v Validator) PotentialConsensusPower(r sdk.Int) int64 {
-	return sdk.TokensToConsensusPower(v.Tokens, r)
+	return MsgExec{
+		Grantee: grantee.String(),
+		Msgs:    msgsAny,
+	}
 }
+```
+
+**File:** x/authz/msgs.go (L212-218)
+```go
+func (msg MsgExec) GetSigners() []sdk.AccAddress {
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		panic(err)
+	}
+	return []sdk.AccAddress{grantee}
+}
+```
+
+**File:** x/authz/keeper/msg_server.go (L14-41)
+```go
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
+	}
+
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
+	}
+
+	authorization := msg.GetAuthorization()
+	if authorization == nil {
+		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
+	}
+
+	t := authorization.MsgTypeURL()
+	if k.router.HandlerByTypeURL(t) == nil {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+	}
+
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgGrantResponse{}, nil
+```
+
+**File:** x/authz/keeper/msg_server.go (L65-82)
+```go
+func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
+	}
+
+	msgs, err := msg.GetMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := k.DispatchActions(ctx, grantee, msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgExecResponse{Results: results}, nil
+```
+
+**File:** x/authz/generic_authorization.go (L24-26)
+```go
+func (a GenericAuthorization) Accept(ctx sdk.Context, msg sdk.Msg) (AcceptResponse, error) {
+	return AcceptResponse{Accept: true}, nil
+}
+```
+
+**File:** x/authz/keeper/keeper_test.go (L132-132)
+```go
+	s.Require().NoError(simapp.FundAccount(app.BankKeeper, s.ctx, granterAddr, sdk.NewCoins(sdk.NewInt64Coin("steak", 10000))))
 ```

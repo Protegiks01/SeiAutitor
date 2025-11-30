@@ -1,189 +1,248 @@
-Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**. Let me provide the detailed audit report:
-
----
-
-Audit Report
+# Audit Report
 
 ## Title
-Race Condition in CommitKVStoreCache Due to Improper Lock Usage in getAndWriteToCache Method
+MsgExec Self-Execution Bypasses ValidateBasic Enabling Governance Vote Weight Manipulation
 
 ## Summary
-The `getAndWriteToCache` method in `store/cache/cache.go` uses a read lock (`RLock`) while performing write operations on a non-thread-safe LRU cache. During concurrent transaction processing, multiple goroutines can simultaneously hold the read lock and invoke `cache.Add()` concurrently, leading to cache corruption and potential node crashes.
+The authz module's `MsgExec` message does not validate inner messages during stateless validation, and the "implicit accept" code path for self-execution skips authorization checks. This allows any voter to submit `MsgVoteWeighted` with invalid total weights (≠ 1.0) through `MsgExec`, amplifying their effective voting power during governance tallying.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
 
-**Intended Logic:**
-The `CommitKVStoreCache` is explicitly designed to handle concurrent access from multiple goroutines during transaction parallelization, as stated in the code comments. [2](#0-1) 
+**Intended logic:** All transaction messages should pass through `ValidateBasic()` during `CheckTx` to ensure stateless validation. For `MsgVoteWeighted`, this includes verifying total weight equals exactly 1.0 and no duplicate options exist. [5](#0-4) 
 
-The `getAndWriteToCache` method should safely handle concurrent Get requests by using appropriate synchronization when modifying the shared cache state.
+**Actual logic:** When `MsgExec` contains inner messages, `MsgExec.ValidateBasic()` only validates the grantee address and messages array existence - it does NOT call `ValidateBasic()` on inner messages. During execution in `DispatchActions()`, when granter equals grantee (self-execution), the code "implicitly accepts" and skips authorization checks, proceeding directly to message execution. The governance `AddVote()` handler only validates individual option validity via `ValidWeightedVoteOption()`, not total weight sum or duplicates. [6](#0-5) 
 
-**Actual Logic:**
-The method acquires only a read lock (`RLock`) before calling `cache.Add()`. The underlying `lru.TwoQueueCache` from `github.com/hashicorp/golang-lru/v2` [3](#0-2)  is not thread-safe and requires external synchronization. Since `RLock` allows multiple goroutines to hold the lock simultaneously, concurrent calls to `cache.Add()` can corrupt the cache's internal data structures (linked lists, hash maps).
+**Exploitation path:**
+1. Attacker constructs `MsgVoteWeighted` with invalid weights (e.g., YES: 0.8, NO: 0.7, total: 1.5)
+2. Attacker wraps this in `MsgExec` where `Grantee` = their own address and inner `Voter` = their own address
+3. Transaction passes `CheckTx` because `MsgExec.ValidateBasic()` doesn't validate inner messages
+4. During `DeliverTx`, `DispatchActions()` extracts granter from inner message's signer (voter address), compares with grantee (same address), and "implicitly accepts" without authorization or validation checks
+5. The `VoteWeighted` handler executes without calling `ValidateBasic()`, calling `AddVote()` directly
+6. Invalid vote is stored with total weight > 1.0
+7. During tally, voting power is multiplied by each option's weight, amplifying effective voting power
 
-This is inconsistent with other methods in the same struct which correctly use full write locks (`Lock`) when modifying the cache:
-- `Set()` uses `Lock()` [4](#0-3) 
-- `Delete()` uses `Lock()` [5](#0-4) 
-- `Reset()` uses `Lock()` [6](#0-5) 
-
-**Exploitation Path:**
-1. The scheduler starts concurrent transaction execution using multiple workers [7](#0-6) 
-2. Multiple transactions execute in parallel, each with its own `VersionIndexedStore`
-3. When transactions read keys not in their local writeset or multiversion store, they call `parent.Get()` on the shared `CommitKVStoreCache` [8](#0-7) 
-4. If the key is not cached, all goroutines call `getAndWriteToCache()` nearly simultaneously [9](#0-8) 
-5. All goroutines acquire `RLock` concurrently and invoke `cache.Add()` without proper synchronization
-6. Concurrent modifications corrupt the non-thread-safe LRU cache's internal state
-
-**Security Guarantee Broken:**
-This violates the thread-safety guarantee explicitly documented for the `CommitKVStoreCache`. The cache corruption can lead to memory safety issues, panics, and unpredictable behavior during transaction execution.
+**Security guarantee broken:** The validation invariant that all messages must pass `ValidateBasic()` before execution is violated. This breaks the governance integrity assumption that each voter's weight distribution must sum to exactly 1.0.
 
 ## Impact Explanation
 
-This vulnerability affects the stability and reliability of validator nodes:
+An attacker can manipulate their effective voting power by submitting votes with total weight > 1.0. For example, with total weight = 1.5, a voter with 10% of staking power effectively casts 15% of the vote weight. During tally, the code directly multiplies voting power by option weights without validation: [7](#0-6) [8](#0-7) 
 
-1. **Node Crashes**: Cache corruption typically manifests as panics (nil pointer dereferences, invalid slice indices) due to corrupted internal linked list pointers and hash map state, causing node shutdowns
-2. **Network Stability**: If multiple nodes experience crashes during high transaction throughput, it impacts network availability
-3. **Unpredictable Transaction Execution**: Corrupted cache state can cause non-deterministic behavior during transaction processing
-
-This qualifies as "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity impact category). While the report claims potential consensus failures, the more realistic impact is node crashes rather than silent data corruption, as LRU cache corruption typically causes crashes rather than returning incorrect values.
+This can swing close proposal outcomes, allowing minority stakeholders to pass or reject proposals against the true will of the majority. While this doesn't directly steal funds, it corrupts the governance process which controls critical protocol operations including parameter changes, community pool spending, and protocol upgrades.
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- Any network participant can trigger this by submitting normal transactions
-- No special privileges required
-- Requires concurrent transaction processing (default mode in sei-cosmos)
-- Multiple transactions must access uncached keys simultaneously
+**Who can trigger:** Any user with voting power (staked tokens or delegations).
 
-**Frequency:**
-The race condition can occur during:
-- High transaction throughput periods
-- After cache evictions or node restarts
-- When accessing newly introduced keys
+**Conditions required:** 
+- An active governance proposal in voting period
+- Single transaction submission containing `MsgExec` with invalid inner `MsgVoteWeighted`
 
-While the race window is relatively small, with sufficient transaction volume the probability increases. The vulnerability is easier to trigger than typical race conditions because the read lock allows unlimited concurrent access.
+**Frequency:** Can be exploited during any proposal's voting period. No special setup, timing requirements, or authorization grants needed - the attacker simply submits `MsgExec` executing their own vote with the grantee field set to their own address. The inner message's voter field is also set to their address, causing the granter == grantee condition in `DispatchActions()` to skip authorization checks.
 
 ## Recommendation
 
-Change the `getAndWriteToCache` method to use a full write lock (`Lock`) instead of a read lock (`RLock`):
+Add validation of inner messages in `MsgExec.ValidateBasic()`:
 
 ```go
-func (ckv *CommitKVStoreCache) getAndWriteToCache(key []byte) []byte {
-    ckv.mtx.Lock()  // Changed from RLock to Lock
-    defer ckv.mtx.Unlock()  // Changed from RUnlock to Unlock
-    value := ckv.CommitKVStore.Get(key)
-    ckv.cache.Add(string(key), value)
-    return value
+func (msg MsgExec) ValidateBasic() error {
+    _, err := sdk.AccAddressFromBech32(msg.Grantee)
+    if err != nil {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+    }
+
+    if len(msg.Msgs) == 0 {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+    }
+
+    // Validate inner messages
+    msgs, err := msg.GetMessages()
+    if err != nil {
+        return err
+    }
+    
+    for _, innerMsg := range msgs {
+        if err := innerMsg.ValidateBasic(); err != nil {
+            return sdkerrors.Wrapf(err, "invalid inner message")
+        }
+    }
+
+    return nil
 }
 ```
 
-This ensures only one goroutine can modify the cache at a time, matching the synchronization pattern used in `Set()`, `Delete()`, and `Reset()` methods. The performance impact is acceptable since cache operations and underlying store reads are already expensive compared to mutex acquisition.
+This ensures all messages undergo stateless validation regardless of how they are submitted, maintaining the security invariant.
 
 ## Proof of Concept
 
-The provided PoC would successfully demonstrate the race condition:
+**Test scenario:**
+1. **Setup:** Create a governance proposal in voting period and a voter account with voting power
+2. **Action:** Submit `MsgExec` with `Grantee` = voter address, containing `MsgVoteWeighted` with `Voter` = same address and invalid weights (total > 1.0)
+3. **Result:** Transaction succeeds, invalid vote is stored, and during tally the voter's power is multiplied by the inflated weight sum
 
-**Setup:**
-1. Create a `CommitKVStoreCache` with an underlying store
-2. Populate the underlying store with keys that are NOT in the cache
-3. Launch multiple goroutines (simulating concurrent transaction execution)
+The vulnerability can be reproduced by:
+- Creating a `MsgVoteWeighted` with options [YES: 0.8, NO: 0.7] (total: 1.5)
+- Verifying it fails `ValidateBasic()` when submitted directly
+- Wrapping it in `MsgExec` where `grantee` = voter address
+- Observing that `MsgExec.ValidateBasic()` passes
+- Executing and confirming the vote is stored with total weight 1.5
+- During tally, confirming the voter's power is multiplied by 1.5x instead of 1.0
 
-**Action:**
-1. All goroutines concurrently call `Get()` on the same uncached keys
-2. This forces concurrent calls to `getAndWriteToCache()`
-3. Multiple goroutines acquire `RLock` simultaneously and call `cache.Add()` concurrently
+## Notes
 
-**Result:**
-Running the test with Go's race detector (`go test -race`) would report data races in the cache operations, confirming concurrent unsynchronized writes to the shared cache data structures. Without the race detector, the test may observe panics from corrupted cache state.
+This vulnerability qualifies as **Medium severity** under the category "A bug in the network code that results in unintended behavior" as it allows manipulation of governance voting outcomes, which is a critical protocol mechanism. While there is no direct fund loss from the vote manipulation itself, governance controls protocol parameters, upgrades, and community pool spending, making this a significant security issue.
 
 ### Citations
 
-**File:** store/cache/cache.go (L34-36)
+**File:** x/authz/msgs.go (L221-232)
 ```go
-		// the same CommitKVStoreCache may be accessed concurrently by multiple
-		// goroutines due to transaction parallelization
-		mtx sync.RWMutex
-```
-
-**File:** store/cache/cache.go (L113-119)
-```go
-func (ckv *CommitKVStoreCache) getAndWriteToCache(key []byte) []byte {
-	ckv.mtx.RLock()
-	defer ckv.mtx.RUnlock()
-	value := ckv.CommitKVStore.Get(key)
-	ckv.cache.Add(string(key), value)
-	return value
-}
-```
-
-**File:** store/cache/cache.go (L124-133)
-```go
-func (ckv *CommitKVStoreCache) Get(key []byte) []byte {
-	types.AssertValidKey(key)
-
-	if value, ok := ckv.getFromCache(key); ok {
-		return value
+func (msg MsgExec) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
 	}
 
-	// if not found in the cache, query the underlying CommitKVStore and init cache value
-	return ckv.getAndWriteToCache(key)
+	if len(msg.Msgs) == 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+	}
+
+	return nil
 }
 ```
 
-**File:** store/cache/cache.go (L137-146)
+**File:** x/authz/keeper/keeper.go (L87-111)
 ```go
-func (ckv *CommitKVStoreCache) Set(key, value []byte) {
-	ckv.mtx.Lock()
-	defer ckv.mtx.Unlock()
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
 
-	types.AssertValidKey(key)
-	types.AssertValidValue(value)
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
 
-	ckv.cache.Add(string(key), value)
-	ckv.CommitKVStore.Set(key, value)
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
+```
+
+**File:** x/gov/keeper/vote.go (L21-25)
+```go
+	for _, option := range options {
+		if !types.ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
+		}
+	}
+```
+
+**File:** x/gov/keeper/msg_server.go (L93-121)
+```go
+func (k msgServer) VoteWeighted(goCtx context.Context, msg *types.MsgVoteWeighted) (*types.MsgVoteWeightedResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	accAddr, accErr := sdk.AccAddressFromBech32(msg.Voter)
+	if accErr != nil {
+		return nil, accErr
+	}
+	err := k.Keeper.AddVote(ctx, msg.ProposalId, accAddr, msg.Options)
+	if err != nil {
+		return nil, err
+	}
+
+	defer telemetry.IncrCounterWithLabels(
+		[]string{types.ModuleName, "vote"},
+		1,
+		[]metrics.Label{
+			telemetry.NewLabel("proposal_id", strconv.Itoa(int(msg.ProposalId))),
+		},
+	)
+
+	ctx.EventManager().EmitEvent(
+		sdk.NewEvent(
+			sdk.EventTypeMessage,
+			sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+			sdk.NewAttribute(sdk.AttributeKeySender, msg.Voter),
+		),
+	)
+
+	return &types.MsgVoteWeightedResponse{}, nil
 }
 ```
 
-**File:** store/cache/cache.go (L150-156)
+**File:** x/gov/types/msgs.go (L243-274)
 ```go
-func (ckv *CommitKVStoreCache) Delete(key []byte) {
-	ckv.mtx.Lock()
-	defer ckv.mtx.Unlock()
+func (msg MsgVoteWeighted) ValidateBasic() error {
+	if msg.Voter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, msg.Voter)
+	}
 
-	ckv.cache.Remove(string(key))
-	ckv.CommitKVStore.Delete(key)
+	if len(msg.Options) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, WeightedVoteOptions(msg.Options).String())
+	}
+
+	totalWeight := sdk.NewDec(0)
+	usedOptions := make(map[VoteOption]bool)
+	for _, option := range msg.Options {
+		if !ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(ErrInvalidVote, option.String())
+		}
+		totalWeight = totalWeight.Add(option.Weight)
+		if usedOptions[option.Option] {
+			return sdkerrors.Wrap(ErrInvalidVote, "Duplicated vote option")
+		}
+		usedOptions[option.Option] = true
+	}
+
+	if totalWeight.GT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight overflow 1.00")
+	}
+
+	if totalWeight.LT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight lower than 1.00")
+	}
+
+	return nil
 }
 ```
 
-**File:** store/cache/cache.go (L158-163)
+**File:** x/gov/types/vote.go (L80-85)
 ```go
-func (ckv *CommitKVStoreCache) Reset() {
-	ckv.mtx.Lock()
-	defer ckv.mtx.Unlock()
-
-	ckv.cache.Purge()
+func ValidWeightedVoteOption(option WeightedVoteOption) bool {
+	if !option.Weight.IsPositive() || option.Weight.GT(sdk.NewDec(1)) {
+		return false
+	}
+	return ValidVoteOption(option.Option)
 }
 ```
 
-**File:** go.mod (L28-28)
-```text
-	github.com/hashicorp/golang-lru/v2 v2.0.1
+**File:** x/gov/keeper/tally.go (L59-62)
+```go
+				for _, option := range vote.Options {
+					subPower := votingPower.Mul(option.Weight)
+					results[option.Option] = results[option.Option].Add(subPower)
+				}
 ```
 
-**File:** tasks/scheduler.go (L308-309)
+**File:** x/gov/keeper/tally.go (L82-85)
 ```go
-	// execution tasks are limited by workers
-	start(workerCtx, s.executeCh, workers)
-```
-
-**File:** store/multiversion/mvkv.go (L172-175)
-```go
-	// if we didn't find it in the multiversion store, then we want to check the parent store + add to readset
-	parentValue := store.parent.Get(key)
-	store.UpdateReadSet(key, parentValue)
-	return parentValue
+		for _, option := range val.Vote {
+			subPower := votingPower.Mul(option.Weight)
+			results[option.Option] = results[option.Option].Add(subPower)
+		}
 ```

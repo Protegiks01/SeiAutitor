@@ -1,264 +1,286 @@
 # Audit Report
 
 ## Title
-Fee Grant Bypass via Authz MsgExec - AllowedMsgAllowance Validation Only Checks Outer Messages
+Authentication Bypass via Zero-Threshold Multisig Public Key Deserialization
 
 ## Summary
-The feegrant module's `AllowedMsgAllowance` only validates top-level transaction messages, failing to check inner messages contained within authz `MsgExec`. This allows grantees to bypass message type restrictions and have fee granters pay for unauthorized transaction types.
+The `LegacyAminoPubKey` protobuf deserialization bypasses constructor validation, allowing creation of multisig accounts with `threshold=0` that accept transactions without any valid signatures. This enables complete authentication bypass and creation of "anyone can spend" addresses, resulting in direct fund theft.
 
 ## Impact
-**Direct loss of funds**
+High
 
 ## Finding Description
 
-**Location:**
-- Fee deduction ante handler: `x/auth/ante/fee.go` line 168
-- Allowance validation: `x/feegrant/filtered_fee.go` lines 65-109  
-- Message type checking: `x/feegrant/filtered_fee.go` lines 98-109
-- MsgExec execution: `x/authz/keeper/msg_server.go` lines 72-77
+**Location:** 
+- `crypto/keys/multisig/keys.pb.go` (protobuf unmarshaling)
+- `crypto/keys/multisig/multisig.go:50-66` (verification logic)
+- `x/auth/ante/sigverify.go:89-97` (pubkey setting)
+- `x/auth/types/account.go:87-97` (account validation)
 
 **Intended Logic:**
-When a fee granter creates an `AllowedMsgAllowance`, they specify which message types the grantee can execute using their fee grant. The feegrant module should validate that ALL messages in a transaction (including nested messages) match the allowed message types before deducting fees from the granter's account.
+The constructor enforces that multisig threshold must be greater than 0 to ensure at least one signature is required for transaction authorization. [1](#0-0) 
 
 **Actual Logic:**
-The fee deduction ante handler calls `UseGrantedFees` with `sdkTx.GetMsgs()`, which only returns top-level transaction messages. [1](#0-0)  When a transaction contains a `MsgExec`, the validation in `AllowedMsgAllowance.Accept` [2](#0-1)  only checks if `MsgExec` itself is in the allowed list by calling `allMsgTypesAllowed` [3](#0-2) , completely ignoring the inner messages that will be extracted and executed later via `DispatchActions`. [4](#0-3) 
+The protobuf `Unmarshal` method directly deserializes the `Threshold` field without any validation. [2](#0-1) 
+
+When `threshold=0`, the signature verification checks become ineffective:
+- Line 60: `len(sigs) < int(m.Threshold)` becomes `0 < 0` (always false)
+- Line 64: `bitarray.NumTrueBitsBefore(size) < int(m.Threshold)` becomes `0 < 0` (always false) [3](#0-2) 
 
 **Exploitation Path:**
-1. Attacker (Bob) obtains a fee grant from Alice with `AllowedMsgAllowance` that includes `MsgExec` in the allowed messages list
-2. Attacker obtains authz permission from Charlie to execute arbitrary messages (e.g., `MsgBurn`) on Charlie's behalf
-3. Attacker creates a transaction containing:
-   - Outer message: `MsgExec` wrapping a `MsgBurn` message
-   - FeeGranter field: Alice's address
-4. Transaction enters ante handler - fee validation sees only `[MsgExec]` from `sdkTx.GetMsgs()`
-5. `AllowedMsgAllowance` checks if `MsgExec` is allowed (it is) and approves
-6. Alice's account pays the transaction fees
-7. `MsgExec` handler extracts inner `MsgBurn` message using `GetMessages()` [5](#0-4) 
-8. `MsgBurn` executes via `DispatchActions` without fee grant validation [6](#0-5) 
-9. Alice paid fees for `MsgBurn`, which was NOT in her allowed messages list
+1. Attacker creates a `LegacyAminoPubKey` with `Threshold: 0` by directly marshaling/unmarshaling via protobuf (bypassing constructor)
+2. Attacker computes the address derived from this malicious key
+3. Victim sends funds to this address (via exchange withdrawal, user error, or social engineering)
+4. Attacker creates a transaction with the threshold=0 pubkey in SignerInfo and a `MultiSignatureData` containing zero signatures (created via `multisig.NewMultisig(n)`)
+5. Transaction passes `ValidateBasic` which only checks that outer `Signatures` array is non-empty [4](#0-3) 
+6. `SetPubKeyDecorator` sets the malicious pubkey on the account without validation [5](#0-4) [6](#0-5) 
+7. `SigVerificationDecorator` calls `VerifyMultisignature`, which passes all checks due to threshold=0
+8. Transaction executes without any valid signatures, enabling fund theft
 
 **Security Guarantee Broken:**
-The message type filtering mechanism of `AllowedMsgAllowance` is completely bypassed. Fee granters cannot restrict which message types consume their grants when `MsgExec` is included in the allowed list.
+Transactions must be cryptographically signed by authorized private key holders. This vulnerability creates addresses where NO private keys are needed—anyone who knows the public key composition can spend funds without possessing any private keys.
 
 ## Impact Explanation
 
-This vulnerability results in direct loss of funds for fee granters through unauthorized fee deductions. The fee granter's token balance decreases to pay transaction fees for message types they explicitly did not authorize. 
+This vulnerability enables:
+- **Direct fund theft**: Anyone who knows the public keys of a threshold=0 multisig can steal all funds sent to that address without possessing any private keys
+- **Social engineering attacks**: Attackers can promote "secure multisig addresses" that are actually threshold=0 and completely insecure
+- **Systemic authentication failure**: Violates the core blockchain security property that transactions require valid signatures
 
-The severity is amplified because:
-- The entire security model of `AllowedMsgAllowance` is defeated - it cannot fulfill its core purpose
-- Attackers can systematically drain fee grants by wrapping any unauthorized message type in `MsgExec`
-- Multiple parties can collaborate (one provides authz grants, another exploits the fee grant)
-- It's reasonable for fee granters to include `MsgExec` in allowed messages for legitimate authz usage, making this a realistic scenario
+All funds sent to threshold=0 multisig addresses are at immediate risk of theft by anyone who discovers the public key composition. This is a fundamental breakdown of the authentication mechanism.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any user who has:
-1. A fee grant with `AllowedMsgAllowance` that includes `MsgExec` in the allowed messages
-2. Authz permissions from any other account to execute messages on their behalf
+**Who Can Trigger:** Any unprivileged user can create transactions with threshold=0 multisig keys.
 
 **Conditions Required:**
-- Normal blockchain operation - no special network conditions
-- The fee granter must have included `MsgExec` in the allowed messages list (common for users who want to enable authz features)
-- The grantee must have authz grants from other accounts (easily obtainable)
+- Attacker creates a threshold=0 multisig key and computes its address
+- Someone sends funds to this address (through exchange, user transfer, or social engineering)
+- No special timing, network conditions, or privileges required
 
-**Frequency:**
-This can be exploited repeatedly until the fee grant is exhausted. Each transaction drains fees from the granter for unauthorized message types. The exploit is deterministic with no timing dependencies or race conditions.
+**Frequency:** Exploitable on-demand during normal network operation. The attack is deterministic and reliable—once funds arrive at a threshold=0 address, they can be stolen immediately by anyone who knows the pubkey composition.
 
 ## Recommendation
 
-Modify the fee grant validation to recursively extract and validate ALL messages, including those nested within `MsgExec`:
+Add post-deserialization validation for `LegacyAminoPubKey`:
 
-1. In the ante handler, before calling `UseGrantedFees`, extract all messages including nested ones from `MsgExec`
-2. Implement a recursive helper function:
-```go
-func extractAllMessages(msgs []sdk.Msg) []sdk.Msg {
-    allMsgs := []sdk.Msg{}
-    for _, msg := range msgs {
-        allMsgs = append(allMsgs, msg)
-        if execMsg, ok := msg.(*authz.MsgExec); ok {
-            innerMsgs, err := execMsg.GetMessages()
-            if err == nil {
-                allMsgs = append(allMsgs, extractAllMessages(innerMsgs)...)
-            }
-        }
-    }
-    return allMsgs
-}
-```
-3. Pass all extracted messages (including nested ones) to `UseGrantedFees` for validation
-4. Update `AllowedMsgAllowance` to validate all message types, not just outer wrappers
+1. **Implement validation method in `LegacyAminoPubKey`:**
+   - Add a `Validate()` method that checks `threshold > 0` and `threshold <= len(pubKeys)`
 
-This ensures the allowance validates actual messages being executed, not just wrapper messages.
+2. **Call validation in critical paths:**
+   - In `BaseAccount.SetPubKey()` before accepting any public key
+   - At the beginning of `VerifyMultisignature()` before signature verification
+   - In transaction `ValidateBasic()` to check all public keys in SignerInfo structures
+
+3. **Add a `Validate()` method to the `cryptotypes.PubKey` interface** that all implementations must provide for structural validation, ensuring consistent validation across all public key types.
 
 ## Proof of Concept
 
+**Test Location:** `crypto/keys/multisig/multisig_test.go` (proposed)
+
 **Setup:**
-1. Initialize chain with three accounts: Alice (fee granter), Bob (grantee/attacker), Charlie (authz granter)
-2. Fund Alice and Charlie with tokens
-3. Alice creates a fee grant to Bob with `AllowedMsgAllowance` allowing `["/cosmos.bank.v1beta1.MsgSend", "/cosmos.authz.v1beta1.MsgExec"]`
-4. Charlie creates an authz grant to Bob allowing execution of `"/cosmos.bank.v1beta1.MsgBurn"`
-5. Record Alice's initial balance
+- Create a `LegacyAminoPubKey` directly with `Threshold: 0` (bypassing constructor)
+- Generate one secp256k1 public key for the multisig
+- Create an empty `MultiSignatureData` via `multisig.NewMultisig(1)` with zero signatures
 
-**Trigger:**
-1. Bob constructs a `MsgExec` message containing a `MsgBurn` message (to burn Charlie's tokens)
-2. Bob creates a transaction with:
-   - Messages: `[MsgExec]` containing the `MsgBurn`
-   - FeeGranter: Alice's address
-   - FeePayer: Bob's address
-3. Submit transaction through ante handler chain and message router
+**Action:**
+- Marshal and unmarshal the threshold=0 key to simulate network deserialization
+- Call `VerifyMultisignature` with the zero-signature MultiSignatureData
 
-**Expected Result (Vulnerability):**
-1. Transaction succeeds - ante handler does not reject it
-2. Alice's balance decreases by the fee amount (she paid fees)  
-3. Charlie's tokens are burned (inner message executed successfully)
-4. Alice paid fees for `MsgBurn`, which was NOT in her allowed messages list
-
-**Observed Behavior:**
-The fee grant's message type restrictions are bypassed. `AllowedMsgAllowance` only validated that `MsgExec` was allowed, never checking the inner `MsgBurn` message type. Alice's funds were used to pay fees for an unauthorized message type, demonstrating direct loss of funds.
+**Result:**
+- Verification returns `nil` (success) instead of error
+- Confirms that threshold=0 bypasses all signature checks
+- Demonstrates complete authentication bypass
 
 ## Notes
 
-This vulnerability exists at the architectural level where fee validation (ante handler) and message execution (message router) are separated. The fee validation sees only the transaction structure before unpacking, while message execution later unpacks and dispatches nested messages. This temporal separation combined with the lack of recursive message extraction creates the bypass opportunity.
+This vulnerability stems from the mismatch between constructor validation and protobuf deserialization. The constructor's panic on `threshold <= 0` clearly indicates this was never intended behavior. The issue affects the core authentication mechanism and represents a critical security failure that violates blockchain's fundamental trust model—transactions must be cryptographically authorized.
+
+The vulnerability is particularly dangerous because:
+1. It's completely invisible to users sending funds to such addresses
+2. The exploit is deterministic and reliable
+3. No private keys are needed for theft
+4. Multiple parties could independently discover and exploit the same vulnerable address
 
 ### Citations
 
-**File:** x/auth/ante/fee.go (L168-168)
+**File:** crypto/keys/multisig/multisig.go (L21-33)
 ```go
-			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
-```
-
-**File:** x/feegrant/filtered_fee.go (L65-86)
-```go
-func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
-	if !a.allMsgTypesAllowed(ctx, msgs) {
-		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
+func NewLegacyAminoPubKey(threshold int, pubKeys []cryptotypes.PubKey) *LegacyAminoPubKey {
+	if threshold <= 0 {
+		panic("threshold k of n multisignature: k <= 0")
 	}
-
-	allowance, err := a.GetAllowance()
+	if len(pubKeys) < threshold {
+		panic("threshold k of n multisignature: len(pubKeys) < k")
+	}
+	anyPubKeys, err := packPubKeys(pubKeys)
 	if err != nil {
-		return false, err
+		panic(err)
 	}
-
-	remove, err := allowance.Accept(ctx, fee, msgs)
-	if err != nil {
-		return false, err
-	}
-
-	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
-	if err != nil {
-		return false, err
-	}
-
-    return remove, nil
+	return &LegacyAminoPubKey{Threshold: uint32(threshold), PubKeys: anyPubKeys}
 }
 ```
 
-**File:** x/feegrant/filtered_fee.go (L98-109)
+**File:** crypto/keys/multisig/multisig.go (L50-66)
 ```go
-func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
-	msgsMap := a.allowedMsgsToMap(ctx)
-
-	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
-		if !msgsMap[sdk.MsgTypeURL(msg)] {
-			return false
-		}
+func (m *LegacyAminoPubKey) VerifyMultisignature(getSignBytes multisigtypes.GetSignBytesFunc, sig *signing.MultiSignatureData) error {
+	bitarray := sig.BitArray
+	sigs := sig.Signatures
+	size := bitarray.Count()
+	pubKeys := m.GetPubKeys()
+	// ensure bit array is the correct size
+	if len(pubKeys) != size {
+		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
 	}
-
-	return true
-}
+	// ensure size of signature list
+	if len(sigs) < int(m.Threshold) || len(sigs) > size {
+		return fmt.Errorf("signature size is incorrect %d", len(sigs))
+	}
+	// ensure at least k signatures are set
+	if bitarray.NumTrueBitsBefore(size) < int(m.Threshold) {
+		return fmt.Errorf("not enough signatures set, have %d, expected %d", bitarray.NumTrueBitsBefore(size), int(m.Threshold))
+	}
 ```
 
-**File:** x/authz/keeper/msg_server.go (L72-77)
+**File:** crypto/keys/multisig/keys.pb.go (L173-274)
 ```go
-	msgs, err := msg.GetMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	results, err := k.DispatchActions(ctx, grantee, msgs)
-```
-
-**File:** x/authz/msgs.go (L198-209)
-```go
-func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
-	msgs := make([]sdk.Msg, len(msg.Msgs))
-	for i, msgAny := range msg.Msgs {
-		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
-		if !ok {
-			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
-		}
-		msgs[i] = msg
-	}
-
-	return msgs, nil
-}
-```
-
-**File:** x/authz/keeper/keeper.go (L76-139)
-```go
-func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
-	results := make([][]byte, len(msgs))
-
-	for i, msg := range msgs {
-		signers := msg.GetSigners()
-		if len(signers) != 1 {
-			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
-		}
-
-		granter := signers[0]
-
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+func (m *LegacyAminoPubKey) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowKeys
 			}
-			resp, err := authorization.Accept(ctx, msg)
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: LegacyAminoPubKey: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: LegacyAminoPubKey: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Threshold", wireType)
+			}
+			m.Threshold = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowKeys
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Threshold |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PubKeys", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowKeys
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthKeys
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthKeys
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.PubKeys = append(m.PubKeys, &types.Any{})
+			if err := m.PubKeys[len(m.PubKeys)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipKeys(dAtA[iNdEx:])
 			if err != nil {
-				return nil, err
+				return err
 			}
-
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthKeys
 			}
-			if err != nil {
-				return nil, err
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
 			}
-
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
+			iNdEx += skippy
 		}
+	}
 
-		handler := k.router.Handler(msg)
-		if handler == nil {
-			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+```
+
+**File:** types/tx/types.go (L88-92)
+```go
+	sigs := t.Signatures
+
+	if len(sigs) == 0 {
+		return sdkerrors.ErrNoSignatures
+	}
+```
+
+**File:** x/auth/ante/sigverify.go (L89-97)
+```go
+		// account already has pubkey set,no need to reset
+		if acc.GetPubKey() != nil {
+			continue
 		}
-
-		msgResp, err := handler(ctx, msg)
+		err = acc.SetPubKey(pk)
 		if err != nil {
-			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
+			return ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidPubKey, err.Error())
 		}
+		spkd.ak.SetAccount(ctx, acc)
+```
 
-		results[i] = msgResp.Data
-
-		// emit the events from the dispatched actions
-		events := msgResp.Events
-		sdkEvents := make([]sdk.Event, 0, len(events))
-		for _, event := range events {
-			e := event
-			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
-
-			sdkEvents = append(sdkEvents, sdk.Event(e))
-		}
-
-		ctx.EventManager().EmitEvents(sdkEvents)
+**File:** x/auth/types/account.go (L87-97)
+```go
+func (acc *BaseAccount) SetPubKey(pubKey cryptotypes.PubKey) error {
+	if pubKey == nil {
+		acc.PubKey = nil
+		return nil
 	}
-
-	return results, nil
+	any, err := codectypes.NewAnyWithValue(pubKey)
+	if err == nil {
+		acc.PubKey = any
+	}
+	return err
 }
 ```

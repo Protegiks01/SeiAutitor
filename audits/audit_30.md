@@ -1,276 +1,209 @@
-# Validation Analysis
-
-Let me systematically verify the technical claims and assess whether this constitutes a valid vulnerability.
-
-## Core Technical Verification
-
-**1. ClaimCapability does NOT populate capMap** [1](#0-0) 
-
-Confirmed: The function sets memStore mappings but has no `capMap[index] = cap` assignment.
-
-**2. Design Inconsistency: NewCapability DOES populate capMap** [2](#0-1) 
-
-Confirmed: Line 260 shows `sk.capMap[index] = cap`, revealing an inconsistency in the API design.
-
-**3. GetCapability panics when capability is in memStore but not capMap** [3](#0-2) 
-
-Confirmed: Lines 382-384 retrieve from capMap and panic with "capability found in memstore is missing from map" if nil.
-
-**4. BeginBlocker Ordering Violation** [4](#0-3) 
-
-Critical finding: Line 364's comment explicitly states "capability module's beginblocker must come before any modules using capabilities", yet line 366 shows `upgradetypes.ModuleName` runs BEFORE `capabilitytypes.ModuleName`.
-
-**5. InitMemStore Documentation** [5](#0-4) 
-
-The documentation states: "InitMemStore must be called every time the app starts before the keeper is used (so `BeginBlock` or `InitChain` - whichever is first)."
-
-This requirement is violated by the BeginBlocker ordering, making it IMPOSSIBLE for upgrade handlers to properly use capabilities.
-
-## Critical Assessment
-
-**The Vulnerability Path:**
-
-1. Chain upgrade executes at scheduled height
-2. Upgrade module's BeginBlocker runs first (per line 366)
-3. Upgrade handler executes custom migration logic
-4. If handler attempts capability operations (ClaimCapability + GetCapability), system panics
-5. All validator nodes halt simultaneously
-6. Complete network shutdown
-
-**Realistic Scenario Assessment:**
-
-While the PoC manually creates a capability object (which is unusual), the underlying issue is the **BeginBlocker ordering flaw**. The system explicitly documents that capability BeginBlocker must run before modules use capabilities, yet upgrade runs first. This creates a design-level vulnerability where:
-
-- Upgrade handlers CANNOT safely interact with capabilities
-- No defensive checks prevent this
-- No documentation warns developers
-- IBC-related upgrades might plausibly need capability migration
-
-**Design Flaws Identified:**
-
-1. **Ordering violation**: Upgrade runs before capability, violating documented requirement
-2. **API inconsistency**: `NewCapability` populates capMap but `ClaimCapability` doesn't
-3. **No safeguards**: System allows dangerous patterns without warning
-
-## Validation Checklist
-
-1. ✅ **Confirm Flow**: Upgrade handler → ClaimCapability → GetCapability → panic
-2. ✅ **State Change Analysis**: capMap remains unpopulated, causing invariant violation
-3. ✅ **Realistic Inputs**: Governance-approved upgrade is realistic
-4. ✅ **Impact Verification**: Total network shutdown confirmed
-5. ✅ **Reproducible PoC**: Provided test demonstrates the issue
-6. ✅ **No Special Privileges**: Governance upgrade, but panic is unintended consequence
-7. ✅ **No Out-of-Scope Dependencies**: Self-contained issue
-
-## Impact Verification
-
-The claim matches this accepted impact criterion:
-- **"Network not being able to confirm new transactions (total network shutdown)"** - Listed as **High** severity
-
-All validator nodes would panic simultaneously, causing complete network halt requiring emergency intervention.
-
 # Audit Report
 
 ## Title
-Capability Module BeginBlocker Ordering Causes Network Shutdown During Upgrades
+State Corruption Through Partial Write Propagation in Concurrent Transaction Execution
 
 ## Summary
-The BeginBlocker execution order places the upgrade module before the capability module, violating the documented requirement that capability initialization must occur before capability usage. This allows upgrade handlers to trigger a panic in `GetCapability` when attempting capability operations before `InitMemStore` populates the in-memory capability map, causing total network shutdown. [4](#0-3) [1](#0-0) [3](#0-2) 
+In the OCC (Optimistic Concurrency Control) concurrent execution mode, failed transactions that run out of gas mid-execution have their partial state writes incorrectly committed to the blockchain state. The `executeTask()` function unconditionally propagates writes to the multiversion store without verifying transaction success, violating the fundamental transaction atomicity property.
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:**
-- BeginBlocker ordering: `simapp/app.go` line 366
-- ClaimCapability function: `x/capability/keeper/keeper.go` lines 287-314
-- GetCapability panic: `x/capability/keeper/keeper.go` lines 382-385
-- InitMemStore documentation: `x/capability/keeper/keeper.go` lines 102-106
+**Location:** [1](#0-0) 
 
-**Intended Logic:**
-The capability module's BeginBlocker must run before any module attempts to use capabilities, as explicitly stated in the comment at line 364. The `InitMemStore` function should populate the in-memory `capMap` with all persisted capabilities before any module operations. [4](#0-3) 
+**Intended Logic:** Transactions must be atomic - either all state changes commit or none do. The sequential execution path correctly enforces this through a cache mechanism that only writes on successful execution. [2](#0-1) 
 
-**Actual Logic:**
-The upgrade module runs FIRST in the BeginBlocker order (line 366), executing upgrade handlers before capability initialization. [6](#0-5) 
-
-Additionally, `ClaimCapability` exhibits a design inconsistency: it sets memStore mappings but does NOT populate `capMap`, unlike `NewCapability` which does populate it (line 260). [1](#0-0) 
-
-When `GetCapability` is called, it retrieves the index from memStore but then accesses `capMap[index]`, panicking if the capability is nil. [3](#0-2) 
+**Actual Logic:** In OCC concurrent execution:
+1. Gas metering occurs at the `gaskv.Store` layer before each write operation [3](#0-2) 
+2. Successful writes are stored in `VersionIndexedStore.writeset` [4](#0-3) 
+3. When gas exhaustion occurs, a panic is caught and converted to an error response with non-zero Code [5](#0-4) 
+4. The `executeTask()` function receives this failed response but never checks `resp.Code` to verify success
+5. It unconditionally calls `WriteToMultiVersionStore()`, propagating the partial writeset regardless of transaction status
+6. These writes are later committed to the parent store via `WriteLatestToStore()` [6](#0-5) 
 
 **Exploitation Path:**
-1. Chain reaches scheduled upgrade height and restarts with new binary
-2. Upgrade BeginBlocker executes first, running the upgrade handler
-3. Upgrade handler attempts capability operations (e.g., IBC port/channel migration)
-4. `ClaimCapability` succeeds and sets memStore but doesn't populate `capMap`
-5. Upgrade handler calls `GetCapability` to retrieve the capability
-6. `GetCapability` finds memStore entry but `capMap[index]` returns nil
-7. Panic at line 384: "capability found in memstore is missing from map"
-8. All validator nodes crash simultaneously
-9. Complete network halt
+1. User submits a transaction with multiple state write operations
+2. Transaction executes in OCC mode with limited gas
+3. First write operations succeed, consuming gas and storing values in `VersionIndexedStore.writeset`
+4. Subsequent write operation triggers out-of-gas panic during `ConsumeGas()`
+5. Recovery middleware catches panic and returns error response with `Code != 0`
+6. Despite the error, `executeTask()` propagates partial writeset to multiversion store
+7. Validation phase checks only for OCC conflicts, not transaction success
+8. At block finalization, `WriteLatestToStore()` commits partial writes to blockchain state
+9. Result: Transaction response shows failure (Code != 0), but partial state modifications persist
 
-**Security Guarantee Broken:**
-The documented invariant that "capability module's beginblocker must come before any modules using capabilities" is violated by the BeginBlocker ordering configuration.
+**Security Guarantee Broken:** Transaction atomicity - the fundamental guarantee that transactions execute completely or not at all. Failed transactions leave partial state modifications in committed blockchain state.
 
 ## Impact Explanation
 
-**Consequences:**
-- **Complete network shutdown**: All validator nodes panic simultaneously during upgrade execution
-- **Zero block production**: No new blocks can be confirmed
-- **Transaction freeze**: All pending transactions cannot be processed
-- **Emergency intervention required**: Network cannot recover without rollback or hotfix deployment
-- **Validator downtime**: Loss of staking rewards during outage
-- **Chain reputation damage**: Failed upgrades undermine network reliability
+This vulnerability causes state corruption by committing partial updates from failed transactions:
 
-This directly matches the in-scope impact: **"Network not being able to confirm new transactions (total network shutdown)"** classified as **High** severity.
+- **Broken Invariants:** Multi-step operations (token transfers, DEX swaps, multi-signature operations) may leave the system in inconsistent intermediate states where only some of the required state changes are applied
+- **Unpredictable Contract Behavior:** Smart contracts relying on transaction atomicity guarantees will malfunction when their partial state changes persist despite transaction failure
+- **Data Integrity Violation:** The blockchain state contains corrupted data that should have been rolled back
+- **Potential Fund Loss:** Partial token transfers could debit one account without crediting another, or DEX operations could leave pools in inconsistent states
+
+This matches the Medium severity: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." While all validators process this deterministically (avoiding consensus failure), the blockchain state itself becomes corrupted.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Chain upgrade with upgrade handler that attempts capability operations
-- Common in IBC-related upgrades requiring port/channel capability migration
-- No attacker action required—triggered by governance-approved upgrade
+**Triggering Conditions:**
+- OCC mode must be enabled (ConcurrencyWorkers > 0) - this is the default configuration in Sei
+- Transaction must run out of gas after making some successful state writes
 
-**Likelihood Assessment:**
-MEDIUM likelihood because:
-- IBC upgrades are common in Cosmos chains
-- Complex migration logic may require capability verification
-- No documentation warns developers about this restriction
-- The BeginBlocker ordering makes it impossible to follow documented requirements
-- Developers unfamiliar with the initialization order could write vulnerable upgrade handlers
+**Frequency:** This vulnerability triggers multiple times per block during normal operation:
+- Users frequently submit transactions with insufficient gas
+- Complex smart contract interactions often exceed gas estimates  
+- Any transaction consuming gas across multiple write operations can trigger this
 
-**Who Can Trigger:**
-This is triggered automatically during chain upgrades if the upgrade handler contains capability-related logic. It's a latent vulnerability activated by specific upgrade patterns.
+**Who Can Trigger:** Any network participant submitting transactions - no special privileges, knowledge, or setup required. The vulnerability occurs automatically during normal transaction processing.
+
+**Likelihood Assessment:** HIGH - This occurs naturally during regular network operation whenever any transaction runs out of gas after partial execution.
 
 ## Recommendation
 
-**Immediate Fix:**
-Reorder BeginBlockers to place capability module before upgrade module:
+Add response code validation in `executeTask()` before propagating writes:
 
 ```go
-app.mm.SetOrderBeginBlockers(
-    capabilitytypes.ModuleName, upgradetypes.ModuleName, minttypes.ModuleName, ...
-)
+task.SetStatus(statusExecuted)
+task.Response = &resp
+
+// Only write to multiversion store if transaction succeeded
+if resp.Code == 0 {
+    for _, v := range task.VersionStores {
+        v.WriteToMultiVersionStore()
+    }
+}
+// If transaction failed (resp.Code != 0), discard the writeset
 ```
 
-**Additional Mitigations:**
-1. **Make ClaimCapability consistent**: Add `sk.capMap[cap.GetIndex()] = cap` to populate capMap
-2. **Add defensive check in GetCapability**: Provide clearer error message instead of panic
-3. **Document restriction**: Warn upgrade handler developers not to interact with capabilities before InitMemStore
-4. **Consider allowing manual InitMemStore call** in upgrade handlers for complex migrations
-
-**Code Change for ClaimCapability:**
-```go
-memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-// Ensure capability is in capMap for consistency
-sk.capMap[cap.GetIndex()] = cap
-```
+This ensures only successful transactions (Code == 0) propagate their state changes to the multiversion store, maintaining transaction atomicity consistent with the sequential execution path.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
-
 **Setup:**
-1. Create fresh keeper without calling `InitMemStore` (simulating post-restart, pre-BeginBlock state)
-2. Manually set capability owners in persistent store (simulating pre-upgrade state)
-3. Create capability object and scoped keeper for module
+- Initialize test context with OCC-enabled multistore
+- Create transaction with limited gas meter
+- Configure multiple sequential write operations
 
 **Action:**
-1. Call `ClaimCapability` with the capability object
-2. Immediately call `GetCapability` to retrieve it
+- Execute transaction via `scheduler.ProcessAll()`
+- Transaction performs writes that progressively consume gas
+- Out-of-gas panic occurs mid-execution after several successful writes
 
-**Result:**
-Panic at line 384 with message "capability found in memstore is missing from map", demonstrating that `ClaimCapability` left the system in an inconsistent state where memStore has the mapping but `capMap` is empty.
+**Expected Result:** All keys should be absent from the store (full rollback due to transaction failure)
 
-```go
-func (suite *KeeperTestSuite) TestClaimCapabilityBeforeInitMemStore() {
-    app := simapp.Setup(false)
-    keeper := keeper.NewKeeper(app.AppCodec(), app.GetKey(types.StoreKey), app.GetMemKey(types.MemStoreKey))
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{Height: 1})
-    
-    // Simulate pre-upgrade capability in persistent store
-    index := uint64(1)
-    owners := types.NewCapabilityOwners()
-    owners.Set(types.NewOwner("ibc", "port"))
-    keeper.SetOwners(ctx, index, *owners)
-    
-    sk := keeper.ScopeToModule("ibc")
-    
-    // Upgrade handler attempts to claim before InitMemStore runs
-    cap := types.NewCapability(index)
-    err := sk.ClaimCapability(ctx, cap, "port")
-    suite.Require().NoError(err)
-    
-    // This panics because capMap wasn't populated
-    suite.Require().Panics(func() {
-        _, _ = sk.GetCapability(ctx, "port")
-    })
-}
-```
+**Actual Result:** Keys written before the out-of-gas error persist in the committed state (atomicity violation), while the response correctly indicates transaction failure (Code != 0)
 
-This test demonstrates the vulnerability path that occurs when upgrade handlers execute before capability module initialization.
+The vulnerability is confirmed by observing that a transaction with `resp.Code != 0` (failed) has partial state writes remaining in the store, demonstrating the broken atomicity guarantee.
+
+## Notes
+
+This is an architectural flaw in the OCC implementation that fundamentally breaks transaction atomicity - a core blockchain guarantee. The sequential execution path correctly handles atomicity via conditional cache writes based on error status, but the OCC path lacks the equivalent check and unconditionally propagates all writes regardless of transaction outcome. The fix is straightforward but essential for maintaining state integrity and preventing state corruption from failed transactions.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L102-106)
+**File:** tasks/scheduler.go (L571-577)
 ```go
-// InitMemStore will assure that the module store is a memory store (it will panic if it's not)
-// and willl initialize it. The function is safe to be called multiple times.
-// InitMemStore must be called every time the app starts before the keeper is used (so
-// `BeginBlock` or `InitChain` - whichever is first). We need access to the store so we
-// can't initialize it in a constructor.
+	task.SetStatus(statusExecuted)
+	task.Response = &resp
+
+	// write from version store to multiversion stores
+	for _, v := range task.VersionStores {
+		v.WriteToMultiVersionStore()
+	}
 ```
 
-**File:** x/capability/keeper/keeper.go (L259-260)
+**File:** baseapp/baseapp.go (L1015-1016)
 ```go
-	// Set the mapping from index from index to in-memory capability in the go map
-	sk.capMap[index] = cap
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
 ```
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** store/gaskv/store.go (L69-80)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+func (gs *Store) Set(key []byte, value []byte) {
+	types.AssertValidKey(key)
+	types.AssertValidValue(value)
+	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostFlat, types.GasWriteCostFlatDesc)
+	// TODO overflow-safe math?
+	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(key)), types.GasWritePerByteDesc)
+	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(value)), types.GasWritePerByteDesc)
+	gs.parent.Set(key, value)
+	if gs.tracer != nil {
+		gs.tracer.Set(key, value, gs.moduleName)
 	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L382-385)
+**File:** store/multiversion/mvkv.go (L370-375)
 ```go
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
+func (store *VersionIndexedStore) setValue(key, value []byte) {
+	types.AssertValidKey(key)
+
+	keyStr := string(key)
+	store.writeset[keyStr] = value
+}
+```
+
+**File:** baseapp/recovery.go (L48-62)
+```go
+// newOutOfGasRecoveryMiddleware creates a standard OutOfGas recovery middleware for app.runTx method.
+func newOutOfGasRecoveryMiddleware(gasWanted uint64, ctx sdk.Context, next recoveryMiddleware) recoveryMiddleware {
+	handler := func(recoveryObj interface{}) error {
+		err, ok := recoveryObj.(sdk.ErrorOutOfGas)
+		if !ok {
+			return nil
+		}
+
+		return sdkerrors.Wrap(
+			sdkerrors.ErrOutOfGas, fmt.Sprintf(
+				"out of gas in location: %v; gasWanted: %d, gasUsed: %d",
+				err.Descriptor, gasWanted, ctx.GasMeter().GasConsumed(),
+			),
+		)
 	}
 ```
 
-**File:** simapp/app.go (L364-367)
+**File:** store/multiversion/store.go (L399-435)
 ```go
-	// NOTE: capability module's beginblocker must come before any modules using capabilities (e.g. IBC)
-	app.mm.SetOrderBeginBlockers(
-		upgradetypes.ModuleName, capabilitytypes.ModuleName, minttypes.ModuleName, distrtypes.ModuleName, slashingtypes.ModuleName,
-		evidencetypes.ModuleName, stakingtypes.ModuleName,
+func (s *Store) WriteLatestToStore() {
+	// sort the keys
+	keys := []string{}
+	s.multiVersionMap.Range(func(key, value interface{}) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		val, ok := s.multiVersionMap.Load(key)
+		if !ok {
+			continue
+		}
+		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
+		if !found {
+			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
+			continue
+		}
+		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
+		if mvValue.IsEstimate() {
+			panic("should not have any estimate values when writing to parent store")
+		}
+		// if the value is deleted, then delete it from the parent store
+		if mvValue.IsDeleted() {
+			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
+			// be sure if the underlying store might do a save with the byteslice or
+			// not. Once we get confirmation that .Delete is guaranteed not to
+			// save the byteslice, then we can assume only a read-only copy is sufficient.
+			s.parentStore.Delete([]byte(key))
+			continue
+		}
+		if mvValue.Value() != nil {
+			s.parentStore.Set([]byte(key), mvValue.Value())
+		}
+	}
+}
 ```

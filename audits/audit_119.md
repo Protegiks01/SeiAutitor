@@ -1,359 +1,249 @@
-Based on my thorough investigation of the codebase, I have validated this security claim and determined it to be a **valid vulnerability**.
+Based on my thorough investigation of the codebase, I can confirm this is a **VALID HIGH SEVERITY VULNERABILITY**. Let me present my findings:
 
 # Audit Report
 
 ## Title
-Governance Module Allows Zero-Deposit Proposal Spam Enabling Resource Exhaustion Attack
+Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
 
 ## Summary
-The governance module's `ValidateBasic()` function fails to enforce the specification requirement that proposals must have non-zero initial deposits, allowing attackers to spam the network with unlimited proposals at minimal cost (only gas fees). This enables sustained resource exhaustion attacks that can exceed the 30% resource consumption threshold.
+A critical validation gap in the distribution module allows governance to set parameters where the sum of `baseProposerReward + bonusProposerReward + communityTax` exceeds 1.0 through individual parameter updates. This causes `voteMultiplier` to become negative in the `AllocateTokens` function, triggering a panic that halts the entire network during block processing.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
 **Location:**
-- Validation logic: [1](#0-0) 
-- Proposal submission handler: [2](#0-1) 
-- Deposit processing: [3](#0-2) 
-- EndBlocker cleanup: [4](#0-3) 
+- Primary vulnerability: [1](#0-0) 
+- Panic trigger: [2](#0-1) 
+- Validation gap: [3](#0-2)  (individual validators)
+- Update mechanism: [4](#0-3) 
+- Governance handler: [5](#0-4) 
 
 **Intended Logic:**
-According to the governance specification, proposals should require non-zero initial deposits to prevent spam. The specification explicitly states: [5](#0-4) 
+The distribution parameters must satisfy the invariant `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. This invariant is explicitly validated in [6](#0-5) 
 
 **Actual Logic:**
-The implementation's `ValidateBasic()` function only checks if coins are valid and not negative, but does NOT reject zero or empty deposits. [6](#0-5) 
-
-The underlying `Coins.Validate()` function explicitly allows empty coin collections: [7](#0-6) 
-
-Additionally, no rate limiting mechanism exists in the ante handler chain. [8](#0-7) 
-
-When `AddDeposit()` is called with empty coins, the `SendCoinsFromAccountToModule()` operation succeeds as a no-op (the for loop in `SubUnlockedCoins` doesn't execute with empty coins), allowing the proposal to be created with zero total deposit. [9](#0-8) 
+When parameters are updated through governance proposals, the system only calls individual validation functions that verify each parameter is between 0 and 1.0, but do NOT verify the combined sum constraint. The `Subspace.Update()` method used by governance proposals validates parameters individually through registered validator functions, which only check bounds for single parameters. The `ValidateBasic()` method that checks the combined constraint is only called during genesis validation, not during governance parameter updates.
 
 **Exploitation Path:**
-1. Attacker submits `MsgSubmitProposal` transactions with `InitialDeposit: sdk.Coins{}` (empty coins)
-2. `ValidateBasic()` passes since empty coins are considered valid
-3. Proposal is created via `SubmitProposalWithExpedite()` and stored in state
-4. Proposals remain in inactive queue for `MaxDepositPeriod` (default 2 days) [10](#0-9) 
-5. During this period, proposals consume storage space, memory, and EndBlocker processing time
-6. Attacker can sustain attack continuously, submitting thousands of proposals per day
-7. After deposit period expires, EndBlocker must iterate and cleanup all expired proposals [11](#0-10) 
+1. Three governance proposals pass independently (each appears valid with 0 ≤ value ≤ 1.0):
+   - `baseProposerReward = 0.5`
+   - `bonusProposerReward = 0.5`  
+   - `communityTax = 0.1`
+   - Combined sum: 1.1 > 1.0 (violates invariant)
+
+2. During the next block's BeginBlock [7](#0-6) , `AllocateTokens` is called
+
+3. With high validator participation (e.g., 100%), `proposerMultiplier = baseProposerReward + bonusProposerReward × fractionVotes = 0.5 + 0.5 × 1.0 = 1.0`
+
+4. `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1` (negative value)
+
+5. `feeMultiplier` becomes negative when multiplying positive fees by negative `voteMultiplier`
+
+6. Each validator receives negative reward tokens
+
+7. When `AllocateTokensToValidator` attempts `tokens.Sub(commission)` with negative tokens, the Sub() operation [8](#0-7)  panics with "negative coin amount"
+
+8. All validator nodes panic simultaneously, halting the network
 
 **Security Guarantee Broken:**
-The governance system's denial-of-service protection invariant is violated. The specification's deposit requirement is meant to economically disincentivize spam, but the implementation allows bypassing this entirely.
+The system fails to enforce the critical invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates, allowing configuration that causes catastrophic network failure.
 
 ## Impact Explanation
 
-An attacker can execute this attack at minimal cost (only gas fees, no deposits required) to cause significant resource consumption:
+**Consequences:**
+- **Total network shutdown**: All validator nodes panic simultaneously when processing any block after the misconfigured parameters take effect
+- **Cannot process transactions**: Network consensus completely breaks down  
+- **Unrecoverable without hard fork**: Emergency governance cannot fix parameters because the network is halted
+- **Requires coordinated manual intervention**: Validators must coordinate off-chain to reset parameters and restart the network
 
-**For 100,000-1,000,000 active proposals (achievable with $1,000-$10,000 in gas costs):**
-
-1. **State Bloat**: 100MB - 1GB of additional blockchain state storage
-2. **EndBlocker Processing**: Must process 3-35 expired proposals per block (versus normal 0-1), representing a 10-35x increase in governance module work
-3. **Query Performance**: Functions like `GetProposals()` must iterate through hundreds of thousands of proposals [12](#0-11) , causing severe degradation or timeouts
-4. **Memory Consumption**: Loading large numbers of proposals significantly increases RAM usage across all nodes
-
-The combined CPU, memory, I/O, and query processing overhead can exceed the 30% resource consumption threshold, particularly when considering that the governance module's work increases by 10-35x. If the governance EndBlocker normally represents 1-2% of total node processing, a 35x increase brings it to 35-70% of its previous load, translating to approximately 34-68% increase in total node resource consumption.
+**Precedent:**
+The developers explicitly recognized and fixed a similar issue for ConsensusParams [9](#0-8) , acknowledging that parameter validation gaps "will cause a chain halt". This precedent confirms the severity of such validation gaps and that distribution parameters lack the same protection.
 
 ## Likelihood Explanation
 
-**Likelihood: HIGH**
+**Who Can Trigger:**
+Any token holder can submit governance proposals. This requires three separate proposals to pass through normal democratic voting.
 
-- **Who can execute**: Any user with funds for gas fees
-- **Prerequisites**: None beyond basic transaction submission capability  
-- **Cost**: Minimal - only gas fees ($1,000-$10,000 for significant impact)
-- **Detectability**: No detection mechanisms exist
-- **Preventability**: No rate limiting or minimum deposit enforcement
-- **Sustainability**: Attack can be maintained continuously as old proposals expire and new ones are submitted
+**Realistic Scenario (Non-Malicious):**
+- Month 1: Proposal to increase proposer rewards (`baseProposerReward = 0.5`)
+- Month 2: Proposal to add voting bonuses (`bonusProposerReward = 0.5`)
+- Month 3: Proposal to fund community pool (`communityTax = 0.1`)
+- Each proposal reviewed individually, all appear valid (0 ≤ value ≤ 1.0)
+- No reviewer checks combined constraint across all parameters
+- Network halts inadvertently
 
-The attack is trivial to execute through standard transaction submission and requires no special privileges or complex setup.
+**Likelihood:** Moderate to High - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint without malicious intent. The fact that each individual change appears valid makes this particularly insidious.
 
 ## Recommendation
 
-Implement multiple protective measures:
+1. **Immediate Fix**: Add special validation for distribution parameters in the governance proposal handler, similar to the existing ConsensusParams validation. When any distribution parameter is updated, retrieve all current distribution parameters, apply the change, and validate the complete `Params` struct using `ValidateBasic()`.
 
-1. **Enforce Non-Zero Initial Deposit**: Add validation to reject zero/empty deposits:
-```go
-// In x/gov/types/msgs.go ValidateBasic()
-if m.InitialDeposit.IsZero() || m.InitialDeposit.Empty() {
-    return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, "initial deposit cannot be zero or empty")
-}
-```
+2. **Alternative Approach**: Modify the individual validator functions (`validateCommunityTax`, `validateBaseProposerReward`, `validateBonusProposerReward`) to query the current values of other distribution parameters from the context and validate that the combined sum will not exceed 1.0 after the update.
 
-2. **Implement Rate Limiting**: Add an ante decorator to limit proposal submissions per address per time period (e.g., maximum 5 proposals per address per day)
+3. **Defensive Programming**: Add a safety check in `AllocateTokens` to detect negative `voteMultiplier` and handle gracefully (clamp to zero, emit error event) rather than allowing the panic to propagate and halt the network.
 
-3. **Increase Minimum Gas Cost**: Set higher gas consumption for proposal submission to make spam attacks economically infeasible
+4. **Follow Existing Pattern**: Apply the same validation pattern used for ConsensusParams to distribution parameters in the proposal validation.
 
 ## Proof of Concept
 
-**Test demonstrates zero-deposit proposals are accepted:**
+**Test File:** `x/distribution/keeper/allocation_test.go`
 
-The provided PoC in the report successfully demonstrates that:
-- Proposals can be submitted with `sdk.Coins{}` (empty deposit)
-- All such proposals pass validation and are stored in state
-- Proposals remain queryable and consume resources
-- EndBlocker must process all expired proposals for cleanup
+**Setup:**
+- Initialize test application using `simapp.Setup(false)`
+- Create two validators with equal voting power using test helpers
+- Set misconfigured parameters via `app.DistrKeeper.SetParams()`:
+  ```
+  Params{
+    CommunityTax: sdk.NewDecWithPrec(10, 2),        // 0.1
+    BaseProposerReward: sdk.NewDecWithPrec(50, 2),  // 0.5
+    BonusProposerReward: sdk.NewDecWithPrec(50, 2), // 0.5
+  }
+  ```
+  Combined sum: 1.1 > 1.0
+- Fund fee collector module with tokens
 
-The test can be executed by:
-- Setup: Initialize test application with governance keeper
-- Action: Submit 100+ proposals with empty `InitialDeposit`
-- Result: All proposals are successfully created with `TotalDeposit.IsZero() == true`, stored in state, and would need to be processed by EndBlocker after the deposit period expires
+**Action:**
+- Call `app.DistrKeeper.AllocateTokens(ctx, 200, 200, proposerConsAddr, votes)` with 100% validator participation (sumPreviousPrecommitPower = 200, totalPreviousPower = 200)
+- This results in `previousFractionVotes = 1.0`
+- `proposerMultiplier = 0.5 + 0.5 × 1.0 = 1.0`
+- `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1`
 
-This confirms the implementation allows zero-deposit proposal spam, directly contradicting the specification's intended behavior and enabling the resource exhaustion attack vector.
+**Expected Result:**
+- Panic with message "negative coin amount" when `AllocateTokensToValidator` attempts `tokens.Sub(commission)` operation on negative token amounts
+- This panic would halt all nodes processing blocks with these parameters in production
 
-## Notes
-
-This vulnerability exists due to a critical gap between the specification and implementation. While the specification explicitly requires non-zero deposits to prevent spam, the implementation's validation logic only checks that coins are valid and non-negative, inadvertently allowing empty coin collections. The absence of rate limiting compounds this issue, making sustained attacks economically viable at scale.
+**Notes:**
+The test follows the structure of existing allocation tests (lines 47-130 of allocation_test.go) and demonstrates that misconfigured parameters cause network-halting panics. The vulnerability represents a validation gap in the code that allows governance to inadvertently exceed its intended authority and cause unrecoverable network failure.
 
 ### Citations
 
-**File:** x/gov/types/msgs.go (L90-113)
+**File:** x/distribution/keeper/allocation.go (L82-84)
 ```go
-func (m MsgSubmitProposal) ValidateBasic() error {
-	if m.Proposer == "" {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, m.Proposer)
+	communityTax := k.GetCommunityTax(ctx)
+	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
+	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
+```
+
+**File:** x/distribution/keeper/allocation.go (L111-114)
+```go
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+```
+
+**File:** x/distribution/types/params.go (L67-71)
+```go
+	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
+		)
 	}
-	if !m.InitialDeposit.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
-	}
-	if m.InitialDeposit.IsAnyNegative() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
+```
+
+**File:** x/distribution/types/params.go (L76-93)
+```go
+func validateCommunityTax(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	content := m.GetContent()
-	if content == nil {
-		return sdkerrors.Wrap(ErrInvalidProposalContent, "missing content")
+	if v.IsNil() {
+		return fmt.Errorf("community tax must be not nil")
 	}
-	if !IsValidProposalType(content.ProposalType()) {
-		return sdkerrors.Wrap(ErrInvalidProposalType, content.ProposalType())
+	if v.IsNegative() {
+		return fmt.Errorf("community tax must be positive: %s", v)
 	}
-	if err := content.ValidateBasic(); err != nil {
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("community tax too large: %s", v)
+	}
+
+	return nil
+}
+```
+
+**File:** x/params/types/subspace.go (L196-219)
+```go
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	}
+
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
 		return err
 	}
 
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
 	return nil
 }
 ```
 
-**File:** x/gov/keeper/msg_server.go (L27-39)
+**File:** x/params/proposal_handler.go (L26-43)
 ```go
-func (k msgServer) SubmitProposal(goCtx context.Context, msg *types.MsgSubmitProposal) (*types.MsgSubmitProposalResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	proposal, err := k.Keeper.SubmitProposalWithExpedite(ctx, msg.GetContent(), msg.IsExpedited)
-	if err != nil {
-		return nil, err
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
+		if !ok {
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+		}
+
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
+
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		}
 	}
 
-	defer telemetry.IncrCounter(1, types.ModuleName, "proposal")
-
-	votingStarted, err := k.Keeper.AddDeposit(ctx, proposal.ProposalId, msg.GetProposer(), msg.GetInitialDeposit())
-	if err != nil {
-		return nil, err
-	}
-```
-
-**File:** x/gov/keeper/deposit.go (L108-162)
-```go
-func (keeper Keeper) AddDeposit(ctx sdk.Context, proposalID uint64, depositorAddr sdk.AccAddress, depositAmount sdk.Coins) (bool, error) {
-	// Checks to see if proposal exists
-	proposal, ok := keeper.GetProposal(ctx, proposalID)
-	if !ok {
-		return false, sdkerrors.Wrapf(types.ErrUnknownProposal, "%d", proposalID)
-	}
-
-	// Check if proposal is still depositable
-	if (proposal.Status != types.StatusDepositPeriod) && (proposal.Status != types.StatusVotingPeriod) {
-		return false, sdkerrors.Wrapf(types.ErrInactiveProposal, "%d", proposalID)
-	}
-
-	// update the governance module's account coins pool
-	err := keeper.bankKeeper.SendCoinsFromAccountToModule(ctx, depositorAddr, types.ModuleName, depositAmount)
-	if err != nil {
-		return false, err
-	}
-
-	// Update proposal
-	proposal.TotalDeposit = proposal.TotalDeposit.Add(depositAmount...)
-	keeper.SetProposal(ctx, proposal)
-
-	// Check if deposit has provided sufficient total funds to transition the proposal into the voting period
-	activatedVotingPeriod := false
-
-	if proposal.Status == types.StatusDepositPeriod && proposal.TotalDeposit.IsAllGTE(keeper.GetDepositParams(ctx).GetMinimumDeposit(proposal.IsExpedited)) {
-		keeper.ActivateVotingPeriod(ctx, proposal)
-
-		activatedVotingPeriod = true
-	}
-
-	// Add or update deposit object
-	deposit, found := keeper.GetDeposit(ctx, proposalID, depositorAddr)
-
-	if found {
-		deposit.Amount = deposit.Amount.Add(depositAmount...)
-	} else {
-		deposit = types.NewDeposit(proposalID, depositorAddr, depositAmount)
-	}
-
-	// called when deposit has been added to a proposal, however the proposal may not be active
-	keeper.AfterProposalDeposit(ctx, proposalID, depositorAddr)
-
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			types.EventTypeProposalDeposit,
-			sdk.NewAttribute(sdk.AttributeKeyAmount, depositAmount.String()),
-			sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposalID)),
-		),
-	)
-
-	keeper.SetDeposit(ctx, deposit)
-
-	return activatedVotingPeriod, nil
+	return nil
 }
 ```
 
-**File:** x/gov/abci.go (L19-45)
+**File:** x/distribution/abci.go (L29-31)
 ```go
-	// delete inactive proposal from store and its deposits
-	keeper.IterateInactiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-		keeper.DeleteProposal(ctx, proposal.ProposalId)
-		keeper.DeleteDeposits(ctx, proposal.ProposalId)
-
-		// called when proposal become inactive
-		keeper.AfterProposalFailedMinDeposit(ctx, proposal.ProposalId)
-
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeInactiveProposal,
-				sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposal.ProposalId)),
-				sdk.NewAttribute(types.AttributeKeyProposalResult, types.AttributeValueProposalDropped),
-			),
-		)
-
-		logger.Info(
-			"proposal did not meet minimum deposit; deleted",
-			"proposal", proposal.ProposalId,
-			"title", proposal.GetTitle(),
-			"min_deposit", keeper.GetDepositParams(ctx).MinDeposit.String(),
-			"min_expedited_deposit", keeper.GetDepositParams(ctx).MinExpeditedDeposit.String(),
-			"total_deposit", proposal.TotalDeposit.String(),
-		)
-
-		return false
-	})
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
 ```
 
-**File:** x/gov/spec/03_messages.md (L40-43)
-```markdown
-  initialDeposit = txGovSubmitProposal.InitialDeposit
-  if (initialDeposit.Atoms <= 0) OR (sender.AtomBalance < initialDeposit.Atoms)
-    // InitialDeposit is negative or null OR sender has insufficient funds
-    throw
-```
-
-**File:** types/coin.go (L217-220)
+**File:** types/dec_coin.go (L302-310)
 ```go
-func (coins Coins) Validate() error {
-	switch len(coins) {
-	case 0:
-		return nil
-```
-
-**File:** x/auth/ante/ante.go (L47-61)
-```go
-	anteDecorators := []sdk.AnteFullDecorator{
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
-		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
-		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-		NewIncrementSequenceDecorator(options.AccountKeeper),
-	}
-	anteHandler, anteDepGenerator := sdk.ChainAnteDecorators(anteDecorators...)
-```
-
-**File:** x/bank/keeper/send.go (L209-246)
-```go
-func (k BaseSendKeeper) SubUnlockedCoins(ctx sdk.Context, addr sdk.AccAddress, amt sdk.Coins, checkNeg bool) error {
-	if !amt.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
+// Sub subtracts a set of DecCoins from another (adds the inverse).
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
 	}
 
-	lockedCoins := k.LockedCoins(ctx, addr)
+	return diff
+}
+```
 
-	for _, coin := range amt {
-		balance := k.GetBalance(ctx, addr, coin.Denom)
-		if checkNeg {
-			locked := sdk.NewCoin(coin.Denom, lockedCoins.AmountOf(coin.Denom))
-			spendable := balance.Sub(locked)
-
-			_, hasNeg := sdk.Coins{spendable}.SafeSub(sdk.Coins{coin})
-			if hasNeg {
-				return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, "%s is smaller than %s", spendable, coin)
+**File:** x/params/types/proposal/proposal.go (L101-109)
+```go
+		// We need to verify ConsensusParams since they are only validated once the proposal passes.
+		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
+		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
+		// Therefore, we validate when we get a param-change msg for ConsensusParams
+		if pc.Subspace == "baseapp" {
+			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
+				return err
 			}
 		}
-
-		var newBalance sdk.Coin
-		if checkNeg {
-			newBalance = balance.Sub(coin)
-		} else {
-			newBalance = balance.SubUnsafe(coin)
-		}
-
-		err := k.setBalance(ctx, addr, newBalance, checkNeg)
-		if err != nil {
-			return err
-		}
-	}
-
-	// emit coin spent event
-	ctx.EventManager().EmitEvent(
-		types.NewCoinSpentEvent(addr, amt),
-	)
-	return nil
-}
-```
-
-**File:** x/gov/types/params.go (L14-16)
-```go
-const (
-	DefaultPeriod          time.Duration = time.Hour * 24 * 2 // 2 days
-	DefaultExpeditedPeriod time.Duration = time.Hour * 24     // 1 day
-```
-
-**File:** x/gov/keeper/keeper.go (L152-167)
-```go
-func (keeper Keeper) IterateInactiveProposalsQueue(ctx sdk.Context, endTime time.Time, cb func(proposal types.Proposal) (stop bool)) {
-	iterator := keeper.InactiveProposalQueueIterator(ctx, endTime)
-
-	defer iterator.Close()
-	for ; iterator.Valid(); iterator.Next() {
-		proposalID, _ := types.SplitInactiveProposalQueueKey(iterator.Key())
-		proposal, found := keeper.GetProposal(ctx, proposalID)
-		if !found {
-			panic(fmt.Sprintf("proposal %d does not exist", proposalID))
-		}
-
-		if cb(proposal) {
-			break
-		}
-	}
-}
-```
-
-**File:** x/gov/keeper/proposal.go (L129-135)
-```go
-func (keeper Keeper) GetProposals(ctx sdk.Context) (proposals types.Proposals) {
-	keeper.IterateProposals(ctx, func(proposal types.Proposal) bool {
-		proposals = append(proposals, proposal)
-		return false
-	})
-	return
-}
 ```

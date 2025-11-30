@@ -1,294 +1,261 @@
-Based on my thorough investigation of the codebase, I can now provide my final validation:
-
 # Audit Report
 
 ## Title
-Block Gas Limit Bypass Due to Missing Cumulative Gas Tracking
+Unbounded Memory Allocation in BeginBlocker via SignedBlocksWindow Parameter Leading to Network Shutdown
 
 ## Summary
-The sei-cosmos blockchain fails to enforce cumulative gas limits at the block level. While individual transactions are validated against the `MaxGas` consensus parameter in the ante handler, the removal of block gas meter functionality allows validators to propose blocks containing multiple transactions whose collective gas consumption exceeds `MaxGas`, forcing all network nodes to process transactions beyond set parameters.
+The `SignedBlocksWindow` parameter validation lacks an upper bound check, allowing governance to set arbitrarily large values that trigger catastrophic memory allocation during BeginBlocker processing. This causes all validator nodes to crash from out-of-memory errors, resulting in complete network shutdown requiring a hard fork to recover.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-- **location**: 
-  - Individual check: [1](#0-0) 
-  - Missing cumulative tracking: [2](#0-1) 
-  - Unused block gas meter field: [3](#0-2) 
+**Location:**
+- Validation: `x/slashing/types/params.go`, lines 72-83 (validateSignedBlocksWindow function) [1](#0-0) 
 
-- **intended logic**: According to the documentation [4](#0-3) , the block gas meter should track cumulative gas consumption across all transactions in a block. When processing transactions via `DeliverTx`, the system should check if cumulative gas exceeds the limit and reject subsequent transactions. After each transaction, the consumed gas should be added to the block gas meter.
+- Memory allocation: `x/slashing/keeper/signing_info.go`, lines 109-116 (ParseBitGroupsToBoolArray function) [2](#0-1) 
 
-- **actual logic**: The current implementation only validates that each individual transaction's requested gas does not exceed `MaxGas` in the ante handler. No cumulative gas tracking occurs during block processing. The `blockGasMeter` field exists in the Context struct but has no accessor method and is never initialized or used. Evidence of intentional removal: [5](#0-4) 
+- Vulnerable execution: `x/slashing/keeper/infractions.go`, lines 157-169 (ResizeMissedBlockArray function) [3](#0-2) 
 
-- **exploitation path**: 
-  1. When a validator's turn arrives to propose a block, they construct a block with multiple transactions
-  2. Each transaction requests gas below `MaxGas` (e.g., 60 when MaxGas=100)  
-  3. Each transaction passes the individual validation check in SetUpContextDecorator
-  4. All transactions are processed via DeliverTx without any cumulative gas check
-  5. The block's total gas consumption (e.g., 3 transactions × 60 gas = 180) exceeds MaxGas (100)
-  6. All network nodes process these transactions, consuming resources beyond configured limits
+- Trigger point: `x/slashing/abci.go`, lines 36-50 (BeginBlocker concurrent processing) [4](#0-3) 
 
-- **security guarantee broken**: The consensus parameter `ConsensusParams.Block.MaxGas` is designed to limit the total computational work per block. This vulnerability allows validators to bypass this limit, violating the resource constraint invariant that protects nodes from excessive processing requirements.
+**Intended logic:**
+The `SignedBlocksWindow` parameter should define a reasonable sliding window for tracking validator liveness (default 108,000 blocks). The validation function should enforce safe operational bounds to prevent resource exhaustion, similar to other parameter validators in the same file.
+
+**Actual logic:**
+The validation only checks if the value is positive (`v > 0`) with no upper bound. When governance sets an extremely large value (e.g., 10^10), the next block triggers concurrent memory allocation for all validators. Each validator's `ResizeMissedBlockArray` function creates two boolean arrays of size `window` - one in `ParseBitGroupsToBoolArray` (line 162) and another at line 163. With 100 validators and window=10^10, this requires approximately 2 TB of total memory allocation, causing immediate OOM crashes.
+
+**Exploitation path:**
+1. Governance proposal submitted to change `SignedBlocksWindow` to large value (e.g., 10^10)
+2. Proposal validation passes because only `v > 0` is checked [5](#0-4) 
+3. Proposal executes, parameter updated in chain state
+4. Next block triggers BeginBlocker which processes all validators concurrently in goroutines
+5. Each goroutine calls `HandleValidatorSignatureConcurrent` which detects window size change [6](#0-5) 
+6. `ResizeMissedBlockArray` allocates two massive boolean arrays per validator (2 × window × number of validators bytes)
+7. All nodes crash from OOM simultaneously
+8. Network completely halts - no blocks can be produced
+9. Parameter persists in chain state, requiring hard fork to recover
+
+**Security guarantee broken:**
+The system fails to enforce resource bounds on governance parameters. This allows governance to inadvertently cause catastrophic, unrecoverable network failure that exceeds governance's intended authority to tune operational parameters. Unlike other parameter validators in the same file that enforce upper bounds (e.g., `validateMinSignedPerWindow` checks `v.GT(sdk.OneDec())`), this validator lacks equivalent protection. [7](#0-6) 
 
 ## Impact Explanation
 
-This vulnerability enables validators to force all network nodes to process blocks with cumulative gas consumption exceeding the configured `MaxGas` limit. This causes:
+**Affected Components:**
+- All validator nodes experience OOM crashes
+- Block production and consensus completely halt
+- Network liveness and availability lost
+- Chain state contains malicious parameter that persists
 
-- Increased CPU, memory, and I/O consumption on all full nodes beyond design parameters
-- Network performance degradation and potentially increased block times
-- Denial of service risk if exploited aggressively with maximum-sized transactions
-- Consensus parameters become unenforceable for block-level gas limiting
+**Severity Analysis:**
+With `SignedBlocksWindow = 10^10` and 100 validators:
+- Each validator requires: 2 allocations × 10^10 bytes = 20 GB
+- Total concurrent allocation: 100 validators × 20 GB = 2 TB
+- All nodes crash immediately from OOM
+- Network cannot produce new blocks
+- Recovery requires hard fork (cannot fix via governance since network is down)
 
-The impact directly matches: "Causing network processing nodes to process transactions from the mempool beyond set parameters" (Medium severity).
+This represents total network shutdown, matching the impact criterion: "Network not being able to confirm new transactions (total network shutdown)" which is classified as **High** severity.
 
 ## Likelihood Explanation
 
-**Trigger frequency**: High. Any validator can exploit this during their normal block proposal turn, which occurs regularly in validator rotation (approximately 1/N blocks for N validators).
+This vulnerability requires governance proposal approval (privileged mechanism), but meets the exception criteria for privileged access because:
 
-**Prerequisites**: 
-- Validator role (privileged but regularly rotating)
-- No special timing or state conditions required
-- Can be triggered repeatedly and consistently
+1. **Inadvertent trigger is realistic**: Simple typos like typing "1000000000" instead of "1000000" (adding 3 extra zeros), or miscalculating time-based values without dividing by block time, could trigger this. No warnings or confirmation prompts exist.
 
-**Realistic scenario**: While validators are trusted participants, consensus parameters exist specifically to constrain validator behavior. Violating `MaxGas` is beyond a validator's intended authority - the parameter defines the limits of what they are authorized to include in blocks. A single malicious or compromised validator can exploit this, or even well-intentioned validators with buggy block construction software could inadvertently trigger it.
+2. **Design inconsistency suggests oversight**: Other parameter validators in the same file enforce upper bounds (validateMinSignedPerWindow, validateSlashFractionDoubleSign, validateSlashFractionDowntime all check maximum values), but SignedBlocksWindow lacks this protection. Simulation tests only use values 10-1000, indicating the design never anticipated extreme values. [8](#0-7) 
 
-The commented-out tests [6](#0-5)  show this functionality previously existed and was intentionally removed, but without proper replacement validation.
+3. **Unrecoverable impact**: Once executed, the malicious parameter persists in chain state. The network is completely down and cannot run governance to fix itself. Recovery requires a hard fork with significant coordination cost.
+
+4. **Beyond intended authority**: Governance should tune operational parameters within safe bounds, not have the power to permanently brick the entire network. This catastrophic failure mode exceeds what governance should be able to cause.
+
+The likelihood is moderate because while governance approval is required, the lack of validation makes accidental misconfiguration realistic, and the consequences are catastrophic and unrecoverable.
 
 ## Recommendation
 
-Restore block-level cumulative gas tracking by:
+Add upper bound validation to `validateSignedBlocksWindow` consistent with other parameter validators:
 
-1. Add a `BlockGasMeter()` accessor method to the `Context` type
-2. Initialize the block gas meter in `BeginBlock` or state initialization with limit from `ConsensusParams.Block.MaxGas`
-3. Before processing each transaction in `DeliverTx`, check if adding its gas would exceed the block gas limit
-4. After each successful transaction execution, consume gas from the block gas meter:
 ```go
-ctx.BlockGasMeter().ConsumeGas(
-    ctx.GasMeter().GasConsumedToLimit(),
-    "block gas meter",
-)
-```
-5. Re-enable and update the commented-out `TestMaxBlockGasLimits` test to verify proper enforcement
+func validateSignedBlocksWindow(i interface{}) error {
+    v, ok := i.(int64)
+    if !ok {
+        return fmt.Errorf("invalid parameter type: %T", i)
+    }
 
-This restores the documented behavior and consensus parameter enforcement.
+    if v <= 0 {
+        return fmt.Errorf("signed blocks window must be positive: %d", v)
+    }
 
-## Proof of Concept
+    // Add maximum bound to prevent resource exhaustion
+    // Maximum based on operational requirements: ~1.5 years at 0.4s blocks
+    const maxSignedBlocksWindow = int64(100_000_000)
+    if v > maxSignedBlocksWindow {
+        return fmt.Errorf("signed blocks window too large (max %d): %d", 
+            maxSignedBlocksWindow, v)
+    }
 
-**Test scenario** (conceptual, based on commented test structure):
-
-- **setup**: Initialize BaseApp with consensus params setting `MaxGas = 100`. Configure ante handler to grant requested gas. Set up message router to consume specified gas amounts.
-
-- **action**: 
-  1. Begin new block with MaxGas=100 consensus parameter
-  2. Deliver transaction requesting 60 gas (passes: 60 < 100)
-  3. Deliver second transaction requesting 60 gas (passes individual check: 60 < 100)  
-  4. Deliver third transaction requesting 60 gas (passes individual check: 60 < 100)
-  
-- **result**: All three transactions succeed and are committed. Total cumulative gas consumed is 180, which is 180% of the configured MaxGas limit of 100. The system processes all transactions despite violating the block gas limit consensus parameter. In a properly functioning system with block gas meter enforcement, the second or third transaction should be rejected with an "out of gas" error when the cumulative limit is exceeded.
-
-The existence of commented-out test code at [6](#0-5)  demonstrates this exact scenario was previously tested before the block gas meter was removed.
-
-### Citations
-
-**File:** x/auth/ante/setup.go (L54-60)
-```go
-	if cp := ctx.ConsensusParams(); cp != nil && cp.Block != nil {
-		// If there exists a maximum block gas limit, we must ensure that the tx
-		// does not exceed it.
-		if cp.Block.MaxGas > 0 && gasTx.GetGas() > uint64(cp.Block.MaxGas) {
-			return newCtx, sdkerrors.Wrapf(sdkerrors.ErrOutOfGas, "tx gas wanted %d exceeds block max gas limit %d", gasTx.GetGas(), cp.Block.MaxGas)
-		}
-	}
-```
-
-**File:** baseapp/abci.go (L284-337)
-```go
-func (app *BaseApp) DeliverTx(ctx sdk.Context, req abci.RequestDeliverTx, tx sdk.Tx, checksum [32]byte) (res abci.ResponseDeliverTx) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "deliver_tx")
-	defer func() {
-		for _, streamingListener := range app.abciListeners {
-			if err := streamingListener.ListenDeliverTx(app.deliverState.ctx, req, res); err != nil {
-				app.logger.Error("DeliverTx listening hook failed", "err", err)
-			}
-		}
-	}()
-
-	gInfo := sdk.GasInfo{}
-	resultStr := "successful"
-
-	defer func() {
-		telemetry.IncrCounter(1, "tx", "count")
-		telemetry.IncrCounter(1, "tx", resultStr)
-		telemetry.SetGauge(float32(gInfo.GasUsed), "tx", "gas", "used")
-		telemetry.SetGauge(float32(gInfo.GasWanted), "tx", "gas", "wanted")
-	}()
-
-	gInfo, result, anteEvents, _, _, _, resCtx, err := app.runTx(ctx.WithTxBytes(req.Tx).WithTxSum(checksum).WithVoteInfos(app.voteInfos), runTxModeDeliver, tx, checksum)
-	if err != nil {
-		resultStr = "failed"
-		// if we have a result, use those events instead of just the anteEvents
-		if result != nil {
-			return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(result.Events, app.indexEvents), app.trace)
-		}
-		return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(anteEvents, app.indexEvents), app.trace)
-	}
-
-	res = abci.ResponseDeliverTx{
-		GasWanted: int64(gInfo.GasWanted), // TODO: Should type accept unsigned ints?
-		GasUsed:   int64(gInfo.GasUsed),   // TODO: Should type accept unsigned ints?
-		Log:       result.Log,
-		Data:      result.Data,
-		Events:    sdk.MarkEventsToIndex(result.Events, app.indexEvents),
-	}
-	if resCtx.IsEVM() {
-		res.EvmTxInfo = &abci.EvmTxInfo{
-			SenderAddress: resCtx.EVMSenderAddress(),
-			Nonce:         resCtx.EVMNonce(),
-			TxHash:        resCtx.EVMTxHash(),
-			VmError:       result.EvmError,
-		}
-		// TODO: populate error data for EVM err
-		if result.EvmError != "" {
-			evmErr := sdkerrors.Wrap(sdkerrors.ErrEVMVMError, result.EvmError)
-			res.Codespace, res.Code, res.Log = sdkerrors.ABCIInfo(evmErr, app.trace)
-			resultStr = "failed"
-			return
-		}
-	}
-	return
+    return nil
 }
 ```
 
-**File:** types/context.go (L41-41)
+This prevents arbitrarily large values while maintaining backward compatibility (current default 108,000 is well below the limit).
+
+## Proof of Concept
+
+**Setup:**
+- Initialize simapp with validator using standard test setup
+- Set initial `SignedBlocksWindow` to default value (108,000)
+- Create validator signing info by processing first block
+
+**Action:**
+- Submit governance proposal to change `SignedBlocksWindow` to 10^10
+- Proposal validation passes (only checks `v > 0`)
+- Execute proposal to update parameter in chain state
+- Trigger next block's BeginBlocker
+
+**Result:**
+- BeginBlocker spawns goroutines for all validators concurrently
+- Each goroutine calls `HandleValidatorSignatureConcurrent`
+- Detects window size change (108,000 → 10^10)
+- Calls `ResizeMissedBlockArray` which allocates:
+  - First: `ParseBitGroupsToBoolArray` creates `make([]bool, 10^10)` = 10 GB
+  - Second: `make([]bool, window)` = 10 GB  
+  - Total per validator: 20 GB
+- With 100 validators concurrently: 2 TB total allocation
+- All nodes crash from OOM
+- Network cannot produce blocks, requiring hard fork to recover
+
+**Notes:**
+This vulnerability is particularly severe because:
+1. Design inconsistency with other parameter validators indicates this is an oversight
+2. Realistic accidental scenario (simple typo) can trigger total network destruction
+3. Zero safeguards exist (no warnings, rate limits, or graceful degradation)
+4. Recovery requires expensive hard fork coordination
+
+### Citations
+
+**File:** x/slashing/types/params.go (L72-83)
 ```go
-	blockGasMeter     GasMeter
+func validateSignedBlocksWindow(i interface{}) error {
+	v, ok := i.(int64)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v <= 0 {
+		return fmt.Errorf("signed blocks window must be positive: %d", v)
+	}
+
+	return nil
+}
 ```
 
-**File:** docs/basics/gas-fees.md (L49-62)
-```markdown
-### Block Gas Meter
-
-`ctx.BlockGasMeter()` is the gas meter used to track gas consumption per block and make sure it does not go above a certain limit. A new instance of the `BlockGasMeter` is created each time [`BeginBlock`](../core/baseapp.md#beginblock) is called. The `BlockGasMeter` is finite, and the limit of gas per block is defined in the application's consensus parameters. By default Cosmos SDK applications use the default consensus parameters provided by Tendermint:
-
-+++ https://github.com/tendermint/tendermint/blob/v0.34.0-rc6/types/params.go#L34-L41
-
-When a new [transaction](../core/transactions.md) is being processed via `DeliverTx`, the current value of `BlockGasMeter` is checked to see if it is above the limit. If it is, `DeliverTx` returns immediately. This can happen even with the first transaction in a block, as `BeginBlock` itself can consume gas. If not, the transaction is processed normally. At the end of `DeliverTx`, the gas tracked by `ctx.BlockGasMeter()` is increased by the amount consumed to process the transaction:
-
+**File:** x/slashing/types/params.go (L85-99)
 ```go
-ctx.BlockGasMeter().ConsumeGas(
-	ctx.GasMeter().GasConsumedToLimit(),
-	"block gas meter",
-)
-```
-```
+func validateMinSignedPerWindow(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
 
-**File:** baseapp/deliver_tx_test.go (L754-853)
-```go
-// func TestMaxBlockGasLimits(t *testing.T) {
-// 	gasGranted := uint64(10)
-// 	anteOpt := func(bapp *BaseApp) {
-// 		bapp.SetAnteHandler(func(ctx sdk.Context, tx sdk.Tx, simulate bool) (newCtx sdk.Context, err error) {
-// 			newCtx = ctx.WithGasMeter(sdk.NewGasMeterWithMultiplier(ctx, gasGranted))
+	if v.IsNegative() {
+		return fmt.Errorf("min signed per window cannot be negative: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("min signed per window too large: %s", v)
+	}
 
-// 			defer func() {
-// 				if r := recover(); r != nil {
-// 					switch rType := r.(type) {
-// 					case sdk.ErrorOutOfGas:
-// 						err = sdkerrors.Wrapf(sdkerrors.ErrOutOfGas, "out of gas in location: %v", rType.Descriptor)
-// 					default:
-// 						panic(r)
-// 					}
-// 				}
-// 			}()
-
-// 			count := tx.(txTest).Counter
-// 			newCtx.GasMeter().ConsumeGas(uint64(count), "counter-ante")
-
-// 			return
-// 		})
-// 	}
-
-// 	routerOpt := func(bapp *BaseApp) {
-// 		r := sdk.NewRoute(routeMsgCounter, func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
-// 			count := msg.(*msgCounter).Counter
-// 			ctx.GasMeter().ConsumeGas(uint64(count), "counter-handler")
-// 			return &sdk.Result{}, nil
-// 		})
-// 		bapp.Router().AddRoute(r)
-// 	}
-
-// 	app := setupBaseApp(t, anteOpt, routerOpt)
-// 	app.InitChain(context.Background(), &abci.RequestInitChain{
-// 		ConsensusParams: &tmproto.ConsensusParams{
-// 			Block: &tmproto.BlockParams{
-// 				MaxGas: 100,
-// 			},
-// 		},
-// 	})
-
-// 	testCases := []struct {
-// 		tx                *txTest
-// 		numDelivers       int
-// 		gasUsedPerDeliver uint64
-// 		fail              bool
-// 		failAfterDeliver  int
-// 	}{
-// 		{newTxCounter(0, 0), 0, 0, false, 0},
-// 		{newTxCounter(9, 1), 2, 10, false, 0},
-// 		{newTxCounter(10, 0), 3, 10, false, 0},
-// 		{newTxCounter(10, 0), 10, 10, false, 0},
-// 		{newTxCounter(2, 7), 11, 9, false, 0},
-// 		{newTxCounter(10, 0), 10, 10, false, 0}, // hit the limit but pass
-
-// 		{newTxCounter(10, 0), 11, 10, true, 10},
-// 		{newTxCounter(10, 0), 15, 10, true, 10},
-// 		{newTxCounter(9, 0), 12, 9, true, 11}, // fly past the limit
-// 	}
-
-// 	for i, tc := range testCases {
-// 		tx := tc.tx
-
-// 		// reset the block gas
-// 		header := tmproto.Header{Height: app.LastBlockHeight() + 1}
-// 		app.setDeliverState(header)
-// 		app.deliverState.ctx = app.deliverState.ctx.WithBlockGasMeter(sdk.NewGasMeter(app.getMaximumBlockGas(app.deliverState.ctx), 1, 1))
-// 		app.BeginBlock(app.deliverState.ctx, abci.RequestBeginBlock{Header: header})
-
-// 		// execute the transaction multiple times
-// 		for j := 0; j < tc.numDelivers; j++ {
-// 			_, result, err := app.Deliver(aminoTxEncoder(), tx)
-
-// 			ctx := app.getState(runTxModeDeliver).ctx
-
-// 			// check for failed transactions
-// 			if tc.fail && (j+1) > tc.failAfterDeliver {
-// 				require.Error(t, err, fmt.Sprintf("tc #%d; result: %v, err: %s", i, result, err))
-// 				require.Nil(t, result, fmt.Sprintf("tc #%d; result: %v, err: %s", i, result, err))
-
-// 				space, code, _ := sdkerrors.ABCIInfo(err, false)
-// 				require.EqualValues(t, sdkerrors.ErrOutOfGas.Codespace(), space, err)
-// 				require.EqualValues(t, sdkerrors.ErrOutOfGas.ABCICode(), code, err)
-// 				require.True(t, ctx.BlockGasMeter().IsOutOfGas())
-// 			} else {
-// 				// check gas used and wanted
-// 				blockGasUsed := ctx.BlockGasMeter().GasConsumed()
-// 				expBlockGasUsed := tc.gasUsedPerDeliver * uint64(j+1)
-// 				require.Equal(
-// 					t, expBlockGasUsed, blockGasUsed,
-// 					fmt.Sprintf("%d,%d: %v, %v, %v, %v", i, j, tc, expBlockGasUsed, blockGasUsed, result),
-// 				)
-
-// 				require.NotNil(t, result, fmt.Sprintf("tc #%d; currDeliver: %d, result: %v, err: %s", i, j, result, err))
-// 				require.False(t, ctx.BlockGasMeter().IsPastLimit())
-// 			}
-// 		}
-// 	}
-// }
+	return nil
+}
 ```
 
-**File:** baseapp/deliver_tx_test.go (L1144-1144)
+**File:** x/slashing/keeper/signing_info.go (L109-116)
 ```go
-	// removed the block gas exceeded because of removal of block gas meter, gasWanted < max block gas is still fulfilled by various other checks
+func (k Keeper) ParseBitGroupsToBoolArray(bitGroups []uint64, window int64) []bool {
+	boolArray := make([]bool, window)
+
+	for i := int64(0); i < window; i++ {
+		boolArray[i] = k.GetBooleanFromBitGroups(bitGroups, i)
+	}
+	return boolArray
+}
+```
+
+**File:** x/slashing/keeper/infractions.go (L52-54)
+```go
+	if found && missedInfo.WindowSize != window {
+		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
+	}
+```
+
+**File:** x/slashing/keeper/infractions.go (L157-169)
+```go
+func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
+	// we need to resize the missed block array AND update the signing info accordingly
+	switch {
+	case missedInfo.WindowSize < window:
+		// missed block array too short, lets expand it
+		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
+		newArray := make([]bool, window)
+		copy(newArray[0:index], boolArray[0:index])
+		if index+1 < missedInfo.WindowSize {
+			// insert `0`s corresponding to the difference between the new window size and old window size
+			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
+		}
+		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
+```
+
+**File:** x/slashing/abci.go (L36-50)
+```go
+	for i, _ := range allVotes {
+		wg.Add(1)
+		go func(valIndex int) {
+			defer wg.Done()
+			vInfo := allVotes[valIndex]
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
+				ConsAddr:    consAddr,
+				MissedInfo:  missedInfo,
+				SigningInfo: signInfo,
+				ShouldSlash: shouldSlash,
+				SlashInfo:   slashInfo,
+			}
+		}(i)
+	}
+```
+
+**File:** x/params/types/subspace.go (L196-219)
+```go
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	}
+
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+		return err
+	}
+
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
+	return nil
+}
+```
+
+**File:** x/slashing/simulation/genesis.go (L27-29)
+```go
+func GenSignedBlocksWindow(r *rand.Rand) int64 {
+	return int64(simulation.RandIntBetween(r, 10, 1000))
+}
 ```

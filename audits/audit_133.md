@@ -1,248 +1,199 @@
 # Audit Report
 
 ## Title
-Governance Vote Weight Manipulation via Nested Message Validation Bypass in MsgExec
+Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
 
 ## Summary
-The `MsgExec` message in the authz module does not recursively validate nested messages, allowing attackers to bypass the `ValidateBasic()` checks on `MsgVoteWeighted` messages. This enables submission of governance votes with total weight exceeding 1.0, amplifying the attacker's voting influence beyond their actual voting power.
+The `TrackHistoricalInfo` function contains a pruning loop that breaks on the first missing historical entry. When `HistoricalEntries` is legitimately changed from non-zero to 0 (documented as valid for non-IBC chains) and later restored to non-zero, a gap is created that permanently prevents pruning of older entries, causing unbounded storage accumulation. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:**
-- [1](#0-0) 
-- [2](#0-1) 
-- [3](#0-2) 
-- [4](#0-3) 
-- [5](#0-4) 
+- **location**: `x/staking/keeper/historical_info.go`, lines 78-85
 
-**Intended Logic:**
-All transaction messages should have their `ValidateBasic()` method called during ante handler processing. For `MsgVoteWeighted`, this validation ensures total weight equals exactly 1.0 and prevents duplicate options [6](#0-5) .
+- **intended logic**: The function should maintain exactly `HistoricalEntries` number of recent historical entries by pruning all entries older than `currentHeight - HistoricalEntries`.
 
-**Actual Logic:**
-The ante handler only validates top-level messages [7](#0-6) . When `MsgExec` is submitted, only its `ValidateBasic()` is called, which does not validate nested messages. During execution via `DispatchActions()`, when granter equals grantee (voter acting on their own behalf), the message handler is invoked directly without nested message validation [3](#0-2) . The `AddVote()` function only validates individual option weights, not total weight [8](#0-7) .
+- **actual logic**: The pruning loop starts at `currentHeight - HistoricalEntries` and iterates backward, deleting found entries but immediately breaking when encountering a missing entry (line 83). The code comment at lines 75-77 reveals the assumption: "entries to be deleted are always in a continuous range." This assumption is violated when HistoricalEntries is set to 0 and back. [2](#0-1) 
 
-**Exploitation Path:**
-1. Attacker creates `MsgExec` with grantee set to their own address
-2. Nests `MsgVoteWeighted` with voter = their address and multiple options with total weight > 1.0 (e.g., {Yes: 0.9, Abstain: 0.9})
-3. Transaction passes ante handler validation (only `MsgExec.ValidateBasic()` checked)
-4. During execution, since granter (voter) equals grantee, authorization check is skipped
-5. `VoteWeighted` handler calls `keeper.AddVote()` which validates each option individually (both 0.9 ≤ 1.0) but not the total
-6. Vote stored with total weight 1.8
-7. During tally, voting power is multiplied by each weight, giving amplified influence [5](#0-4) 
+- **exploitation path**:
+  1. Network operates with `HistoricalEntries=100`, creating entries 1-100
+  2. Governance changes `HistoricalEntries` to 0 via parameter proposal (documented as legitimate for non-IBC chains)
+  3. During blocks with `HistoricalEntries=0`, no new entries are saved due to early return at lines 88-90
+  4. Governance restores `HistoricalEntries=5` via another proposal
+  5. At the next block (e.g., 111), pruning starts at height 106 (111-5)
+  6. `GetHistoricalInfo(ctx, 106)` returns `found=false` (gap period)
+  7. Break statement executes, exiting loop without deleting entries 1-100
+  8. New entries accumulate: {1-100, 111, 112, ...}
+  9. Every subsequent block hits the gap first, preventing all pruning indefinitely [3](#0-2) 
 
-**Security Guarantee Broken:**
-Governance voting invariant that each voter's influence equals exactly their voting power. The total weight constraint (must equal 1.0) can be violated, allowing arbitrary vote amplification.
+- **security guarantee broken**: The storage bound invariant is violated. The system should maintain at most `HistoricalEntries` entries but instead accumulates entries indefinitely after a gap is created.
 
 ## Impact Explanation
 
-This vulnerability enables manipulation of governance proposals by allowing voters to amplify their influence beyond their actual voting power. An attacker with voting power of 100 who votes {Yes: 0.9, Abstain: 0.9} contributes 90 to Yes votes while also reducing the threshold denominator by 90 (since it's totalVotingPower - Abstain). This creates a ~2x amplification effect compared to a normal {Yes: 1.0} vote.
+Each historical entry contains a complete block header and full validator set. With the default 35 validators, this represents substantial data per entry. [4](#0-3) [5](#0-4) 
 
-Governance in Cosmos chains typically controls critical functions including protocol parameter changes, software upgrades, and treasury management. Manipulation could lead to unauthorized parameter changes, malicious upgrades, or improper fund allocations, though no concrete funds are at immediate risk from the vote manipulation itself.
+Over months of operation with continuous block production, this leads to:
+- **Storage exhaustion**: Thousands of unbounded entries consuming gigabytes of disk space
+- **Resource consumption**: >30% increase compared to expected bounded levels
+- **Node instability**: Nodes crash when disk space exhausted
+- **Network degradation**: If 30%+ of nodes affected, network stability compromised
+
+This directly matches the Medium severity impact category: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
 
 ## Likelihood Explanation
 
-**Triggerable by:** Any network participant with voting power (staked tokens)
+**Trigger mechanism**: The `HistoricalEntries` parameter is governance-controlled and can be changed through standard parameter change proposals. [6](#0-5) 
 
-**Conditions:**
-- Active governance proposal in voting period
-- Standard transaction submission capability
-- No special privileges required
+**Realistic scenario**: Setting `HistoricalEntries=0` is explicitly documented as a legitimate operation for chains that don't use IBC. The validation function allows zero values (only checks type). [7](#0-6) 
 
-**Frequency:** Exploitable deterministically on any governance proposal. The attack requires no timing, race conditions, or rare circumstances.
+**Automatic execution**: `TrackHistoricalInfo` is called automatically in `BeginBlocker` every single block, ensuring continuous accumulation once the gap is created. [8](#0-7) 
+
+**Frequency**: This can occur during normal governance operations when a chain temporarily disables historical tracking and later re-enables it. Once triggered, the effect compounds with every subsequent block indefinitely, making storage issues highly likely over the network's operational lifetime.
 
 ## Recommendation
 
-Modify `MsgExec.ValidateBasic()` to recursively validate all nested messages:
+Modify the pruning logic to iterate through all heights that should be pruned, regardless of gaps:
 
 ```go
-func (msg MsgExec) ValidateBasic() error {
-    _, err := sdk.AccAddressFromBech32(msg.Grantee)
-    if err != nil {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+// Prune all entries older than retention height
+pruneHeight := ctx.BlockHeight() - int64(entryNum)
+for i := pruneHeight - 1; i >= 0; i-- {
+    _, found := k.GetHistoricalInfo(ctx, i)
+    if found {
+        k.DeleteHistoricalInfo(ctx, i)
     }
-
-    if len(msg.Msgs) == 0 {
-        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
-    }
-
-    // Validate all nested messages
-    msgs, err := msg.GetMessages()
-    if err != nil {
-        return err
-    }
-    
-    for _, m := range msgs {
-        if err := m.ValidateBasic(); err != nil {
-            return err
-        }
-    }
-
-    return nil
+    // Continue checking all heights - do not break on gaps
 }
 ```
+
+Alternatively, maintain metadata tracking the oldest and newest stored entry heights to enable efficient targeted deletion without iterating through all possible heights.
 
 ## Proof of Concept
 
-**Note:** The provided PoC uses a single option with weight=2.0, which would be rejected by `ValidWeightedVoteOption()` since it checks individual weights must be ≤ 1.0 [8](#0-7) . The correct exploitation uses multiple options with individual weights ≤ 1.0 but total > 1.0.
+**Test conceptual outline** (to be added to `x/staking/keeper/historical_info_test.go`):
 
-**Corrected exploitation:**
-```go
-maliciousVote := &types.MsgVoteWeighted{
-    ProposalId: proposal.ProposalId,
-    Voter:      attacker.String(),
-    Options: types.WeightedVoteOptions{
-        {Option: types.OptionYes, Weight: sdk.MustNewDecFromStr("0.9")},
-        {Option: types.OptionAbstain, Weight: sdk.MustNewDecFromStr("0.9")},
-    },
-}
+**Setup**:
+- Initialize staking keeper with test validators
+- Set `HistoricalEntries=100`
+- Generate blocks 1-100 to create 100 historical entries
+- Verify 100 entries exist in storage
 
-// This would fail ValidateBasic (total = 1.8)
-err = maliciousVote.ValidateBasic()
-require.Error(t, err)
+**Action**:
+1. Change `HistoricalEntries` to 0 via `SetParams`
+2. Generate blocks 101-110 (creates gap - no entries saved due to early return)
+3. Verify entries 1-100 still exist, no entries 101-110
+4. Change `HistoricalEntries` to 5
+5. Generate blocks 111-120
 
-// Wrap in MsgExec to bypass validation
-msgExec := authz.NewMsgExec(attacker, []sdk.Msg{maliciousVote})
-err = msgExec.ValidateBasic()
-require.NoError(t, err) // Passes
+**Expected Result**: Only 5 most recent entries (116-120) should exist
 
-// Execute successfully despite invalid total weight
-_, err = app.AuthzKeeper.DispatchActions(ctx, attacker, msgs)
-require.NoError(t, err)
+**Actual Result**: 
+- Entries 1-100 remain (never pruned)
+- Entries 111-120 are created
+- Total: 110 entries instead of 5
+- Storage bound of `HistoricalEntries=5` is permanently violated
 
-// Vote stored with total weight = 1.8
-vote, found := app.GovKeeper.GetVote(ctx, proposal.ProposalId, attacker)
-require.True(t, found)
-totalWeight := vote.Options[0].Weight.Add(vote.Options[1].Weight)
-require.True(t, totalWeight.GT(sdk.OneDec())) // Total > 1.0
-```
-
-## Notes
-
-The vulnerability mechanism is valid: `MsgExec` fails to validate nested messages, allowing governance vote weight manipulation. While the original PoC has an implementation error (single weight > 1.0 gets rejected at the keeper level), the attack succeeds using multiple options with individual weights ≤ 1.0 but total weight > 1.0. This bypasses the critical total weight validation in `MsgVoteWeighted.ValidateBasic()` and amplifies governance influence, constituting a Medium severity issue per the "bug in network code resulting in unintended behavior" category.
+The test demonstrates that after creating a gap by setting `HistoricalEntries=0`, the storage bound invariant is permanently broken, with entries accumulating indefinitely beyond the configured limit.
 
 ### Citations
 
-**File:** x/authz/msgs.go (L221-232)
+**File:** x/staking/keeper/historical_info.go (L68-98)
 ```go
-func (msg MsgExec) ValidateBasic() error {
-	_, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+func (k Keeper) TrackHistoricalInfo(ctx sdk.Context) {
+	entryNum := k.HistoricalEntries(ctx)
+
+	// Prune store to ensure we only have parameter-defined historical entries.
+	// In most cases, this will involve removing a single historical entry.
+	// In the rare scenario when the historical entries gets reduced to a lower value k'
+	// from the original value k. k - k' entries must be deleted from the store.
+	// Since the entries to be deleted are always in a continuous range, we can iterate
+	// over the historical entries starting from the most recent version to be pruned
+	// and then return at the first empty entry.
+	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
+		_, found := k.GetHistoricalInfo(ctx, i)
+		if found {
+			k.DeleteHistoricalInfo(ctx, i)
+		} else {
+			break
+		}
 	}
 
-	if len(msg.Msgs) == 0 {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+	// if there is no need to persist historicalInfo, return
+	if entryNum == 0 {
+		return
+	}
+
+	// Create HistoricalInfo struct
+	lastVals := k.GetLastValidators(ctx)
+	historicalEntry := types.NewHistoricalInfo(ctx.BlockHeader(), lastVals, k.PowerReduction(ctx))
+
+	// Set latest HistoricalInfo at current height
+	k.SetHistoricalInfo(ctx, ctx.BlockHeight(), &historicalEntry)
+}
+```
+
+**File:** x/staking/types/params.go (L24-24)
+```go
+	DefaultMaxValidators uint32 = 35
+```
+
+**File:** x/staking/types/params.go (L29-32)
+```go
+	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
+	// value by not adding the staking module to the application module manager's
+	// SetOrderBeginBlockers.
+	DefaultHistoricalEntries uint32 = 10000
+```
+
+**File:** x/staking/types/params.go (L81-92)
+```go
+func (p *Params) ParamSetPairs() paramtypes.ParamSetPairs {
+	return paramtypes.ParamSetPairs{
+		paramtypes.NewParamSetPair(KeyUnbondingTime, &p.UnbondingTime, validateUnbondingTime),
+		paramtypes.NewParamSetPair(KeyMaxValidators, &p.MaxValidators, validateMaxValidators),
+		paramtypes.NewParamSetPair(KeyMaxEntries, &p.MaxEntries, validateMaxEntries),
+		paramtypes.NewParamSetPair(KeyMaxVotingPower, &p.MaxVotingPowerRatio, validateMaxVotingPowerRatio),
+		paramtypes.NewParamSetPair(KeyMaxVotingPowerEnforcementThreshold, &p.MaxVotingPowerEnforcementThreshold, validateMaxVotingPowerEnforcementThreshold),
+		paramtypes.NewParamSetPair(KeyHistoricalEntries, &p.HistoricalEntries, validateHistoricalEntries),
+		paramtypes.NewParamSetPair(KeyBondDenom, &p.BondDenom, validateBondDenom),
+		paramtypes.NewParamSetPair(KeyMinCommissionRate, &p.MinCommissionRate, validateMinCommissionRate),
+	}
+}
+```
+
+**File:** x/staking/types/params.go (L242-249)
+```go
+func validateHistoricalEntries(i interface{}) error {
+	_, ok := i.(uint32)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
 	return nil
 }
 ```
 
-**File:** baseapp/baseapp.go (L787-800)
+**File:** x/staking/types/historical_info.go (L17-26)
 ```go
-// validateBasicTxMsgs executes basic validator calls for messages.
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-	if len(msgs) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
-	}
+func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
+	// Must sort in the same way that tendermint does
+	sort.SliceStable(valSet, func(i, j int) bool {
+		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
+	})
 
-	for _, msg := range msgs {
-		err := msg.ValidateBasic()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-```
-
-**File:** baseapp/baseapp.go (L921-925)
-```go
-	msgs := tx.GetMsgs()
-
-	if err := validateBasicTxMsgs(msgs); err != nil {
-		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
+	return HistoricalInfo{
+		Header: header,
+		Valset: valSet,
 	}
 ```
 
-**File:** x/authz/keeper/keeper.go (L87-111)
+**File:** x/staking/abci.go (L15-19)
 ```go
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
-			}
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
 
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
-			}
-		}
-```
-
-**File:** x/gov/keeper/vote.go (L21-25)
-```go
-	for _, option := range options {
-		if !types.ValidWeightedVoteOption(option) {
-			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
-		}
-	}
-```
-
-**File:** x/gov/keeper/tally.go (L59-62)
-```go
-				for _, option := range vote.Options {
-					subPower := votingPower.Mul(option.Weight)
-					results[option.Option] = results[option.Option].Add(subPower)
-				}
-```
-
-**File:** x/gov/types/msgs.go (L252-271)
-```go
-	totalWeight := sdk.NewDec(0)
-	usedOptions := make(map[VoteOption]bool)
-	for _, option := range msg.Options {
-		if !ValidWeightedVoteOption(option) {
-			return sdkerrors.Wrap(ErrInvalidVote, option.String())
-		}
-		totalWeight = totalWeight.Add(option.Weight)
-		if usedOptions[option.Option] {
-			return sdkerrors.Wrap(ErrInvalidVote, "Duplicated vote option")
-		}
-		usedOptions[option.Option] = true
-	}
-
-	if totalWeight.GT(sdk.NewDec(1)) {
-		return sdkerrors.Wrap(ErrInvalidVote, "Total weight overflow 1.00")
-	}
-
-	if totalWeight.LT(sdk.NewDec(1)) {
-		return sdkerrors.Wrap(ErrInvalidVote, "Total weight lower than 1.00")
-	}
-```
-
-**File:** x/gov/types/vote.go (L80-84)
-```go
-func ValidWeightedVoteOption(option WeightedVoteOption) bool {
-	if !option.Weight.IsPositive() || option.Weight.GT(sdk.NewDec(1)) {
-		return false
-	}
-	return ValidVoteOption(option.Option)
+	k.TrackHistoricalInfo(ctx)
+}
 ```

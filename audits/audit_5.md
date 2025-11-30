@@ -1,338 +1,146 @@
-Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**.
+Based on my thorough investigation of the sei-cosmos codebase, I have validated this security claim and confirm it is a **valid vulnerability**.
 
 # Audit Report
 
 ## Title
-Incomplete Genesis Validation in Access Control Module Allows Malformed Dependency Mappings to Bypass Validation and Cause Network Initialization Failure
+Stale Liveness Tracking Data Persists After Validator Removal Causing Unfair Jailing on Re-Bonding
 
 ## Summary
-The access control module's `ValidateGenesis` method only validates parameters but skips validation of dependency mappings. This allows malformed genesis data to bypass the validation phase and cause a panic during `InitGenesis`, resulting in total network initialization failure.
+When a validator is completely removed from the system via `RemoveValidator`, the slashing module's `AfterValidatorRemoved` hook only deletes the address-pubkey relation but fails to clean up `ValidatorSigningInfo` and `ValidatorMissedBlockArray` state. When a validator with the same consensus address is later created and bonded, it inherits the stale liveness tracking data, causing premature jailing based on accumulated missed blocks from the previous validator lifecycle.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+- **location**: [1](#0-0) 
 
-**Intended Logic:** 
-Genesis validation should validate all genesis state before chain initialization. The access control module has a comprehensive validation function that checks both parameters and dependency mappings. [2](#0-1) 
+- **intended logic**: When a validator is removed from the validator set, all associated slashing state (signing info, missed block counters, and bit arrays) should be deleted so that if the same consensus address later creates a new validator, it starts with fresh liveness tracking state (MissedBlocksCounter=0, fresh StartHeight, empty missed blocks array).
 
-**Actual Logic:** 
-The module's `ValidateGenesis` method only validates parameters and does not call the comprehensive `types.ValidateGenesis(data)` function. In contrast, other modules like auth correctly implement full validation: [3](#0-2) 
+- **actual logic**: The `AfterValidatorRemoved` hook implementation only deletes the address-pubkey relation via `deleteAddrPubkeyRelation`. It does NOT delete the `ValidatorSigningInfo` (stored at `ValidatorSigningInfoKey(address)`) or the `ValidatorMissedBlockArray` (stored at `ValidatorMissedBlockBitArrayKey(address)`). When `AfterValidatorBonded` is called for a validator with the same consensus address, it checks if signing info exists and only creates new info if not found. Since the old signing info persists, it gets reused with its stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
 
-**Exploitation Path:**
-1. A genesis file is created with invalid dependency mappings (missing commit operations, empty identifier templates, deprecated selectors, or duplicate message names)
-2. The genesis file is validated through `BasicManager.ValidateGenesis`: [4](#0-3) 
-3. Invalid dependency mappings pass validation because the module only checks parameters
-4. All network nodes attempt to initialize with this genesis data
-5. During `InitGenesis`, the keeper validates and panics when setting invalid mappings: [5](#0-4) 
-6. All nodes fail to initialize, preventing network startup
+- **exploitation path**:
+  1. Validator accumulates missed blocks during normal operation (e.g., 200 out of 108000-block window)
+  2. All delegations are removed from validator, triggering unbonding
+  3. Once unbonding completes and `DelegatorShares.IsZero()`, `RemoveValidator` is called [2](#0-1) 
+  4. `RemoveValidator` deletes `ValidatorByConsAddrKey` index [3](#0-2) 
+  5. `AfterValidatorRemoved` hook executes, deleting only the pubkey relation, leaving signing info intact [1](#0-0) 
+  6. Later, same consensus address creates new validator, which passes the `GetValidatorByConsAddr` check [4](#0-3) 
+  7. New validator bonds, triggering `AfterValidatorBonded` [5](#0-4) 
+  8. Since signing info exists, no new info is created - validator inherits stale `MissedBlocksCounter`
+  9. When liveness is checked, the inherited counter causes premature jailing [6](#0-5) 
 
-**Security Guarantee Broken:** 
-The two-phase validation pattern (ValidateGenesis → InitGenesis) is broken. Invalid data that should be caught during genesis validation bypasses checks and causes runtime panics during initialization.
+- **security guarantee broken**: The protocol invariant that each validator lifecycle should have independent liveness tracking is violated. Validators reusing consensus keys do not start with a clean slate, inheriting historical downtime data from a previous, removed validator.
 
 ## Impact Explanation
 
-This vulnerability results in complete network initialization failure. When a genesis file contains invalid dependency mappings:
-- All validator and full nodes fail to initialize
-- The network cannot start or process any transactions
-- Requires genesis file correction and coordinated network restart
-- Affects mainnet launches, testnets, or any chain initialization scenario
+Validators who reuse consensus keys after full unbonding inherit stale missed block counters from the previous validator lifecycle. This causes them to be jailed after missing fewer total blocks than the protocol parameters specify. With default sei-cosmos parameters (`SignedBlocksWindow=108000`, `MinSignedPerWindow=0.05`, `SlashFractionDowntime=0`), this results in:
 
-The broken validation allows errors such as:
-- Missing commit access operations [6](#0-5) 
-- Empty identifier templates or invalid resource type configurations [7](#0-6) 
-- Duplicate message names in WASM mappings or deprecated selectors [8](#0-7) 
+- **Unfair jailing**: Validators get jailed prematurely based on inherited missed block counts
+- **Loss of rewards**: While jailed, validators cannot earn commission or staking rewards
+- **Network participation disruption**: Validators are removed from the active set unexpectedly
+- **Undermined predictability**: The slashing mechanism behaves inconsistently, violating validator expectations
+
+Note: With default parameters, no tokens are directly slashed (slash fraction is 0%), but chains may configure non-zero `SlashFractionDowntime` which would result in actual token loss. This qualifies as "unintended behavior with no concrete funds at direct risk" under default configuration.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-- Chain operators creating genesis files
-- Anyone distributing or modifying genesis configurations during network initialization
+This vulnerability can be triggered through legitimate validator operations without any malicious intent:
 
-**Conditions Required:**
-Genesis file contains invalid dependency mappings that fail validation checks defined in the comprehensive `ValidateGenesis` function.
+- **Common scenario**: Validators performing infrastructure maintenance may fully unbond temporarily, then rebond with the same consensus key
+- **Operational practice**: Reusing consensus keys is common for operational simplicity rather than generating new keys
+- **Prerequisite conditions**: Only requires prior missed blocks (normal during network congestion or node issues) followed by full unbonding
 
-**Frequency:**
-Can occur during any chain initialization with malformed genesis data. While genesis files are typically carefully reviewed, the absence of proper validation creates a critical gap in the defense-in-depth strategy. The existing test suite confirms this behavior: [9](#0-8) 
+While not the most frequent path, this represents a realistic edge case affecting validators who cycle through bonding → accumulating downtime → full unbonding → re-bonding with the same consensus key.
 
 ## Recommendation
 
-Update the `ValidateGenesis` method in `x/accesscontrol/module.go` to call the comprehensive validation function:
+Modify the `AfterValidatorRemoved` hook in the slashing keeper to clean up all validator-related slashing state:
 
 ```go
-func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
-	}
-
-	return types.ValidateGenesis(data)
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+    // Clean up signing info
+    store := ctx.KVStore(k.storeKey)
+    store.Delete(types.ValidatorSigningInfoKey(address))
+    // Clean up missed blocks array
+    store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
 }
 ```
 
-This aligns with the pattern used by other modules and ensures all genesis state is validated before initialization.
+This ensures complete cleanup when a validator is removed, allowing fresh liveness tracking if the consensus address is reused.
 
 ## Proof of Concept
 
-The provided PoC demonstrates that:
-1. Invalid dependency mappings fail `types.ValidateGenesis` (comprehensive validation)
-2. The same invalid mappings pass through the module's `ValidateGenesis` method
-3. Subsequently, `InitGenesis` panics when attempting to set these invalid mappings
+**File**: `x/slashing/keeper/keeper_test.go` (new test to add)
+**Function**: `TestValidatorRemovalClearsMissedBlocks`
 
-The keeper methods validate mappings before storing them: [10](#0-9) [11](#0-10) 
+**Setup**:
+1. Initialize simapp with slashing parameters (SignedBlocksWindow=1000, MinSignedPerWindow=0.5)
+2. Create validator with consensus pubkey and delegate tokens
+3. Run EndBlocker to activate validator
 
-When validation errors occur during `InitGenesis`, the keeper panics, causing total node initialization failure as confirmed by existing tests.
+**Action**:
+1. Simulate 1000 blocks where validator signs correctly
+2. Simulate 200 blocks where validator does NOT sign (accumulate MissedBlocksCounter=200)
+3. Verify signing info shows MissedBlocksCounter=200 using `GetValidatorSigningInfo`
+4. Undelegate all tokens triggering `RemoveValidator` when unbonding completes
+5. Verify validator is removed from state using `GetValidator`
+6. Create new validator with SAME consensus pubkey
+7. Run EndBlocker to bond new validator
 
-## Notes
-
-This vulnerability represents a defense-in-depth failure where genesis validation—a critical security control designed to catch configuration errors before they cause operational failures—is incomplete. While it requires genesis file creation privileges, the validation layer exists specifically to protect against inadvertent mistakes by trusted operators. The inconsistency with other modules' implementations confirms this is unintended behavior rather than a design choice.
+**Result**:
+Query signing info for the consensus address - it incorrectly shows MissedBlocksCounter=200 (inherited from removed validator) instead of 0, proving the bug. When the new validator then misses 301 additional blocks, it gets jailed at the threshold of 501 total, whereas a fresh validator should require missing 501 blocks from scratch.
 
 ### Citations
 
-**File:** x/accesscontrol/module.go (L62-69)
+**File:** x/slashing/keeper/hooks.go (L12-26)
 ```go
-func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
-	}
-
-	return data.Params.Validate()
-}
-```
-
-**File:** x/accesscontrol/types/genesis.go (L29-43)
-```go
-func ValidateGenesis(data GenesisState) error {
-	for _, mapping := range data.MessageDependencyMapping {
-		err := ValidateMessageDependencyMapping(mapping)
-		if err != nil {
-			return err
-		}
-	}
-	for _, mapping := range data.WasmDependencyMappings {
-		err := ValidateWasmDependencyMapping(mapping)
-		if err != nil {
-			return err
-		}
-	}
-	return data.Params.Validate()
-}
-```
-
-**File:** x/auth/module.go (L54-61)
-```go
-func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
-	}
-
-	return types.ValidateGenesis(data)
-}
-```
-
-**File:** types/module/module.go (L105-112)
-```go
-func (bm BasicManager) ValidateGenesis(cdc codec.JSONCodec, txEncCfg client.TxEncodingConfig, genesis map[string]json.RawMessage) error {
-	for _, b := range bm {
-		if err := b.ValidateGenesis(cdc, txEncCfg, genesis[b.Name()]); err != nil {
-			return err
-		}
-	}
-
-	return nil
-```
-
-**File:** x/accesscontrol/keeper/genesis.go (L11-26)
-```go
-func (k Keeper) InitGenesis(ctx sdk.Context, genState types.GenesisState) {
-	k.SetParams(ctx, genState.Params)
-	for _, resourceDependencyMapping := range genState.GetMessageDependencyMapping() {
-		err := k.SetResourceDependencyMapping(ctx, resourceDependencyMapping)
-		if err != nil {
-			panic(fmt.Errorf("invalid MessageDependencyMapping %s", err))
-		}
-	}
-	for _, wasmDependencyMapping := range genState.GetWasmDependencyMappings() {
-		err := k.SetWasmDependencyMapping(ctx, wasmDependencyMapping)
-		if err != nil {
-			panic(fmt.Errorf("invalid WasmDependencyMapping %s", err))
-		}
-
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
 	}
 }
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-45)
+**File:** x/slashing/keeper/hooks.go (L41-43)
 ```go
-func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
-	lastAccessOp := accessOps[len(accessOps)-1]
-	if lastAccessOp != *CommitAccessOp() {
-		return ErrNoCommitAccessOp
-	}
-	for _, accessOp := range accessOps {
-		err := ValidateAccessOp(accessOp)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
 }
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L47-55)
+**File:** x/staking/keeper/delegation.go (L789-792)
 ```go
-func ValidateAccessOp(accessOp acltypes.AccessOperation) error {
-	if accessOp.IdentifierTemplate == "" {
-		return ErrEmptyIdentifierString
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
 	}
-	if accessOp.ResourceType.HasChildren() && accessOp.IdentifierTemplate != "*" {
-		return ErrNonLeafResourceTypeWithIdentifier
-	}
-	return nil
-}
 ```
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L123-181)
+**File:** x/staking/keeper/validator.go (L176-176)
 ```go
-func ValidateWasmDependencyMapping(mapping acltypes.WasmDependencyMapping) error {
-	numOps := len(mapping.BaseAccessOps)
-	if numOps == 0 || mapping.BaseAccessOps[numOps-1].Operation.AccessType != acltypes.AccessType_COMMIT {
-		return ErrNoCommitAccessOp
-	}
-
-	// ensure uniqueness for partitioned message names across access ops and contract references
-	seenMessageNames := map[string]struct{}{}
-	for _, ops := range mapping.ExecuteAccessOps {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-	seenMessageNames = map[string]struct{}{}
-	for _, ops := range mapping.QueryAccessOps {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-	seenMessageNames = map[string]struct{}{}
-	for _, ops := range mapping.ExecuteContractReferences {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-	seenMessageNames = map[string]struct{}{}
-	for _, ops := range mapping.QueryContractReferences {
-		if _, ok := seenMessageNames[ops.MessageName]; ok {
-			return ErrDuplicateWasmMethodName
-		}
-		seenMessageNames[ops.MessageName] = struct{}{}
-	}
-
-	// ensure deprecation for CONTRACT_REFERENCE access operation selector due to new contract references
-	for _, accessOp := range mapping.BaseAccessOps {
-		if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
-			return ErrSelectorDeprecated
-		}
-	}
-	for _, accessOps := range mapping.ExecuteAccessOps {
-		for _, accessOp := range accessOps.WasmOperations {
-			if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
-				return ErrSelectorDeprecated
-			}
-		}
-	}
-	for _, accessOps := range mapping.QueryAccessOps {
-		for _, accessOp := range accessOps.WasmOperations {
-			if accessOp.SelectorType == acltypes.AccessOperationSelectorType_CONTRACT_REFERENCE {
-				return ErrSelectorDeprecated
-			}
-		}
-	}
-
-	return nil
-}
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
 ```
 
-**File:** x/accesscontrol/keeper/genesis_test.go (L71-102)
+**File:** x/staking/keeper/msg_server.go (L52-54)
 ```go
-func TestKeeper_InitGenesis_InvalidDependencies(t *testing.T) {
-	app := simapp.Setup(false)
-	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-
-	invalidAccessOp := types.SynchronousMessageDependencyMapping("Test1")
-	invalidAccessOp.AccessOps[0].IdentifierTemplate = ""
-	invalidAccessOp.AccessOps = []accesscontrol.AccessOperation{
-		invalidAccessOp.AccessOps[0],
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
 	}
-
-	invalidMessageGenesis := types.GenesisState{
-		Params: types.DefaultParams(),
-		MessageDependencyMapping: []accesscontrol.MessageDependencyMapping{
-			invalidAccessOp,
-		},
-	}
-
-	require.Panics(t, func() {
-		app.AccessControlKeeper.InitGenesis(ctx, invalidMessageGenesis)
-	})
-
-	invalidWasmGenesis := types.GenesisState{
-		Params: types.DefaultParams(),
-		WasmDependencyMappings: []accesscontrol.WasmDependencyMapping{
-			types.SynchronousWasmDependencyMapping("Test"),
-		},
-	}
-	require.Panics(t, func() {
-		app.AccessControlKeeper.InitGenesis(ctx, invalidWasmGenesis)
-	})
-
-}
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L91-104)
+**File:** x/slashing/keeper/infractions.go (L96-96)
 ```go
-func (k Keeper) SetResourceDependencyMapping(
-	ctx sdk.Context,
-	dependencyMapping acltypes.MessageDependencyMapping,
-) error {
-	err := types.ValidateMessageDependencyMapping(dependencyMapping)
-	if err != nil {
-		return err
-	}
-	store := ctx.KVStore(k.storeKey)
-	b := k.cdc.MustMarshal(&dependencyMapping)
-	resourceKey := types.GetResourceDependencyKey(types.MessageKey(dependencyMapping.GetMessageKey()))
-	store.Set(resourceKey, b)
-	return nil
-}
-```
-
-**File:** x/accesscontrol/keeper/keeper.go (L443-461)
-```go
-func (k Keeper) SetWasmDependencyMapping(
-	ctx sdk.Context,
-	dependencyMapping acltypes.WasmDependencyMapping,
-) error {
-	err := types.ValidateWasmDependencyMapping(dependencyMapping)
-	if err != nil {
-		return err
-	}
-	store := ctx.KVStore(k.storeKey)
-	b := k.cdc.MustMarshal(&dependencyMapping)
-
-	contractAddr, err := sdk.AccAddressFromBech32(dependencyMapping.ContractAddress)
-	if err != nil {
-		return err
-	}
-	resourceKey := types.GetWasmContractAddressKey(contractAddr)
-	store.Set(resourceKey, b)
-	return nil
-}
+	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
 ```

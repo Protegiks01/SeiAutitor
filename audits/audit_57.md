@@ -1,211 +1,246 @@
 # Audit Report
 
 ## Title
-Chain Fails to Start When Genesis Contains Wei Balances Due to Missing Base Denom Registration
+Denial-of-Service via Front-Running Module Account Creation During Chain Upgrades
 
 ## Summary
-The bank keeper's `InitGenesis` function panics during chain initialization when the genesis state contains wei balances but `sdk.RegisterDenom()` has never been called. Since `RegisterDenom()` is only invoked in test setup functions and never in the production application startup sequence, any genesis file containing wei balances will cause total network shutdown, preventing all validators from starting the chain. [1](#0-0) 
+An attacker can halt the entire blockchain by sending coins to a predicted future module account address before a chain upgrade executes. The deterministic module address derivation allows predicting addresses, automatic account creation enables creating a `BaseAccount` at the target address, and `GetModuleAccount` panics when it encounters a `BaseAccount` instead of a `ModuleAccountI` during upgrade initialization, halting all validator nodes.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
 **Location:**
-- Primary: `x/bank/keeper/genesis.go`, lines 39-46 in the `InitGenesis` function
-- Secondary: `types/denom.go`, lines 48-54 in the `GetBaseDenom` function [1](#0-0) [2](#0-1) 
+- Module address derivation: [1](#0-0) 
+- Panic condition: [2](#0-1) 
+- Account auto-creation: [3](#0-2) 
+- BlockedAddr check: [4](#0-3) 
+- Blocklist population: [5](#0-4) 
+- Module permissions map: [6](#0-5) 
+- New module InitGenesis trigger: [7](#0-6) 
+- InitGenesis calling GetModuleAccount: [8](#0-7) 
+- Upgrade execution flow: [9](#0-8) 
+- Panic propagation: [10](#0-9) 
 
-**Intended logic:** 
-The code expects that `sdk.RegisterDenom()` is called during application startup to register the base denomination before `InitGenesis` processes wei balances. Wei balances (with 18-decimal precision) should be converted to the base denomination during genesis initialization for EVM compatibility. [3](#0-2) 
+**Intended Logic:**
+When a chain upgrade introduces a new module, `GetModuleAccount` should create a `ModuleAccountI` at the deterministic module address during `InitGenesis`. If no account exists at that address, it creates a new module account. If a module account already exists, it returns it for use by the module.
 
-**Actual logic:**
-`sdk.RegisterDenom()` is never called in the production startup path. The function only appears in test setup code. The package-level variable `baseDenom` remains an empty string. When `InitGenesis` processes wei balances:
-1. Wei balances are accumulated into `weiInUsei`
-2. The code calls `sdk.GetBaseDenom()` which returns an error ("no denom is registered") because `baseDenom` is empty
-3. Since `weiInUsei` is non-zero, the panic condition triggers
-4. All validator nodes fail with: "base denom is not registered ... yet there exists wei balance" [4](#0-3) [5](#0-4) [6](#0-5) 
+**Actual Logic:**
+The `GetModuleAccount` function performs a type assertion and panics if it finds a `BaseAccount` instead of a `ModuleAccountI` at the module address. While `BlockedAddr` prevents sending coins to existing module accounts, the blocklist is populated only from the current `maccPerms` map at application initialization. Future module addresses from pending upgrades are not included in this blocklist, allowing attackers to send coins to these predictable addresses, which triggers automatic `BaseAccount` creation.
 
-**Exploitation path:**
-1. Chain operators prepare a genesis file with wei balances (a documented feature for EVM compatibility)
-2. Validators execute normal chain startup (`simd start`)
-3. During ABCI `InitChain`, the module manager calls `bank.InitGenesis`
-4. InitGenesis processes wei balances but panics due to unregistered base denomination
-5. All validator nodes crash before producing any blocks [7](#0-6) [8](#0-7) 
+**Exploitation Path:**
+1. Attacker monitors on-chain governance proposals for scheduled upgrades
+2. Downloads the upgrade binary and inspects the source or binary to identify new module names added to `maccPerms`
+3. Computes the future module address using the deterministic formula: `crypto.AddressHash([]byte(newModuleName))`
+4. Submits a `MsgSend` transaction transferring coins (even dust amounts) to the predicted address
+5. The `BlockedAddr` check passes because the future module address is not in the current `blockedAddrs` map
+6. A `BaseAccount` is automatically created at the module address when coins are received
+7. At the upgrade height, `BeginBlocker` executes the upgrade handler
+8. The upgrade handler calls `RunMigrations`, which detects the new module (not in `fromVM`) and calls `InitGenesis` with default genesis state
+9. `InitGenesis` calls `GetModuleAccount` to ensure the module account exists
+10. `GetModuleAccount` retrieves the account at the module address, finds a `BaseAccount`, fails the type assertion, and panics with "account is not a module account"
+11. The panic propagates uncaught through the call stack: `InitGenesis` → `RunMigrations` → upgrade handler → `ApplyUpgrade` → `BeginBlocker`
+12. All validator nodes halt at the upgrade height, unable to progress beyond this block
 
-**Security guarantee broken:**
-Network availability - the chain cannot initialize and produce blocks despite using documented features correctly.
+**Security Guarantee Broken:**
+The system assumes that governance-approved upgrades will execute successfully at the designated height. This vulnerability allows any unprivileged user to prevent approved upgrades from completing, achieving denial-of-service by exploiting the predictable module address generation and lack of forward-looking address blocking.
 
 ## Impact Explanation
 
-This vulnerability causes complete network shutdown. When a genesis file contains wei balances:
-- 100% of validator nodes panic on startup with identical errors
-- The chain cannot produce any blocks or process transactions (zero throughput)
-- Network is completely non-functional until codebase is patched or genesis is modified
-- All users, validators, and applications depending on the network are affected
+**Consequences:**
+- **Total network shutdown**: All validator nodes halt execution at the upgrade height and cannot produce or commit new blocks
+- **No transaction processing**: The network becomes unable to confirm any new transactions, freezing all blockchain activity
+- **Emergency intervention required**: Recovery requires coordinated action such as a rollback to pre-upgrade height, release of a hotfix binary with handling for the malicious account, or out-of-band coordination among validators
+- **Economic disruption**: All blockchain services cease operation until resolution, potentially causing significant economic damage
+- **Governance undermined**: Legitimate governance-approved upgrades become attack vectors that malicious actors can weaponize
 
-Wei balances are a core feature providing 18-decimal precision for EVM compatibility (similar to Ethereum's wei system with `OneUseiInWei = 1,000,000,000,000`). The feature is properly implemented throughout the banking module but the initialization sequence is broken. [9](#0-8) 
+**Affected Systems:**
+- Consensus layer: Upgrade execution fails during block processing
+- All validator nodes: Every validator hits the same panic at the same height
+- Governance process: Approved upgrades can be sabotaged by any participant
+
+This matches the "Network not being able to confirm new transactions (total network shutdown)" impact category, classified as **Medium severity** according to the provided impact taxonomy.
 
 ## Likelihood Explanation
 
-The likelihood is HIGH for any chain attempting to use wei balances in genesis:
+**Trigger Conditions:**
+- **Public information**: Upgrade proposals and their associated binaries are publicly available on-chain and in repositories
+- **Low cost**: The attack requires only standard transaction fees plus a minimal coin amount (even dust quantities work)
+- **No privileges required**: Any user capable of submitting transactions can execute this attack
+- **High frequency**: Every upgrade that introduces new modules with module accounts is vulnerable
+- **Trivial timing**: Attacker only needs to submit the transaction before the upgrade height, which could be days or weeks in advance
 
-**Triggering conditions:**
-- Genesis file contains non-zero wei balances in the bank module's `WeiBalances` field
-- Chain performs initial startup or restarts from genesis (e.g., during upgrades)
-- Normal chain startup procedure is followed
+**Attacker Profile:**
+- Requires basic blockchain interaction skills (ability to submit transactions)
+- Needs ability to inspect binaries or source code to identify new module names
+- Must understand the module address derivation algorithm (publicly documented)
+- No special access, permissions, or resources required beyond a funded account
 
-**Probability factors:**
-- Wei balances are documented in the proto definition as a standard feature
-- EVM compatibility is a key feature of Sei (requiring wei precision)
-- Genesis files commonly initialize balances for token distribution
-- This will trigger 100% of the time when wei balances are present
-- Every validator is affected identically
-
-While controlled by chain operators (trusted role), using wei balances is a legitimate, documented use case - not misconfiguration. The resulting unrecoverable failure extends beyond the operators' intended authority.
+**Probability:**
+High likelihood of exploitation. The attack is straightforward, low-cost, and can systematically target every future upgrade that adds modules. Once this vulnerability becomes known, rational adversaries or griefers could exploit it to disrupt the network. The deterministic nature of module addresses makes the attack highly reliable.
 
 ## Recommendation
 
-Add `sdk.RegisterDenom()` call in the application initialization before modules are initialized. Implement in `simapp/simd/cmd/root.go` in the `initRootCmd` function before `cfg.Seal()`:
+**Immediate Fix:**
+Modify `GetModuleAccountAndPermissions` in `x/auth/keeper/keeper.go` to handle `BaseAccount` gracefully instead of panicking:
 
 ```go
-func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
-    cfg := sdk.GetConfig()
-    // Register the base denomination before sealing config
-    if err := sdk.RegisterDenom(sdk.DefaultBondDenom, sdk.OneDec()); err != nil {
-        panic(err)
+acc := ak.GetAccount(ctx, addr)
+if acc != nil {
+    macc, ok := acc.(types.ModuleAccountI)
+    if !ok {
+        // Check if account is uninitialized and safe to migrate
+        if acc.GetSequence() != 0 {
+            return nil, []string{}, fmt.Errorf("cannot create module account: active account exists at %s with non-zero sequence", addr)
+        }
+        // Check if account has received funds
+        balance := ak.bankKeeper.GetAllBalances(ctx, addr)
+        if !balance.IsZero() {
+            return nil, []string{}, fmt.Errorf("cannot create module account: account at %s has non-zero balance", addr)
+        }
+        // Safe to convert empty BaseAccount to ModuleAccount
+        // Delete the BaseAccount and create a proper ModuleAccount
+        ak.RemoveAccount(ctx, acc)
+    } else {
+        return macc, perms
     }
-    cfg.Seal()
-    // ... rest of function
 }
+// Create new module account (existing logic)
+macc := types.NewEmptyModuleAccount(moduleName, perms...)
+// ... rest of creation logic
 ```
 
-This ensures the base denomination is registered before any module initialization occurs, matching the pattern used in all test files. [10](#0-9) 
+**Additional Protections:**
+1. **Pre-upgrade validation**: Add validation in upgrade `BeginBlocker` that checks for account conflicts at future module addresses before executing the upgrade handler, failing fast with a clear error message
+2. **Extended blocking**: When an upgrade proposal is submitted, dynamically add predicted future module addresses to the `BlockedAddr` list to prevent front-running
+3. **Non-deterministic derivation**: Consider adding entropy (e.g., block hash at upgrade height) to module address derivation to make addresses unpredictable until upgrade execution, though this would require careful design to maintain determinism across validators
+4. **Upgrade plan validation**: Add a governance proposal validation step that checks for conflicts at future module addresses when upgrades are proposed
 
 ## Proof of Concept
 
+**Test File:** Create `x/auth/keeper/keeper_test.go` or add to existing test file
+
 **Setup:**
-Create a genesis state with wei balances without calling `sdk.RegisterDenom()` to simulate production startup behavior.
+1. Initialize a test application using `simapp` with the current set of modules
+2. Identify a future module name (e.g., "newmodule") that will be added in an upgrade
+3. Compute the predicted module address: `futureAddr := authtypes.NewModuleAddress("newmodule")`
+4. Create and fund an attacker account with sufficient coins for the test
+5. Execute `bankKeeper.SendCoins(ctx, attackerAddr, futureAddr, coins)` to send coins to the predicted address
+6. Verify that a `BaseAccount` now exists at `futureAddr` using `accountKeeper.GetAccount(ctx, futureAddr)`
 
 **Action:**
-Call `InitGenesis` with the genesis state containing wei balances through the normal chain initialization sequence (ABCI `InitChain` → `app.InitChainer` → `app.mm.InitGenesis` → `bank.InitGenesis`). [11](#0-10) 
+1. Simulate the upgrade scenario by adding "newmodule" to the `maccPerms` map
+2. Create a new `AccountKeeper` instance or modify the existing one to include "newmodule" in its module permissions
+3. Call `accountKeeper.GetModuleAccount(ctx, "newmodule")` to simulate what would happen during `InitGenesis` execution
 
 **Result:**
-The function panics with error: "base denom is not registered no denom is registered yet there exists wei balance X", preventing the chain from starting. This can be verified by examining the existing test suite which always calls `sdk.RegisterDenom()` before testing genesis with wei balances, demonstrating awareness of this dependency.
+The call to `GetModuleAccount` panics with the error message "account is not a module account". This demonstrates that:
+- The `BaseAccount` was successfully created at the predicted address before the upgrade
+- The panic occurs during module account retrieval as claimed
+- In production, this panic would propagate uncaught through the upgrade execution path, halting the chain at the upgrade height
 
-The vulnerability is reproducible 100% of the time when genesis contains wei balances and proves that production chains would experience total startup failure when attempting to use this documented feature.
+**Validation Points:**
+- Confirm `BaseAccount` exists at the predicted address with non-zero balance
+- Confirm panic occurs with the expected error message
+- Trace that no defer/recover mechanisms exist in the upgrade path to catch this panic
+- Verify all validators would experience identical behavior, causing consensus failure
+
+## Notes
+
+This vulnerability demonstrates a critical gap in the upgrade safety mechanisms where deterministic address generation for module accounts creates a predictable attack surface. The issue is exacerbated by the separation between the blocklist population (which happens at app initialization with current modules) and the module addition process (which happens during upgrades). The lack of error handling for unexpected account types at module addresses transforms what should be a recoverable error into a consensus-halting panic.
 
 ### Citations
 
-**File:** x/bank/keeper/genesis.go (L39-46)
+**File:** x/auth/types/account.go (L163-165)
 ```go
-	baseDenom, err := sdk.GetBaseDenom()
+func NewModuleAddress(name string) sdk.AccAddress {
+	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
+}
+```
+
+**File:** x/auth/keeper/keeper.go (L187-192)
+```go
+	acc := ak.GetAccount(ctx, addr)
+	if acc != nil {
+		macc, ok := acc.(types.ModuleAccountI)
+		if !ok {
+			panic("account is not a module account")
+		}
+```
+
+**File:** x/bank/keeper/send.go (L166-170)
+```go
+	accExists := k.ak.HasAccount(ctx, toAddr)
+	if !accExists {
+		defer telemetry.IncrCounter(1, "new", "account")
+		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
+	}
+```
+
+**File:** x/bank/keeper/msg_server.go (L47-48)
+```go
+	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to receive funds", msg.ToAddress)
+```
+
+**File:** simapp/app.go (L135-142)
+```go
+	maccPerms = map[string][]string{
+		authtypes.FeeCollectorName:     nil,
+		distrtypes.ModuleName:          nil,
+		minttypes.ModuleName:           {authtypes.Minter},
+		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
+		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
+		govtypes.ModuleName:            {authtypes.Burner},
+	}
+```
+
+**File:** simapp/app.go (L607-613)
+```go
+func (app *SimApp) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range maccPerms {
+		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+	}
+
+	return modAccAddrs
+```
+
+**File:** types/module/module.go (L575-589)
+```go
+		} else {
+			cfgtor, ok := cfg.(configurator)
+			if !ok {
+				// Currently, the only implementator of Configurator (the interface)
+				// is configurator (the struct).
+				return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", configurator{}, cfg)
+			}
+
+			moduleValUpdates := module.InitGenesis(ctx, cfgtor.cdc, module.DefaultGenesis(cfgtor.cdc))
+			ctx.Logger().Info(fmt.Sprintf("adding a new module: %s", moduleName))
+			// The module manager assumes only one module will update the
+			// validator set, and that it will not be by a new module.
+			if len(moduleValUpdates) > 0 {
+				return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "validator InitGenesis updates already set by a previous module")
+			}
+```
+
+**File:** x/mint/genesis.go (L13-13)
+```go
+	ak.GetModuleAccount(ctx, types.ModuleName)
+```
+
+**File:** x/upgrade/abci.go (L115-117)
+```go
+func applyUpgrade(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
+	ctx.Logger().Info(fmt.Sprintf("applying upgrade \"%s\" at %s", plan.Name, plan.DueAt()))
+	k.ApplyUpgrade(ctx, plan)
+```
+
+**File:** x/upgrade/keeper/keeper.go (L371-373)
+```go
+	updatedVM, err := handler(ctx, plan, k.GetModuleVersionMap(ctx))
 	if err != nil {
-		if !weiInUsei.IsZero() {
-			panic(fmt.Errorf("base denom is not registered %s yet there exists wei balance %s", err, weiInUsei))
-		}
-	} else {
-		totalSupply = totalSupply.Add(sdk.NewCoin(baseDenom, weiInUsei))
-	}
-```
-
-**File:** types/denom.go (L14-31)
-```go
-// RegisterDenom registers a denomination with a corresponding unit. If the
-// denomination is already registered, an error will be returned.
-func RegisterDenom(denom string, unit Dec) error {
-	if err := ValidateDenom(denom); err != nil {
-		return err
-	}
-
-	if _, ok := denomUnits[denom]; ok {
-		return fmt.Errorf("denom %s already registered", denom)
-	}
-
-	denomUnits[denom] = unit
-
-	if baseDenom == "" || unit.LT(denomUnits[baseDenom]) {
-		baseDenom = denom
-	}
-	return nil
-}
-```
-
-**File:** types/denom.go (L48-54)
-```go
-// GetBaseDenom returns the denom of smallest unit registered
-func GetBaseDenom() (string, error) {
-	if baseDenom == "" {
-		return "", fmt.Errorf("no denom is registered")
-	}
-	return baseDenom, nil
-}
-```
-
-**File:** simapp/simd/cmd/root.go (L149-152)
-```go
-func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
-	cfg := sdk.GetConfig()
-	cfg.Seal()
-
-```
-
-**File:** simapp/simd/main.go (L12-24)
-```go
-func main() {
-	rootCmd, _ := cmd.NewRootCmd()
-
-	if err := svrcmd.Execute(rootCmd, simapp.DefaultNodeHome); err != nil {
-		switch e := err.(type) {
-		case server.ErrorCode:
-			os.Exit(e.Code)
-
-		default:
-			os.Exit(1)
-		}
-	}
-}
-```
-
-**File:** x/bank/keeper/keeper_test.go (L100-101)
-```go
-func (suite *IntegrationTestSuite) SetupTest() {
-	sdk.RegisterDenom(sdk.DefaultBondDenom, sdk.OneDec())
-```
-
-**File:** simapp/app.go (L591-599)
-```go
-// InitChainer application update at chain initialization
-func (app *SimApp) InitChainer(ctx sdk.Context, req abci.RequestInitChain) abci.ResponseInitChain {
-	var genesisState GenesisState
-	if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
 		panic(err)
-	}
-	app.UpgradeKeeper.SetModuleVersionMap(ctx, app.mm.GetVersionMap())
-	return app.mm.InitGenesis(ctx, app.appCodec, genesisState, genesistypes.GenesisImportConfig{})
-}
-```
-
-**File:** proto/cosmos/bank/v1beta1/genesis.proto (L26-28)
-```text
-  // wei balances
-  repeated WeiBalance wei_balances = 5 [(gogoproto.nullable) = false];
-}
-```
-
-**File:** x/bank/keeper/send.go (L52-52)
-```go
-var OneUseiInWei sdk.Int = sdk.NewInt(1_000_000_000_000)
-```
-
-**File:** types/staking.go (L7-7)
-```go
-	DefaultBondDenom = "usei"
-```
-
-**File:** x/bank/keeper/genesis_test.go (L86-89)
-```go
-	weiBalances := []types.WeiBalance{
-		{Amount: sdk.OneInt(), Address: "cosmos1f9xjhxm0plzrh9cskf4qee4pc2xwp0n0556gh0"},
-		{Amount: keeper.OneUseiInWei.Sub(sdk.OneInt()), Address: "cosmos1m3h30wlvsf8llruxtpukdvsy0km2kum8g38c8q"},
-	}
 ```

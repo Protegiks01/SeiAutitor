@@ -1,359 +1,240 @@
-Based on my thorough investigation of the codebase, I have validated this security claim and determined it to be a **valid vulnerability**.
-
 # Audit Report
 
 ## Title
-Governance Module Allows Zero-Deposit Proposal Spam Enabling Resource Exhaustion Attack
+Network Halt Due to Missing Nil Check in Validator Reward Allocation Loop
 
 ## Summary
-The governance module's `ValidateBasic()` function fails to enforce the specification requirement that proposals must have non-zero initial deposits, allowing attackers to spam the network with unlimited proposals at minimal cost (only gas fees). This enables sustained resource exhaustion attacks that can exceed the 30% resource consumption threshold.
+The `AllocateTokens` function in the distribution module lacks a nil check when allocating rewards to validators who voted in the previous block. When a validator is removed from state between voting in block N and reward distribution in block N+1, the code attempts to dereference a nil validator interface, causing a deterministic panic that crashes all nodes simultaneously and halts the network.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
-**Location:**
-- Validation logic: [1](#0-0) 
-- Proposal submission handler: [2](#0-1) 
-- Deposit processing: [3](#0-2) 
-- EndBlocker cleanup: [4](#0-3) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:**
-According to the governance specification, proposals should require non-zero initial deposits to prevent spam. The specification explicitly states: [5](#0-4) 
+**Intended logic:** 
+The reward allocation loop should safely distribute fees to all validators who participated in consensus, handling edge cases where validators may have been removed from state between the voting phase and reward distribution phase.
 
-**Actual Logic:**
-The implementation's `ValidateBasic()` function only checks if coins are valid and not negative, but does NOT reject zero or empty deposits. [6](#0-5) 
+**Actual logic:** 
+The code retrieves validators via `ValidatorByConsAddr` without checking for nil before passing them to `AllocateTokensToValidator`. When the validator is nil, the immediate call to `val.GetCommission()` causes a nil pointer dereference panic. [2](#0-1) 
 
-The underlying `Coins.Validate()` function explicitly allows empty coin collections: [7](#0-6) 
+**Exploitation path:**
+1. **Block N**: A bonded validator participates in consensus and votes. All delegations are removed via `Undelegate` transactions, causing `DelegatorShares` to reach zero.
 
-Additionally, no rate limiting mechanism exists in the ante handler chain. [8](#0-7) 
+2. **Block N EndBlock**: The staking module processes validator state changes:
+   - `ApplyAndReturnValidatorSetUpdates` transitions the validator from Bonded → Unbonding [3](#0-2) 
+   
+   - With a short unbonding period (validation only requires > 0), `UnbondAllMatureValidators` immediately transitions the validator from Unbonding → Unbonded [4](#0-3) 
+   
+   - Since `DelegatorShares.IsZero()` and validator is `IsUnbonded()`, `RemoveValidator` deletes the validator including its consensus address mapping [5](#0-4) 
 
-When `AddDeposit()` is called with empty coins, the `SendCoinsFromAccountToModule()` operation succeeds as a no-op (the for loop in `SubUnlockedCoins` doesn't execute with empty coins), allowing the proposal to be created with zero total deposit. [9](#0-8) 
+3. **Block N+1 BeginBlock**: Distribution module's `BeginBlocker` calls `AllocateTokens` with votes from block N [6](#0-5) 
+   
+   - `ValidatorByConsAddr` returns nil for the removed validator [7](#0-6) 
+   
+   - The code calls `AllocateTokensToValidator(ctx, nil, reward)` without checking nil, causing immediate panic in BeginBlock
 
-**Exploitation Path:**
-1. Attacker submits `MsgSubmitProposal` transactions with `InitialDeposit: sdk.Coins{}` (empty coins)
-2. `ValidateBasic()` passes since empty coins are considered valid
-3. Proposal is created via `SubmitProposalWithExpedite()` and stored in state
-4. Proposals remain in inactive queue for `MaxDepositPeriod` (default 2 days) [10](#0-9) 
-5. During this period, proposals consume storage space, memory, and EndBlocker processing time
-6. Attacker can sustain attack continuously, submitting thousands of proposals per day
-7. After deposit period expires, EndBlocker must iterate and cleanup all expired proposals [11](#0-10) 
-
-**Security Guarantee Broken:**
-The governance system's denial-of-service protection invariant is violated. The specification's deposit requirement is meant to economically disincentivize spam, but the implementation allows bypassing this entirely.
+**Security guarantee broken:** 
+Network liveness and availability. BeginBlock must complete successfully for consensus to proceed. The panic violates the invariant that all state transitions must be handled gracefully without crashing the system.
 
 ## Impact Explanation
 
-An attacker can execute this attack at minimal cost (only gas fees, no deposits required) to cause significant resource consumption:
+This vulnerability causes complete network shutdown when triggered. Since BeginBlock execution is deterministic and consensus-critical, all validators process identical state and crash at the same block height. This results in:
 
-**For 100,000-1,000,000 active proposals (achievable with $1,000-$10,000 in gas costs):**
+1. **Total network halt** - No new blocks can be produced since all nodes panic
+2. **Loss of transaction finality** - All pending transactions remain unprocessed
+3. **Requires emergency intervention** - Manual coordination among validators to restart nodes, potentially requiring a coordinated upgrade or hard fork
 
-1. **State Bloat**: 100MB - 1GB of additional blockchain state storage
-2. **EndBlocker Processing**: Must process 3-35 expired proposals per block (versus normal 0-1), representing a 10-35x increase in governance module work
-3. **Query Performance**: Functions like `GetProposals()` must iterate through hundreds of thousands of proposals [12](#0-11) , causing severe degradation or timeouts
-4. **Memory Consumption**: Loading large numbers of proposals significantly increases RAM usage across all nodes
-
-The combined CPU, memory, I/O, and query processing overhead can exceed the 30% resource consumption threshold, particularly when considering that the governance module's work increases by 10-35x. If the governance EndBlocker normally represents 1-2% of total node processing, a 35x increase brings it to 35-70% of its previous load, translating to approximately 34-68% increase in total node resource consumption.
+The severity qualifies as **High** per the specified impact criteria: "Network not being able to confirm new transactions (total network shutdown)."
 
 ## Likelihood Explanation
 
-**Likelihood: HIGH**
+**Who can trigger:** Any network participant with delegations can submit `Undelegate` transactions. No special privileges required.
 
-- **Who can execute**: Any user with funds for gas fees
-- **Prerequisites**: None beyond basic transaction submission capability  
-- **Cost**: Minimal - only gas fees ($1,000-$10,000 for significant impact)
-- **Detectability**: No detection mechanisms exist
-- **Preventability**: No rate limiting or minimum deposit enforcement
-- **Sustainability**: Attack can be maintained continuously as old proposals expire and new ones are submitted
+**Conditions:**
+1. Unbonding period configured to a short duration (validation only requires > 0, allowing values as low as 1 nanosecond) [8](#0-7) 
 
-The attack is trivial to execute through standard transaction submission and requires no special privileges or complex setup.
+2. A validator must have all delegations removed in a single block
+3. The validator must participate in consensus during that block
+
+**Frequency:**
+- With short unbonding periods (commonly used in testnets): Moderately likely during normal operations
+- With standard periods: Less likely but still possible when unbonding naturally completes
+
+**Critical Evidence of Known Edge Case:**
+
+The code explicitly acknowledges this scenario can occur in the proposer reward allocation, which includes a nil check and detailed warning: [9](#0-8) 
+
+The comments confirm: "previous proposer can be unknown if say, the unbonding period is 1 block" and that validators can be "removed entirely by block X+1's endblock."
+
+Additionally, the codebase comments explicitly acknowledge instant unbonding as a supported scenario: [10](#0-9) 
+
+Furthermore, other modules (evidence and slashing) defensively check for nil validators when calling `ValidatorByConsAddr`, confirming this is a known pattern that requires defensive handling throughout the codebase.
 
 ## Recommendation
 
-Implement multiple protective measures:
+Add a nil check in the vote allocation loop, mirroring the defensive approach used for proposer rewards:
 
-1. **Enforce Non-Zero Initial Deposit**: Add validation to reject zero/empty deposits:
 ```go
-// In x/gov/types/msgs.go ValidateBasic()
-if m.InitialDeposit.IsZero() || m.InitialDeposit.Empty() {
-    return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, "initial deposit cannot be zero or empty")
+for _, vote := range bondedVotes {
+    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+    
+    if validator == nil {
+        logger.Error(fmt.Sprintf(
+            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
+            "This should happen only if the validator unbonded completely within a single block.",
+            vote.Validator.Address.String()))
+        continue
+    }
+    
+    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+    reward := feeMultiplier.MulDecTruncate(powerFraction)
+    
+    k.AllocateTokensToValidator(ctx, validator, reward)
+    remaining = remaining.Sub(reward)
 }
 ```
 
-2. **Implement Rate Limiting**: Add an ante decorator to limit proposal submissions per address per time period (e.g., maximum 5 proposals per address per day)
-
-3. **Increase Minimum Gas Cost**: Set higher gas consumption for proposal submission to make spam attacks economically infeasible
+When a validator is removed, their allocated rewards remain in the pool and get added to the community pool at function end, maintaining consistency with proposer reward behavior.
 
 ## Proof of Concept
 
-**Test demonstrates zero-deposit proposals are accepted:**
+**Test Location:** `x/distribution/keeper/allocation_test.go`
 
-The provided PoC in the report successfully demonstrates that:
-- Proposals can be submitted with `sdk.Coins{}` (empty deposit)
-- All such proposals pass validation and are stored in state
-- Proposals remain queryable and consume resources
-- EndBlocker must process all expired proposals for cleanup
+**Setup:**
+1. Initialize test app with 1-nanosecond unbonding period via staking params
+2. Create a validator with minimal delegation (e.g., 100 tokens)
+3. Fund the fee collector module account with distributable fees
+4. Include the validator in the vote list for block N
 
-The test can be executed by:
-- Setup: Initialize test application with governance keeper
-- Action: Submit 100+ proposals with empty `InitialDeposit`
-- Result: All proposals are successfully created with `TotalDeposit.IsZero() == true`, stored in state, and would need to be processed by EndBlocker after the deposit period expires
+**Trigger:**
+1. Submit `Undelegate` messages removing all delegations from the validator
+2. Call `staking.EndBlocker(ctx)` to process validator state changes:
+   - Validator transitions Bonded → Unbonding
+   - Unbonding completes immediately (1ns period elapsed)
+   - Validator removed from state due to zero delegator shares
+3. Call `distribution.BeginBlocker(ctx, req)` with `req.LastCommitInfo.Votes` containing the removed validator
 
-This confirms the implementation allows zero-deposit proposal spam, directly contradicting the specification's intended behavior and enabling the resource exhaustion attack vector.
+**Expected Result:**
+Panic with nil pointer dereference when `AllocateTokens` attempts to call `val.GetCommission()` on the nil interface, causing BeginBlock to fail and halt the network.
 
 ## Notes
 
-This vulnerability exists due to a critical gap between the specification and implementation. While the specification explicitly requires non-zero deposits to prevent spam, the implementation's validation logic only checks that coins are valid and non-negative, inadvertently allowing empty coin collections. The absence of rate limiting compounds this issue, making sustained attacks economically viable at scale.
+The vulnerability is confirmed by a critical code inconsistency: the proposer reward allocation path includes defensive nil checking with detailed warnings, while the voter reward allocation path lacks this protection despite calling the same underlying function and facing identical risks. This pattern, combined with explicit comments acknowledging the edge case and defensive nil checks in other modules (evidence and slashing), proves this is an oversight in defensive programming rather than intentional design. The deterministic nature of BeginBlock execution ensures all validators crash simultaneously, making this a network-halting vulnerability rather than a node-specific issue.
 
 ### Citations
 
-**File:** x/gov/types/msgs.go (L90-113)
+**File:** x/distribution/keeper/allocation.go (L68-79)
 ```go
-func (m MsgSubmitProposal) ValidateBasic() error {
-	if m.Proposer == "" {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, m.Proposer)
-	}
-	if !m.InitialDeposit.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
-	}
-	if m.InitialDeposit.IsAnyNegative() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, m.InitialDeposit.String())
-	}
-
-	content := m.GetContent()
-	if content == nil {
-		return sdkerrors.Wrap(ErrInvalidProposalContent, "missing content")
-	}
-	if !IsValidProposalType(content.ProposalType()) {
-		return sdkerrors.Wrap(ErrInvalidProposalType, content.ProposalType())
-	}
-	if err := content.ValidateBasic(); err != nil {
-		return err
-	}
-
-	return nil
-}
-```
-
-**File:** x/gov/keeper/msg_server.go (L27-39)
-```go
-func (k msgServer) SubmitProposal(goCtx context.Context, msg *types.MsgSubmitProposal) (*types.MsgSubmitProposalResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	proposal, err := k.Keeper.SubmitProposalWithExpedite(ctx, msg.GetContent(), msg.IsExpedited)
-	if err != nil {
-		return nil, err
-	}
-
-	defer telemetry.IncrCounter(1, types.ModuleName, "proposal")
-
-	votingStarted, err := k.Keeper.AddDeposit(ctx, proposal.ProposalId, msg.GetProposer(), msg.GetInitialDeposit())
-	if err != nil {
-		return nil, err
-	}
-```
-
-**File:** x/gov/keeper/deposit.go (L108-162)
-```go
-func (keeper Keeper) AddDeposit(ctx sdk.Context, proposalID uint64, depositorAddr sdk.AccAddress, depositAmount sdk.Coins) (bool, error) {
-	// Checks to see if proposal exists
-	proposal, ok := keeper.GetProposal(ctx, proposalID)
-	if !ok {
-		return false, sdkerrors.Wrapf(types.ErrUnknownProposal, "%d", proposalID)
-	}
-
-	// Check if proposal is still depositable
-	if (proposal.Status != types.StatusDepositPeriod) && (proposal.Status != types.StatusVotingPeriod) {
-		return false, sdkerrors.Wrapf(types.ErrInactiveProposal, "%d", proposalID)
-	}
-
-	// update the governance module's account coins pool
-	err := keeper.bankKeeper.SendCoinsFromAccountToModule(ctx, depositorAddr, types.ModuleName, depositAmount)
-	if err != nil {
-		return false, err
-	}
-
-	// Update proposal
-	proposal.TotalDeposit = proposal.TotalDeposit.Add(depositAmount...)
-	keeper.SetProposal(ctx, proposal)
-
-	// Check if deposit has provided sufficient total funds to transition the proposal into the voting period
-	activatedVotingPeriod := false
-
-	if proposal.Status == types.StatusDepositPeriod && proposal.TotalDeposit.IsAllGTE(keeper.GetDepositParams(ctx).GetMinimumDeposit(proposal.IsExpedited)) {
-		keeper.ActivateVotingPeriod(ctx, proposal)
-
-		activatedVotingPeriod = true
-	}
-
-	// Add or update deposit object
-	deposit, found := keeper.GetDeposit(ctx, proposalID, depositorAddr)
-
-	if found {
-		deposit.Amount = deposit.Amount.Add(depositAmount...)
 	} else {
-		deposit = types.NewDeposit(proposalID, depositorAddr, depositAmount)
+		// previous proposer can be unknown if say, the unbonding period is 1 block, so
+		// e.g. a validator undelegates at block X, it's removed entirely by
+		// block X+1's endblock, then X+2 we need to refer to the previous
+		// proposer for X+1, but we've forgotten about them.
+		logger.Error(fmt.Sprintf(
+			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
+				"This should happen only if the proposer unbonded completely within a single block, "+
+				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
+				"We recommend you investigate immediately.",
+			previousProposer.String()))
 	}
-
-	// called when deposit has been added to a proposal, however the proposal may not be active
-	keeper.AfterProposalDeposit(ctx, proposalID, depositorAddr)
-
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			types.EventTypeProposalDeposit,
-			sdk.NewAttribute(sdk.AttributeKeyAmount, depositAmount.String()),
-			sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposalID)),
-		),
-	)
-
-	keeper.SetDeposit(ctx, deposit)
-
-	return activatedVotingPeriod, nil
-}
 ```
 
-**File:** x/gov/abci.go (L19-45)
+**File:** x/distribution/keeper/allocation.go (L91-102)
 ```go
-	// delete inactive proposal from store and its deposits
-	keeper.IterateInactiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-		keeper.DeleteProposal(ctx, proposal.ProposalId)
-		keeper.DeleteDeposits(ctx, proposal.ProposalId)
+	for _, vote := range bondedVotes {
+		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
 
-		// called when proposal become inactive
-		keeper.AfterProposalFailedMinDeposit(ctx, proposal.ProposalId)
+		// TODO: Consider micro-slashing for missing votes.
+		//
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
+		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+		reward := feeMultiplier.MulDecTruncate(powerFraction)
 
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeInactiveProposal,
-				sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposal.ProposalId)),
-				sdk.NewAttribute(types.AttributeKeyProposalResult, types.AttributeValueProposalDropped),
-			),
-		)
-
-		logger.Info(
-			"proposal did not meet minimum deposit; deleted",
-			"proposal", proposal.ProposalId,
-			"title", proposal.GetTitle(),
-			"min_deposit", keeper.GetDepositParams(ctx).MinDeposit.String(),
-			"min_expedited_deposit", keeper.GetDepositParams(ctx).MinExpeditedDeposit.String(),
-			"total_deposit", proposal.TotalDeposit.String(),
-		)
-
-		return false
-	})
-```
-
-**File:** x/gov/spec/03_messages.md (L40-43)
-```markdown
-  initialDeposit = txGovSubmitProposal.InitialDeposit
-  if (initialDeposit.Atoms <= 0) OR (sender.AtomBalance < initialDeposit.Atoms)
-    // InitialDeposit is negative or null OR sender has insufficient funds
-    throw
-```
-
-**File:** types/coin.go (L217-220)
-```go
-func (coins Coins) Validate() error {
-	switch len(coins) {
-	case 0:
-		return nil
-```
-
-**File:** x/auth/ante/ante.go (L47-61)
-```go
-	anteDecorators := []sdk.AnteFullDecorator{
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
-		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
-		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-		NewIncrementSequenceDecorator(options.AccountKeeper),
+		k.AllocateTokensToValidator(ctx, validator, reward)
+		remaining = remaining.Sub(reward)
 	}
-	anteHandler, anteDepGenerator := sdk.ChainAnteDecorators(anteDecorators...)
 ```
 
-**File:** x/bank/keeper/send.go (L209-246)
+**File:** x/distribution/keeper/allocation.go (L111-115)
 ```go
-func (k BaseSendKeeper) SubUnlockedCoins(ctx sdk.Context, addr sdk.AccAddress, amt sdk.Coins, checkNeg bool) error {
-	if !amt.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
-	}
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
 
-	lockedCoins := k.LockedCoins(ctx, addr)
+```
 
-	for _, coin := range amt {
-		balance := k.GetBalance(ctx, addr, coin.Denom)
-		if checkNeg {
-			locked := sdk.NewCoin(coin.Denom, lockedCoins.AmountOf(coin.Denom))
-			spendable := balance.Sub(locked)
+**File:** x/staking/keeper/val_state_change.go (L22-26)
+```go
+	// This fixes a bug when the unbonding period is instant (is the case in
+	// some of the tests). The test expected the validator to be completely
+	// unbonded after the Endblocker (go from Bonded -> Unbonding during
+	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
+	// UnbondAllMatureValidatorQueue).
+```
 
-			_, hasNeg := sdk.Coins{spendable}.SafeSub(sdk.Coins{coin})
-			if hasNeg {
-				return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, "%s is smaller than %s", spendable, coin)
-			}
-		}
-
-		var newBalance sdk.Coin
-		if checkNeg {
-			newBalance = balance.Sub(coin)
-		} else {
-			newBalance = balance.SubUnsafe(coin)
-		}
-
-		err := k.setBalance(ctx, addr, newBalance, checkNeg)
+**File:** x/staking/keeper/val_state_change.go (L190-199)
+```go
+	for _, valAddrBytes := range noLongerBonded {
+		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
+		validator, err = k.bondedToUnbonding(ctx, validator)
 		if err != nil {
-			return err
+			return
 		}
+		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
+		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
+		updates = append(updates, validator.ABCIValidatorUpdateZero())
+	}
+```
+
+**File:** x/staking/keeper/validator.go (L176-176)
+```go
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+```
+
+**File:** x/staking/keeper/validator.go (L441-444)
+```go
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
+
+**File:** x/distribution/abci.go (L29-32)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+	}
+```
+
+**File:** x/staking/keeper/alias_functions.go (L88-96)
+```go
+// ValidatorByConsAddr gets the validator interface for a particular pubkey
+func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
+	val, found := k.GetValidatorByConsAddr(ctx, addr)
+	if !found {
+		return nil
 	}
 
-	// emit coin spent event
-	ctx.EventManager().EmitEvent(
-		types.NewCoinSpentEvent(addr, amt),
-	)
+	return val
+}
+```
+
+**File:** x/staking/types/params.go (L167-178)
+```go
+func validateUnbondingTime(i interface{}) error {
+	v, ok := i.(time.Duration)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v <= 0 {
+		return fmt.Errorf("unbonding time must be positive: %d", v)
+	}
+
 	return nil
-}
-```
-
-**File:** x/gov/types/params.go (L14-16)
-```go
-const (
-	DefaultPeriod          time.Duration = time.Hour * 24 * 2 // 2 days
-	DefaultExpeditedPeriod time.Duration = time.Hour * 24     // 1 day
-```
-
-**File:** x/gov/keeper/keeper.go (L152-167)
-```go
-func (keeper Keeper) IterateInactiveProposalsQueue(ctx sdk.Context, endTime time.Time, cb func(proposal types.Proposal) (stop bool)) {
-	iterator := keeper.InactiveProposalQueueIterator(ctx, endTime)
-
-	defer iterator.Close()
-	for ; iterator.Valid(); iterator.Next() {
-		proposalID, _ := types.SplitInactiveProposalQueueKey(iterator.Key())
-		proposal, found := keeper.GetProposal(ctx, proposalID)
-		if !found {
-			panic(fmt.Sprintf("proposal %d does not exist", proposalID))
-		}
-
-		if cb(proposal) {
-			break
-		}
-	}
-}
-```
-
-**File:** x/gov/keeper/proposal.go (L129-135)
-```go
-func (keeper Keeper) GetProposals(ctx sdk.Context) (proposals types.Proposals) {
-	keeper.IterateProposals(ctx, func(proposal types.Proposal) bool {
-		proposals = append(proposals, proposal)
-		return false
-	})
-	return
 }
 ```

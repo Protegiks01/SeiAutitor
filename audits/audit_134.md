@@ -1,313 +1,199 @@
-Based on my thorough investigation of the codebase, I will validate this security claim.
-
-## Validation Results
-
-I have traced the complete execution flow and confirmed the following:
-
-### Flow Verification
-
-**Entry Point Confirmed:** [1](#0-0) 
-
-Transaction decoding happens immediately upon CheckTx, before any validation or gas checks.
-
-**Unbounded Memory Allocation:** [2](#0-1) 
-
-The TxBody.Unmarshal function appends messages in a loop without any count validation. Each iteration allocates a new `types.Any` struct.
-
-**Memory Overhead Structure:** [3](#0-2) 
-
-Each Any struct contains significant overhead (TypeUrl string, Value []byte, cached values, multiple XXX fields), creating memory amplification beyond the wire format size.
-
-**No Message Count Validation:** [4](#0-3) 
-
-ValidateBasic() checks gas limits, fees, and signatures but does NOT check the number of messages. [5](#0-4) 
-
-validateBasicTxMsgs only requires at least one message, with no upper bound check.
-
-**Gas Consumption Occurs After Decoding:** [6](#0-5) 
-
-Messages are extracted after decoding completes. [7](#0-6) 
-
-Gas consumption for transaction size happens in the AnteHandler, which executes after all deserialization and message extraction.
-
-### Critical Vulnerability Assessment
-
-The vulnerability is **VALID** for the following reasons:
-
-1. **Design Flaw Confirmed**: Gas-based DoS protection is bypassed because memory allocation occurs before gas metering can reject oversized operations.
-
-2. **Memory Amplification**: Protobuf's efficient encoding (≈40 bytes per minimal message) expands to ≈100+ bytes in memory per Any struct, creating 2-3x amplification.
-
-3. **Realistic Attack Vector**: With block sizes allowing multi-MB transactions (testing shows 200KB-30MB range), an attacker can include tens of thousands to hundreds of thousands of messages per transaction.
-
-4. **No Special Privileges**: Any network participant can broadcast transactions without special permissions or funds.
-
-5. **Compound Effect**: Multiple such transactions submitted concurrently (normal network behavior, not brute force) compound memory consumption before garbage collection.
-
-6. **Meets Medium Severity Criteria**: The vulnerability enables "Increasing network processing node resource consumption by at least 30% without brute force actions" through legitimate transaction submission that bypasses intended protections.
-
----
-
 # Audit Report
 
 ## Title
-Unbounded Memory Allocation During Transaction Deserialization Enables Resource Exhaustion DoS
+Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
 
 ## Summary
-The transaction deserialization process allocates memory for message arrays without enforcing count limits, occurring before gas consumption checks. This allows attackers to craft transactions with excessive message counts that cause disproportionate memory allocation relative to wire size, bypassing gas-based DoS protections.
+The `TrackHistoricalInfo` function contains a pruning loop that breaks on the first missing historical entry. When `HistoricalEntries` is legitimately changed from non-zero to 0 (documented as valid for non-IBC chains) and later restored to non-zero, a gap is created that permanently prevents pruning of older entries, causing unbounded storage accumulation. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- `types/tx/tx.pb.go` (lines 2162-2165): Unbounded message array allocation
-- `baseapp/abci.go` (line 226): Immediate decoding before validation
-- `types/tx/types.go` (lines 40-102): No message count validation
+- **location**: `x/staking/keeper/historical_info.go`, lines 78-85
 
-**Intended Logic:**
-Transaction processing should prevent resource exhaustion through gas limits and validation checks that reject abusive transactions before consuming significant resources.
+- **intended logic**: The function should maintain exactly `HistoricalEntries` number of recent historical entries by pruning all entries older than `currentHeight - HistoricalEntries`.
 
-**Actual Logic:**
-During `TxBody.Unmarshal`, the code unconditionally appends each message to the array, allocating a `types.Any` struct (containing multiple fields with significant overhead) for every message in the protobuf stream. This occurs in `CheckTx` immediately after receiving transaction bytes, before any validation or gas consumption. The `ValidateBasic()` function validates gas limits, fees, and signatures but does not check message array length.
+- **actual logic**: The pruning loop starts at `currentHeight - HistoricalEntries` and iterates backward, deleting found entries but immediately breaking when encountering a missing entry (line 83). The code comment at lines 75-77 reveals the assumption: "entries to be deleted are always in a continuous range." This assumption is violated when HistoricalEntries is set to 0 and back. [2](#0-1) 
 
-**Exploitation Path:**
-1. Attacker crafts a protobuf transaction with tens of thousands of minimal messages (small type URLs and values)
-2. Wire format remains compact due to protobuf efficiency (≈40 bytes per message)
-3. Attacker broadcasts transaction to network nodes
-4. Upon receipt via CheckTx, nodes immediately call txDecoder
-5. TxBody.Unmarshal allocates memory for each message (≈100+ bytes per Any struct)
-6. Memory amplification occurs (2-3x) before gas metering can reject the transaction
-7. Multiple concurrent transactions compound memory pressure
-8. Nodes experience memory exhaustion, GC pressure, or performance degradation
+- **exploitation path**:
+  1. Network operates with `HistoricalEntries=100`, creating entries 1-100
+  2. Governance changes `HistoricalEntries` to 0 via parameter proposal (documented as legitimate for non-IBC chains)
+  3. During blocks with `HistoricalEntries=0`, no new entries are saved due to early return at lines 88-90
+  4. Governance restores `HistoricalEntries=5` via another proposal
+  5. At the next block (e.g., 111), pruning starts at height 106 (111-5)
+  6. `GetHistoricalInfo(ctx, 106)` returns `found=false` (gap period)
+  7. Break statement executes, exiting loop without deleting entries 1-100
+  8. New entries accumulate: {1-100, 111, 112, ...}
+  9. Every subsequent block hits the gap first, preventing all pruning indefinitely [3](#0-2) 
 
-**Security Guarantee Broken:**
-The gas-based DoS protection mechanism is rendered ineffective because memory allocation occurs before cost-based resource accounting can intervene.
+- **security guarantee broken**: The storage bound invariant is violated. The system should maintain at most `HistoricalEntries` entries but instead accumulates entries indefinitely after a gap is created.
 
 ## Impact Explanation
 
-This vulnerability affects all nodes processing transactions (validators, full nodes, RPC nodes). Attackers can cause excessive memory consumption leading to:
-- Out-of-memory conditions on nodes with limited resources
-- Severe garbage collection pressure degrading performance
-- Network-wide slowdown as multiple nodes process malicious transactions simultaneously
-- Potential node crashes affecting network availability
+Each historical entry contains a complete block header and full validator set. With the default 35 validators, this represents substantial data per entry. [4](#0-3) [5](#0-4) 
 
-The Medium severity is justified as it enables "Increasing network processing node resource consumption by at least 30% without brute force actions" through memory amplification that bypasses intended protections. Multiple malicious transactions (normal network behavior) compound to reach this threshold.
+Over months of operation with continuous block production, this leads to:
+- **Storage exhaustion**: Thousands of unbounded entries consuming gigabytes of disk space
+- **Resource consumption**: >30% increase compared to expected bounded levels
+- **Node instability**: Nodes crash when disk space exhausted
+- **Network degradation**: If 30%+ of nodes affected, network stability compromised
+
+This directly matches the Medium severity impact category: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
 
 ## Likelihood Explanation
 
-**High likelihood of exploitation:**
-- Any network participant can trigger by submitting transactions
-- No special permissions, accounts, or funds required beyond transaction broadcast capability
-- Works during normal network operation without special timing or state
-- Attacker can continuously submit transactions with large message arrays
-- Malicious transactions appear similar to legitimate failed transactions in logs
-- Protobuf encoding efficiency enables packing many messages in compact wire format
+**Trigger mechanism**: The `HistoricalEntries` parameter is governance-controlled and can be changed through standard parameter change proposals. [6](#0-5) 
+
+**Realistic scenario**: Setting `HistoricalEntries=0` is explicitly documented as a legitimate operation for chains that don't use IBC. The validation function allows zero values (only checks type). [7](#0-6) 
+
+**Automatic execution**: `TrackHistoricalInfo` is called automatically in `BeginBlocker` every single block, ensuring continuous accumulation once the gap is created. [8](#0-7) 
+
+**Frequency**: This can occur during normal governance operations when a chain temporarily disables historical tracking and later re-enables it. Once triggered, the effect compounds with every subsequent block indefinitely, making storage issues highly likely over the network's operational lifetime.
 
 ## Recommendation
 
-1. **Add maximum message count parameter** in auth module (e.g., `MaxMsgsPerTx = 1000`)
+Modify the pruning logic to iterate through all heights that should be pruned, regardless of gaps:
 
-2. **Implement early validation** in `TxBody.Unmarshal` to track and limit message count during deserialization, rejecting transactions before allocating excessive memory
+```go
+// Prune all entries older than retention height
+pruneHeight := ctx.BlockHeight() - int64(entryNum)
+for i := pruneHeight - 1; i >= 0; i-- {
+    _, found := k.GetHistoricalInfo(ctx, i)
+    if found {
+        k.DeleteHistoricalInfo(ctx, i)
+    }
+    // Continue checking all heights - do not break on gaps
+}
+```
 
-3. **Add message count check** in `ValidateBasic()` to validate `len(body.Messages)` against the maximum
-
-4. **Alternative: Streaming deserialization** that validates count before full allocation, or two-pass validation checking message count before unmarshaling
-
-The fix must occur before memory allocation to prevent resource exhaustion.
+Alternatively, maintain metadata tracking the oldest and newest stored entry heights to enable efficient targeted deletion without iterating through all possible heights.
 
 ## Proof of Concept
 
-**File:** `baseapp/deliver_tx_test.go`
+**Test conceptual outline** (to be added to `x/staking/keeper/historical_info_test.go`):
 
-**Setup:** Create app with codec and test message types registered
+**Setup**:
+- Initialize staking keeper with test validators
+- Set `HistoricalEntries=100`
+- Generate blocks 1-100 to create 100 historical entries
+- Verify 100 entries exist in storage
 
-**Action:** 
-- Create transaction with 100,000 minimal messages
-- Marshal to bytes
-- Measure memory before decoding
-- Call `DefaultTxDecoder` on transaction bytes
-- Measure memory after decoding
+**Action**:
+1. Change `HistoricalEntries` to 0 via `SetParams`
+2. Generate blocks 101-110 (creates gap - no entries saved due to early return)
+3. Verify entries 1-100 still exist, no entries 101-110
+4. Change `HistoricalEntries` to 5
+5. Generate blocks 111-120
 
-**Result:**
-- Transaction deserializes successfully without errors
-- Memory allocation >10MB occurs for 100,000 messages
-- No limit check prevents deserialization
-- Demonstrates memory is allocated before any gas consumption or validation that could reject the transaction
+**Expected Result**: Only 5 most recent entries (116-120) should exist
 
-**Notes**
+**Actual Result**: 
+- Entries 1-100 remain (never pruned)
+- Entries 111-120 are created
+- Total: 110 entries instead of 5
+- Storage bound of `HistoricalEntries=5` is permanently violated
 
-The vulnerability fundamentally breaks the intended DoS protection model. While gas limits are designed to prevent resource abuse, they cannot protect against this attack vector because memory allocation occurs in the deserialization phase before gas metering begins. The memory amplification (2-3x from wire format to in-memory structures) combined with the ability to send multiple transactions creates a realistic attack scenario that meets the Medium severity threshold without requiring brute force.
+The test demonstrates that after creating a gap by setting `HistoricalEntries=0`, the storage bound invariant is permanently broken, with entries accumulating indefinitely beyond the configured limit.
 
 ### Citations
 
-**File:** baseapp/abci.go (L226-226)
+**File:** x/staking/keeper/historical_info.go (L68-98)
 ```go
-	tx, err := app.txDecoder(req.Tx)
-```
+func (k Keeper) TrackHistoricalInfo(ctx sdk.Context) {
+	entryNum := k.HistoricalEntries(ctx)
 
-**File:** types/tx/tx.pb.go (L2162-2165)
-```go
-			m.Messages = append(m.Messages, &types.Any{})
-			if err := m.Messages[len(m.Messages)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-```
-
-**File:** codec/types/any.go (L11-57)
-```go
-type Any struct {
-	// A URL/resource name that uniquely identifies the type of the serialized
-	// protocol buffer message. This string must contain at least
-	// one "/" character. The last segment of the URL's path must represent
-	// the fully qualified name of the type (as in
-	// `path/google.protobuf.Duration`). The name should be in a canonical form
-	// (e.g., leading "." is not accepted).
-	//
-	// In practice, teams usually precompile into the binary all types that they
-	// expect it to use in the context of Any. However, for URLs which use the
-	// scheme `http`, `https`, or no scheme, one can optionally set up a type
-	// server that maps type URLs to message definitions as follows:
-	//
-	// * If no scheme is provided, `https` is assumed.
-	// * An HTTP GET on the URL must yield a [google.protobuf.Type][]
-	//   value in binary format, or produce an error.
-	// * Applications are allowed to cache lookup results based on the
-	//   URL, or have them precompiled into a binary to avoid any
-	//   lookup. Therefore, binary compatibility needs to be preserved
-	//   on changes to types. (Use versioned type names to manage
-	//   breaking changes.)
-	//
-	// Note: this functionality is not currently available in the official
-	// protobuf release, and it is not used for type URLs beginning with
-	// type.googleapis.com.
-	//
-	// Schemes other than `http`, `https` (or the empty scheme) might be
-	// used with implementation specific semantics.
-
-	// nolint
-	TypeUrl string `protobuf:"bytes,1,opt,name=type_url,json=typeUrl,proto3" json:"type_url,omitempty"`
-	// Must be a valid serialized protocol buffer of the above specified type.
-	Value []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-
-	// nolint
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-
-	// nolint
-	XXX_unrecognized []byte `json:"-"`
-
-	// nolint
-	XXX_sizecache int32 `json:"-"`
-
-	cachedValue interface{}
-
-	compat *anyCompat
-}
-```
-
-**File:** types/tx/types.go (L40-102)
-```go
-func (t *Tx) ValidateBasic() error {
-	if t == nil {
-		return fmt.Errorf("bad Tx")
-	}
-
-	body := t.Body
-	if body == nil {
-		return fmt.Errorf("missing TxBody")
-	}
-
-	authInfo := t.AuthInfo
-	if authInfo == nil {
-		return fmt.Errorf("missing AuthInfo")
-	}
-
-	fee := authInfo.Fee
-	if fee == nil {
-		return fmt.Errorf("missing fee")
-	}
-
-	if fee.GasLimit > MaxGasWanted {
-		return sdkerrors.Wrapf(
-			sdkerrors.ErrInvalidRequest,
-			"invalid gas supplied; %d > %d", fee.GasLimit, MaxGasWanted,
-		)
-	}
-
-	if fee.Amount.IsAnyNil() {
-		return sdkerrors.Wrapf(
-			sdkerrors.ErrInsufficientFee,
-			"invalid fee provided: null",
-		)
-	}
-
-	if fee.Amount.IsAnyNegative() {
-		return sdkerrors.Wrapf(
-			sdkerrors.ErrInsufficientFee,
-			"invalid fee provided: %s", fee.Amount,
-		)
-	}
-
-	if fee.Payer != "" {
-		_, err := sdk.AccAddressFromBech32(fee.Payer)
-		if err != nil {
-			return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid fee payer address (%s)", err)
+	// Prune store to ensure we only have parameter-defined historical entries.
+	// In most cases, this will involve removing a single historical entry.
+	// In the rare scenario when the historical entries gets reduced to a lower value k'
+	// from the original value k. k - k' entries must be deleted from the store.
+	// Since the entries to be deleted are always in a continuous range, we can iterate
+	// over the historical entries starting from the most recent version to be pruned
+	// and then return at the first empty entry.
+	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
+		_, found := k.GetHistoricalInfo(ctx, i)
+		if found {
+			k.DeleteHistoricalInfo(ctx, i)
+		} else {
+			break
 		}
 	}
 
-	sigs := t.Signatures
-
-	if len(sigs) == 0 {
-		return sdkerrors.ErrNoSignatures
+	// if there is no need to persist historicalInfo, return
+	if entryNum == 0 {
+		return
 	}
 
-	if len(sigs) != len(t.GetSigners()) {
-		return sdkerrors.Wrapf(
-			sdkerrors.ErrUnauthorized,
-			"wrong number of signers; expected %d, got %d", len(t.GetSigners()), len(sigs),
-		)
-	}
+	// Create HistoricalInfo struct
+	lastVals := k.GetLastValidators(ctx)
+	historicalEntry := types.NewHistoricalInfo(ctx.BlockHeader(), lastVals, k.PowerReduction(ctx))
 
-	return nil
+	// Set latest HistoricalInfo at current height
+	k.SetHistoricalInfo(ctx, ctx.BlockHeight(), &historicalEntry)
 }
 ```
 
-**File:** baseapp/baseapp.go (L788-801)
+**File:** x/staking/types/params.go (L24-24)
 ```go
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-	if len(msgs) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
-	}
+	DefaultMaxValidators uint32 = 35
+```
 
-	for _, msg := range msgs {
-		err := msg.ValidateBasic()
-		if err != nil {
-			return err
-		}
-	}
+**File:** x/staking/types/params.go (L29-32)
+```go
+	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
+	// value by not adding the staking module to the application module manager's
+	// SetOrderBeginBlockers.
+	DefaultHistoricalEntries uint32 = 10000
+```
 
-	return nil
+**File:** x/staking/types/params.go (L81-92)
+```go
+func (p *Params) ParamSetPairs() paramtypes.ParamSetPairs {
+	return paramtypes.ParamSetPairs{
+		paramtypes.NewParamSetPair(KeyUnbondingTime, &p.UnbondingTime, validateUnbondingTime),
+		paramtypes.NewParamSetPair(KeyMaxValidators, &p.MaxValidators, validateMaxValidators),
+		paramtypes.NewParamSetPair(KeyMaxEntries, &p.MaxEntries, validateMaxEntries),
+		paramtypes.NewParamSetPair(KeyMaxVotingPower, &p.MaxVotingPowerRatio, validateMaxVotingPowerRatio),
+		paramtypes.NewParamSetPair(KeyMaxVotingPowerEnforcementThreshold, &p.MaxVotingPowerEnforcementThreshold, validateMaxVotingPowerEnforcementThreshold),
+		paramtypes.NewParamSetPair(KeyHistoricalEntries, &p.HistoricalEntries, validateHistoricalEntries),
+		paramtypes.NewParamSetPair(KeyBondDenom, &p.BondDenom, validateBondDenom),
+		paramtypes.NewParamSetPair(KeyMinCommissionRate, &p.MinCommissionRate, validateMinCommissionRate),
+	}
 }
 ```
 
-**File:** baseapp/baseapp.go (L921-925)
+**File:** x/staking/types/params.go (L242-249)
 ```go
-	msgs := tx.GetMsgs()
-
-	if err := validateBasicTxMsgs(msgs); err != nil {
-		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
-	}
-```
-
-**File:** x/auth/ante/basic.go (L109-116)
-```go
-func (cgts ConsumeTxSizeGasDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
+func validateHistoricalEntries(i interface{}) error {
+	_, ok := i.(uint32)
 	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
-	params := cgts.ak.GetParams(ctx)
 
-	ctx.GasMeter().ConsumeGas(params.TxSizeCostPerByte*sdk.Gas(len(ctx.TxBytes())), "txSize")
+	return nil
+}
+```
+
+**File:** x/staking/types/historical_info.go (L17-26)
+```go
+func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
+	// Must sort in the same way that tendermint does
+	sort.SliceStable(valSet, func(i, j int) bool {
+		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
+	})
+
+	return HistoricalInfo{
+		Header: header,
+		Valset: valSet,
+	}
+```
+
+**File:** x/staking/abci.go (L15-19)
+```go
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+
+	k.TrackHistoricalInfo(ctx)
+}
 ```

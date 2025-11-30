@@ -4,51 +4,53 @@
 Front-Running Module Account Creation Causes Network-Wide Panic During Chain Upgrades
 
 ## Summary
-An attacker can front-run module account creation during chain upgrades by pre-creating a `BaseAccount` at the deterministic module address before the upgrade executes. When the new module's `InitGenesis` calls `GetModuleAccount`, it encounters the `BaseAccount` instead of a `ModuleAccountI`, triggering an unconditional panic that halts all validators simultaneously.
+An attacker can exploit the static nature of the `blockedAddrs` mechanism to pre-create a `BaseAccount` at a future module's deterministic address before a chain upgrade. During the upgrade, when `InitGenesis` calls `GetModuleAccount`, the system encounters the `BaseAccount` instead of the expected `ModuleAccountI`, triggering an unconditional panic that simultaneously halts all validators.
 
 ## Impact
-**High**
+High
 
 ## Finding Description
 
 **Location:**
 - Panic location: [1](#0-0) 
-- Account creation vector: [2](#0-1) 
+- Account creation: [2](#0-1) 
 - Blocked address check: [3](#0-2) 
-- Module address initialization: [4](#0-3) 
+- Module address calculation: [4](#0-3) 
+- Blocked addresses initialization: [5](#0-4) 
 
 **Intended Logic:**
 Module accounts should only exist as `ModuleAccountI` types at their deterministic addresses. The `blockedAddrs` mechanism should prevent regular users from creating accounts at module addresses. When a chain upgrade adds a new module, `GetModuleAccount` should safely create the module account during `InitGenesis`.
 
 **Actual Logic:**
-The `blockedAddrs` map is populated only from existing modules in `maccPerms` at app initialization. [4](#0-3)  Future modules that will be added via upgrade are not in this map. When an attacker sends coins to a future module address, the `BlockedAddr` check passes because the address isn't blocked yet. [5](#0-4)  This creates a `BaseAccount` at the module address. [6](#0-5)  During the upgrade, when `GetModuleAccountAndPermissions` retrieves this account and finds it's not a `ModuleAccountI`, it executes an unconditional panic. [7](#0-6) 
+The `blockedAddrs` map is populated only from existing modules in `maccPerms` at app initialization [6](#0-5) . Future modules added via upgrade are not in this map. When an attacker sends coins to a future module address, the `BlockedAddr` check passes because the address isn't blocked yet [7](#0-6) . This creates a `BaseAccount` at the module address using the default account prototype [8](#0-7)  which is configured as `ProtoBaseAccount` [9](#0-8) . During the upgrade, when `GetModuleAccountAndPermissions` retrieves this account and finds it's not a `ModuleAccountI`, it executes an unconditional panic.
 
 **Exploitation Path:**
-1. Attacker observes upgrade proposal announcing new module "newmodule" at height 100000
-2. Attacker calculates deterministic module address: `crypto.AddressHash([]byte("newmodule"))` [8](#0-7) 
-3. At block 99990, attacker submits `MsgSend` with 1 token to the calculated address
-4. `Send` handler checks `BlockedAddr(to)` - returns false (address not in blockedAddrs yet)
-5. `SendCoins` creates `BaseAccount` at module address via `NewAccountWithAddress` [9](#0-8) 
-6. At block 100000, upgrade executes `RunMigrations` [10](#0-9) 
-7. New module's `InitGenesis` calls `GetModuleAccount` (as seen in multiple modules like mint, gov, auth)
-8. `GetModuleAccountAndPermissions` finds `BaseAccount`, executes `panic("account is not a module account")`
-9. All validators panic at the same height during consensus
-10. Network completely halts
+1. Attacker observes upgrade proposal announcing new module "newmodule" with upgrade height 100000
+2. Attacker calculates deterministic module address using `crypto.AddressHash([]byte("newmodule"))` 
+3. Before upgrade (e.g., block 99990), attacker submits `MsgSend` with 1 token to the calculated address
+4. `Send` handler checks `BlockedAddr(to)` - returns false because address is not in `blockedAddrs` yet
+5. `SendCoins` creates `BaseAccount` at module address via `NewAccountWithAddress`
+6. At block 100000, upgrade executes and `RunMigrations` is called [10](#0-9) 
+7. New module's `InitGenesis` is called for modules not in fromVM [11](#0-10) 
+8. `InitGenesis` calls `GetModuleAccount` which calls `GetModuleAccountAndPermissions`
+9. `GetModuleAccountAndPermissions` finds `BaseAccount` at module address, type assertion fails, panic occurs
+10. All validators panic at the same height during consensus execution
+11. Network completely halts
 
 **Security Guarantee Broken:**
-Network availability and upgrade safety are violated. The deterministic module address derivation combined with the static blockedAddrs map creates a race condition where attackers can claim future module addresses before they're protected.
+Network availability and upgrade safety are violated. The deterministic module address derivation combined with the static `blockedAddrs` map creates a race condition where attackers can claim future module addresses before they're protected.
 
 ## Impact Explanation
 
 This vulnerability causes complete network shutdown affecting all validators simultaneously. When all validators panic at the same block height during upgrade execution:
 
 - No new transactions can be confirmed after the upgrade height
-- The upgrade plan is already consumed but module initialization failed, leaving state inconsistent
+- The upgrade plan is consumed but module initialization failed, leaving state inconsistent
 - Chain cannot progress without manual intervention
 - Recovery requires coordinated hard fork with state export/import or emergency patch
 - Existing upgrade cannot be rolled back cleanly
 
-This matches the HIGH impact criterion: "Network not being able to confirm new transactions (total network shutdown)."
+This matches the specified impact criterion: "Network not being able to confirm new transactions (total network shutdown)."
 
 ## Likelihood Explanation
 
@@ -67,7 +69,7 @@ This matches the HIGH impact criterion: "Network not being able to confirm new t
 - Indistinguishable from legitimate transfers
 - Only becomes apparent when all validators crash during upgrade
 
-The combination of public information, minimal cost, large time window, and inability to detect makes exploitation highly likely.
+The combination of public information, minimal cost, large attack window, and inability to detect makes exploitation highly likely.
 
 ## Recommendation
 
@@ -97,39 +99,30 @@ Implement proactive blocking of future module addresses by maintaining a registr
 
 ## Proof of Concept
 
-**Test File:** `x/auth/keeper/keeper_test.go`
-
-**Setup:**
-1. Create test app and context using `createTestApp(true)`
-2. Calculate deterministic module address for "newmodule" using `types.NewModuleAddress(moduleName)`
-3. Create and fund attacker account with tokens
+**Test Setup:**
+1. Create test app and context
+2. Calculate deterministic module address for "testmodule" using `types.NewModuleAddress("testmodule")`
+3. Fund an attacker account with tokens
 
 **Action:**
-1. Attacker sends 1 token to calculated module address via `BankKeeper.SendCoins`
-2. Verify `BaseAccount` created at module address (type assertion confirms it's not `ModuleAccount`)
-3. Call `GetModuleAccount` for the module name
+1. Before the module is added to `maccPerms`, send 1 token to the calculated module address via `BankKeeper.SendCoins`
+2. Verify a `BaseAccount` is created at the module address (type assertion confirms it's not a `ModuleAccount`)
+3. Update the app's `maccPerms` to include "testmodule" and reinitialize the AccountKeeper with the new permissions
+4. Call `GetModuleAccount(ctx, "testmodule")`
 
-**Result:**
+**Expected Result:**
 - `GetModuleAccount` panics with message "account is not a module account"
-- Demonstrates that validators would crash during actual upgrade
-- Confirms network shutdown scenario
-
-The test validates that the attack path is feasible and would cause the claimed network-wide panic during consensus execution.
+- Demonstrates that validators would crash during actual upgrade when `InitGenesis` is called
+- Confirms the network shutdown scenario
 
 ## Notes
 
-The vulnerability stems from a fundamental design assumption that module addresses are "reserved" through the `blockedAddrs` mechanism, but this mechanism is static and only protects addresses of modules that exist at initialization time. The deterministic address derivation [8](#0-7)  allows attackers to precompute future module addresses, and the account creation logic [6](#0-5)  permits account creation at any non-blocked address. Combined with the unconditional panic [7](#0-6)  and the upgrade flow that calls `InitGenesis` for new modules [11](#0-10) , this creates a critical vulnerability in the upgrade process.
+The vulnerability stems from a fundamental design assumption that module addresses are "reserved" through the `blockedAddrs` mechanism, but this mechanism is static and only protects addresses of modules that exist at initialization time. The deterministic address derivation allows attackers to precompute future module addresses, and the account creation logic permits account creation at any non-blocked address. Combined with the unconditional panic and the upgrade flow that calls `InitGenesis` for new modules, this creates a critical vulnerability in the upgrade process.
 
 ### Citations
 
-**File:** x/auth/keeper/keeper.go (L181-202)
+**File:** x/auth/keeper/keeper.go (L187-193)
 ```go
-func (ak AccountKeeper) GetModuleAccountAndPermissions(ctx sdk.Context, moduleName string) (types.ModuleAccountI, []string) {
-	addr, perms := ak.GetModuleAddressAndPermissions(moduleName)
-	if addr == nil {
-		return nil, []string{}
-	}
-
 	acc := ak.GetAccount(ctx, addr)
 	if acc != nil {
 		macc, ok := acc.(types.ModuleAccountI)
@@ -137,106 +130,32 @@ func (ak AccountKeeper) GetModuleAccountAndPermissions(ctx sdk.Context, moduleNa
 			panic("account is not a module account")
 		}
 		return macc, perms
-	}
-
-	// create a new module account
-	macc := types.NewEmptyModuleAccount(moduleName, perms...)
-	maccI := (ak.NewAccount(ctx, macc)).(types.ModuleAccountI) // set the account number
-	ak.SetModuleAccount(ctx, maccI)
-
-	return maccI, perms
-}
 ```
 
-**File:** x/bank/keeper/send.go (L155-173)
+**File:** x/bank/keeper/send.go (L166-170)
 ```go
-// SendCoins transfers amt coins from a sending account to a receiving account.
-// An error is returned upon failure.
-func (k BaseSendKeeper) SendCoins(ctx sdk.Context, fromAddr sdk.AccAddress, toAddr sdk.AccAddress, amt sdk.Coins) error {
-	if err := k.SendCoinsWithoutAccCreation(ctx, fromAddr, toAddr, amt); err != nil {
-		return err
-	}
-
-	// Create account if recipient does not exist.
-	//
-	// NOTE: This should ultimately be removed in favor a more flexible approach
-	// such as delegated fee messages.
 	accExists := k.ak.HasAccount(ctx, toAddr)
 	if !accExists {
 		defer telemetry.IncrCounter(1, "new", "account")
 		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
 	}
-
-	return nil
-}
 ```
 
-**File:** x/bank/keeper/msg_server.go (L26-76)
+**File:** x/bank/keeper/send.go (L348-355)
 ```go
-func (k msgServer) Send(goCtx context.Context, msg *types.MsgSend) (*types.MsgSendResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-
-	if err := k.IsSendEnabledCoins(ctx, msg.Amount...); err != nil {
-		return nil, err
-	}
-
-	from, err := sdk.AccAddressFromBech32(msg.FromAddress)
-	if err != nil {
-		return nil, err
-	}
-	to, err := sdk.AccAddressFromBech32(msg.ToAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	allowListCache := make(map[string]AllowedAddresses)
-	if !k.IsInDenomAllowList(ctx, from, msg.Amount, allowListCache) {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to send funds", msg.FromAddress)
-	}
-
-	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to receive funds", msg.ToAddress)
-	}
-
-	err = k.SendCoins(ctx, from, to, msg.Amount)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		for _, a := range msg.Amount {
-			if a.Amount.IsInt64() {
-				telemetry.SetGaugeWithLabels(
-					[]string{"tx", "msg", "send"},
-					float32(a.Amount.Int64()),
-					[]metrics.Label{telemetry.NewLabel("denom", a.Denom)},
-				)
-			}
+func (k BaseSendKeeper) BlockedAddr(addr sdk.AccAddress) bool {
+	if len(addr) == len(CoinbaseAddressPrefix)+8 {
+		if bytes.Equal(CoinbaseAddressPrefix, addr[:len(CoinbaseAddressPrefix)]) {
+			return true
 		}
-	}()
-
-	ctx.EventManager().EmitEvent(
-		sdk.NewEvent(
-			sdk.EventTypeMessage,
-			sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
-		),
-	)
-
-	return &types.MsgSendResponse{}, nil
+	}
+	return k.blockedAddrs[addr.String()]
 }
 ```
 
-**File:** simapp/app.go (L606-614)
+**File:** x/bank/keeper/msg_server.go (L47-47)
 ```go
-// ModuleAccountAddrs returns all the app's module account addresses.
-func (app *SimApp) ModuleAccountAddrs() map[string]bool {
-	modAccAddrs := make(map[string]bool)
-	for acc := range maccPerms {
-		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
-	}
-
-	return modAccAddrs
-}
+	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
 ```
 
 **File:** x/auth/types/account.go (L162-165)
@@ -244,6 +163,37 @@ func (app *SimApp) ModuleAccountAddrs() map[string]bool {
 // NewModuleAddress creates an AccAddress from the hash of the module's name
 func NewModuleAddress(name string) sdk.AccAddress {
 	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
+}
+```
+
+**File:** simapp/app.go (L135-142)
+```go
+	maccPerms = map[string][]string{
+		authtypes.FeeCollectorName:     nil,
+		distrtypes.ModuleName:          nil,
+		minttypes.ModuleName:           {authtypes.Minter},
+		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
+		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
+		govtypes.ModuleName:            {authtypes.Burner},
+	}
+```
+
+**File:** simapp/app.go (L261-263)
+```go
+	app.AccountKeeper = authkeeper.NewAccountKeeper(
+		appCodec, keys[authtypes.StoreKey], app.GetSubspace(authtypes.ModuleName), authtypes.ProtoBaseAccount, maccPerms,
+	)
+```
+
+**File:** simapp/app.go (L607-614)
+```go
+func (app *SimApp) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range maccPerms {
+		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+	}
+
+	return modAccAddrs
 }
 ```
 
@@ -260,38 +210,8 @@ func (ak AccountKeeper) NewAccountWithAddress(ctx sdk.Context, addr sdk.AccAddre
 }
 ```
 
-**File:** types/module/module.go (L545-596)
+**File:** types/module/module.go (L575-589)
 ```go
-// Please also refer to docs/core/upgrade.md for more information.
-func (m Manager) RunMigrations(ctx sdk.Context, cfg Configurator, fromVM VersionMap) (VersionMap, error) {
-	c, ok := cfg.(configurator)
-	if !ok {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", configurator{}, cfg)
-	}
-	var modules = m.OrderMigrations
-	if modules == nil {
-		modules = DefaultMigrationsOrder(m.ModuleNames())
-	}
-
-	updatedVM := VersionMap{}
-	for _, moduleName := range modules {
-		module := m.Modules[moduleName]
-		fromVersion, exists := fromVM[moduleName]
-		toVersion := module.ConsensusVersion()
-
-		// Only run migrations when the module exists in the fromVM.
-		// Run InitGenesis otherwise.
-		//
-		// the module won't exist in the fromVM in two cases:
-		// 1. A new module is added. In this case we run InitGenesis with an
-		// empty genesis state.
-		// 2. An existing chain is upgrading to v043 for the first time. In this case,
-		// all modules have yet to be added to x/upgrade's VersionMap store.
-		if exists {
-			err := c.runModuleMigrations(ctx, moduleName, fromVersion, toVersion)
-			if err != nil {
-				return nil, err
-			}
 		} else {
 			cfgtor, ok := cfg.(configurator)
 			if !ok {
@@ -307,11 +227,9 @@ func (m Manager) RunMigrations(ctx sdk.Context, cfg Configurator, fromVM Version
 			if len(moduleValUpdates) > 0 {
 				return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "validator InitGenesis updates already set by a previous module")
 			}
-		}
+```
 
-		updatedVM[moduleName] = toVersion
-	}
-
-	return updatedVM, nil
-}
+**File:** x/mint/genesis.go (L13-13)
+```go
+	ak.GetModuleAccount(ctx, types.ModuleName)
 ```

@@ -1,10 +1,10 @@
 # Audit Report
 
 ## Title
-Unbounded Pagination Limit Causes Resource Exhaustion in gRPC Query Endpoints
+Unmetered Storage Access Operations During Parallel Execution Validation Phase
 
 ## Summary
-The pagination system in the Cosmos SDK query handlers lacks enforcement of maximum limits on user-supplied pagination parameters. This allows unauthenticated attackers to request arbitrarily large result sets, causing excessive memory consumption and CPU usage on nodes serving gRPC queries. Multiple concurrent malicious queries can exhaust node resources and degrade or halt query service availability.
+The multiversion store's validation logic in the optimistic concurrency control (OCC) parallel execution system performs storage read and iterator operations without gas metering. During validation, the `ValidateTransactionState` method directly accesses the parent store without the gas metering wrapper that protects normal transaction execution, allowing attackers to consume validator resources disproportionate to gas paid.
 
 ## Impact
 Medium
@@ -12,203 +12,313 @@ Medium
 ## Finding Description
 
 **Location:**
-- Primary vulnerability: `types/query/pagination.go` lines 61-74
-- gRPC server initialization: `server/grpc/server.go` line 19
-- Query handlers: `x/bank/keeper/grpc_query.go` lines 59-70, `x/bank/keeper/keeper.go` lines 79-101, `x/staking/keeper/grpc_query.go` lines 34-61 [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
+- `store/multiversion/store.go` lines 355 (checkReadsetAtIndex), 279-281 (validateIterator)
+- `tasks/scheduler.go` line 171 (validation trigger), line 224 (parent store initialization)
 
 **Intended Logic:**
-The pagination system should allow clients to retrieve large datasets in manageable chunks while preventing excessive resource consumption. The `DefaultLimit` of 100 entries provides a reasonable balance between usability and resource protection. The system should reject or cap unreasonably large pagination limit requests.
+All storage access operations should be gas-metered to prevent resource exhaustion attacks. The gas metering system charges for Get, Set, Iterator, and iteration operations to ensure users pay for computational resources consumed. [1](#0-0) [2](#0-1) [3](#0-2) 
 
 **Actual Logic:**
-The `Paginate` and `FilteredPaginate` functions accept any positive user-supplied limit value without validation against a maximum threshold. While `limit = 0` defaults to 100, any positive value up to `math.MaxUint64` is accepted without bounds checking. Query handlers accumulate all requested entries in memory slices (e.g., `balances`, `supply`, `validators`) before marshaling the response. The gRPC server is initialized without explicit message size limits, relying on defaults. [5](#0-4) 
+During parallel execution validation, gas metering is bypassed:
+
+1. The multiversion store's parent store is initialized using `ctx.MultiStore().GetKVStore(sk)` instead of `ctx.KVStore(sk)`, so it lacks the `gaskv.NewStore()` wrapper: [4](#0-3) 
+
+2. In `checkReadsetAtIndex`, when the latest value is nil, the code directly accesses `s.parentStore.Get()` without gas metering: [5](#0-4) 
+
+3. In `validateIterator`, the code creates parent store iterators and iterates through all keys without gas charges: [6](#0-5) 
 
 **Exploitation Path:**
-1. Attacker identifies a gRPC query endpoint that returns potentially large datasets (e.g., `TotalSupply` which can contain thousands of token denominations, or `Validators`)
-2. Attacker crafts gRPC queries with `PageRequest.Limit` set to very large values (e.g., 1,000,000 or higher)
-3. The `Paginate` function accepts this limit without validation and begins iterating through store entries
-4. Query handler unmarshals and accumulates entries in memory until either the limit is reached or the iterator is exhausted
-5. For stores with thousands of entries, this results in multi-megabyte memory allocations per query
-6. Attacker sends multiple concurrent queries (50-100+) to multiply the impact
-7. Node experiences significant memory pressure (250MB-500MB+ above baseline) and CPU consumption from iteration and unmarshaling
-8. RPC query service degrades or becomes unresponsive, affecting users and dApps that depend on it
+1. Attacker submits transaction T1 that iterates over large key ranges (e.g., 10,000+ keys)
+2. During execution, T1 pays gas for iterations through the gas-metered store wrapper
+3. T1's execution records its iterateset (all iterated keys)
+4. Attacker submits transaction T2 that writes to keys within T1's iteration range
+5. Scheduler detects conflict and triggers validation via `findConflicts` → `ValidateTransactionState`: [7](#0-6) 
+
+6. During validation, `validateIterator` creates parent store iterator and iterates through all keys without consuming gas
+7. With `maximumIterations = 10`, validation can occur up to 10 times per transaction: [8](#0-7) 
+
+8. Attacker effectively forces validators to perform 10× more storage operations than paid for
 
 **Security Guarantee Broken:**
-The system fails to enforce resource consumption limits for unauthenticated query requests, violating the principle of bounded resource usage for untrusted inputs. This enables unprivileged denial-of-service attacks against critical RPC infrastructure.
+The economic security property of gas metering is violated. The system should ensure users pay for all computational resources they consume. However, validation operations scale linearly with transaction complexity (readset/iterateset size) but are not accounted for in gas costs.
 
 ## Impact Explanation
 
-This vulnerability enables resource exhaustion attacks against nodes serving gRPC queries:
+This vulnerability enables resource exhaustion attacks against validator nodes:
 
-**Resource Consumption:**
-- Single query with large limit on TotalSupply (10,000 denominations × 500 bytes = 5MB) consumes significant memory
-- 50-100 concurrent malicious queries = 250-500MB memory allocation
-- On typical RPC nodes with 500MB baseline usage, this represents 50-100% increase (well exceeding the 30% threshold for Medium severity)
-- Sustained attacks can exhaust available memory and crash nodes
+- **Resource Consumption Multiplier**: Each validation iteration performs full storage reads and iterations proportional to the transaction's readset/iterateset size. With up to 10 potential validations per transaction, validators perform 2-11× more work than the gas payment covers.
 
-**Affected Components:**
-- All RPC nodes serving public gRPC query endpoints
-- Query service availability for legitimate users and dApps
-- Node stability and memory resources
+- **Network-wide Impact**: All validators in the network must perform these unmetered validation operations when processing blocks, increasing CPU, I/O, and memory consumption across the entire network.
 
-**Severity Justification:**
-This matches the Medium severity impact criterion: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours." The attack can be sustained, requires no privileges, and directly impacts critical infrastructure that blockchain users depend on for chain interaction.
+- **Economic Security Violation**: The gas system's fundamental guarantee—that resource consumption is proportional to payment—is broken. Attackers can pay for X work but force validators to perform 2X-11X work.
+
+- **Severity Justification**: This qualifies as Medium severity under "Increasing network processing node resource consumption by at least 30% without brute force actions" because:
+  - Attackers can craft transactions with large iteratesets (10,000+ keys)
+  - Each validation doubles the work (100% increase minimum)
+  - Multiple validations multiply this further (up to 1,000% increase)
+  - A batch of such transactions easily increases network resource consumption by 30-300%
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant with access to gRPC endpoints can trigger this vulnerability. No authentication, special privileges, or on-chain state is required. This includes:
-- External users with network access to public RPC nodes
-- Automated scripts or bots
-- Malicious actors targeting network infrastructure
-
-**Required Conditions:**
-- Publicly accessible gRPC endpoint (standard RPC node configuration)
-- Knowledge of gRPC query endpoints (publicly documented in protobuf definitions)
-- Standard gRPC client tools (trivial to use)
+**Triggering Conditions:**
+- Any unprivileged user can submit transactions with large read/iterate sets
+- Conflicts are easily inducible by submitting transactions that access overlapping key ranges
+- The scheduler automatically triggers validation for all executed transactions
+- No special permissions, configuration, or edge-case conditions required
 
 **Frequency:**
-- Attack can be executed immediately and repeatedly
-- No rate limiting prevents sustained attacks
-- No cost or barrier to execution
-- Multiple queries can be sent in parallel
-- Impact is immediate upon query execution
+- Occurs during normal parallel execution whenever transactions conflict
+- Attacker can deliberately maximize this by submitting batches of conflicting transactions with large iteratesets
+- Each block with parallel execution is potentially vulnerable
 
-The trivial nature of exploitation combined with lack of protections makes this vulnerability highly likely to be discovered and exploited in production environments.
+**Accessibility:**
+- Exploitable by any user submitting normal transactions
+- Requires no privileged access or system misconfiguration
+- Works with default parallel execution settings
+- Attack cost bounded only by transaction gas limits, but the resource consumption multiplier (2-11×) makes it economically viable
 
 ## Recommendation
 
-Implement defense-in-depth protections to prevent resource exhaustion:
+Add gas metering to validation operations:
 
-1. **Enforce maximum pagination limit** in `types/query/pagination.go`:
-   - Add `const MaxPageLimit uint64 = 1000` (or make configurable)
-   - In `Paginate` and `FilteredPaginate`, add: `if limit > MaxPageLimit { limit = MaxPageLimit }`
+1. **Pass gas meter to validation functions**: Modify `ValidateTransactionState`, `checkReadsetAtIndex`, and `validateIterator` to accept a gas meter parameter from the transaction context
 
-2. **Configure explicit gRPC message size limits** in `server/grpc/server.go`:
-   ```go
-   grpcSrv := grpc.NewServer(
-       grpc.MaxRecvMsgSize(10 * 1024 * 1024), // 10 MB
-       grpc.MaxSendMsgSize(10 * 1024 * 1024), // 10 MB
-   )
-   ```
+2. **Wrap parent store accesses**: When validation accesses the parent store, wrap it with `gaskv.NewStore()` to meter the operations, or charge gas directly before/after each operation using the gas meter
 
-3. **Implement rate limiting** for query endpoints to prevent abuse from single sources
+3. **Charge against transaction gas limit**: Validation gas should be charged against the original transaction's gas limit. If validation would exceed remaining gas, the transaction should fail validation
 
-4. **Add response size validation** before marshaling to detect and reject oversized responses early
+4. **Alternative mitigations**:
+   - Impose hard limits on readset/iterateset sizes per transaction
+   - Cap the number of validation iterations more aggressively (e.g., reduce from 10 to 3)
+   - Implement a separate "validation gas budget" that scales with transaction gas used
 
-5. **Document limits** clearly in API documentation and return informative errors when limits are exceeded
-
-6. **Monitor query patterns** to detect and alert on potential abuse
+5. **Implementation pattern**: Modify validation functions to accept and use a gas meter, consuming gas for parent store accesses similar to how `gaskv.Store` does: [9](#0-8) 
 
 ## Proof of Concept
 
-**Test Location:** Can be added to `x/bank/keeper/grpc_query_test.go`
+**Conceptual Test**: `TestUnmeteredValidationStorageAccess` in `tasks/scheduler_test.go`
 
 **Setup:**
-1. Create test environment with bank module configured
-2. Populate TotalSupply store with multiple token denominations (simulating realistic chain state)
-3. Initialize gRPC query client
+1. Initialize test context with tracked gas meter
+2. Create multiversion store with base store containing 1,000 pre-populated keys
+3. Create two transactions:
+   - T1: Iterates over all 1,000 keys (using Iterator)
+   - T2: Writes to a key within T1's iteration range
 
 **Action:**
-1. Send `TotalSupply` query with `PageRequest.Limit = 1000000`
-2. Observe that query is accepted without validation error
-3. Send multiple concurrent queries (50-100) with large limits
-4. Monitor memory consumption during query processing
+1. Execute T1 through scheduler - record gas consumed (should be ~1,000 × IterNextCostFlat + ReadCostPerByte × sizes)
+2. Execute T2 through scheduler - creates write conflict with T1
+3. Scheduler validates T1 via `findConflicts` → `ValidateTransactionState` → `validateIterator`
+4. Validation creates parent store iterator and iterates through 1,000 keys
+5. Monitor gas meter during validation phase
 
 **Expected Result:**
-- Queries with excessively large limits are accepted without validation
-- Memory consumption increases significantly (multiple MB per query)
-- Multiple concurrent queries cause cumulative resource exhaustion
-- Node experiences degraded performance or unresponsiveness
+- During T1 execution: Gas meter increases by ~300,000+ gas (1,000 × 30 IterNextCostFlat + key/value read costs)
+- During T1 validation: Gas meter does NOT increase despite performing same iteration operations
+- Validation performs expensive `parentStore.Iterator()` and `iterator.Next()` calls without gas charges
+- With multiple conflicts triggering multiple validations, unmetered work multiplies
 
-**Demonstration:**
-The vulnerability is confirmed by observing that:
-1. No maximum limit is enforced in the `Paginate` function (lines 61-74)
-2. Query handlers accumulate results without size bounds
-3. gRPC server lacks explicit message size configuration
-4. No rate limiting prevents sustained attacks
-5. Multiple concurrent queries can consume 250MB+ memory above baseline (50-100% increase, exceeding 30% threshold)
+**Observation:**
+The test demonstrates that validation work (storage reads, iterator creation, key iteration) happens outside gas accounting, confirming attackers can force validators to perform significantly more work than gas payment covers.
 
-The provided PoC concept in the claim demonstrates the lack of validation, though the real impact is best shown with queries like `TotalSupply` that can have thousands of actual entries in production environments.
+## Notes
+
+The validation phase is architecturally necessary for OCC parallel execution consistency. However, the current implementation performs validation operations that scale linearly with transaction complexity without accounting for their cost. Since validation work is proportional to execution work (both iterate through the same readsets/iteratesets), and validation can occur up to 10 times per transaction, this represents a significant bypass of the gas accounting mechanism that violates the economic security model.
 
 ### Citations
 
-**File:** types/query/pagination.go (L61-74)
+**File:** types/context.go (L567-574)
 ```go
-	limit := pageRequest.Limit
-	countTotal := pageRequest.CountTotal
-	reverse := pageRequest.Reverse
-
-	if offset > 0 && key != nil {
-		return nil, fmt.Errorf("invalid request, either offset or key is expected, got both")
-	}
-
-	if limit == 0 {
-		limit = DefaultLimit
-
-		// count total results when the limit is zero/not supplied
-		countTotal = true
-	}
-```
-
-**File:** server/grpc/server.go (L18-19)
-```go
-func StartGRPCServer(clientCtx client.Context, app types.Application, address string) (*grpc.Server, error) {
-	grpcSrv := grpc.NewServer()
-```
-
-**File:** x/bank/keeper/grpc_query.go (L59-70)
-```go
-	balances := sdk.NewCoins()
-	accountStore := k.getAccountStore(sdkCtx, addr)
-
-	pageRes, err := query.Paginate(accountStore, req.Pagination, func(_, value []byte) error {
-		var result sdk.Coin
-		err := k.cdc.Unmarshal(value, &result)
-		if err != nil {
-			return err
+func (c Context) KVStore(key StoreKey) KVStore {
+	if c.isTracing {
+		if _, ok := c.nextStoreKeys[key.Name()]; ok {
+			return gaskv.NewStore(c.nextMs.GetKVStore(key), c.GasMeter(), stypes.KVGasConfig(), key.Name(), c.StoreTracer())
 		}
-		balances = append(balances, result)
-		return nil
-	})
+	}
+	return gaskv.NewStore(c.MultiStore().GetKVStore(key), c.GasMeter(), stypes.KVGasConfig(), key.Name(), c.StoreTracer())
+}
 ```
 
-**File:** x/bank/keeper/keeper.go (L79-95)
+**File:** store/gaskv/store.go (L54-66)
 ```go
-func (k BaseKeeper) GetPaginatedTotalSupply(ctx sdk.Context, pagination *query.PageRequest) (sdk.Coins, *query.PageResponse, error) {
-	store := ctx.KVStore(k.storeKey)
-	supplyStore := prefix.NewStore(store, types.SupplyKey)
+func (gs *Store) Get(key []byte) (value []byte) {
+	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostFlat, types.GasReadCostFlatDesc)
+	value = gs.parent.Get(key)
 
-	supply := sdk.NewCoins()
+	// TODO overflow-safe math?
+	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(key)), types.GasReadPerByteDesc)
+	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(value)), types.GasReadPerByteDesc)
+	if gs.tracer != nil {
+		gs.tracer.Get(key, value, gs.moduleName)
+	}
 
-	pageRes, err := query.Paginate(supplyStore, pagination, func(key, value []byte) error {
-		var amount sdk.Int
-		err := amount.Unmarshal(value)
-		if err != nil {
-			return fmt.Errorf("unable to convert amount string to Int %v", err)
+	return value
+}
+```
+
+**File:** store/gaskv/store.go (L107-153)
+```go
+func (gs *Store) Iterator(start, end []byte) types.Iterator {
+	return gs.iterator(start, end, true)
+}
+
+// ReverseIterator implements the KVStore interface. It returns a reverse
+// iterator which incurs a flat gas cost for seeking to the first key/value pair
+// and a variable gas cost based on the current value's length if the iterator
+// is valid.
+func (gs *Store) ReverseIterator(start, end []byte) types.Iterator {
+	return gs.iterator(start, end, false)
+}
+
+// Implements KVStore.
+func (gs *Store) CacheWrap(_ types.StoreKey) types.CacheWrap {
+	panic("cannot CacheWrap a GasKVStore")
+}
+
+// CacheWrapWithTrace implements the KVStore interface.
+func (gs *Store) CacheWrapWithTrace(_ types.StoreKey, _ io.Writer, _ types.TraceContext) types.CacheWrap {
+	panic("cannot CacheWrapWithTrace a GasKVStore")
+}
+
+// CacheWrapWithListeners implements the CacheWrapper interface.
+func (gs *Store) CacheWrapWithListeners(_ types.StoreKey, _ []types.WriteListener) types.CacheWrap {
+	panic("cannot CacheWrapWithListeners a GasKVStore")
+}
+
+func (gs *Store) iterator(start, end []byte, ascending bool) types.Iterator {
+	var parent types.Iterator
+	if ascending {
+		parent = gs.parent.Iterator(start, end)
+	} else {
+		parent = gs.parent.ReverseIterator(start, end)
+	}
+
+	gi := newGasIterator(gs.gasMeter, gs.gasConfig, parent, gs.moduleName, gs.tracer)
+	defer func() {
+		if err := recover(); err != nil {
+			// if there is a panic, we close the iterator then reraise
+			gi.Close()
+			panic(err)
 		}
+	}()
+	gi.(*gasIterator).consumeSeekGas()
 
-		// `Add` omits the 0 coins addition to the `supply`.
-		supply = supply.Add(sdk.NewCoin(string(key), amount))
-		return nil
-	})
+	return gi
+}
 ```
 
-**File:** types/query/filtered_pagination.go (L29-44)
+**File:** tasks/scheduler.go (L38-40)
 ```go
-	offset := pageRequest.Offset
-	key := pageRequest.Key
-	limit := pageRequest.Limit
-	countTotal := pageRequest.CountTotal
-	reverse := pageRequest.Reverse
+	statusWaiting status = "waiting"
+	// maximumIterations before we revert to sequential (for high conflict rates)
+	maximumIterations = 10
+```
 
-	if offset > 0 && key != nil {
-		return nil, fmt.Errorf("invalid request, either offset or key is expected, got both")
+**File:** tasks/scheduler.go (L166-183)
+```go
+func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
+	var conflicts []int
+	uniq := make(map[int]struct{})
+	valid := true
+	for _, mv := range s.multiVersionStores {
+		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
+		for _, c := range mvConflicts {
+			if _, ok := uniq[c]; !ok {
+				conflicts = append(conflicts, c)
+				uniq[c] = struct{}{}
+			}
+		}
+		// any non-ok value makes valid false
+		valid = valid && ok
 	}
+	sort.Ints(conflicts)
+	return valid, conflicts
+}
+```
 
-	if limit == 0 {
-		limit = DefaultLimit
-
-		// count total results when the limit is zero/not supplied
-		countTotal = true
+**File:** tasks/scheduler.go (L217-227)
+```go
+func (s *scheduler) tryInitMultiVersionStore(ctx sdk.Context) {
+	if s.multiVersionStores != nil {
+		return
 	}
+	mvs := make(map[sdk.StoreKey]multiversion.MultiVersionStore)
+	keys := ctx.MultiStore().StoreKeys()
+	for _, sk := range keys {
+		mvs[sk] = multiversion.NewMultiVersionStore(ctx.MultiStore().GetKVStore(sk))
+	}
+	s.multiVersionStores = mvs
+}
+```
+
+**File:** store/multiversion/store.go (L278-307)
+```go
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+```
+
+**File:** store/multiversion/store.go (L352-358)
+```go
+		latestValue := s.GetLatestBeforeIndex(index, []byte(key))
+		if latestValue == nil {
+			// this is possible if we previously read a value from a transaction write that was later reverted, so this time we read from parent store
+			parentVal := s.parentStore.Get([]byte(key))
+			if !bytes.Equal(parentVal, value) {
+				valid = false
+			}
+```
+
+**File:** store/types/gas.go (L329-351)
+```go
+// GasConfig defines gas cost for each operation on KVStores
+type GasConfig struct {
+	HasCost          Gas
+	DeleteCost       Gas
+	ReadCostFlat     Gas
+	ReadCostPerByte  Gas
+	WriteCostFlat    Gas
+	WriteCostPerByte Gas
+	IterNextCostFlat Gas
+}
+
+// KVGasConfig returns a default gas config for KVStores.
+func KVGasConfig() GasConfig {
+	return GasConfig{
+		HasCost:          1000,
+		DeleteCost:       1000,
+		ReadCostFlat:     1000,
+		ReadCostPerByte:  3,
+		WriteCostFlat:    2000,
+		WriteCostPerByte: 30,
+		IterNextCostFlat: 30,
+	}
+}
 ```

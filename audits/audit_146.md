@@ -1,304 +1,228 @@
 # Audit Report
 
 ## Title
-Pre-Gas-Check CPU Exhaustion via Excessive Message Count in Transactions
+Network-Wide Denial of Service via Future-Height Evidence Submission Causing Panic in Slash Function
 
 ## Summary
-The sei-cosmos blockchain performs expensive message validation operations, including cryptographic Bech32 address parsing, before checking gas limits. An attacker can submit transactions with thousands of messages that consume excessive CPU during `ValidateBasic()` checks before being rejected for insufficient gas, enabling resource exhaustion attacks. [1](#0-0) 
+An attacker can submit equivocation evidence with a future block height through `MsgSubmitEvidence`, which bypasses all validation checks and causes all nodes to panic when the staking keeper's `Slash` function detects the future infraction height, resulting in a complete network shutdown.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary vulnerability: `baseapp/baseapp.go` lines 921-925
-- Message validation function: `baseapp/baseapp.go` lines 788-801
-- Gas consumption (occurs after): `x/auth/ante/basic.go` lines 109-116
-- Expensive Bech32 parsing: `x/bank/types/msgs.go` lines 29-49
+**location:** 
+- Validation gap: `x/evidence/types/evidence.go` lines 46-61 [1](#0-0) 
+- Age check bypass: `x/evidence/keeper/infraction.go` lines 42-64 [2](#0-1) 
+- Panic trigger: `x/staking/keeper/slash.go` lines 67-71 [3](#0-2) 
 
-**Intended Logic:**
-Transactions should be validated efficiently with gas-based rate limiting preventing resource exhaustion. The `CheckTx` flow is designed to reject invalid or under-funded transactions before consuming excessive node resources. The documentation explicitly states that `ValidateBasic` should avoid "impacting performance of the CheckTx phase" [2](#0-1) .
+**intended logic:**
+Evidence should only represent past infractions. The system should reject any evidence claiming an infraction occurred at a future block height, as this is logically impossible and indicates malicious or corrupted data.
 
-**Actual Logic:**
-In the `runTx` function, `tx.GetMsgs()` and `validateBasicTxMsgs()` execute before the `AnteHandler` runs:
-1. At line 921, `tx.GetMsgs()` iterates through all messages [3](#0-2) 
-2. At line 923, `validateBasicTxMsgs(msgs)` calls `ValidateBasic()` on each message [4](#0-3) 
-3. For `MsgSend`, `ValidateBasic()` performs two `AccAddressFromBech32()` calls (from/to addresses) [5](#0-4) 
-4. Each `AccAddressFromBech32()` invokes `bech32.DecodeAndConvert()` via `GetFromBech32()` [6](#0-5) [7](#0-6) 
-5. Only after these operations does the `AnteHandler` run and consume gas [8](#0-7) [9](#0-8) 
+**actual logic:**
+The `Equivocation.ValidateBasic()` function only validates that `Height >= 1` but does not check if the height is in the future. [4](#0-3) 
 
-Critically, `validateBasicTxMsgs()` only checks for at least one message but imposes no maximum limit [10](#0-9) .
+When `HandleEquivocationEvidence` calculates evidence age, the expression `ageBlocks = ctx.BlockHeader().Height - infractionHeight` produces a negative value for future heights. [5](#0-4)  This negative value does not satisfy the "too old" rejection condition `ageBlocks > cp.Evidence.MaxAgeNumBlocks`. [6](#0-5) 
 
-**Exploitation Path:**
-1. Attacker crafts a transaction with 3,000-5,000 `MsgSend` messages (fitting within Tendermint's transaction size limit)
-2. Transaction submitted via `CheckTx` [11](#0-10) 
-3. Transaction decoded and messages unmarshaled [12](#0-11) 
-4. Node calls `GetMsgs()` which extracts all messages [13](#0-12) 
-5. Node calls `ValidateBasic()` on each message, performing 6,000-10,000 Bech32 parsing operations
-6. Only then does `AnteHandler` run and reject the transaction for insufficient gas
-7. Attacker repeats with many such transactions
+The evidence proceeds to slashing where `distributionHeight = infractionHeight - sdk.ValidatorUpdateDelay` still results in a future height. [7](#0-6)  This value is passed through the slashing keeper [8](#0-7)  which forwards it to the staking keeper. [9](#0-8) 
 
-**Security Guarantee Broken:**
-The vulnerability violates the resource accounting invariant that expensive operations should be gas-metered before execution. CPU resources are consumed before gas validation, enabling denial-of-service where nodes waste resources on transactions that will be rejected.
+When the staking keeper's `Slash` function receives a future height as `infractionHeight`, it explicitly checks for this condition and triggers a panic. [3](#0-2) 
+
+**exploitation path:**
+1. Attacker crafts a `MsgSubmitEvidence` with an `Equivocation` where `Height = currentBlockHeight + N` (any positive N)
+2. The message is submitted through standard transaction submission [10](#0-9) 
+3. Message validation passes because `ValidateBasic()` only checks `Height >= 1`
+4. Transaction is included in a block and processed by all validators
+5. `HandleEquivocationEvidence` is invoked with `infractionHeight = currentBlockHeight + N`
+6. Age check calculates: `ageBlocks = currentBlockHeight - (currentBlockHeight + N) = -N`
+7. Since `-N` is NOT `> MaxAgeNumBlocks`, evidence is not rejected
+8. `distributionHeight = infractionHeight - 1 = currentBlockHeight + N - 1` (still future)
+9. This future height is passed to staking keeper's `Slash` function
+10. Check `infractionHeight > ctx.BlockHeight()` evaluates to `true`, causing panic
+11. All nodes processing this block panic simultaneously
+12. Network halts completely
+
+**security guarantee broken:**
+This violates the availability guarantee of the blockchain. The network should reject invalid evidence and continue operating, but instead accepts malicious future-height evidence that causes a coordinated network-wide crash.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- Node CPU resources consumed processing message validation (6,000-10,000 Bech32 operations per attack transaction vs. 2-20 for normal transactions)
-- Network bandwidth handling oversized transactions
-- Mempool processing capacity diverted to resource-intensive transactions
+**Affected Processes:** Network availability and consensus
 
-**Severity of Damage:**
-An attacker flooding the network with such transactions can increase node CPU consumption by 30%+ compared to normal operation. With each attack transaction requiring 300-500x more `ValidateBasic()` calls than normal transactions, sustained flooding creates significant CPU overhead. This degradation:
-- Reduces transaction processing throughput for legitimate users
-- Diverts validator CPU from consensus operations
-- Can lead to temporary network slowdown or node instability under sustained attack
+**Consequences:**
+- All validator nodes processing the block containing the malicious evidence panic simultaneously
+- The network cannot progress to produce new blocks
+- All pending transactions remain unprocessed indefinitely
+- Recovery requires coordinated manual intervention across all validators to restart nodes
+- Potential need for emergency patching and network coordination to exclude the malicious transaction
 
-**System Reliability Impact:**
-This bypasses the intended gas-based rate limiting mechanism. Nodes cannot economically price out attackers since resource consumption occurs before gas accounting. This asymmetry where cheap-to-create transactions become expensive-to-validate enables resource exhaustion attacks that undermine network availability.
+This vulnerability enables a complete denial of service attack against the blockchain network. A single unprivileged attacker can halt the entire network with one transaction, preventing all economic activity and transaction processing until manual recovery procedures are executed.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant can submit transactions. No special privileges required.
+**Who Can Trigger:** Any user with the ability to submit transactions to the network (no special privileges required)
 
 **Required Conditions:**
-- Attacker crafts transactions with maximum messages fitting in Tendermint's transaction size limit (typically 1MB)
-- No gas payment required since transactions are rejected before execution
-- Works during normal network operation
-- No special infrastructure needed beyond standard transaction submission
+- Attacker needs a valid validator consensus address (publicly available on-chain information)
+- No special timing, state conditions, or privileged access required
+- Can be executed at any time during normal network operation
 
-**Frequency of Exploitation:**
-- Can be triggered immediately and continuously
-- Attacker can submit many such transactions from multiple accounts
-- Each transaction consumes disproportionate CPU (300-500x amplification) relative to normal transactions
-- Attack is economically viable since rejected transactions don't cost the attacker gas fees
-- No rate limiting exists at the message count level
+**Frequency:** This attack can be executed immediately and repeatedly. An attacker could submit multiple such transactions to ensure network disruption. Once the vulnerability is discovered by malicious actors, it represents an imminent threat to network availability that could be exploited continuously until patched.
+
+The attack is trivial to execute and has deterministic results - every node will panic when processing the malicious evidence.
 
 ## Recommendation
 
-**Immediate Fix:**
-Add a message count limit early in the transaction validation pipeline before expensive operations:
+Add explicit validation in `HandleEquivocationEvidence` to reject evidence from the future before any processing occurs:
 
-1. **Option A - Decoder Level:** In the transaction decoder, check `len(body.Messages)` immediately after unmarshaling and reject if exceeds a reasonable limit (e.g., 100-500 messages) [12](#0-11) 
+```go
+func (k Keeper) HandleEquivocationEvidence(ctx sdk.Context, evidence *types.Equivocation) {
+    logger := k.Logger(ctx)
+    consAddr := evidence.GetConsensusAddress()
+    
+    infractionHeight := evidence.GetHeight()
+    
+    // Reject evidence from the future
+    if infractionHeight > ctx.BlockHeight() {
+        logger.Info(
+            "ignored equivocation; evidence from future height",
+            "validator", consAddr,
+            "infraction_height", infractionHeight,
+            "current_height", ctx.BlockHeight(),
+        )
+        return
+    }
+    
+    // ... rest of the existing function
+}
+```
 
-2. **Option B - RunTx Level:** Add message count check at the beginning of `runTx()` before line 921, checking the length before calling `GetMsgs()`
-
-3. **Option C - Parameter-Based:** Add a parameter to the auth module (similar to `TxSigLimit`) for `MaxMsgCount` with a sensible default [14](#0-13) 
-
-**Additional Hardening:**
-- Consider lazy evaluation in `GetMsgs()` to avoid processing all messages upfront
-- Add early gas consumption proportional to message count before validation
-- Document the message count limit in consensus parameters
+This check should be placed immediately after retrieving the infraction height (line 43 of infraction.go) and before any age calculations or slashing operations. This ensures future-height evidence is rejected early in the validation flow before it can reach the panic condition in the staking keeper.
 
 ## Proof of Concept
 
-**File:** `baseapp/deliver_tx_test.go` (add new test function)
-
-**Test Function Name:** `TestCheckTxWithExcessiveMessageCount`
+**Test Location:** Create new test in `x/evidence/keeper/infraction_test.go`
 
 **Setup:**
-1. Initialize a test app with default ante handlers including `ConsumeTxSizeGasDecorator`
-2. Create test accounts with funds
-3. Generate a transaction containing 5,000 `MsgSend` messages with valid bech32 addresses and minimal coin amounts
-4. Set gas limit insufficient for the transaction size (e.g., 100,000 gas when actual requirement would be millions)
-5. Encode the transaction using the standard codec
+```go
+// Initialize test context with block height 10
+ctx := suite.ctx.WithIsCheckTx(false).WithBlockHeight(10)
+suite.populateValidators(ctx)
 
-**Trigger:**
-1. Record start time/CPU metrics before calling `CheckTx`
-2. Call `app.CheckTx()` with the crafted transaction bytes
-3. Record end time/CPU metrics after `CheckTx` returns
-4. Verify the transaction was rejected with an out-of-gas or insufficient gas error
+// Create validator
+power := int64(100)
+operatorAddr, val := valAddresses[0], pubkeys[0]
+tstaking := teststaking.NewHelper(suite.T(), ctx, suite.app.StakingKeeper)
+tstaking.CreateValidatorWithValPower(operatorAddr, val, power, true)
+staking.EndBlocker(ctx, suite.app.StakingKeeper)
+```
 
-**Result:**
-The test demonstrates that:
-- Significant CPU time is consumed processing 10,000 Bech32 parsing operations before rejection
-- The transaction is ultimately rejected for insufficient gas
-- The computational work done before gas checking is disproportionate (300-500x amplification)
-- Multiple such transactions can measurably increase node CPU consumption
+**Action:**
+```go
+// Create Equivocation evidence with future height
+evidence := &types.Equivocation{
+    Height:           50,  // Future height (current is 10)
+    Time:             time.Unix(0, 0),
+    Power:            power,
+    ConsensusAddress: sdk.ConsAddress(val.Address()).String(),
+}
 
-This proves that expensive validation occurs before gas checks, enabling the described resource exhaustion attack.
+// This call will panic
+suite.app.EvidenceKeeper.HandleEquivocationEvidence(ctx, evidence)
+```
 
-## Notes
+**Expected Result:**
+- The system panics with message: "impossible attempt to slash future infraction at height 49 but we are at height 10"
+- This panic confirms the vulnerability - in production, this would crash all nodes processing this transaction
+- The panic occurs because `distributionHeight = 50 - 1 = 49`, which is greater than current height of 10
 
-The vulnerability is confirmed through code analysis showing that `validateBasicTxMsgs()` iterates through all messages calling `ValidateBasic()` before the `AnteHandler` enforces gas limits. The official documentation acknowledges that `ValidateBasic` runs without gas charging and recommends keeping it lightweight, but no enforcement mechanism exists. While the exact 30% CPU increase threshold lacks empirical benchmarks in the report, the 300-500x amplification factor from processing thousands of messages versus normal transactions makes this impact category plausible and appropriate for a Medium severity classification per the defined impact criteria.
+The test demonstrates that evidence with future heights bypasses all validation checks in `ValidateBasic()` and the age check in `HandleEquivocationEvidence`, proceeding all the way to the staking keeper where it triggers a panic that would cause network-wide denial of service in a production environment.
 
 ### Citations
 
-**File:** baseapp/baseapp.go (L788-801)
+**File:** x/evidence/types/evidence.go (L46-61)
 ```go
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-	if len(msgs) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
+func (e *Equivocation) ValidateBasic() error {
+	if e.Time.Unix() <= 0 {
+		return fmt.Errorf("invalid equivocation time: %s", e.Time)
 	}
-
-	for _, msg := range msgs {
-		err := msg.ValidateBasic()
-		if err != nil {
-			return err
-		}
+	if e.Height < 1 {
+		return fmt.Errorf("invalid equivocation height: %d", e.Height)
+	}
+	if e.Power < 1 {
+		return fmt.Errorf("invalid equivocation validator power: %d", e.Power)
+	}
+	if e.ConsensusAddress == "" {
+		return fmt.Errorf("invalid equivocation validator consensus address: %s", e.ConsensusAddress)
 	}
 
 	return nil
 }
 ```
 
-**File:** baseapp/baseapp.go (L921-925)
+**File:** x/evidence/keeper/infraction.go (L42-64)
 ```go
-	msgs := tx.GetMsgs()
+	// calculate the age of the evidence
+	infractionHeight := evidence.GetHeight()
+	infractionTime := evidence.GetTime()
+	ageDuration := ctx.BlockHeader().Time.Sub(infractionTime)
+	ageBlocks := ctx.BlockHeader().Height - infractionHeight
 
-	if err := validateBasicTxMsgs(msgs); err != nil {
-		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
-	}
-```
-
-**File:** baseapp/baseapp.go (L947-947)
-```go
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
-```
-
-**File:** docs/basics/tx-lifecycle.md (L92-92)
-```markdown
-Gas is not charged when `ValidateBasic` is executed so we recommend only performing all necessary stateless checks to enable middleware operations (for example, parsing the required signer accounts to validate a signature by a middleware) and stateless sanity checks not impacting performance of the CheckTx phase.
-```
-
-**File:** x/bank/types/msgs.go (L29-49)
-```go
-func (msg MsgSend) ValidateBasic() error {
-	_, err := sdk.AccAddressFromBech32(msg.FromAddress)
-	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid sender address (%s)", err)
-	}
-
-	_, err = sdk.AccAddressFromBech32(msg.ToAddress)
-	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid recipient address (%s)", err)
-	}
-
-	if !msg.Amount.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
-	}
-
-	if !msg.Amount.IsAllPositive() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
-	}
-
-	return nil
-}
-```
-
-**File:** types/address.go (L168-185)
-```go
-func AccAddressFromBech32(address string) (addr AccAddress, err error) {
-	if len(strings.TrimSpace(address)) == 0 {
-		return AccAddress{}, errors.New("empty address string is not allowed")
-	}
-
-	bech32PrefixAccAddr := GetConfig().GetBech32AccountAddrPrefix()
-
-	bz, err := GetFromBech32(address, bech32PrefixAccAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	err = VerifyAddressFormat(bz)
-	if err != nil {
-		return nil, err
-	}
-
-	return AccAddress(bz), nil
-```
-
-**File:** types/address.go (L637-653)
-```go
-// GetFromBech32 decodes a bytestring from a Bech32 encoded string.
-func GetFromBech32(bech32str, prefix string) ([]byte, error) {
-	if len(bech32str) == 0 {
-		return nil, errBech32EmptyAddress
-	}
-
-	hrp, bz, err := bech32.DecodeAndConvert(bech32str)
-	if err != nil {
-		return nil, err
-	}
-
-	if hrp != prefix {
-		return nil, fmt.Errorf("invalid Bech32 prefix; expected %s, got %s", prefix, hrp)
-	}
-
-	return bz, nil
-}
-```
-
-**File:** x/auth/ante/basic.go (L116-116)
-```go
-	ctx.GasMeter().ConsumeGas(params.TxSizeCostPerByte*sdk.Gas(len(ctx.TxBytes())), "txSize")
-```
-
-**File:** baseapp/abci.go (L226-231)
-```go
-	tx, err := app.txDecoder(req.Tx)
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
-```
-
-**File:** x/auth/tx/decoder.go (L45-48)
-```go
-		err = cdc.Unmarshal(raw.BodyBytes, &body)
-		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
+	// Reject evidence if the double-sign is too old. Evidence is considered stale
+	// if the difference in time and number of blocks is greater than the allowed
+	// parameters defined.
+	cp := ctx.ConsensusParams()
+	if cp != nil && cp.Evidence != nil {
+		if ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks {
+			logger.Info(
+				"ignored equivocation; evidence too old",
+				"validator", consAddr,
+				"infraction_height", infractionHeight,
+				"max_age_num_blocks", cp.Evidence.MaxAgeNumBlocks,
+				"infraction_time", infractionTime,
+				"max_age_duration", cp.Evidence.MaxAgeDuration,
+			)
+			return
 		}
+	}
 ```
 
-**File:** types/tx/types.go (L22-37)
+**File:** x/evidence/keeper/infraction.go (L101-101)
 ```go
-func (t *Tx) GetMsgs() []sdk.Msg {
-	if t == nil || t.Body == nil {
-		return nil
-	}
-
-	anys := t.Body.Messages
-	res := make([]sdk.Msg, len(anys))
-	for i, any := range anys {
-		cached := any.GetCachedValue()
-		if cached == nil {
-			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
-		}
-		res[i] = cached.(sdk.Msg)
-	}
-	return res
-}
+	distributionHeight := infractionHeight - sdk.ValidatorUpdateDelay
 ```
 
-**File:** x/auth/types/params.go (L14-38)
+**File:** x/evidence/keeper/infraction.go (L107-112)
 ```go
-	DefaultTxSigLimit             uint64 = 7
-	DefaultTxSizeCostPerByte      uint64 = 10
-	DefaultSigVerifyCostED25519   uint64 = 590
-	DefaultSigVerifyCostSecp256k1 uint64 = 1000
-)
+	k.slashingKeeper.Slash(
+		ctx,
+		consAddr,
+		k.slashingKeeper.SlashFractionDoubleSign(ctx),
+		evidence.GetValidatorPower(), distributionHeight,
+	)
+```
 
-// Parameter keys
-var (
-	KeyMaxMemoCharacters      = []byte("MaxMemoCharacters")
-	KeyTxSigLimit             = []byte("TxSigLimit")
-	KeyTxSizeCostPerByte      = []byte("TxSizeCostPerByte")
-	KeySigVerifyCostED25519   = []byte("SigVerifyCostED25519")
-	KeySigVerifyCostSecp256k1 = []byte("SigVerifyCostSecp256k1")
-	KeyDisableSeqnoCheck      = []byte("KeyDisableSeqnoCheck")
-)
+**File:** x/staking/keeper/slash.go (L67-71)
+```go
+	case infractionHeight > ctx.BlockHeight():
+		// Can't slash infractions in the future
+		panic(fmt.Sprintf(
+			"impossible attempt to slash future infraction at height %d but we are at height %d",
+			infractionHeight, ctx.BlockHeight()))
+```
 
-var _ paramtypes.ParamSet = &Params{}
+**File:** x/slashing/keeper/keeper.go (L78-78)
+```go
+	k.sk.Slash(ctx, consAddr, distributionHeight, power, fraction)
+```
 
-// NewParams creates a new Params object
-func NewParams(
-	maxMemoCharacters, txSigLimit, txSizeCostPerByte, sigVerifyCostED25519, sigVerifyCostSecp256k1 uint64,
-) Params {
-	return Params{
-		MaxMemoCharacters:      maxMemoCharacters,
-		TxSigLimit:             txSigLimit,
+**File:** x/evidence/keeper/msg_server.go (L23-29)
+```go
+func (ms msgServer) SubmitEvidence(goCtx context.Context, msg *types.MsgSubmitEvidence) (*types.MsgSubmitEvidenceResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	evidence := msg.GetEvidence()
+	if err := ms.Keeper.SubmitEvidence(ctx, evidence); err != nil {
+		return nil, err
+	}
 ```

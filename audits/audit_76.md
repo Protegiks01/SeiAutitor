@@ -1,186 +1,250 @@
 # Audit Report
 
 ## Title
-Commission Rate Decrease Bypass - MaxChangeRate Validation Only Enforced for Increases
+ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
 
 ## Summary
-The `ValidateNewRate()` function in the staking module only validates `MaxChangeRate` limits for commission rate increases, allowing validators to decrease their commission by any amount regardless of the configured `MaxChangeRate` parameter. This bypasses the intended gradual rate change mechanism.
+The `ClaimCapability` function in the Cosmos SDK capability module allows a single module to claim the same capability multiple times under different names, causing forward-map corruption that breaks authentication and creates permanent orphaned state in the capability tracking system.
 
 ## Impact
-Medium
+**Medium**
 
 ## Finding Description
 
 **Location:** [1](#0-0) 
 
-**Intended Logic:** The `MaxChangeRate` parameter is designed to enforce that commission rate changes (in either direction) cannot exceed a specified limit within a 24-hour period. The code comment explicitly states "new rate % points change cannot be greater than the max change rate" [2](#0-1) , indicating that the absolute value of any change should be validated.
+**Intended Logic:** The ClaimCapability function should prevent a module from claiming the same capability object more than once. Each (module, capability) pair should have exactly one forward mapping to maintain authentication consistency. Modules should only be able to claim a capability once under a specific name.
 
-**Actual Logic:** The validation uses `newRate.Sub(c.Rate).GT(c.MaxChangeRate)` which performs: `(newRate - currentRate) > MaxChangeRate`. This only catches cases where the result is positive and exceeds the limit. When validators decrease their rate (newRate < currentRate), the subtraction yields a negative value. Since negative values are never greater than positive `MaxChangeRate` values [3](#0-2) , the validation always passes for decreases regardless of magnitude.
+**Actual Logic:** ClaimCapability only validates whether the exact (module, name) pair already exists as an owner through `CapabilityOwners.Set()`. [2](#0-1)  The owner key is "module/name", so Owner("foo", "channel-1") and Owner("foo", "channel-2") are treated as different entries and both succeed.
+
+However, the forward mapping key is based solely on (module, capability) [3](#0-2) , meaning there can only be ONE forward mapping per (module, capability) pair. When the same module claims the same capability with a different name, the forward mapping gets overwritten while the owners list and reverse mappings accumulate multiple entries, creating state inconsistency.
 
 **Exploitation Path:**
-1. Any validator sends a `MsgEditValidator` transaction with a new commission rate [4](#0-3) 
-2. The transaction is processed through `UpdateValidatorCommission` [5](#0-4) 
-3. `ValidateNewRate()` is called to validate the change [6](#0-5) 
-4. For rate decreases, the check at line 97 passes regardless of how large the decrease is
-5. The commission rate is updated, bypassing the intended `MaxChangeRate` restriction
+1. Module "foo" claims capability with name "channel-1"
+   - Forward map: `foo/fwd/0xCAP` → "channel-1"
+   - Reverse map: `foo/rev/channel-1` → index
+   - Owners: [("foo", "channel-1")]
 
-**Security Guarantee Broken:** The invariant that commission rate changes must be gradual and limited by `MaxChangeRate` is violated for decreases. The existing test suite confirms this: a validator with rate 0.40 and MaxChangeRate 0.10 can decrease to 0.10 (a 0.30 or 30% decrease, 3x the limit) [7](#0-6) .
+2. Module "foo" claims the same capability with name "channel-2"
+   - Owner check passes (different name key "foo/channel-2" vs "foo/channel-1")
+   - Forward map OVERWRITES: `foo/fwd/0xCAP` → "channel-2" [4](#0-3) 
+   - New reverse map: `foo/rev/channel-2` → index [5](#0-4) 
+   - Owners: [("foo", "channel-1"), ("foo", "channel-2")]
+
+3. Authentication fails for "channel-1": `AuthenticateCapability` checks if `GetCapabilityName` returns "channel-1", but it returns "channel-2" (the overwritten value) [6](#0-5) 
+
+4. `ReleaseCapability` only cleans up the last claimed name ("channel-2") based on `GetCapabilityName`, leaving the "channel-1" reverse mapping and owner entry permanently orphaned [7](#0-6) 
+
+**Security Guarantee Broken:** The capability authentication invariant is violated - modules cannot authenticate capabilities they legitimately own, and the cleanup mechanism creates permanent state corruption that cannot be recovered without a chain upgrade.
 
 ## Impact Explanation
 
-This vulnerability allows validators to manipulate the delegation market by:
+This vulnerability affects the core capability authentication mechanism used throughout the Cosmos SDK, particularly in IBC:
 
-1. **Market Manipulation:** Validators can suddenly drop their commission to 0% to attract delegators, then gradually increase it back up (respecting the limit for increases), effectively luring delegators with artificially low rates
-2. **Unfair Competition:** Creates an asymmetric competitive advantage where validators can rapidly decrease rates but competitors cannot respond as quickly
-3. **Delegator Protection Bypass:** The `MaxChangeRate` mechanism is designed to protect delegators from sudden rate changes, but this protection only applies to increases
-4. **Validator Set Instability:** Large sudden commission drops can trigger rapid delegation shifts, potentially destabilizing the validator set distribution
+1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it, potentially blocking IBC channel operations or other capability-protected actions.
 
-This qualifies as Medium severity under: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last name's mappings get cleaned up. Previous names' reverse mappings and owner entries remain permanently orphaned in storage, creating inconsistent state that cannot be recovered without a hard fork or chain upgrade.
+
+3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate in memory and persistent storage, consuming resources that can never be reclaimed through normal operations.
+
+This qualifies as **Medium** severity under the impact criteria: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - the capability module is core Cosmos SDK infrastructure that causes module misbehavior without directly risking funds.
 
 ## Likelihood Explanation
 
-**Exploitability:** High
-- Any validator can trigger this through normal `MsgEditValidator` transactions
-- No special privileges or conditions required beyond being a validator
-- Can be executed once every 24 hours (after the standard cooldown period)
+**Likelihood: Medium**
 
-**Motivation:** Validators have direct financial incentives to attract more delegations to increase their rewards. The ability to bypass rate change restrictions provides a competitive advantage that rational validators would exploit.
+While the capability module is used by trusted on-chain modules (not external actors), this vulnerability can be inadvertently triggered during normal operation when:
+- Module code has bugs in capability tracking logic
+- Retry or error recovery logic attempts to re-claim an already-claimed capability
+- Complex state transitions in IBC handshakes (e.g., crossing hellos scenarios) cause confusion about which capabilities are already owned
+- A module implementation doesn't check ownership before claiming
 
-**Frequency:** Can be exploited repeatedly by any validator in the network once per 24-hour period.
+The IBC module documentation explicitly shows defensive code checking `AuthenticateCapability` before claiming [8](#0-7) , indicating this is a known concern that module developers must guard against. However, the capability module itself should enforce this invariant rather than relying on all callers to implement defensive checks.
+
+Once triggered, the corruption is permanent and cannot self-heal, requiring a chain upgrade to fix the corrupted state.
 
 ## Recommendation
 
-Modify the validation logic in `ValidateNewRate()` to check the absolute value of the rate change:
+Add a check in `ClaimCapability` to verify the calling module hasn't already claimed the capability under any name:
 
-Replace line 97 with:
 ```go
-case newRate.Sub(c.Rate).Abs().GT(c.MaxChangeRate):
-    // new rate % points change cannot be greater than the max change rate
-    return ErrCommissionGTMaxChangeRate
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+    // ... existing validation ...
+    
+    // Check if this module already owns this capability under any name
+    existingName := sk.GetCapabilityName(ctx, cap)
+    if existingName != "" {
+        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
+            "module %s already owns capability under name %s", sk.module, existingName)
+    }
+    
+    // ... rest of function ...
+}
 ```
 
-This ensures both increases and decreases are subject to the `MaxChangeRate` limit, maintaining the intended invariant that commission changes must be gradual regardless of direction. The `Abs()` method is already available in the decimal type [8](#0-7) .
+This ensures each module can only claim a given capability once, preventing forward-map corruption and maintaining the authentication invariant.
 
 ## Proof of Concept
 
-**Test Setup:** The vulnerability is already demonstrated in the existing test suite.
+**Test File:** `x/capability/keeper/keeper_test.go`
 
-**Existing Test Evidence:**
-From `x/staking/types/commission_test.go` lines 40-62:
-- Commission c1 is created with: Rate=0.40 (40%), MaxRate=0.80 (80%), MaxChangeRate=0.10 (10%)
-- Test case at line 62: `{c1, sdk.MustNewDecFromStr("0.10"), now.Add(48 * time.Hour), false}`
-- This tests changing from 0.40 to 0.10 with expectErr=false
+**Setup:**
+- Create a scoped keeper for a test module
+- Create a new capability with name "original" using `NewCapability`
+- Verify initial authentication works
 
-**Action:** The change from 0.40 to 0.10 represents a 0.30 decrease (30%)
+**Action:**
+1. Call `ClaimCapability(ctx, cap, "duplicate")` with the same capability but different name
+2. Attempt `AuthenticateCapability(ctx, cap, "original")`
+3. Call `ReleaseCapability(ctx, cap)`
+4. Check for orphaned state in reverse mappings
 
-**Result:** Despite MaxChangeRate being only 0.10 (10%), this 3x bypass is expected to pass validation (expectErr=false), confirming the vulnerability
+**Result:**
+1. The second `ClaimCapability` succeeds (should fail) - demonstrates the bug allows duplicate claims
+2. `AuthenticateCapability(cap, "original")` returns false - proves forward map was overwritten and authentication is broken
+3. After `ReleaseCapability`, the reverse mapping for "original" still exists while "duplicate" was cleaned up - confirms orphaned state
+4. The owners list still contains the "original" owner entry - proves permanent state corruption
 
-**Additional PoC:** A validator could:
-1. Set commission to 50% with MaxChangeRate of 1%
-2. After 24 hours, decrease commission to 0% in a single transaction (bypassing the 1% limit)
-3. Attract delegators with 0% commission
-4. Gradually increase commission back to desired level (respecting the 1% limit for increases)
+The existing test suite confirms this scenario is not covered - `TestClaimCapability` only tests claiming with the same name (correctly fails) and different modules claiming (correctly succeeds), but not the same module claiming with different names. [9](#0-8) 
 
 ## Notes
 
-The code comment at line 98 clearly states "new rate % points **change**" (emphasis added), not "increase", indicating that the validation should apply to changes in both directions. The asymmetric enforcement creates an exploitable loophole that violates the intended design of gradual, predictable commission rate changes.
+This is a defensive programming issue in core Cosmos SDK infrastructure. While it requires a module to inadvertently call `ClaimCapability` twice with different names, the consequences are severe and permanent: broken authentication and unrecoverable state corruption. The capability module should enforce its own invariants rather than relying on all calling modules to implement defensive checks, as evidenced by the IBC module's explicit protection against this scenario.
 
 ### Citations
 
-**File:** x/staking/types/commission.go (L81-103)
+**File:** x/capability/keeper/keeper.go (L275-280)
 ```go
-// ValidateNewRate performs basic sanity validation checks of a new commission
-// rate. If validation fails, an SDK error is returned.
-func (c Commission) ValidateNewRate(newRate sdk.Dec, blockTime time.Time) error {
-	switch {
-	case blockTime.Sub(c.UpdateTime).Hours() < 24:
-		// new rate cannot be changed more than once within 24 hours
-		return ErrCommissionUpdateTime
-
-	case newRate.IsNegative():
-		// new rate cannot be negative
-		return ErrCommissionNegative
-
-	case newRate.GT(c.MaxRate):
-		// new rate cannot be greater than the max rate
-		return ErrCommissionGTMaxRate
-
-	case newRate.Sub(c.Rate).GT(c.MaxChangeRate):
-		// new rate % points change cannot be greater than the max change rate
-		return ErrCommissionGTMaxChangeRate
+func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
+	if strings.TrimSpace(name) == "" || cap == nil {
+		return false
 	}
+	return sk.GetCapabilityName(ctx, cap) == name
+}
+```
+
+**File:** x/capability/keeper/keeper.go (L287-314)
+```go
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+	}
+	if strings.TrimSpace(name) == "" {
+		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
+	}
+	// update capability owner set
+	if err := sk.addOwner(ctx, cap, name); err != nil {
+		return err
+	}
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Set the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
+
+	// Set the reverse mapping between the module and capability name and the
+	// index in the in-memory store. Since marshalling and unmarshalling into a store
+	// will change memory address of capability, we simply store index as value here
+	// and retrieve the in-memory pointer to the capability from our map
+	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
+
+	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
 
 	return nil
 }
 ```
 
-**File:** types/decimal.go (L211-211)
+**File:** x/capability/keeper/keeper.go (L323-340)
 ```go
-func (d Dec) GT(d2 Dec) bool    { return (d.i).Cmp(d2.i) > 0 }        // greater than
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	}
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
 ```
 
-**File:** types/decimal.go (L216-216)
+**File:** x/capability/types/types.go (L46-58)
 ```go
-func (d Dec) Abs() Dec          { return Dec{new(big.Int).Abs(d.i)} } // absolute value
+func (co *CapabilityOwners) Set(owner Owner) error {
+	i, ok := co.Get(owner)
+	if ok {
+		// owner already exists at co.Owners[i]
+		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
+	}
+
+	// owner does not exist in the set of owners, so we insert at position i
+	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
+	copy(co.Owners[i+1:], co.Owners[i:])
+	co.Owners[i] = owner
+
+	return nil
 ```
 
-**File:** x/staking/keeper/msg_server.go (L130-160)
+**File:** x/capability/types/keys.go (L41-50)
 ```go
-func (k msgServer) EditValidator(goCtx context.Context, msg *types.MsgEditValidator) (*types.MsgEditValidatorResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
-	if err != nil {
-		return nil, err
+func FwdCapabilityKey(module string, cap *Capability) []byte {
+	// encode the key to a fixed length to avoid breaking consensus state machine
+	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
+	// the length 10 is picked so it's backward compatible on common architectures.
+	key := fmt.Sprintf("%#010p", cap)
+	if len(key) > 10 {
+		key = key[len(key)-10:]
 	}
-	// validator must already be registered
-	validator, found := k.GetValidator(ctx, valAddr)
-	if !found {
-		return nil, types.ErrNoValidatorFound
-	}
-
-	// replace all editable fields (clients should autofill existing values)
-	description, err := validator.Description.UpdateDescription(msg.Description)
-	if err != nil {
-		return nil, err
-	}
-
-	validator.Description = description
-
-	if msg.CommissionRate != nil {
-		commission, err := k.UpdateValidatorCommission(ctx, validator, *msg.CommissionRate)
-		if err != nil {
-			return nil, err
-		}
-
-		// call the before-modification hook since we're about to update the commission
-		k.BeforeValidatorModified(ctx, valAddr)
-
-		validator.Commission = commission
-	}
+	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
+}
 ```
 
-**File:** x/staking/keeper/validator.go (L131-147)
-```go
-// An error is returned if the new commission rate is invalid.
-func (k Keeper) UpdateValidatorCommission(ctx sdk.Context,
-	validator types.Validator, newRate sdk.Dec) (types.Commission, error) {
-	commission := validator.Commission
-	blockTime := ctx.BlockHeader().Time
-
-	if err := commission.ValidateNewRate(newRate, blockTime); err != nil {
-		return commission, err
-	}
-
-	if newRate.LT(k.MinCommissionRate(ctx)) {
-		return commission, fmt.Errorf("cannot set validator commission to less than minimum rate of %s", k.MinCommissionRate(ctx))
-	}
-	commission.Rate = newRate
-	commission.UpdateTime = blockTime
-
-	return commission, nil
+**File:** docs/ibc/custom.md (L77-86)
+```markdown
+    // Module may have already claimed capability in OnChanOpenInit in the case of crossing hellos
+    // (ie chainA and chainB both call ChanOpenInit before one of them calls ChanOpenTry)
+    // If the module can already authenticate the capability then the module already owns it so we don't need to claim
+    // Otherwise, module does not have channel capability and we must claim it from IBC
+    if !k.AuthenticateCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)) {
+        // Only claim channel capability passed back by IBC module if we do not already own it
+        if err := k.scopedKeeper.ClaimCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)); err != nil {
+            return err
+        }
+    }
 ```
 
-**File:** x/staking/types/commission_test.go (L62-62)
+**File:** x/capability/keeper/keeper_test.go (L156-178)
 ```go
-		{c1, sdk.MustNewDecFromStr("0.10"), now.Add(48 * time.Hour), false},
+func (suite *KeeperTestSuite) TestClaimCapability() {
+	sk1 := suite.keeper.ScopeToModule(banktypes.ModuleName)
+	sk2 := suite.keeper.ScopeToModule(stakingtypes.ModuleName)
+	sk3 := suite.keeper.ScopeToModule("foo")
+
+	cap, err := sk1.NewCapability(suite.ctx, "transfer")
+	suite.Require().NoError(err)
+	suite.Require().NotNil(cap)
+
+	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
+	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
+
+	got, ok := sk1.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
+
+	got, ok = sk2.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
+
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, cap, "  "))
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, nil, "transfer"))
+}
 ```

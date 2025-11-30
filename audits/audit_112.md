@@ -1,189 +1,426 @@
-Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**. Here is my assessment:
-
 # Audit Report
 
 ## Title
-Unrecovered Panic in Concurrent BeginBlocker Goroutines Can Cause Total Network Shutdown
+Permanent Loss of Transaction Fees Due to Missing WriteDeferredBalances Call in EndBlocker
 
 ## Summary
-The BeginBlocker function in the slashing module spawns concurrent goroutines to process validator signatures without any panic recovery mechanism. When these goroutines encounter missing validator state (pubkey or signing info), they panic and crash the entire node. If this condition affects all validators simultaneously (e.g., during a buggy chain upgrade or state corruption), it causes complete network shutdown. [1](#0-0) [2](#0-1) 
+The banking module's deferred balance system deducts transaction fees from user accounts into persistent storage but caches them in a non-persistent memory-only store, with the documented intention of flushing to module accounts via `WriteDeferredBalances` in EndBlock. However, the bank module does not implement an EndBlock method, and `WriteDeferredBalances` is never called in production code. This results in permanent loss of all accumulated transaction fees when nodes restart, as the memory cache is cleared while user account deductions remain persisted.
 
 ## Impact
-High
+High - Direct loss of funds
 
 ## Finding Description
 
 **Location:**
-- Primary: `x/slashing/abci.go` BeginBlocker function, specifically the concurrent goroutines spawned without panic recovery
-- Secondary: `x/slashing/keeper/infractions.go` HandleValidatorSignatureConcurrent function with explicit panic calls
+- Deferred send implementation: [1](#0-0) 
+- Fee deduction call site: [2](#0-1) 
+- Memory store implementation: [3](#0-2) 
+- Memory store registration: [4](#0-3) 
+- Bank keeper initialization with memory store: [5](#0-4) 
+- Bank module definition (no EndBlock method): [6](#0-5) 
+- FinalizeBlocker (no WriteDeferredBalances call): [7](#0-6) 
 
-**Intended Logic:**
-The BeginBlocker is designed to process validator signatures concurrently for performance. Each goroutine reads validator state (pubkey and signing info) and computes slashing decisions. The system assumes all validators in the vote set have properly initialized state through staking module hooks.
+**Intended logic:**
+The code documentation explicitly states the intended behavior: [8](#0-7) . The system is designed to: (1) immediately deduct fees from user accounts via `SubUnlockedCoins` to persistent storage, (2) cache the deducted amounts in a deferred cache indexed by module and transaction, and (3) flush all deferred balances to module accounts during EndBlock by calling `WriteDeferredBalances`.
 
-**Actual Logic:**
-The concurrent goroutines lack panic recovery mechanisms. When HandleValidatorSignatureConcurrent encounters missing validator state, it explicitly panics without any recovery. Since goroutines have no `defer recover()`, these panics propagate and crash the entire node process. [1](#0-0) 
+**Actual logic:**
+The deferred cache uses a memory store that is explicitly not persisted: [3](#0-2) . When transaction fees are processed:
+1. User balance is reduced via `SubUnlockedCoins` which writes to persistent storage [9](#0-8) 
+2. The amount is stored in the memory-only deferred cache [10](#0-9) 
+3. The bank module has no EndBlock method (verified by examining the entire module.go file)
+4. `WriteDeferredBalances` is never called in production code (grep search confirms it only appears in test files)
+5. On node restart, the memory store is cleared, losing all deferred amounts
+6. User accounts retain their reduced balances, but module accounts never receive the funds
 
-**Exploitation Path:**
-1. A chain upgrade occurs with a state migration bug that fails to properly migrate signing info for validators
-2. These validators remain in the active set and sign blocks  
-3. BeginBlock is called and spawns goroutines to process votes
-4. When processing affected validators, HandleValidatorSignatureConcurrent panics due to missing signing info
-5. The panic in the goroutine crashes the node (no recovery mechanism exists)
-6. ALL validators experience identical crashes (same corrupted state)
-7. Network halts completely - no validators can produce blocks
-8. Requires manual intervention, emergency patch, or hard fork to recover [2](#0-1) 
+**Exploitation path:**
+No attacker is required - this occurs during normal blockchain operation:
+1. User submits transaction with fees via the ante handler [2](#0-1) 
+2. User's balance is immediately reduced and persisted to the IAVL store
+3. Amount is cached in memory-only deferred store
+4. Block processing completes without calling `WriteDeferredBalances` [11](#0-10) 
+5. Node operator performs routine restart, upgrade, or node crashes
+6. Memory store is cleared on restart (not persisted to disk)
+7. Deferred cache loses all accumulated fees since last restart
+8. User accounts show permanently reduced balances, but fee collector module account never received the funds
 
-**Security Guarantee Broken:**
-This violates the availability and fault tolerance properties of the consensus system. The lack of defensive panic recovery creates a single point of failure where any state invariant violation causes catastrophic network-wide shutdown rather than graceful degradation.
+**Security guarantee broken:**
+This violates the fundamental accounting invariant that all coins deducted from accounts must exist somewhere in the system. The `TotalSupply` invariant correctly includes deferred balances during normal operation [12](#0-11) , but after a node restart when the deferred cache is cleared, the sum of all account balances would be less than the recorded total supply, breaking the invariant.
 
 ## Impact Explanation
 
-The impact is severe and matches the valid category "Network not being able to confirm new transactions (total network shutdown)":
+All transaction fees paid by users since the last node restart are permanently and irrecoverably lost. This represents a direct loss of funds with severe consequences:
 
-- **Network availability:** Complete chain halt with 0% of validators operational
-- **Validator nodes:** All crash simultaneously when processing the same corrupted state
-- **Transaction processing:** No new transactions can be confirmed
-- **User funds:** Temporarily frozen (no transactions executable)
-- **Recovery:** Requires emergency intervention (manual fix, patch deployment, or hard fork)
-
-The concurrent design intended for performance optimization becomes a systemic vulnerability when combined with lack of panic recovery. State corruption or bugs in migration code cause complete network failure rather than isolated node issues.
+- **Permanent fund loss**: Transaction fees are deducted from user accounts but never reach the fee collector module account intended for validator rewards and governance
+- **Accumulates continuously**: Every transaction that pays fees (essentially all transactions) contributes to the loss until node restart
+- **No recovery mechanism**: Once the node restarts and clears the memory store, the deferred amounts cannot be recovered from any source
+- **Network-wide impact**: Every validator and full node experiences this independently on every restart, affecting the entire network's economic model
+- **Economic sustainability**: The blockchain's fee collection mechanism is fundamentally broken, making it economically unsustainable as validators never receive transaction fee rewards
 
 ## Likelihood Explanation
 
-**Trigger conditions:**
-- Cannot be directly triggered by external attackers
-- Can be triggered by bugs in chain upgrade/migration code (internal protocol code)
-- Can be triggered by database corruption (operational issue)
-- Can be triggered by race conditions in state management
+**Triggering conditions:**
+- Any transaction that pays fees (essentially all transactions on the network)
+- Any node restart (routine maintenance, crashes, upgrades, hardware failures)
 
-**Likelihood assessment:**
-- Low frequency under normal operation (state invariants typically hold)
-- Higher risk during chain upgrades when state migrations occur
-- When triggered, impact is immediate and total (all nodes crash simultaneously)
+**Frequency and scope:**
+- **Every transaction**: Fees are deferred on every single transaction via the ante handler
+- **Every restart**: All accumulated deferred fees are lost on every node restart
+- **Network-wide**: Every validator node and full node experiences this independently
 
-The key concern is system brittleness - any future bug in the protocol that corrupts validator state causes network-wide catastrophic failure. Historical precedent shows buggy chain upgrades have caused major incidents in blockchain networks.
+Node restarts are routine operational requirements that occur regularly for software updates, security patches, network upgrades, crashes, hardware maintenance, and datacenter operations.
 
-**Evidence of concern:**
-The codebase itself demonstrates awareness of this pattern:
-- Panic recovery IS used in other critical paths [3](#0-2) 
-- Tests explicitly verify panics occur when operating on validators without signing info [4](#0-3) 
-- Migration code previously considered checking for missing signing info [5](#0-4) 
+**Affected parties:**
+- All users paying transaction fees (funds permanently lost)
+- The protocol itself (fee collector never receives fees for validator rewards/governance)
+- All nodes (operating with broken economic model)
+
+The likelihood is **very high** because this vulnerability is triggered during normal blockchain operation without requiring any special conditions or attacker action. Node restarts are unavoidable operational requirements.
 
 ## Recommendation
 
-Add panic recovery to concurrent goroutines in BeginBlocker:
+**Immediate fix:**
+Add an EndBlock method to the bank module that calls `WriteDeferredBalances`:
 
+In `x/bank/module.go`, add to the AppModule:
 ```go
-go func(valIndex int) {
-    defer func() {
-        if r := recover(); r != nil {
-            // Log the panic with context
-            logger.Error("panic in validator signature processing", 
-                "error", r, "validator_index", valIndex)
-            // Set nil to handle gracefully after goroutines complete
-            slashingWriteInfo[valIndex] = nil
-        }
-    }()
-    defer wg.Done()
-    // ... existing code
-}(i)
-```
-
-After `wg.Wait()`, handle nil entries gracefully:
-
-```go
-for i, writeInfo := range slashingWriteInfo {
-    if writeInfo == nil {
-        logger.Error("skipping validator due to processing error", "index", i)
-        continue
-    }
-    // ... existing processing
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    am.keeper.WriteDeferredBalances(ctx)
+    return []abci.ValidatorUpdate{}
 }
 ```
 
-This ensures that even if state invariants are violated, nodes log errors and continue processing rather than crashing, providing graceful degradation and making the system more robust against edge cases and bugs.
+The bank module is already registered in the EndBlocker order [13](#0-12) , so once the method is added, it will be called automatically.
+
+**Alternative fix:**
+Add the call directly in the application's FinalizeBlocker before `SetDeliverStateToCommit()`:
+```go
+deferredEvents := app.BankKeeper.WriteDeferredBalances(ctx)
+events = append(events, deferredEvents...)
+```
+
+**Verification:**
+- Ensure `WriteDeferredBalances` is called exactly once per block
+- Verify fee collector module accounts receive all accumulated fees
+- Confirm TotalSupply invariant passes after node restarts
+- Validate no deferred balances remain in cache at the end of each block
 
 ## Proof of Concept
 
-The provided PoC demonstrates the vulnerability by:
+The vulnerability can be demonstrated through code analysis:
 
-**Setup:** 
-1. Initialize blockchain with one validator
-2. Bond validator to create signing info (normal flow)
-3. Verify signing info exists
+**Setup:**
+1. System configured with deferred cache [4](#0-3) 
+2. Bank keeper uses memory store for deferred cache [5](#0-4) 
 
-**Trigger:**
-1. Manually delete signing info from store (simulating state corruption)
-2. Call BeginBlocker with votes from that validator
+**Action:**
+1. Transaction processed, `DeferredSendCoinsFromAccountToModule` called [2](#0-1) 
+2. User balance reduced via persistent storage [9](#0-8) 
+3. Amount cached in memory store [10](#0-9) 
+4. Block completes without calling WriteDeferredBalances [11](#0-10) 
+5. Node restart clears memory store
 
 **Result:**
-BeginBlocker panics when encountering missing signing info. In production, this panic would crash all validator nodes simultaneously, causing complete network shutdown.
+- User balance remains reduced (persisted)
+- Fee collector never receives funds
+- Deferred cache is empty (cleared on restart)
+- Funds permanently lost
 
-The test confirms that without panic recovery, the system is vulnerable to state corruption or bugs that violate expected invariants, leading to catastrophic failure rather than graceful degradation.
+The key observation confirmed by grep search: `WriteDeferredBalances` only appears in test files (`keeper_test.go`, `fee_test.go`, `testutil_test.go`, `deferred_cache_test.go`), never in production code paths.
 
 ## Notes
 
-This vulnerability is valid because:
-1. It matches the explicitly listed impact category: "Network not being able to confirm new transactions (total network shutdown)" (High severity)
-2. The trigger involves bugs in protocol code itself (upgrade/migration bugs), which are within scope
-3. Even trusted developers making mistakes in upgrade code should not cause total network shutdown - this exceeds intended authority
-4. Defensive programming against state corruption is a standard security practice in distributed consensus systems
-5. The codebase itself uses panic recovery in other critical paths, indicating awareness of this pattern
-6. Historical evidence shows buggy chain upgrades have caused real incidents in blockchain networks
+This vulnerability represents a critical implementation gap where the documented design (calling `WriteDeferredBalances` in EndBlocker) was never implemented in production code, despite the deferred balance system being actively used for fee collection on every transaction. The memory store explicitly states it is "not committed as part of app state" [3](#0-2) , confirming that deferred balances are lost on node restart.
 
 ### Citations
 
-**File:** x/slashing/abci.go (L38-49)
+**File:** x/bank/keeper/keeper.go (L404-407)
 ```go
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
+```
+
+**File:** x/bank/keeper/keeper.go (L408-432)
+```go
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
+	}
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+```
+
+**File:** x/auth/ante/fee.go (L208-208)
+```go
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** simapp/app.go (L230-230)
+```go
+	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** simapp/app.go (L372-379)
+```go
+	app.mm.SetOrderEndBlockers(
+		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
+		capabilitytypes.ModuleName, authtypes.ModuleName, banktypes.ModuleName, distrtypes.ModuleName,
+		slashingtypes.ModuleName, minttypes.ModuleName,
+		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
+		feegrant.ModuleName,
+		paramstypes.ModuleName, upgradetypes.ModuleName, vestingtypes.ModuleName, acltypes.ModuleName,
+	)
+```
+
+**File:** simapp/app.go (L476-574)
+```go
+func (app *SimApp) FinalizeBlocker(ctx sdk.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
+	events := []abci.Event{}
+	beginBlockResp := app.BeginBlock(ctx, abci.RequestBeginBlock{
+		Hash: req.Hash,
+		ByzantineValidators: utils.Map(req.ByzantineValidators, func(mis abci.Misbehavior) abci.Evidence {
+			return abci.Evidence{
+				Type:             abci.MisbehaviorType(mis.Type),
+				Validator:        abci.Validator(mis.Validator),
+				Height:           mis.Height,
+				Time:             mis.Time,
+				TotalVotingPower: mis.TotalVotingPower,
 			}
-		}(i)
-```
+		}),
+		LastCommitInfo: abci.LastCommitInfo{
+			Round: req.DecidedLastCommit.Round,
+			Votes: utils.Map(req.DecidedLastCommit.Votes, func(vote abci.VoteInfo) abci.VoteInfo {
+				return abci.VoteInfo{
+					Validator:       abci.Validator(vote.Validator),
+					SignedLastBlock: vote.SignedLastBlock,
+				}
+			}),
+		},
+		Header: tmproto.Header{
+			ChainID:         app.ChainID,
+			Height:          req.Height,
+			Time:            req.Time,
+			ProposerAddress: ctx.BlockHeader().ProposerAddress,
+		},
+	})
+	events = append(events, beginBlockResp.Events...)
 
-**File:** x/slashing/keeper/infractions.go (L28-36)
-```go
-	if _, err := k.GetPubkey(ctx, addr); err != nil {
-		panic(fmt.Sprintf("Validator consensus-address %s not found", consAddr))
+	typedTxs := []sdk.Tx{}
+	for _, tx := range req.Txs {
+		typedTx, err := app.txDecoder(tx)
+		if err != nil {
+			typedTxs = append(typedTxs, nil)
+		} else {
+			typedTxs = append(typedTxs, typedTx)
+		}
 	}
 
-	// fetch signing info
-	signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
-	if !found {
-		panic(fmt.Sprintf("Expected signing info for validator %s but not found", consAddr))
+	txResults := []*abci.ExecTxResult{}
+	for i, tx := range req.Txs {
+		ctx = ctx.WithContext(context.WithValue(ctx.Context(), ante.ContextKeyTxIndexKey, i))
+		if typedTxs[i] == nil {
+			txResults = append(txResults, &abci.ExecTxResult{}) // empty result
+			continue
+		}
+		deliverTxResp := app.DeliverTx(ctx, abci.RequestDeliverTx{
+			Tx: tx,
+		}, typedTxs[i], sha256.Sum256(tx))
+		txResults = append(txResults, &abci.ExecTxResult{
+			Code:      deliverTxResp.Code,
+			Data:      deliverTxResp.Data,
+			Log:       deliverTxResp.Log,
+			Info:      deliverTxResp.Info,
+			GasWanted: deliverTxResp.GasWanted,
+			GasUsed:   deliverTxResp.GasUsed,
+			Events:    deliverTxResp.Events,
+			Codespace: deliverTxResp.Codespace,
+		})
 	}
+	endBlockResp := app.EndBlock(ctx, abci.RequestEndBlock{
+		Height: req.Height,
+	})
+	events = append(events, endBlockResp.Events...)
+
+	app.SetDeliverStateToCommit()
+	app.WriteState()
+	appHash := app.GetWorkingHash()
+	return &abci.ResponseFinalizeBlock{
+		Events:    events,
+		TxResults: txResults,
+		ValidatorUpdates: utils.Map(endBlockResp.ValidatorUpdates, func(v abci.ValidatorUpdate) abci.ValidatorUpdate {
+			return abci.ValidatorUpdate{
+				PubKey: v.PubKey,
+				Power:  v.Power,
+			}
+		}),
+		ConsensusParamUpdates: &tmproto.ConsensusParams{
+			Block: &tmproto.BlockParams{
+				MaxBytes: endBlockResp.ConsensusParamUpdates.Block.MaxBytes,
+				MaxGas:   endBlockResp.ConsensusParamUpdates.Block.MaxGas,
+			},
+			Evidence: &tmproto.EvidenceParams{
+				MaxAgeNumBlocks: endBlockResp.ConsensusParamUpdates.Evidence.MaxAgeNumBlocks,
+				MaxAgeDuration:  endBlockResp.ConsensusParamUpdates.Evidence.MaxAgeDuration,
+				MaxBytes:        endBlockResp.ConsensusParamUpdates.Block.MaxBytes,
+			},
+			Validator: &tmproto.ValidatorParams{
+				PubKeyTypes: endBlockResp.ConsensusParamUpdates.Validator.PubKeyTypes,
+			},
+			Version: &tmproto.VersionParams{
+				AppVersion: endBlockResp.ConsensusParamUpdates.Version.AppVersion,
+			},
+		},
+		AppHash: appHash,
+	}, nil
+}
 ```
 
-**File:** x/auth/ante/setup.go (L66-75)
+**File:** x/bank/module.go (L107-210)
 ```go
-	defer func() {
-		if r := recover(); r != nil {
-			switch rType := r.(type) {
-			case sdk.ErrorOutOfGas:
-				log := fmt.Sprintf(
-					"out of gas in location: %v; gasWanted: %d, gasUsed: %d",
-					rType.Descriptor, gasTx.GetGas(), newCtx.GasMeter().GasConsumed())
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
 
-				err = sdkerrors.Wrap(sdkerrors.ErrOutOfGas, log)
-			default:
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
+}
+
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
+	}
+}
+
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
+
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
+}
 ```
 
-**File:** x/slashing/keeper/signing_info_test.go (L45-45)
+**File:** x/bank/keeper/invariants.go (L74-78)
 ```go
-	require.Panics(t, func() { app.SlashingKeeper.Tombstone(ctx, sdk.ConsAddress(addrDels[0])) })
-```
-
-**File:** x/slashing/keeper/migrations.go (L93-95)
-```go
-		// if !found {
-		// 	return fmt.Errorf("signing info not found")
-		// }
+		// also iterate over deferred balances
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
+			return false
+		})
 ```

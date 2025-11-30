@@ -1,216 +1,221 @@
 # Audit Report
 
 ## Title
-Missing Validation for IAVL Items Before Store Items in StoreV2 Snapshot Restoration Causes Node Crash
+Deferred Balance Cache Accumulation Causes Invariant Violation and Chain Halt
 
 ## Summary
-The StoreV2 snapshot restoration implementation in `storev2/rootmulti/store.go` lacks a critical validation check that exists in the traditional store implementation. It does not verify that a `SnapshotItem_Store` has been received before processing `SnapshotItem_IAVL` items, allowing malicious peers to craft snapshot data that crashes nodes during state sync via an uncaught panic.
+The bank module's deferred balance system accumulates fee payments across blocks without ever clearing the cache, eventually causing the TotalSupply invariant to fail and the chain to halt. The `WriteDeferredBalances` method that should clear the cache is never called in production code, despite being designed to run "In the EndBlocker" according to code comments. [1](#0-0) 
 
 ## Impact
-Low to Medium
+Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:** 
+- Deferred cache implementation: x/bank/keeper/keeper.go (lines 408-432)
+- Fee deduction entry point: x/auth/ante/fee.go (line 208)
+- Invariant check: x/bank/keeper/invariants.go (lines 74-78, 97)
+- Missing cleanup: No call to WriteDeferredBalances in production code
 
-**Intended Logic:** 
-During snapshot restoration, the system expects to receive `SnapshotItem_Store` items first to initialize store trees via `AddTree()`, followed by `SnapshotItem_IAVL` items to populate those stores. This ordering ensures proper initialization before data insertion.
+**Intended Logic:**
+When `DeferredSendCoinsFromAccountToModule` is called during fee payment, it should: (1) deduct coins from the sender's account, (2) store the pending credit in a temporary cache, and (3) have `WriteDeferredBalances` called in an EndBlocker to credit module accounts and clear the cache for the next block. [2](#0-1) 
 
-**Actual Logic:** 
-The StoreV2 implementation initializes `storeKey` as an empty string and processes items without validating the ordering. When an IAVL item arrives before any Store item:
-- The empty `storeKey` is used when creating `SnapshotNode` structures
-- If `ssStore` is enabled, nodes with empty `StoreKey` are sent to the import goroutine [2](#0-1) 
-- The goroutine has an uncaught `panic(err)` that crashes the entire process [3](#0-2) 
-
-In contrast, the traditional store explicitly validates this: [4](#0-3) 
+**Actual Logic:**
+The deferred cache uses a MemoryStoreKey which persists data between commits and blocks [3](#0-2) , unlike TransientStoreKey which resets on each commit [4](#0-3) . However, `WriteDeferredBalances` is never called because: (1) simapp does not configure a PreCommitHandler [5](#0-4) , (2) the bank module has no EndBlocker implementation, and (3) grep search confirms `WriteDeferredBalances` only appears in test files.
 
 **Exploitation Path:**
-1. Malicious peer offers snapshot during state sync discovery
-2. Attacker crafts chunks with `SnapshotItem_IAVL` before `SnapshotItem_Store`
-3. Chunks include correct SHA256 hashes (calculated by attacker) so they pass validation [5](#0-4) 
-4. Target node processes chunks through `RestoreChunk()` which feeds data to restore stream
-5. StoreV2 `restore()` receives IAVL items with `storeKey` still empty
-6. If ssStore enabled, `SnapshotNode` with empty `StoreKey` sent to Import goroutine
-7. `ssStore.Import()` likely fails on invalid data, triggering `panic(err)`
-8. Uncaught panic in goroutine terminates the entire node process
+1. User submits a transaction with fees
+2. Ante handler calls `DeductFees` which invokes `DeferredSendCoinsFromAccountToModule` [6](#0-5) 
+3. User's balance is deducted, amount stored in deferred cache
+4. Block commits, but MemoryStore persists (no clearing) [7](#0-6) 
+5. Additional transactions in subsequent blocks accumulate more deferred balances in the same cache
+6. Crisis module EndBlocker periodically runs invariant checks [8](#0-7) 
+7. TotalSupply invariant iterates over all accumulated deferred balances and adds them to expectedTotal [9](#0-8) 
+8. Invariant detects that expectedTotal (account_balances + accumulated_deferred_from_multiple_blocks) ≠ supply
+9. Invariant returns broken=true, triggering panic [10](#0-9) 
+10. Chain halts deterministically across all nodes
 
-**Security Guarantee Broken:** 
-Denial of service through malformed state sync data. The snapshot restoration protocol assumes well-formed data ordering but lacks validation to enforce this assumption in StoreV2.
+**Security Guarantee Broken:**
+The accounting invariant that total supply equals the sum of all account balances plus current in-flight transfers is violated. The system incorrectly assumes the deferred cache only contains the current block's pending transfers, not accumulated transfers from multiple blocks.
 
 ## Impact Explanation
 
-This vulnerability enables denial-of-service attacks against nodes using StoreV2 with ssStore enabled during state sync. When exploited:
-- Target nodes crash completely and cannot complete state sync
-- New nodes or nodes catching up cannot join/rejoin the network through the malicious peer
-- Network resilience is reduced as node recovery/growth is hindered
-- No fund loss occurs, but node availability is compromised
+This vulnerability causes a complete network shutdown. When the TotalSupply invariant check fails, the crisis module triggers a panic that halts the chain. This affects:
+- All network validators cannot produce new blocks
+- All user transactions are blocked
+- The chain requires manual intervention (emergency upgrade or governance action) to recover
+- During the halt, the network is completely unavailable
 
-The impact is limited to:
-1. Nodes using StoreV2 (appears to be alternative to traditional store based on codebase structure)
-2. Nodes with ssStore enabled (opt-in via configuration)
-3. Nodes actively performing state sync (temporary state)
-
-This affects a subset of network nodes rather than the entire network, qualifying as a low-to-medium severity DoS vulnerability.
+This is a protocol-level consensus failure that affects every node. The deterministic nature means all validators fail simultaneously at the same block height.
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any network participant can exploit this by running a node that responds to snapshot requests with malformed data. No special privileges, stake, or resources required.
+**Who Can Trigger:** Any user submitting normal transactions on the network. The issue occurs naturally through regular usage as every fee-paying transaction accumulates deferred balances.
 
-**Conditions required:**
-- Target nodes must use StoreV2 with ssStore enabled
-- Target nodes must be performing state sync
-- Malicious peer must be selected as snapshot provider
+**Conditions Required:**
+- Bank keeper initialized with deferred cache support (default in simapp) [11](#0-10) 
+- Transactions that pay fees over multiple blocks (normal network activity)
+- Sufficient accumulation to create a detectable invariant violation
+- Invariant checks enabled and running periodically (invCheckPeriod > 0)
 
-**Frequency:** Can be triggered whenever qualifying nodes perform state sync. More impactful during network upgrades or growth periods when many nodes sync simultaneously. Nodes can recover by restarting and selecting different peers, but repeated attacks can significantly delay network participation.
+**Frequency:** This will occur deterministically once enough fee-paying transactions accumulate across blocks. The time to failure depends on transaction volume and invariant check frequency. Given that every fee-paying transaction contributes to accumulation, this is inevitable in an active network.
 
 ## Recommendation
 
-Add validation matching the traditional store implementation:
-
+**Option 1 (Recommended):** Add a PreCommitHandler in simapp that calls `WriteDeferredBalances` before each block commit:
 ```go
-case *snapshottypes.SnapshotItem_IAVL:
-    if storeKey == "" {
-        restoreErr = errors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
-        break loop
-    }
-    // ... rest of IAVL processing
+app.SetPreCommitHandler(func(ctx sdk.Context) error {
+    app.BankKeeper.WriteDeferredBalances(ctx)
+    return nil
+})
 ```
 
-Additionally, implement proper error propagation in the ssStore import goroutine instead of using `panic()`, or add a `recover()` mechanism to prevent uncaught panics from terminating the process.
+**Option 2:** Implement an EndBlocker for the bank module that calls `WriteDeferredBalances` as intended by the code comment.
+
+**Option 3:** Change the deferred cache to use TransientStoreKey instead of MemoryStoreKey, though this requires refactoring the per-block clearing logic.
 
 ## Proof of Concept
 
-**Test Structure:** A test in `storev2/rootmulti/store_test.go` demonstrating the vulnerability:
+The logical flow is verifiable through code inspection:
 
 **Setup:**
-- Create StoreV2 instance with `StateStoreConfig{Enable: true}`
-- Prepare protobuf stream with `SnapshotItem_IAVL` before any `SnapshotItem_Store`
-- Create StreamReader from malformed chunks
+1. Simapp initializes BankKeeper with deferred cache using MemoryStoreKey
+2. Crisis module configured with invariant check period > 0
 
 **Action:**
-- Call `restore()` with the malformed stream
-- IAVL items processed before Store items
+1. Block N: User transaction pays fees → ante handler calls `DeferredSendCoinsFromAccountToModule` → sender balance deducted, amount stored in memory store
+2. Block N commits → MemoryStore Commit() is no-op, cache persists
+3. Block N+1: Another user transaction pays fees → additional amount added to existing deferred cache
+4. Block N+2 (when invariant runs): Crisis module calls `TotalSupply` invariant → invariant iterates deferred balances → counts accumulated balances from blocks N and N+1 → expectedTotal exceeds supply → returns broken=true
 
-**Expected Result:**
-- Current implementation: node crashes via uncaught panic (when ssStore.Import fails on empty StoreKey)
-- With fix: returns error "received IAVL node item before store item"
+**Result:**
+Chain panics and halts with error: "invariant broken: total supply" because expectedTotal (which includes all accumulated deferred balances from multiple blocks) does not equal the actual supply.
 
-The vulnerability is demonstrated by comparing StoreV2's missing check [6](#0-5)  against the traditional store's validation [4](#0-3) .
+**Supporting Evidence:**
+Test files demonstrate the expected behavior - `WriteDeferredBalances` must be explicitly called to credit module accounts and clear the cache, but this never happens in production code (only in tests).
 
 ## Notes
 
-The severity classification (Low to Medium) reflects uncertainty about StoreV2 deployment statistics. The vulnerability is technically valid and exploitable, but the percentage of affected nodes depends on StoreV2 adoption rates and ssStore configuration prevalence, which cannot be determined from the codebase alone. If StoreV2 with ssStore is widely deployed (≥30% of nodes), this would be Medium severity; if less widespread (10-30%), it would be Low severity.
+This vulnerability exists due to an implementation gap between intended design (as documented in code comments) and actual implementation (no EndBlocker or PreCommitHandler calls `WriteDeferredBalances`). The deferred balance system was correctly designed but incompletely implemented, making the chain vulnerable to deterministic halt through normal operation.
 
 ### Citations
 
-**File:** storev2/rootmulti/store.go (L714-803)
+**File:** x/bank/keeper/keeper.go (L404-407)
 ```go
-func (rs *Store) restore(height int64, protoReader protoio.Reader) (snapshottypes.SnapshotItem, error) {
-	var (
-		ssImporter   chan sstypes.SnapshotNode
-		snapshotItem snapshottypes.SnapshotItem
-		storeKey     string
-		restoreErr   error
-	)
-	scImporter, err := rs.scStore.Importer(height)
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
+```
+
+**File:** x/bank/keeper/keeper.go (L408-432)
+```go
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
 	if err != nil {
-		return snapshottypes.SnapshotItem{}, err
+		return err
 	}
-	if rs.ssStore != nil {
-		ssImporter = make(chan sstypes.SnapshotNode, 10000)
-		go func() {
-			err := rs.ssStore.Import(height, ssImporter)
-			if err != nil {
-				panic(err)
-			}
-		}()
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
 	}
-loop:
-	for {
-		snapshotItem = snapshottypes.SnapshotItem{}
-		err = protoReader.ReadMsg(&snapshotItem)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			restoreErr = errors.Wrap(err, "invalid protobuf message")
-			break loop
-		}
-
-		switch item := snapshotItem.Item.(type) {
-		case *snapshottypes.SnapshotItem_Store:
-			storeKey = item.Store.Name
-			if err = scImporter.AddTree(storeKey); err != nil {
-				restoreErr = err
-				break loop
-			}
-			rs.logger.Info(fmt.Sprintf("Start restoring store: %s", storeKey))
-		case *snapshottypes.SnapshotItem_IAVL:
-			if item.IAVL.Height > math.MaxInt8 {
-				restoreErr = errors.Wrapf(sdkerrors.ErrLogic, "node height %v cannot exceed %v",
-					item.IAVL.Height, math.MaxInt8)
-				break loop
-			}
-			node := &sctypes.SnapshotNode{
-				Key:     item.IAVL.Key,
-				Value:   item.IAVL.Value,
-				Height:  int8(item.IAVL.Height),
-				Version: item.IAVL.Version,
-			}
-			// Protobuf does not differentiate between []byte{} as nil, but fortunately IAVL does
-			// not allow nil keys nor nil values for leaf nodes, so we can always set them to empty.
-			if node.Key == nil {
-				node.Key = []byte{}
-			}
-			if node.Height == 0 && node.Value == nil {
-				node.Value = []byte{}
-			}
-			scImporter.AddNode(node)
-
-			// Check if we should also import to SS store
-			if rs.ssStore != nil && node.Height == 0 && ssImporter != nil {
-				ssImporter <- sstypes.SnapshotNode{
-					StoreKey: storeKey,
-					Key:      node.Key,
-					Value:    node.Value,
-				}
-			}
-		default:
-			// unknown element, could be an extension
-			break loop
-		}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
 	}
 
-	if err = scImporter.Close(); err != nil {
-		if restoreErr == nil {
-			restoreErr = err
-		}
-	}
-	if ssImporter != nil {
-		close(ssImporter)
-	}
-	// initialize the earliest version for SS store
-	if rs.ssStore != nil {
-		rs.ssStore.SetEarliestVersion(height, false)
-	}
-
-	return snapshotItem, restoreErr
+	return nil
 }
 ```
 
-**File:** store/rootmulti/store.go (L906-909)
+**File:** store/mem/store.go (L20-21)
 ```go
-		case *snapshottypes.SnapshotItem_IAVL:
-			if importer == nil {
-				return snapshottypes.SnapshotItem{}, sdkerrors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
-			}
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
 ```
 
-**File:** snapshots/manager.go (L363-368)
+**File:** store/mem/store.go (L54-55)
 ```go
-	hash := sha256.Sum256(chunk)
-	expected := m.restoreChunkHashes[m.restoreChunkIndex]
-	if !bytes.Equal(hash[:], expected) {
-		return false, sdkerrors.Wrapf(types.ErrChunkHashMismatch,
-			"expected %x, got %x", hash, expected)
+// Commit performs a no-op as entries are persistent between commitments.
+func (s *Store) Commit(_ bool) (id types.CommitID) { return }
+```
+
+**File:** store/transient/store.go (L24-28)
+```go
+// Commit cleans up Store.
+func (ts *Store) Commit(_ bool) (id types.CommitID) {
+	ts.Store = dbadapter.Store{DB: dbm.NewMemDB()}
+	return
+}
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** simapp/app.go (L442-447)
+```go
+	app.SetAnteHandler(anteHandler)
+	app.SetAnteDepGenerator(anteDepGenerator)
+	app.SetEndBlocker(app.EndBlocker)
+	app.SetPrepareProposalHandler(app.PrepareProposalHandler)
+	app.SetProcessProposalHandler(app.ProcessProposalHandler)
+	app.SetFinalizeBlocker(app.FinalizeBlocker)
+```
+
+**File:** x/auth/ante/fee.go (L203-214)
+```go
+func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
 	}
+
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
+	}
+
+	return nil
+}
+```
+
+**File:** x/crisis/abci.go (L13-21)
+```go
+func EndBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyEndBlocker)
+
+	if k.InvCheckPeriod() == 0 || ctx.BlockHeight()%int64(k.InvCheckPeriod()) != 0 {
+		// skip running the invariant check
+		return
+	}
+	k.AssertInvariants(ctx)
+}
+```
+
+**File:** x/bank/keeper/invariants.go (L74-78)
+```go
+		// also iterate over deferred balances
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
+			return false
+		})
+```
+
+**File:** x/crisis/keeper/keeper.go (L83-85)
+```go
+			panic(fmt.Errorf("invariant broken: %s\n"+
+				"\tCRITICAL please submit the following transaction:\n"+
+				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
 ```

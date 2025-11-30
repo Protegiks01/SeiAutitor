@@ -1,220 +1,263 @@
-Based on my thorough analysis of the codebase, I can confirm this is a **valid vulnerability**. Let me trace through the execution flow:
-
-## Validation Analysis
-
-**1. Evidence Age Check Uses AND Logic (Confirmed)**
-
-The evidence age validation at line 53 uses logical AND, requiring BOTH conditions to be true before rejecting evidence: [1](#0-0) 
-
-**2. Default Parameters Create Timing Window (Confirmed)**
-
-The parameters are configured assuming 6-second blocks:
-- UnbondingTime: 21 days [2](#0-1) 
-- MaxAgeDuration: 504 hours (21 days) [3](#0-2) 
-- MaxAgeNumBlocks: 302,400 blocks [4](#0-3) 
-
-At 6s blocks: 21 days = 302,400 blocks (perfectly aligned)
-At 10s blocks: 21 days = 181,440 blocks (40% fewer)
-
-**3. Validator Removal After Unbonding (Confirmed)**
-
-When unbonding completes and the validator has zero delegator shares, it is removed from state: [5](#0-4) 
-
-This deletion includes the ValidatorByConsAddr mapping: [6](#0-5) 
-
-**4. Evidence Handler Returns Early When Validator Not Found (Confirmed)**
-
-When the validator is nil or unbonded, the evidence handler returns without processing: [7](#0-6) 
-
-**5. Mature Unbonding Entries Cannot Be Slashed (Confirmed)**
-
-Once unbonding entries mature, they cannot be slashed: [8](#0-7) 
-
-Tokens are returned to delegators when unbonding completes: [9](#0-8) 
-
-**Exploit Path Verification:**
-
-With 10-second block times (realistic during network stress):
-- Day 0: Validator commits infraction
-- Day 21: Unbonding completes (time-based), validator removed, tokens distributed
-- Day 22: Evidence submitted
-  - ageDuration = 22 days > 21 days ✓
-  - ageBlocks = ~193,500 < 302,400 ✗
-  - Result: `TRUE && FALSE = FALSE` → Evidence NOT rejected
-  - Validator lookup returns nil → Evidence handler returns early
-  - No slashing occurs
-
----
-
 # Audit Report
 
 ## Title
-Validator Can Escape Slashing Through Timing Attack Exploiting AND-Based Evidence Age Validation
+Unrecovered Panic in State Sync Snapshot Restoration Crashes Nodes Processing Malformed Peer Data
 
 ## Summary
-The evidence age validation uses AND logic requiring both time AND block count to exceed limits before rejecting evidence. During network slowdowns with reduced block production, time-based unbonding can complete (allowing validator removal) while block-based evidence validation still accepts the evidence. When evidence is submitted in this window, it passes validation but the validator has already been removed from state, resulting in no slashing.
+The storev2 snapshot restoration code spawns a goroutine that panics without recovery when processing malformed snapshot data from peers. When `ssStore.Import` fails during state sync, the unrecovered panic crashes the entire node process, causing a denial-of-service vulnerability.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Evidence age validation: [1](#0-0) 
-- Validator removal during unbonding: [5](#0-4) 
-- Evidence handler early return: [7](#0-6) 
+**Location:** [1](#0-0) 
 
-**Intended Logic:**
-Evidence should be rejected if it's too old to allow slashing. The unbonding period (21 days) and evidence max age (21 days, 302,400 blocks) are aligned to ensure validators can be slashed for infractions committed while they had stake. This prevents Nothing-At-Stake attacks where validators unbond and can no longer be slashed.
+**Intended Logic:** During snapshot restoration via ABCI state sync, the system should gracefully handle errors in snapshot data processing and return appropriate error responses to Tendermint, allowing the node to reject malformed snapshots and request data from different peers.
 
-**Actual Logic:**
-The evidence age check uses `&&` (AND) instead of `||` (OR), requiring BOTH time duration AND block count to exceed their limits before rejecting evidence. When network block production slows (e.g., from 6s to 10s per block), the time-based unbonding completes after 21 days while only ~181,440 blocks have passed (< 302,400). The validator is removed via [5](#0-4) , including deletion of the ValidatorByConsAddr mapping [6](#0-5) . Evidence submitted on day 22 passes the age check (22 days > 21 days is TRUE, but blocks < 302,400 is FALSE, so TRUE && FALSE = FALSE, meaning NOT rejected), but when the evidence handler attempts to look up the validator, it returns nil and the handler returns early without processing the slashing.
+**Actual Logic:** When storev2 state store is enabled (`ssStore != nil`), the `restore()` method spawns an asynchronous goroutine that calls `ssStore.Import()`. If this import operation encounters an error, the goroutine directly calls `panic(err)` without any defer/recover mechanism. Since panics in goroutines without recovery propagate to the Go runtime, this crashes the entire application. The main restoration function does not wait for this goroutine to complete or handle any errors from it.
 
 **Exploitation Path:**
-1. Validator commits double-sign infraction at height H
-2. Validator initiates unbonding (requires zero delegator shares - self-delegation or all delegators unbond)
-3. Network experiences slower block production (10-12s blocks due to validator outages, network stress, or coordinated downtime)
-4. After 21 days, unbonding completes (time-based) at ~181,440 blocks
-5. Validator is removed from state including ValidatorByConsAddr mapping
-6. Unbonding delegations complete, tokens returned to delegators [9](#0-8) 
-7. Evidence submitted on day 22 at ~193,500 blocks
-8. Evidence passes age check: `(22d > 21d) && (193,500 > 302,400)` = `TRUE && FALSE` = `FALSE` (not rejected)
-9. ValidatorByConsAddr returns nil
-10. Evidence handler returns early at line 70 without slashing
-11. Mature unbonding entries cannot be slashed [8](#0-7) 
+1. Attacker sets up a malicious peer node in Tendermint's P2P network (no special privileges required)
+2. Victim node initiates state sync during initial sync, catching up, or after downtime
+3. Tendermint discovers attacker's node through P2P peer discovery [2](#0-1) 
+4. Attacker offers snapshot with valid metadata passing initial validation
+5. Victim calls ABCI `ApplySnapshotChunk` to process chunks [3](#0-2) 
+6. Chunks are validated by hash (snapshots/manager.go lines 362-368) - this only checks integrity, not semantic correctness
+7. Chunks pass protobuf unmarshaling but contain malformed data (invalid tree structure, constraint violations, corrupted node data)
+8. Malformed data is sent to `ssImporter` channel [4](#0-3) 
+9. `ssStore.Import` fails on deeper validation (database constraints, tree structure validation, key ordering violations, etc.)
+10. Goroutine panics with no recovery, crashing the victim node process
 
-**Security Guarantee Broken:**
-The slashing mechanism's economic security guarantee is violated. Validators who commit infractions should have their stake and their delegators' stakes partially slashed. This exploit allows complete evasion of slashing consequences.
+**Security Guarantee Broken:** The state sync mechanism should be resilient to untrusted peer data and handle errors gracefully. The panic violates the fundamental principle that external untrusted input should never crash the application, breaking availability and fault-tolerance guarantees.
 
 ## Impact Explanation
 
-This vulnerability results in direct loss of funds that should have been slashed from the validator and delegators' stakes. In a typical double-sign scenario with 5% slash fraction, the validator and all delegators keep 100% of their stake instead of losing 5%. The validator also avoids permanent tombstoning. This undermines the entire economic security model of proof-of-stake, as validators face no consequences for misbehavior, reducing their incentive to maintain honest operation. The protocol assumes slashing as a deterrent, but this exploit makes it circumventable.
+**Node-Level Impact:**
+- Complete node crash requiring manual restart
+- Repeated denial-of-service - attacker can crash nodes attempting to sync multiple times
+- Prevents nodes from successfully completing state sync
+
+**Network-Level Impact:**
+- New nodes cannot join the network via state sync
+- Validators recovering from downtime cannot resync reliably
+- During network upgrades when multiple nodes sync simultaneously, an attacker can crash 30% or more of syncing nodes
+- State sync feature becomes unreliable, forcing operators to disable it or find alternative sync methods
+- Network resilience degraded during critical periods (upgrades, mass validator onboarding)
+
+This meets the **Medium** severity threshold of "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network" when multiple nodes are syncing concurrently during network upgrades or mass onboarding events.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Validator commits a slashable infraction (double-signing)
-- Validator must have zero delegator shares when unbonding completes (achievable via self-delegation or if delegators choose to unbond)
-- Network experiences slower-than-expected block production during the 21-day unbonding period
-- Evidence is submitted after unbonding completes but within the block-based evidence window
+**Who Can Trigger:** Any network participant running a peer node. No special privileges, stake, or authentication required to participate in Tendermint P2P network and offer snapshots.
 
-**Likelihood:**
-Medium to High. Cosmos SDK chains commonly experience variable block times. Block times of 8-15 seconds occur naturally during network congestion, validator outages, or periods of reduced validator participation. With default parameters assuming 6-second blocks, any sustained period of 10+ second blocks creates this vulnerability window. Additionally, a malicious validator could potentially influence block times by coordinating temporary downtime with other validators they control or coordinate with. Self-delegated validators (common in practice) can trigger the unbonding condition unilaterally.
+**Conditions Required:**
+- Storev2 must be enabled on victim nodes (`ssConfig.Enable = true`) [5](#0-4) 
+- Victim node must be performing state sync [6](#0-5) 
+- Attacker's peer must be discovered by Tendermint peer discovery
+- Attacker must craft snapshot chunks that pass protobuf unmarshaling and hash validation but fail `ssStore.Import` validation
 
-**Realistic Scenario:**
-A validator operating with primarily self-delegation commits an infraction, immediately unbonds, and waits. If the network experiences natural slowdown (which happens periodically on most chains) or the validator contributes to slowdown by going offline, the timing window opens. This is not a theoretical edge case but a practical exploit path.
+**Frequency:** High likelihood for networks with storev2 enabled because:
+- New nodes regularly join networks via state sync
+- Validators resync after upgrades or operational issues
+- State sync is a standard Cosmos SDK feature enabled on many nodes
+- Attack can be repeated with minimal cost to the attacker
+- Particularly common during high-sync periods (post-upgrade, validator onboarding events)
 
 ## Recommendation
 
-**Option 1 (Recommended):** Change the evidence age validation logic from AND to OR:
+Add panic recovery to the goroutine handling state store imports and propagate errors through an error channel:
 
 ```go
-if ageDuration > cp.Evidence.MaxAgeDuration || ageBlocks > cp.Evidence.MaxAgeNumBlocks {
-    // reject evidence
+if rs.ssStore != nil {
+    ssImporter = make(chan sstypes.SnapshotNode, 10000)
+    ssImportErr := make(chan error, 1)
+    
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                ssImportErr <- fmt.Errorf("panic in ssStore.Import: %v", r)
+            }
+        }()
+        
+        err := rs.ssStore.Import(height, ssImporter)
+        if err != nil {
+            ssImportErr <- err
+            return
+        }
+        close(ssImportErr)
+    }()
+    
+    // Before returning from restore(), wait for goroutine completion
+    // and check ssImportErr for any errors
 }
 ```
 
-This ensures evidence is rejected if EITHER the time OR block count exceeds the limit, preventing the timing window.
-
-**Option 2:** Add parameter validation to ensure MaxAgeNumBlocks accounts for realistic worst-case block times. For example, require `MaxAgeNumBlocks >= MaxAgeDuration / (target_block_time * 0.5)` to provide a safety buffer for network slowdowns.
-
-**Option 3:** Maintain historical validator records for the evidence max age period, even after removal, allowing the slash function to process slashing against historical validator state and their unbonding delegations.
-
-**Option 4:** Prevent validator removal if they have unbonding delegations or redelegations that haven't matured beyond the evidence max age period.
+Additionally, ensure the main `restore()` function waits for goroutine completion and properly propagates any errors before returning success. This matches the error handling pattern used for `scImporter` at lines 789-792.
 
 ## Proof of Concept
 
-**Conceptual Test:** `TestValidatorEscapesSlashingThroughTimingWindow`
+**Test Scenario:**
+1. Initialize a storev2 Store with ssStore enabled using test configuration [5](#0-4) 
+2. Create a mock `protoReader` that returns `SnapshotItem` messages with leaf nodes containing data that will cause `ssStore.Import` to fail (e.g., duplicate keys, constraint violations, invalid versions)
+3. Call `store.Restore()` with the malformed data [6](#0-5) 
+4. Observe that the panic in the goroutine crashes the test/node, demonstrating the vulnerability
+5. After applying the recommended fix with proper error handling, verify that errors are properly returned instead of panicking
 
-**Setup:**
-1. Initialize chain with default consensus params (MaxAgeDuration=21 days, MaxAgeNumBlocks=302,400)
-2. Create validator with self-delegation of 1000 tokens
-3. Validator commits double-sign at block 1000, time T0
-
-**Execution:**
-1. Immediately unbond all validator delegations at block 1000
-2. Advance blockchain state simulating slow block production:
-   - Advance time by 21 days (1,814,400 seconds)
-   - Advance blocks by only 181,440 (simulating 10-second block time)
-3. Call EndBlock to process unbonding queue
-4. Verify validator is removed from ValidatorByConsAddr mapping
-5. Verify tokens returned to delegator account
-6. Advance time by 1 more day and blocks by ~12,000
-7. Submit double-sign evidence from block 1000
-
-**Expected Result:**
-- Evidence age check: ageDuration = 22 days > 21 days (TRUE), ageBlocks = 193,440 < 302,400 (FALSE) → NOT rejected
-- ValidatorByConsAddr returns nil
-- No slashing occurs
-- Assert: Delegator balance equals original stake (1000 tokens, not reduced by slash fraction)
-- Assert: No tokens burned from slashing
-
-This test would demonstrate that valid evidence within the supposed evidence window fails to trigger slashing due to the validator being removed before the block-based limit is reached.
-
-## Notes
-
-The claim has a minor technical inaccuracy in stating that "Slash returns early at line 48" when actually the evidence handler returns early at line 70 before Slash is ever called. However, this doesn't affect the validity of the vulnerability - the end result is identical (no slashing occurs). The core issue is the AND logic in evidence age validation combined with time-based unbonding completion versus block-based evidence validation, creating an exploitable timing window during network slowdowns.
+**Note:** The vulnerability is evident from code inspection - line 730 explicitly calls `panic(err)` in a goroutine without recovery. In Go, this is guaranteed to crash the process. A complete working PoC would require access to the external sei-db package to trigger actual `ssStore.Import` failures with specific data patterns, but the code defect and its consequences are unambiguous from the source code analysis.
 
 ### Citations
 
-**File:** x/evidence/keeper/infraction.go (L53-53)
+**File:** storev2/rootmulti/store.go (L61-95)
 ```go
-		if ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks {
-```
-
-**File:** x/evidence/keeper/infraction.go (L66-71)
-```go
-	validator := k.stakingKeeper.ValidatorByConsAddr(ctx, consAddr)
-	if validator == nil || validator.IsUnbonded() {
-		// Defensive: Simulation doesn't take unbonding periods into account, and
-		// Tendermint might break this assumption at some point.
-		return
+func NewStore(
+	homeDir string,
+	logger log.Logger,
+	scConfig config.StateCommitConfig,
+	ssConfig config.StateStoreConfig,
+	migrateIavl bool,
+) *Store {
+	scStore := sc.NewCommitStore(homeDir, logger, scConfig)
+	store := &Store{
+		logger:         logger,
+		scStore:        scStore,
+		storesParams:   make(map[types.StoreKey]storeParams),
+		storeKeys:      make(map[string]types.StoreKey),
+		ckvStores:      make(map[types.StoreKey]types.CommitKVStore),
+		pendingChanges: make(chan VersionedChangesets, 1000),
 	}
-```
-
-**File:** x/staking/types/params.go (L21-21)
-```go
-	DefaultUnbondingTime time.Duration = time.Hour * 24 * 7 * 3
-```
-
-**File:** simapp/test_helpers.go (L45-45)
-```go
-		MaxAgeNumBlocks: 302400,
-```
-
-**File:** simapp/test_helpers.go (L46-46)
-```go
-		MaxAgeDuration:  504 * time.Hour, // 3 weeks is the max duration
-```
-
-**File:** x/staking/keeper/validator.go (L176-176)
-```go
-	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
-```
-
-**File:** x/staking/keeper/validator.go (L441-444)
-```go
-				val = k.UnbondingToUnbonded(ctx, val)
-				if val.GetDelegatorShares().IsZero() {
-					k.RemoveValidator(ctx, val.GetOperator())
-				}
-```
-
-**File:** x/staking/keeper/slash.go (L179-182)
-```go
-		if entry.IsMature(now) {
-			// Unbonding delegation no longer eligible for slashing, skip it
-			continue
+	if ssConfig.Enable {
+		ssStore, err := ss.NewStateStore(logger, homeDir, ssConfig)
+		if err != nil {
+			panic(err)
 		}
+		// Check whether SC was enabled before but SS was not
+		ssVersion, _ := ssStore.GetLatestVersion()
+		scVersion, _ := scStore.GetLatestVersion()
+		if ssVersion <= 0 && scVersion > 0 && !migrateIavl {
+			panic("Enabling SS store without state sync could cause data corruption")
+		}
+		if err = ss.RecoverStateStore(logger, homeDir, ssStore); err != nil {
+			panic(err)
+		}
+		store.ssStore = ssStore
+		go store.StateStoreCommit()
+	}
+	return store
+
 ```
 
-**File:** x/staking/keeper/delegation.go (L887-893)
+**File:** storev2/rootmulti/store.go (L698-712)
 ```go
-				if err := k.bankKeeper.UndelegateCoinsFromModuleToAccount(
-					ctx, types.NotBondedPoolName, delegatorAddress, sdk.NewCoins(amt),
-				); err != nil {
-					return nil, err
-				}
+func (rs *Store) Restore(
+	height uint64, format uint32, protoReader protoio.Reader,
+) (snapshottypes.SnapshotItem, error) {
+	if rs.scStore != nil {
+		if err := rs.scStore.Close(); err != nil {
+			return snapshottypes.SnapshotItem{}, fmt.Errorf("failed to close db: %w", err)
+		}
+	}
+	item, err := rs.restore(int64(height), protoReader)
+	if err != nil {
+		return snapshottypes.SnapshotItem{}, err
+	}
 
-				balances = balances.Add(amt)
+	return item, rs.LoadLatestVersion()
+}
+```
+
+**File:** storev2/rootmulti/store.go (L727-732)
+```go
+		go func() {
+			err := rs.ssStore.Import(height, ssImporter)
+			if err != nil {
+				panic(err)
+			}
+		}()
+```
+
+**File:** storev2/rootmulti/store.go (L776-782)
+```go
+			if rs.ssStore != nil && node.Height == 0 && ssImporter != nil {
+				ssImporter <- sstypes.SnapshotNode{
+					StoreKey: storeKey,
+					Key:      node.Key,
+					Value:    node.Value,
+				}
+			}
+```
+
+**File:** snapshots/manager.go (L249-300)
+```go
+// Restore begins an async snapshot restoration, mirroring ABCI OfferSnapshot. Chunks must be fed
+// via RestoreChunk() until the restore is complete or a chunk fails.
+func (m *Manager) Restore(snapshot types.Snapshot) error {
+	if snapshot.Chunks == 0 {
+		return sdkerrors.Wrap(types.ErrInvalidMetadata, "no chunks")
+	}
+	if uint32(len(snapshot.Metadata.ChunkHashes)) != snapshot.Chunks {
+		return sdkerrors.Wrapf(types.ErrInvalidMetadata, "snapshot has %v chunk hashes, but %v chunks",
+			uint32(len(snapshot.Metadata.ChunkHashes)),
+			snapshot.Chunks)
+	}
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	// check multistore supported format preemptive
+	if snapshot.Format != types.CurrentFormat {
+		return sdkerrors.Wrapf(types.ErrUnknownFormat, "snapshot format %v", snapshot.Format)
+	}
+	if snapshot.Height == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrLogic, "cannot restore snapshot at height 0")
+	}
+	if snapshot.Height > uint64(math.MaxInt64) {
+		return sdkerrors.Wrapf(types.ErrInvalidMetadata,
+			"snapshot height %v cannot exceed %v", snapshot.Height, int64(math.MaxInt64))
+	}
+
+	err := m.beginLocked(opRestore)
+	if err != nil {
+		return err
+	}
+
+	// Start an asynchronous snapshot restoration, passing chunks and completion status via channels.
+	chChunks := make(chan io.ReadCloser, chunkBufferSize)
+	chDone := make(chan restoreDone, 1)
+
+	go func() {
+		startTime := time.Now()
+		err := m.restoreSnapshot(snapshot, chChunks)
+		chDone <- restoreDone{
+			complete: err == nil,
+			err:      err,
+		}
+		close(chDone)
+		m.logger.Info(fmt.Sprintf("Restoring snapshot for version %d took %s", snapshot.Height, time.Since(startTime)))
+	}()
+
+	m.chRestore = chChunks
+	m.chRestoreDone = chDone
+	m.restoreChunkHashes = snapshot.Metadata.ChunkHashes
+	m.restoreChunkIndex = 0
+	return nil
+}
+```
+
+**File:** baseapp/abci.go (L628-642)
+```go
+func (app *BaseApp) ApplySnapshotChunk(context context.Context, req *abci.RequestApplySnapshotChunk) (*abci.ResponseApplySnapshotChunk, error) {
+	if app.snapshotManager == nil {
+		app.logger.Error("snapshot manager not configured")
+		return &abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ABORT}, nil
+	}
+
+	done, err := app.snapshotManager.RestoreChunk(req.Chunk)
+	switch {
+	case err == nil:
+		if done {
+			if app.interBlockCache != nil {
+				app.interBlockCache.Reset()
+			}
+		}
+		return &abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil
 ```

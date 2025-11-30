@@ -1,186 +1,255 @@
 # Audit Report
 
 ## Title
-Commission Rate Decrease Bypass - MaxChangeRate Validation Only Enforced for Increases
+Message Filtering Bypass in AllowedMsgAllowance via MsgExec Wrapping
 
 ## Summary
-The `ValidateNewRate()` function in the staking module only validates `MaxChangeRate` limits for commission rate increases, allowing validators to decrease their commission by any amount regardless of the configured `MaxChangeRate` parameter. This bypasses the intended gradual rate change mechanism.
+The `AllowedMsgAllowance` fee grant filtering mechanism only validates top-level message types and does not recursively check nested messages within `MsgExec`. This allows grantees to consume fee allowances for message types that granters did not authorize, violating the documented security guarantee. [1](#0-0) 
 
 ## Impact
-Medium
+Low
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+- **location:** `x/feegrant/filtered_fee.go`, lines 98-109 in the `allMsgTypesAllowed()` method
 
-**Intended Logic:** The `MaxChangeRate` parameter is designed to enforce that commission rate changes (in either direction) cannot exceed a specified limit within a 24-hour period. The code comment explicitly states "new rate % points change cannot be greater than the max change rate" [2](#0-1) , indicating that the absolute value of any change should be validated.
+- **intended logic:** According to the module specification, the SDK should "iterate over the messages being sent by the grantee to ensure the messages adhere to the filter" and "stop iterating and fail the transaction if it finds a message that does not conform to the filter." [2](#0-1)  The proto documentation states `AllowedMsgAllowance` "creates allowance only for specified message types." [3](#0-2) 
 
-**Actual Logic:** The validation uses `newRate.Sub(c.Rate).GT(c.MaxChangeRate)` which performs: `(newRate - currentRate) > MaxChangeRate`. This only catches cases where the result is positive and exceeds the limit. When validators decrease their rate (newRate < currentRate), the subtraction yields a negative value. Since negative values are never greater than positive `MaxChangeRate` values [3](#0-2) , the validation always passes for decreases regardless of magnitude.
+- **actual logic:** The `allMsgTypesAllowed()` method only iterates through top-level messages from the transaction and checks their type URLs against the allowed list. It does not recursively inspect nested messages within `MsgExec`. The ante handler passes only top-level messages via `sdkTx.GetMsgs()` to the fee grant validation. [4](#0-3) 
 
-**Exploitation Path:**
-1. Any validator sends a `MsgEditValidator` transaction with a new commission rate [4](#0-3) 
-2. The transaction is processed through `UpdateValidatorCommission` [5](#0-4) 
-3. `ValidateNewRate()` is called to validate the change [6](#0-5) 
-4. For rate decreases, the check at line 97 passes regardless of how large the decrease is
-5. The commission rate is updated, bypassing the intended `MaxChangeRate` restriction
+- **exploitation path:**
+  1. Granter creates an `AllowedMsgAllowance` with specific allowed message types (e.g., `/cosmos.bank.v1beta1.MsgSend`)
+  2. Granter includes `/cosmos.authz.v1beta1.MsgExec` in the allowed list for legitimate authz use cases
+  3. Grantee constructs a `MsgExec` that wraps disallowed messages (e.g., `/cosmos.staking.v1beta1.MsgDelegate`)
+  4. During ante handler execution, only the outer `MsgExec` type is validated, which passes the filter check
+  5. The transaction proceeds to execution phase where `MsgExec.GetMessages()` extracts the wrapped messages [5](#0-4) 
+  6. The inner disallowed messages are executed via `DispatchActions()` using the fee grant [6](#0-5) 
 
-**Security Guarantee Broken:** The invariant that commission rate changes must be gradual and limited by `MaxChangeRate` is violated for decreases. The existing test suite confirms this: a validator with rate 0.40 and MaxChangeRate 0.10 can decrease to 0.10 (a 0.30 or 30% decrease, 3x the limit) [7](#0-6) .
+- **security guarantee broken:** The documented guarantee that "all messages must conform to the filter" is violated. The system fails to enforce message type restrictions for nested messages within `MsgExec`, allowing fee consumption for unauthorized message types.
 
 ## Impact Explanation
 
-This vulnerability allows validators to manipulate the delegation market by:
-
-1. **Market Manipulation:** Validators can suddenly drop their commission to 0% to attract delegators, then gradually increase it back up (respecting the limit for increases), effectively luring delegators with artificially low rates
-2. **Unfair Competition:** Creates an asymmetric competitive advantage where validators can rapidly decrease rates but competitors cannot respond as quickly
-3. **Delegator Protection Bypass:** The `MaxChangeRate` mechanism is designed to protect delegators from sudden rate changes, but this protection only applies to increases
-4. **Validator Set Instability:** Large sudden commission drops can trigger rapid delegation shifts, potentially destabilizing the validator set distribution
-
-This qualifies as Medium severity under: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+This vulnerability allows grantees to consume fee allowances for message types that granters did not intend to authorize. Fee grants can be depleted for operations like staking, governance, or IBC transfers when only basic transfers were intended. While the grantee still needs valid authz authorization for the inner messages (preventing completely arbitrary operations), the granter's trust model and fee budget restrictions are violated. This constitutes "modification of transaction fees outside of design parameters" as classified in the Low severity impact category.
 
 ## Likelihood Explanation
 
-**Exploitability:** High
-- Any validator can trigger this through normal `MsgEditValidator` transactions
-- No special privileges or conditions required beyond being a validator
-- Can be executed once every 24 hours (after the standard cooldown period)
+The vulnerability can be exploited whenever:
+- A granter includes `MsgExec` in their allowed messages list (a reasonable choice for legitimate authz use cases)
+- A grantee has both a fee grant and authz authorization for the desired inner messages
 
-**Motivation:** Validators have direct financial incentives to attract more delegations to increase their rewards. The ability to bypass rate change restrictions provides a competitive advantage that rational validators would exploit.
-
-**Frequency:** Can be exploited repeatedly by any validator in the network once per 24-hour period.
+Granters may not realize that allowing `MsgExec` effectively bypasses all message filtering, as this behavior contradicts the documented specification that promises all messages will be validated. The exploit requires no special privileges beyond being a grantee and is repeatable until the fee grant is exhausted. No existing tests cover this nested message scenario. [7](#0-6) 
 
 ## Recommendation
 
-Modify the validation logic in `ValidateNewRate()` to check the absolute value of the rate change:
+Modify the `allMsgTypesAllowed()` method in `x/feegrant/filtered_fee.go` to recursively validate nested messages when encountering `MsgExec`:
 
-Replace line 97 with:
-```go
-case newRate.Sub(c.Rate).Abs().GT(c.MaxChangeRate):
-    // new rate % points change cannot be greater than the max change rate
-    return ErrCommissionGTMaxChangeRate
-```
+1. Detect `MsgExec` messages during iteration by checking the message type URL
+2. Extract inner messages using the `GetMessages()` method
+3. Recursively validate inner messages against the allowed list
+4. Handle nested `MsgExec` scenarios through recursion
 
-This ensures both increases and decreases are subject to the `MaxChangeRate` limit, maintaining the intended invariant that commission changes must be gradual regardless of direction. The `Abs()` method is already available in the decimal type [8](#0-7) .
+The fix should consume appropriate gas for each nested message checked (following the existing pattern of 10 gas per message from line 102) and reject transactions containing any disallowed nested message types.
 
 ## Proof of Concept
 
-**Test Setup:** The vulnerability is already demonstrated in the existing test suite.
+**Scenario:**
+- **Setup:** Granter creates `AllowedMsgAllowance` for grantee with allowed messages: `["/cosmos.bank.v1beta1.MsgSend", "/cosmos.authz.v1beta1.MsgExec"]`. Grantee has authz authorization for `/cosmos.staking.v1beta1.MsgDelegate` from another account.
 
-**Existing Test Evidence:**
-From `x/staking/types/commission_test.go` lines 40-62:
-- Commission c1 is created with: Rate=0.40 (40%), MaxRate=0.80 (80%), MaxChangeRate=0.10 (10%)
-- Test case at line 62: `{c1, sdk.MustNewDecFromStr("0.10"), now.Add(48 * time.Hour), false}`
-- This tests changing from 0.40 to 0.10 with expectErr=false
+- **Action:** Grantee submits transaction with:
+  - Fee granter set to the granter's address
+  - Messages: `[MsgExec{ Grantee: grantee, Msgs: [MsgDelegate{...}] }]`
+  
+- **Result:** 
+  - The ante handler calls `allMsgTypesAllowed()` with `[MsgExec]` (top-level only)
+  - Validation passes because `MsgExec` is in the allowed list
+  - Fee grant is accepted and consumed
+  - During execution, `MsgDelegate` is extracted and executed
+  - The disallowed `MsgDelegate` message executes using the fee grant, despite not being in the granter's allowed message list
 
-**Action:** The change from 0.40 to 0.10 represents a 0.30 decrease (30%)
-
-**Result:** Despite MaxChangeRate being only 0.10 (10%), this 3x bypass is expected to pass validation (expectErr=false), confirming the vulnerability
-
-**Additional PoC:** A validator could:
-1. Set commission to 50% with MaxChangeRate of 1%
-2. After 24 hours, decrease commission to 0% in a single transaction (bypassing the 1% limit)
-3. Attract delegators with 0% commission
-4. Gradually increase commission back to desired level (respecting the 1% limit for increases)
-
-## Notes
-
-The code comment at line 98 clearly states "new rate % points **change**" (emphasis added), not "increase", indicating that the validation should apply to changes in both directions. The asymmetric enforcement creates an exploitable loophole that violates the intended design of gradual, predictable commission rate changes.
+This demonstrates that the filtering mechanism fails to enforce restrictions on nested messages, violating the documented security guarantee and the granter's intended fee budget restrictions.
 
 ### Citations
 
-**File:** x/staking/types/commission.go (L81-103)
+**File:** x/feegrant/filtered_fee.go (L98-109)
 ```go
-// ValidateNewRate performs basic sanity validation checks of a new commission
-// rate. If validation fails, an SDK error is returned.
-func (c Commission) ValidateNewRate(newRate sdk.Dec, blockTime time.Time) error {
-	switch {
-	case blockTime.Sub(c.UpdateTime).Hours() < 24:
-		// new rate cannot be changed more than once within 24 hours
-		return ErrCommissionUpdateTime
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
 
-	case newRate.IsNegative():
-		// new rate cannot be negative
-		return ErrCommissionNegative
-
-	case newRate.GT(c.MaxRate):
-		// new rate cannot be greater than the max rate
-		return ErrCommissionGTMaxRate
-
-	case newRate.Sub(c.Rate).GT(c.MaxChangeRate):
-		// new rate % points change cannot be greater than the max change rate
-		return ErrCommissionGTMaxChangeRate
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
+		}
 	}
 
-	return nil
+	return true
 }
 ```
 
-**File:** types/decimal.go (L211-211)
-```go
-func (d Dec) GT(d2 Dec) bool    { return (d.i).Cmp(d2.i) > 0 }        // greater than
+**File:** x/feegrant/spec/01_concepts.md (L76-76)
+```markdown
+In order to prevent DoS attacks, using a filtered `x/feegrant` incurs gas. The SDK must assure that the `grantee`'s transactions all conform to the filter set by the `granter`. The SDK does this by iterating over the allowed messages in the filter and charging 10 gas per filtered message. The SDK will then iterate over the messages being sent by the `grantee` to ensure the messages adhere to the filter, also charging 10 gas per message. The SDK will stop iterating and fail the transaction if it finds a message that does not conform to the filter.
 ```
 
-**File:** types/decimal.go (L216-216)
-```go
-func (d Dec) Abs() Dec          { return Dec{new(big.Int).Abs(d.i)} } // absolute value
+**File:** proto/cosmos/feegrant/v1beta1/feegrant.proto (L56-66)
+```text
+// AllowedMsgAllowance creates allowance only for specified message types.
+message AllowedMsgAllowance {
+  option (gogoproto.goproto_getters)         = false;
+  option (cosmos_proto.implements_interface) = "FeeAllowanceI";
+
+  // allowance can be any of basic and filtered fee allowance.
+  google.protobuf.Any allowance = 1 [(cosmos_proto.accepts_interface) = "FeeAllowanceI"];
+
+  // allowed_messages are the messages for which the grantee has the access.
+  repeated string allowed_messages = 2;
+}
 ```
 
-**File:** x/staking/keeper/msg_server.go (L130-160)
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-func (k msgServer) EditValidator(goCtx context.Context, msg *types.MsgEditValidator) (*types.MsgEditValidatorResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
-	if err != nil {
-		return nil, err
-	}
-	// validator must already be registered
-	validator, found := k.GetValidator(ctx, valAddr)
-	if !found {
-		return nil, types.ErrNoValidatorFound
-	}
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+```
 
-	// replace all editable fields (clients should autofill existing values)
-	description, err := validator.Description.UpdateDescription(msg.Description)
-	if err != nil {
-		return nil, err
-	}
-
-	validator.Description = description
-
-	if msg.CommissionRate != nil {
-		commission, err := k.UpdateValidatorCommission(ctx, validator, *msg.CommissionRate)
-		if err != nil {
-			return nil, err
+**File:** x/authz/msgs.go (L197-209)
+```go
+// GetMessages returns the cache values from the MsgExecAuthorized.Msgs if present.
+func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
+	msgs := make([]sdk.Msg, len(msg.Msgs))
+	for i, msgAny := range msg.Msgs {
+		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
+		if !ok {
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
 		}
-
-		// call the before-modification hook since we're about to update the commission
-		k.BeforeValidatorModified(ctx, valAddr)
-
-		validator.Commission = commission
+		msgs[i] = msg
 	}
+
+	return msgs, nil
+}
 ```
 
-**File:** x/staking/keeper/validator.go (L131-147)
+**File:** x/authz/keeper/msg_server.go (L65-82)
 ```go
-// An error is returned if the new commission rate is invalid.
-func (k Keeper) UpdateValidatorCommission(ctx sdk.Context,
-	validator types.Validator, newRate sdk.Dec) (types.Commission, error) {
-	commission := validator.Commission
-	blockTime := ctx.BlockHeader().Time
-
-	if err := commission.ValidateNewRate(newRate, blockTime); err != nil {
-		return commission, err
+func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
 	}
 
-	if newRate.LT(k.MinCommissionRate(ctx)) {
-		return commission, fmt.Errorf("cannot set validator commission to less than minimum rate of %s", k.MinCommissionRate(ctx))
+	msgs, err := msg.GetMessages()
+	if err != nil {
+		return nil, err
 	}
-	commission.Rate = newRate
-	commission.UpdateTime = blockTime
 
-	return commission, nil
+	results, err := k.DispatchActions(ctx, grantee, msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgExecResponse{Results: results}, nil
 ```
 
-**File:** x/staking/types/commission_test.go (L62-62)
+**File:** x/feegrant/filtered_fee_test.go (L1-100)
 ```go
-		{c1, sdk.MustNewDecFromStr("0.10"), now.Add(48 * time.Hour), false},
+package feegrant_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
+
+	"github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/simapp"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"github.com/cosmos/cosmos-sdk/x/feegrant"
+)
+
+func TestFilteredFeeValidAllow(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{
+		Time: time.Now(),
+	})
+
+	eth := sdk.NewCoins(sdk.NewInt64Coin("eth", 10))
+	atom := sdk.NewCoins(sdk.NewInt64Coin("atom", 555))
+	smallAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 43))
+	bigAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 1000))
+	leftAtom := bigAtom.Sub(smallAtom)
+	now := ctx.BlockTime()
+	oneHour := now.Add(1 * time.Hour)
+	from := sdk.MustAccAddressFromBech32("cosmos18cgkqduwuh253twzmhedesw3l7v3fm37sppt58")
+	to := sdk.MustAccAddressFromBech32("cosmos1yq8lgssgxlx9smjhes6ryjasmqmd3ts2559g0t")
+
+	// small fee without expire
+	msgType := "/cosmos.bank.v1beta1.MsgSend"
+	any, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// all fee without expire
+	any2, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: smallAtom,
+	})
+
+	// wrong fee
+	any3, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// wrong fee
+	any4, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	// expired
+	any5, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+		Expiration: &now,
+	})
+
+	// few more than allowed
+	any6, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: atom,
+		Expiration: &now,
+	})
+
+	// with out spend limit
+	any7, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &oneHour,
+	})
+
+	// expired no spend limit
+	any8, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	// msg type not allowed
+	msgType2 := "/cosmos.ibc.applications.transfer.v1.MsgTransfer"
+	any9, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	cases := map[string]struct {
+		allowance *feegrant.AllowedMsgAllowance
+		msgs      []sdk.Msg
+		fee       sdk.Coins
+		blockTime time.Time
+		valid     bool
+		accept    bool
+		remove    bool
+		remains   sdk.Coins
+	}{
+		"small fee without expire": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any,
+				AllowedMessages: []string{msgType},
+			},
+			msgs: []sdk.Msg{&banktypes.MsgSend{
+				FromAddress: from.String(),
+				ToAddress:   to.String(),
 ```

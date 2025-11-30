@@ -1,290 +1,211 @@
-## Audit Report
+# Audit Report
 
 ## Title
-Pre-Gas-Check CPU Exhaustion via Excessive Message Count in Transactions
+Chain Halt Due to Orphaned Missed Blocks in Genesis State
 
 ## Summary
-The sei-cosmos blockchain processes transaction messages through expensive validation operations (including Bech32 address parsing) before the gas metering system is initialized. An attacker can submit transactions containing thousands of messages that consume excessive CPU during `ValidateBasic()` checks before being rejected for insufficient gas, enabling a resource exhaustion attack at no cost to the attacker.
+The slashing module's `ValidateGenesis` function fails to validate the consistency between missed blocks and signing info entries. Combined with an implementation that panics instead of using default values (as specified in documentation), this allows genesis files with orphaned missed blocks to cause total network shutdown when affected validators participate in consensus.
 
 ## Impact
-**Medium**
+High
 
 ## Finding Description
 
-**Location:** 
-- `baseapp/baseapp.go` lines 921-924 (message retrieval and validation before gas setup)
-- `x/bank/types/msgs.go` lines 29-49 (expensive Bech32 parsing in ValidateBasic)
-- `x/auth/ante/ante.go` line 48 (gas meter setup occurs only in AnteHandler)
-- `types/address.go` lines 168-185 (Bech32 decoding operations)
+**Location:**
+- Validation gap: [1](#0-0) 
+- Independent import without cross-validation: [2](#0-1) 
+- Panic trigger: [3](#0-2) 
+- Hook bypass mechanism: [4](#0-3) 
 
-**Intended Logic:** 
-Transactions should undergo efficient preliminary validation, with the gas metering system preventing resource exhaustion by rejecting underfunded transactions early in the processing pipeline.
+**Intended Logic:**
+According to the specification [5](#0-4) , the system should use a 0-value default signing info if not present. Genesis validation should enforce the invariant that missed blocks entries only exist for validators with corresponding signing info.
 
-**Actual Logic:** 
-In the transaction processing flow:
-1. `tx.GetMsgs()` is called to iterate through all messages [1](#0-0) 
-2. `validateBasicTxMsgs(msgs)` is immediately called, which invokes `ValidateBasic()` on each message [2](#0-1) 
-3. For `MsgSend`, each `ValidateBasic()` call performs two `AccAddressFromBech32()` operations (from/to addresses) [3](#0-2) 
-4. Each `AccAddressFromBech32()` call performs cryptographic Bech32 decoding with checksum verification [4](#0-3) 
-5. Only AFTER these operations does the `AnteHandler` execute, where the gas meter is first initialized in `SetUpContextDecorator` [5](#0-4) 
-6. Gas consumption for transaction size occurs in `ConsumeTxSizeGasDecorator` [6](#0-5) 
+**Actual Logic:**
+1. `ValidateGenesis` only validates slashing parameters but does NOT validate the relationship between `MissedBlocks` and `SigningInfos` [1](#0-0) 
+
+2. `InitGenesis` imports signing infos and missed blocks independently without cross-validation [2](#0-1) 
+
+3. When `Exported: true` is set in staking genesis, validator creation hooks are skipped [4](#0-3) , preventing automatic signing info creation via the `AfterValidatorBonded` hook [6](#0-5) 
+
+4. When a validator with orphaned missed blocks participates in consensus, `HandleValidatorSignatureConcurrent` panics [3](#0-2)  instead of using default values as specified
 
 **Exploitation Path:**
-1. Attacker crafts a transaction with 3,000-5,000 `MsgSend` messages (all from the same address to bypass the TxSigLimit of 7)
-2. Transaction fits within Tendermint's typical MaxTxBytes limit (~1MB)
-3. Transaction is submitted via `CheckTx` [7](#0-6) 
-4. Node processes `GetMsgs()` iterating 3,000-5,000 times [8](#0-7) 
-5. Node executes `ValidateBasic()` on each message, performing 6,000-10,000 Bech32 decode operations
-6. AnteHandler finally executes and rejects the transaction for insufficient gas
-7. No gas fees are charged (transaction rejected in CheckTx before block inclusion)
-8. Attacker repeats continuously at no cost
+1. Genesis file is created with `ValidatorMissedBlockArray` entries but no corresponding `SigningInfo` entries, with `Exported: true` in staking genesis (can occur through manual construction, custom tooling bugs, or merging multiple genesis sources)
+2. Genesis validation passes because `ValidateGenesis` only checks parameters
+3. Chain operators initialize using `InitGenesis`, importing the orphaned missed blocks
+4. When the validator participates in consensus, `BeginBlocker` invokes `HandleValidatorSignatureConcurrent` [7](#0-6) 
+5. The function panics with "Expected signing info for validator %s but not found"
+6. Entire chain halts due to consensus failure
 
-**Security Guarantee Broken:** 
-The invariant that expensive computational operations should be gas-metered is violated. CPU resources are consumed before any gas accounting occurs, creating an asymmetry where cheap-to-submit transactions are expensive-to-validate.
+**Security Guarantee Broken:**
+The system fails to maintain the critical invariant that missed blocks can only exist for validators with signing info. The implementation contradicts the specification by panicking instead of using default values.
 
 ## Impact Explanation
 
-**Resource Exhaustion:**
-- Each transaction performs thousands of cryptographic Bech32 decode operations before gas validation
-- Node CPU resources are consumed processing these validations
-- Network bandwidth is consumed transmitting and broadcasting these transactions
-- Mempool capacity is filled with resource-intensive transactions
+This vulnerability causes **total network shutdown**, which is explicitly listed in the acceptance criteria as a HIGH severity impact: "Network not being able to confirm new transactions (total network shutdown)."
 
-**Network-Wide Effects:**
-- An attacker flooding the network with such transactions can increase node CPU consumption by 30%+ compared to normal operation
-- This degradation directly impacts transaction processing throughput for legitimate users
-- Validators spending CPU on attack transactions have reduced capacity for consensus operations
-- Could lead to temporary network slowdown or individual node instability under sustained attack
+When the panic occurs in `BeginBlocker` during consensus:
+- The entire blockchain network halts immediately
+- No new blocks can be produced or transactions confirmed
+- The network remains down until all validators coordinate to restart with a corrected genesis file
+- Recovery requires complex coordination and potentially a hard fork
 
-**Economic Impact:**
-This bypasses the intended gas-based rate limiting mechanism. Since resource consumption occurs before gas accounting, nodes cannot economically price out attackers. The attack is economically viable because rejected CheckTx transactions don't charge gas fees, allowing unlimited repetition at zero cost.
+This is a consensus-breaking failure that impacts the entire network simultaneously, not an application-level error affecting individual transactions.
 
 ## Likelihood Explanation
 
 **Who Can Trigger:**
-Any network participant can submit transactions. No special privileges, permissions, or stake requirements are needed.
+Genesis file creators during chain launch or network restart, including:
+- Participants in multi-party genesis coordination (standard for blockchain launches)
+- Those using custom genesis generation tooling
+- Anyone manually constructing or merging genesis files
 
 **Required Conditions:**
-- Attacker crafts transactions with maximum messages fitting within Tendermint's MaxTxBytes (typically 1MB)
-- All messages from same signer (single signature) to bypass TxSigLimit
-- Standard network operation - no special conditions required
+1. Genesis file with orphaned missed blocks must be used during chain initialization
+2. The validator addresses in orphaned missed blocks must participate in consensus
+3. `Exported: true` must be set in staking genesis (standard for chain upgrades/restarts)
 
-**Frequency of Exploitation:**
-- Can be triggered immediately and continuously
-- Attacker can submit multiple such transactions simultaneously
-- Each transaction consumes disproportionate CPU relative to its validation cost
-- Attack is economically viable since rejected transactions incur no gas costs
-- No existing message count limit prevents this attack [2](#0-1) 
+**Likelihood Assessment:**
+This is realistic because:
+- Multi-party genesis coordination is standard practice
+- The validation gap makes it easy to miss this inconsistency during review
+- Genesis files passing `ValidateGenesis` gives false confidence of correctness
+- Specification states missing signing info should be handled gracefully, suggesting this edge case was intended to be supported
+- Once imported, the issue persists as a "time bomb" until triggered
 
-The codebase has a `TxSigLimit` parameter (default 7) [9](#0-8)  but no corresponding message count limit, leaving this attack vector unprotected.
+The specification-implementation mismatch is critical: even a trusted genesis creator following the documented behavior could inadvertently create this state, causing an unrecoverable security failure (total chain halt) beyond their intended authority of setting initial chain state.
 
 ## Recommendation
 
-**Immediate Fix:**
-Implement a message count limit early in the transaction validation pipeline:
+**Fix 1: Add Validation in ValidateGenesis**
+Add cross-validation in `x/slashing/types/genesis.go` after line 56 to ensure all missed blocks have corresponding signing info:
+- Create a map of signing info addresses
+- Iterate through missed blocks and verify each has a corresponding signing info entry
+- Return an error if orphaned missed blocks are found
 
-1. Add a `MaxMsgCount` parameter to the auth module (similar to existing `TxSigLimit`) with a sensible default (e.g., 100-500 messages)
+**Fix 2: Implement Graceful Handling (Defense-in-Depth)**
+Align implementation with specification in `x/slashing/keeper/infractions.go` lines 33-36 by creating default signing info instead of panicking, as documented in the specification.
 
-2. Check message count in the transaction decoder immediately after unmarshaling the body [10](#0-9) :
-   ```go
-   if len(body.Messages) > maxMsgCount {
-       return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "too many messages")
-   }
-   ```
-
-3. Alternatively, add the check at the beginning of `runTx()` before calling `GetMsgs()` at line 921
-
-**Additional Hardening:**
-- Consider lazy evaluation in `GetMsgs()` to avoid allocating memory for all messages upfront
-- Document the message count limit in consensus parameters
-- Add monitoring/alerting for transactions approaching the limit
+**Recommended Approach:** Implement both fixes for defense-in-depth:
+- Fix 1 prevents the issue at genesis validation time (fail-fast)
+- Fix 2 aligns implementation with specification and provides fallback protection
 
 ## Proof of Concept
 
-**File:** `baseapp/deliver_tx_test.go` (new test function)
-
-**Function Name:** `TestCheckTxWithExcessiveMessageCount`
+While the report references a test `TestOrphanedMissedBlocksCausesPanic`, the vulnerability is demonstrable through code analysis:
 
 **Setup:**
-1. Initialize test application with default ante handler chain including `ConsumeTxSizeGasDecorator`
-2. Create test account with sufficient funds
-3. Generate transaction containing 5,000 `MsgSend` messages:
-   - All messages from same account (single signature)
-   - Each with valid bech32 addresses and minimal coin amounts
-   - Total transaction size ~1MB (within Tendermint limits)
-4. Set gas limit to 100,000 (insufficient for actual execution)
+1. Create a genesis state with a `ValidatorMissedBlockArray` entry for a validator address
+2. Do NOT include a corresponding `SigningInfo` entry for that address
+3. Set `Exported: true` in the staking genesis to bypass hook-based signing info creation
+4. Verify the malformed genesis passes `ValidateGenesis` (it will, as it only checks parameters)
 
-**Trigger:**
-1. Record CPU time/operation count before CheckTx
-2. Call `app.CheckTx()` with the crafted transaction bytes
-3. Record CPU time/operation count after CheckTx returns
-4. Verify transaction rejected with out-of-gas error
+**Action:**
+5. Import the genesis using `InitGenesis`
+6. Trigger `BeginBlocker` with a validator vote for the address with orphaned missed blocks
 
-**Expected Result:**
-- Significant CPU time consumed processing 10,000 Bech32 parse operations
-- Transaction ultimately rejected for insufficient gas
-- Computational work done before gas checking disproportionate to rejection cost
-- Demonstrates expensive validation occurs before gas metering
+**Result:**
+7. The chain panics in `HandleValidatorSignatureConcurrent` with "Expected signing info for validator %s but not found" [3](#0-2) 
+8. This causes total network shutdown
 
-This proves the vulnerability: expensive validation operations execute before the gas accounting system can prevent resource exhaustion, enabling a denial-of-service attack at zero cost to the attacker.
+The vulnerability is confirmed by the discrepancy between the specification [5](#0-4)  (which states default values should be used) and the implementation (which panics), combined with the validation gap in [1](#0-0) .
 
 ## Notes
 
-The vulnerability matches the Medium severity impact criterion: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours." The attack requires no special privileges and can be executed continuously at zero cost since rejected CheckTx transactions don't charge gas fees.
+This vulnerability represents a critical gap where the system fails to enforce its own documented invariants. The specification explicitly states that missing signing info should be handled gracefully with default values, but the implementation panics instead. This discrepancy, combined with incomplete validation, creates a scenario where even trusted parties can inadvertently create genesis files that cause total network shutdown - an impact far beyond the intended authority of setting initial chain state.
 
 ### Citations
 
-**File:** baseapp/baseapp.go (L788-801)
+**File:** x/slashing/types/genesis.go (L32-58)
 ```go
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-	if len(msgs) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
+func ValidateGenesis(data GenesisState) error {
+	downtime := data.Params.SlashFractionDowntime
+	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
 	}
 
-	for _, msg := range msgs {
-		err := msg.ValidateBasic()
-		if err != nil {
-			return err
-		}
+	dblSign := data.Params.SlashFractionDoubleSign
+	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
+	}
+
+	minSign := data.Params.MinSignedPerWindow
+	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
+	}
+
+	downtimeJail := data.Params.DowntimeJailDuration
+	if downtimeJail < 1*time.Minute {
+		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
+	}
+
+	signedWindow := data.Params.SignedBlocksWindow
+	if signedWindow < 10 {
+		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
 	}
 
 	return nil
-}
 ```
 
-**File:** baseapp/baseapp.go (L921-921)
+**File:** x/slashing/genesis.go (L24-38)
 ```go
-	msgs := tx.GetMsgs()
-```
-
-**File:** x/bank/types/msgs.go (L29-49)
-```go
-func (msg MsgSend) ValidateBasic() error {
-	_, err := sdk.AccAddressFromBech32(msg.FromAddress)
-	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid sender address (%s)", err)
-	}
-
-	_, err = sdk.AccAddressFromBech32(msg.ToAddress)
-	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid recipient address (%s)", err)
-	}
-
-	if !msg.Amount.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
-	}
-
-	if !msg.Amount.IsAllPositive() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
-	}
-
-	return nil
-}
-```
-
-**File:** types/address.go (L168-185)
-```go
-func AccAddressFromBech32(address string) (addr AccAddress, err error) {
-	if len(strings.TrimSpace(address)) == 0 {
-		return AccAddress{}, errors.New("empty address string is not allowed")
-	}
-
-	bech32PrefixAccAddr := GetConfig().GetBech32AccountAddrPrefix()
-
-	bz, err := GetFromBech32(address, bech32PrefixAccAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	err = VerifyAddressFormat(bz)
-	if err != nil {
-		return nil, err
-	}
-
-	return AccAddress(bz), nil
-```
-
-**File:** x/auth/ante/ante.go (L47-48)
-```go
-	anteDecorators := []sdk.AnteFullDecorator{
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-```
-
-**File:** x/auth/ante/basic.go (L109-116)
-```go
-func (cgts ConsumeTxSizeGasDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	sigTx, ok := tx.(authsigning.SigVerifiableTx)
-	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
-	}
-	params := cgts.ak.GetParams(ctx)
-
-	ctx.GasMeter().ConsumeGas(params.TxSizeCostPerByte*sdk.Gas(len(ctx.TxBytes())), "txSize")
-```
-
-**File:** baseapp/abci.go (L226-231)
-```go
-	tx, err := app.txDecoder(req.Tx)
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
-```
-
-**File:** types/tx/types.go (L22-37)
-```go
-func (t *Tx) GetMsgs() []sdk.Msg {
-	if t == nil || t.Body == nil {
-		return nil
-	}
-
-	anys := t.Body.Messages
-	res := make([]sdk.Msg, len(anys))
-	for i, any := range anys {
-		cached := any.GetCachedValue()
-		if cached == nil {
-			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
-		}
-		res[i] = cached.(sdk.Msg)
-	}
-	return res
-}
-```
-
-**File:** x/auth/types/params.go (L14-38)
-```go
-	DefaultTxSigLimit             uint64 = 7
-	DefaultTxSizeCostPerByte      uint64 = 10
-	DefaultSigVerifyCostED25519   uint64 = 590
-	DefaultSigVerifyCostSecp256k1 uint64 = 1000
-)
-
-// Parameter keys
-var (
-	KeyMaxMemoCharacters      = []byte("MaxMemoCharacters")
-	KeyTxSigLimit             = []byte("TxSigLimit")
-	KeyTxSizeCostPerByte      = []byte("TxSizeCostPerByte")
-	KeySigVerifyCostED25519   = []byte("SigVerifyCostED25519")
-	KeySigVerifyCostSecp256k1 = []byte("SigVerifyCostSecp256k1")
-	KeyDisableSeqnoCheck      = []byte("KeyDisableSeqnoCheck")
-)
-
-var _ paramtypes.ParamSet = &Params{}
-
-// NewParams creates a new Params object
-func NewParams(
-	maxMemoCharacters, txSigLimit, txSizeCostPerByte, sigVerifyCostED25519, sigVerifyCostSecp256k1 uint64,
-) Params {
-	return Params{
-		MaxMemoCharacters:      maxMemoCharacters,
-		TxSigLimit:             txSigLimit,
-```
-
-**File:** x/auth/tx/decoder.go (L45-48)
-```go
-		err = cdc.Unmarshal(raw.BodyBytes, &body)
+	for _, info := range data.SigningInfos {
+		address, err := sdk.ConsAddressFromBech32(info.Address)
 		if err != nil {
-			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
+			panic(err)
 		}
+		keeper.SetValidatorSigningInfo(ctx, address, info.ValidatorSigningInfo)
+	}
+
+	for _, array := range data.MissedBlocks {
+		address, err := sdk.ConsAddressFromBech32(array.Address)
+		if err != nil {
+			panic(err)
+		}
+		keeper.SetValidatorMissedBlocks(ctx, address, array)
+	}
+```
+
+**File:** x/slashing/keeper/infractions.go (L33-36)
+```go
+	signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
+	if !found {
+		panic(fmt.Sprintf("Expected signing info for validator %s but not found", consAddr))
+	}
+```
+
+**File:** x/staking/genesis.go (L47-49)
+```go
+		if !data.Exported {
+			keeper.AfterValidatorCreated(ctx, validator.GetOperator())
+		}
+```
+
+**File:** x/slashing/spec/04_begin_block.md (L35-36)
+```markdown
+  // signed. We use the 0-value default signing info if not present, except for
+  // start height.
+```
+
+**File:** x/slashing/keeper/hooks.go (L12-25)
+```go
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
+	}
+```
+
+**File:** x/slashing/abci.go (L41-41)
+```go
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
 ```

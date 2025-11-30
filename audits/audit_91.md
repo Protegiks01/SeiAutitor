@@ -1,188 +1,316 @@
 # Audit Report
 
 ## Title
-Genesis Import Panic Due to Mismatched Window Sizes and Index Offsets in Validator Missed Block Arrays
+Non-Transactional capMap Deletion in ReleaseCapability Causes Inconsistent State and Network-Wide Node Disruption
 
 ## Summary
-The slashing module's genesis import accepts `ValidatorMissedBlockArray` data with inconsistent `window_size` values and `ValidatorSigningInfo.index_offset` values without validation. When the first block is processed, the `ResizeMissedBlockArray` function attempts an out-of-bounds slice operation, causing a runtime panic that crashes all nodes and results in total network shutdown.
+The `ReleaseCapability` function performs a non-transactional Go map deletion (`delete(sk.capMap, index)`) alongside transactional store deletions. When a transaction rolls back after calling `ReleaseCapability`, the store changes are reverted but the map deletion persists, creating an inconsistent state where `GetCapability` panics with "capability found in memstore is missing from map", affecting all validators processing the same block. [1](#0-0) 
 
 ## Impact
-Medium
+**Medium**
 
 ## Finding Description
 
-**Location:** The vulnerability originates in genesis import at [1](#0-0)  where `SetValidatorMissedBlocks` is called without data consistency validation. The panic occurs during block processing in [2](#0-1)  within the `ResizeMissedBlockArray` function.
+**Location:** 
+- Module: `x/capability`
+- File: `x/capability/keeper/keeper.go`
+- Functions: `ReleaseCapability` (lines 319-356) and `GetCapability` (lines 361-388)
 
-**Intended Logic:** The genesis import should only accept `ValidatorMissedBlockArray` data where:
-1. The `window_size` field matches the genesis params `SignedBlocksWindow`
-2. The corresponding `ValidatorSigningInfo.index_offset` is less than the `window_size`
-3. These constraints are validated during genesis import to prevent runtime panics
+**Intended Logic:**
+When a transaction that releases a capability fails and gets reverted, all state changes should be rolled back atomically to maintain consistency between the persistent store, memory store (memStore), and the in-memory capability map (capMap).
 
-**Actual Logic:** The genesis validation function [3](#0-2)  only validates parameter ranges but does not check data consistency between `ValidatorMissedBlockArray` and `ValidatorSigningInfo`. During first block processing at [4](#0-3) , when a window size mismatch is detected at [5](#0-4) , the resize logic creates a `boolArray` with length equal to `missedInfo.WindowSize` (line 162), then attempts `copy(newArray[0:index], boolArray[0:index])` where `index` comes from `signInfo.IndexOffset`. If `index > len(boolArray)`, this panics with "slice bounds out of range".
+**Actual Logic:**
+The `ReleaseCapability` function performs three types of deletions when a capability has no remaining owners:
+1. Deletes from memStore (lines 332, 336) - transactional, reverted on rollback [2](#0-1) 
+2. Deletes from persistent store (line 347) - transactional, reverted on rollback [3](#0-2) 
+3. Deletes from capMap using Go's `delete()` (line 349) - **NOT transactional, CANNOT be reverted** [4](#0-3) 
+
+The Cosmos SDK's transaction mechanism only writes cached store changes if the transaction succeeds [5](#0-4) . When a transaction fails, operations 1 and 2 are reverted, but operation 3 persists because Go map operations are not part of the transactional context.
 
 **Exploitation Path:**
-1. Genesis file is created with `Params.SignedBlocksWindow = 10000`
-2. A `ValidatorMissedBlockArray` has `window_size = 100` 
-3. The corresponding `ValidatorSigningInfo` has `index_offset = 5000`
-4. Genesis validation passes because consistency checks are absent
-5. All nodes import the genesis successfully
-6. On first block, `BeginBlocker` processes validator signatures
-7. `HandleValidatorSignatureConcurrent` detects window size mismatch (100 vs 10000)
-8. `ResizeMissedBlockArray` is called with index=5000
-9. The function creates `boolArray` of length 100, then tries to access `boolArray[0:5000]`
-10. Runtime panic: "slice bounds out of range"
-11. All nodes crash simultaneously
+1. A module owns a capability as the sole owner
+2. A transaction calls `ReleaseCapability`, which executes and deletes from stores and capMap
+3. Later in the same transaction, an error occurs (out of gas, validation failure, panic, etc.)
+4. Transaction rollback reverts store changes, but capMap deletion is permanent
+5. memStore now contains the `RevCapabilityKey` mapping (restored by rollback), but `capMap[index]` is nil
+6. Any subsequent call to `GetCapability` will find the index in memStore [6](#0-5) , look up nil in capMap [7](#0-6) , and panic [8](#0-7) 
 
-**Security Guarantee Broken:** This violates the **availability** security property. The panic causes immediate node crashes and total network shutdown with no automatic recovery mechanism.
+**Security Guarantee Broken:**
+This violates the atomicity invariant of transaction execution. All state changes within a transaction should either all commit or all revert together. The mixing of transactional (store operations) and non-transactional (Go map operations) state modifications breaks this fundamental guarantee.
+
+The developers acknowledge this issue class in a TODO comment [9](#0-8) , but have only implemented a partial fix for the `NewCapability` case (when capMap has an entry but memStore doesn't), not the reverse `ReleaseCapability` case (when memStore has an entry but capMap doesn't).
 
 ## Impact Explanation
 
-This vulnerability causes total network shutdown affecting:
-- **All validator and full nodes**: Every node importing the malformed genesis crashes on the first block
-- **Network availability**: No blocks can be produced or transactions confirmed
-- **Recovery cost**: Requires emergency coordination and hard fork with corrected genesis data
-- **Consensus failure**: The blockchain cannot progress until all nodes restart with fixed state
+**Affected Components:**
+- Node availability and transaction processing
+- Network reliability for all validators
 
-This matches the Medium severity impact: "Network not being able to confirm new transactions (total network shutdown)".
+**Consequences:**
+When triggered, this vulnerability creates a persistent inconsistent state where:
+
+1. If `GetCapability` is called within transaction context (during message execution), the panic is caught by the recovery middleware [10](#0-9) , causing the transaction to fail. However, the inconsistent state persists, so **every subsequent transaction** attempting to access that capability will also panic and fail.
+
+2. If `GetCapability` is called outside transaction context (e.g., in BeginBlock or EndBlock processing) [11](#0-10) , there is no panic recovery handler, causing an **immediate node crash**.
+
+3. The inconsistent state persists across blocks because `InitMemStore` only repopulates the capMap once when the memory store is first initialized [12](#0-11) , not on every block. The state remains inconsistent until node restart.
+
+**Network-Wide Impact:**
+If the triggering transaction is included in a block, **all validators** processing that block will execute the same transaction and end up with the same inconsistent state simultaneously. This means a single malicious or accidentally malformed transaction can affect 100% of network validators, meeting the Medium severity criteria of "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions."
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-- Chain initiators who create genesis files (privileged role)
-- Can occur accidentally through misconfiguration during genesis creation or network upgrades
+**Who can trigger it:**
+Any user who can submit a transaction that:
+1. Includes a capability release operation (e.g., IBC channel closing, port unbinding)
+2. Subsequently fails for any reason
 
-**Required Conditions:**
-- Malformed genesis with mismatched `window_size` and `index_offset` values must be distributed
-- At least one validator must have these inconsistent values
-- Triggers automatically on first block processing
+**Conditions required:**
+- The capability must have only one owner (so `len(capOwners.Owners) == 0` after removal, triggering the `delete()` path)
+- The transaction must fail AFTER `ReleaseCapability` executes but BEFORE final commit
+- This can happen naturally through common transaction failures (out of gas, validation errors, message execution failures)
 
 **Frequency:**
-- Occurs once per malformed genesis import
-- Affects all nodes simultaneously
-- Cannot self-resolve without manual intervention
-- While genesis creation is privileged, the lack of validation makes accidental misconfiguration a realistic threat
+This vulnerability can be triggered whenever:
+- IBC channels are closed within a transaction that subsequently fails
+- Ports are released within a transaction that subsequently fails
+- Any other capability management operation happens in a failing transaction
 
-**Note:** Although genesis creation is a privileged operation, this vulnerability qualifies as valid because even a trusted role inadvertently triggering it causes an unrecoverable security failure (total network shutdown requiring hard fork) that is beyond their intended authority. Privileged operations should still have validation to prevent catastrophic system failures.
+Given that transaction failures are common in blockchain operations (out of gas is particularly frequent), and capability operations occur regularly in IBC-enabled chains, this has a moderate to high likelihood of natural occurrence.
 
 ## Recommendation
 
-1. **Add genesis validation checks** in [3](#0-2) :
-   - Verify each `ValidatorMissedBlockArray.window_size` matches `Params.SignedBlocksWindow`
-   - Verify each `ValidatorSigningInfo.index_offset < window_size`
-   - Verify `len(missed_blocks) >= (window_size + 63) / 64`
+Implement a transaction-aware mechanism for `capMap` modifications that only applies deletions after successful transaction commit:
 
-2. **Add defensive bounds checking** in [2](#0-1) :
-   - Before line 164, add: `if index > missedInfo.WindowSize { index = 0 }`
-   - Ensure slice operations cannot panic on out-of-bounds access
+1. **Immediate fix:** Track capability deletions in a separate temporary structure during transaction execution. Only apply these deletions to `capMap` after `msCache.Write()` succeeds, potentially using a post-commit hook or by deferring the deletion until the context is finalized.
 
-3. **Auto-correction during import**: If mismatches are detected, automatically reset `index_offset` to 0 and resize arrays appropriately rather than accepting invalid state.
+2. **Long-term solution:** Implement the reverse lookup mechanism mentioned in the TODO comment (issue #7805) that would allow properly cleaning up `capMap` entries based on store state, eliminating the reliance on non-transactional map operations during transaction execution.
 
-## Proof of Concept
+3. **Additional safety:** Add defensive checks in `GetCapability` for the reverse scenario (memStore has entry but capMap doesn't), similar to the existing check for the NewCapability case, to at least prevent the panic and return a graceful error instead:
 
-**File:** `x/slashing/genesis_test.go`
-
-**Setup:**
-- Initialize test app and context
-- Create validator with consensus address
-- Set genesis params with `SignedBlocksWindow = 10000`
-- Create `ValidatorMissedBlockArray` with `window_size = 100` and `MissedBlocks` of 2 uint64s
-- Create `ValidatorSigningInfo` with `index_offset = 5000` (exceeds window_size)
-- Construct genesis state with these mismatched values
-
-**Action:**
-- Import genesis via `slashing.InitGenesis()`
-- Create and bond validator
-- Call `slashing.BeginBlocker()` with validator signature in first block
-
-**Result:**
-- Runtime panic with error: "slice bounds out of range [5000:100]"
-- Occurs when `ResizeMissedBlockArray` executes `copy(newArray[0:5000], boolArray[0:5000])` where `len(boolArray) = 100`
-- Confirms total network shutdown on first block processing
-
-The PoC demonstrates that all nodes importing this genesis will crash simultaneously, requiring a hard fork to recover.
-
-### Citations
-
-**File:** x/slashing/genesis.go (L32-38)
 ```go
-	for _, array := range data.MissedBlocks {
-		address, err := sdk.ConsAddressFromBech32(array.Address)
-		if err != nil {
-			panic(err)
-		}
-		keeper.SetValidatorMissedBlocks(ctx, address, array)
-	}
-```
-
-**File:** x/slashing/keeper/infractions.go (L52-54)
-```go
-	if found && missedInfo.WindowSize != window {
-		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
-	}
-```
-
-**File:** x/slashing/keeper/infractions.go (L157-181)
-```go
-func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
-	// we need to resize the missed block array AND update the signing info accordingly
-	switch {
-	case missedInfo.WindowSize < window:
-		// missed block array too short, lets expand it
-		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
-		newArray := make([]bool, window)
-		copy(newArray[0:index], boolArray[0:index])
-		if index+1 < missedInfo.WindowSize {
-			// insert `0`s corresponding to the difference between the new window size and old window size
-			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
-		}
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
-		missedInfo.WindowSize = window
-	case missedInfo.WindowSize > window:
-		// if window size is reduced, we would like to make a clean state so that no validators are unexpectedly jailed due to more recent missed blocks
-		newMissedBlocks := make([]bool, window)
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newMissedBlocks)
-		signInfo.MissedBlocksCounter = int64(0)
-		missedInfo.WindowSize = window
-		signInfo.IndexOffset = 0
-		index = 0
-	}
-	return missedInfo, signInfo, index
+if cap == nil {
+    // Handle ReleaseCapability rollback case
+    delete(sk.capMap, index) // Clean up if exists
+    return nil, false
 }
 ```
 
-**File:** x/slashing/types/genesis.go (L31-58)
+## Proof of Concept
+
+The following test demonstrates the vulnerability:
+
+**Setup:**
+- Initialize a capability keeper with a scoped module
+- Create a capability with a single owner using `NewCapability`
+- Verify the capability can be retrieved with `GetCapability`
+
+**Action:**
+- Create a cached context simulating transaction execution using `ctx.MultiStore().CacheMultiStore()`
+- Call `ReleaseCapability` in the cached context, which deletes from stores (transactional) and capMap (non-transactional)
+- Do NOT call `msCache.Write()` to simulate transaction failure/rollback
+- Store changes are reverted, but capMap deletion is permanent
+
+**Result:**
+- Calling `GetCapability` in the original context will panic
+- The memStore has the `RevCapabilityKey` (transaction rollback restored it)
+- The `capMap[index]` is nil (Go map deletion is not transactional)
+- This triggers the panic: "capability found in memstore is missing from map"
+
+Test implementation can be added to `x/capability/keeper/keeper_test.go`:
+
 ```go
-// ValidateGenesis validates the slashing genesis parameters
-func ValidateGenesis(data GenesisState) error {
-	downtime := data.Params.SlashFractionDowntime
-	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
+func (suite *KeeperTestSuite) TestReleaseCapabilityRollback() {
+    sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
+    
+    // Create capability with single owner
+    cap, err := sk.NewCapability(suite.ctx, "test-cap")
+    suite.Require().NoError(err)
+    
+    // Verify it exists
+    got, ok := sk.GetCapability(suite.ctx, "test-cap")
+    suite.Require().True(ok)
+    suite.Require().Equal(cap, got)
+    
+    // Create cached context (simulating transaction)
+    ms := suite.ctx.MultiStore()
+    msCache := ms.CacheMultiStore()
+    cacheCtx := suite.ctx.WithMultiStore(msCache)
+    
+    // Release capability in cached context
+    err = sk.ReleaseCapability(cacheCtx, cap)
+    suite.Require().NoError(err)
+    
+    // DO NOT call msCache.Write() - simulating transaction failure
+    
+    // Try to get capability in original context
+    // This will panic because memStore has entry but capMap doesn't
+    suite.Require().Panics(func() {
+        sk.GetCapability(suite.ctx, "test-cap")
+    })
+}
+```
+
+## Notes
+
+This is a genuine architectural vulnerability in the capability module where the mixing of transactional (store-based) and non-transactional (Go map-based) state management violates the atomicity guarantees expected in blockchain transaction processing. While developers have acknowledged the general problem (as evidenced by the TODO comment), they have only implemented a partial mitigation for one direction of the inconsistency (NewCapability case), leaving the reverse case (ReleaseCapability) unhandled and exploitable. The vulnerability affects 100% of validators when a malicious transaction is included in a block, qualifying it for Medium severity under the "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions" impact category.
+
+### Citations
+
+**File:** x/capability/keeper/keeper.go (L107-135)
+```go
+func (k *Keeper) InitMemStore(ctx sdk.Context) {
+	memStore := ctx.KVStore(k.memKey)
+	memStoreType := memStore.GetStoreType()
+	if memStoreType != sdk.StoreTypeMemory {
+		panic(fmt.Sprintf("invalid memory store type; got %s, expected: %s", memStoreType, sdk.StoreTypeMemory))
 	}
 
-	dblSign := data.Params.SlashFractionDoubleSign
-	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
+	// check if memory store has not been initialized yet by checking if initialized flag is nil.
+	if !k.IsInitialized(ctx) {
+		prefixStore := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefixIndexCapability)
+		iterator := sdk.KVStorePrefixIterator(prefixStore, nil)
+
+		// initialize the in-memory store for all persisted capabilities
+		defer iterator.Close()
+
+		for ; iterator.Valid(); iterator.Next() {
+			index := types.IndexFromKey(iterator.Key())
+
+			var capOwners types.CapabilityOwners
+
+			k.cdc.MustUnmarshal(iterator.Value(), &capOwners)
+			k.InitializeCapability(ctx, index, capOwners)
+		}
+
+		// set the initialized flag so we don't rerun initialization logic
+		memStore := ctx.KVStore(k.memKey)
+		memStore.Set(types.KeyMemInitialized, []byte{1})
+	}
+}
+```
+
+**File:** x/capability/keeper/keeper.go (L319-356)
+```go
+func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	}
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
 	}
 
-	minSign := data.Params.MinSignedPerWindow
-	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
-	}
+	memStore := ctx.KVStore(sk.memKey)
 
-	downtimeJail := data.Params.DowntimeJailDuration
-	if downtimeJail < 1*time.Minute {
-		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
-	}
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
 
-	signedWindow := data.Params.SignedBlocksWindow
-	if signedWindow < 10 {
-		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
+
+	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
+	indexKey := types.IndexToKey(cap.GetIndex())
+
+	if len(capOwners.Owners) == 0 {
+		// remove capability owner set
+		prefixStore.Delete(indexKey)
+		// since no one owns capability, we can delete capability from map
+		delete(sk.capMap, cap.GetIndex())
+	} else {
+		// update capability owner set
+		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
 	}
 
 	return nil
+}
 ```
 
-**File:** x/slashing/abci.go (L41-41)
+**File:** x/capability/keeper/keeper.go (L367-369)
 ```go
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+	key := types.RevCapabilityKey(sk.module, name)
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
+```
+
+**File:** x/capability/keeper/keeper.go (L371-379)
+```go
+	if len(indexBytes) == 0 {
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+
+		return nil, false
+```
+
+**File:** x/capability/keeper/keeper.go (L382-382)
+```go
+	cap := sk.capMap[index]
+```
+
+**File:** x/capability/keeper/keeper.go (L383-385)
+```go
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
+	}
+```
+
+**File:** baseapp/baseapp.go (L904-915)
+```go
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
+		}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
+```
+
+**File:** baseapp/baseapp.go (L1015-1016)
+```go
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
+```
+
+**File:** baseapp/abci.go (L133-157)
+```go
+// BeginBlock implements the ABCI application interface.
+func (app *BaseApp) BeginBlock(ctx sdk.Context, req abci.RequestBeginBlock) (res abci.ResponseBeginBlock) {
+	defer telemetry.MeasureSince(time.Now(), "abci", "begin_block")
+
+	if !req.Simulate {
+		if err := app.validateHeight(req); err != nil {
+			panic(err)
+		}
+	}
+
+	if app.beginBlocker != nil {
+		res = app.beginBlocker(ctx, req)
+		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	}
+
+	// call the streaming service hooks with the EndBlock messages
+	if !req.Simulate {
+		for _, streamingListener := range app.abciListeners {
+			if err := streamingListener.ListenBeginBlock(app.deliverState.ctx, req, res); err != nil {
+				app.logger.Error("EndBlock listening hook failed", "height", req.Header.Height, "err", err)
+			}
+		}
+	}
+	return res
+}
 ```

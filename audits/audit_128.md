@@ -1,10 +1,10 @@
 # Audit Report
 
 ## Title
-Non-Deterministic Iterator Validation Due to Race Condition in Channel Selection
+Future-Height Evidence Bypasses Validation and Causes Network Halt via Panic in Slash Function
 
 ## Summary
-The `validateIterator` function contains a race condition where both `abortChannel` and `validChannel` can simultaneously have values when an estimate is encountered during validation. Go's `select` statement non-deterministically chooses between ready channels, causing different nodes to reach different validation decisions for the same transaction, leading to consensus failures and chain splits.
+The evidence module fails to validate that evidence height is not from the future before processing. When evidence with `infractionHeight > currentHeight` enters through BeginBlock, a logic flaw in the age validation allows it to pass, ultimately causing the staking module's Slash function to panic and halt the entire network.
 
 ## Impact
 High
@@ -12,316 +12,266 @@ High
 ## Finding Description
 
 **Location:**
-- Primary: `store/multiversion/store.go`, lines 262-318 (function `validateIterator`)
-- Contributing: `store/multiversion/memiterator.go`, lines 114-117 (function `validationIterator.Value()`) [1](#0-0) [2](#0-1) 
+- `x/evidence/keeper/infraction.go` lines 43-64 (flawed age validation logic) [1](#0-0) 
 
-**Intended logic:**
-When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically fail by returning `false` consistently across all nodes.
+- `x/evidence/keeper/infraction.go` lines 95-112 (distribution height calculation leading to slash call) [2](#0-1) 
 
-**Actual logic:**
-When `validationIterator.Value()` encounters an estimate, it sends an abort to `abortChannel` but does not terminate execution. The function continues and returns the estimate value. The validation goroutine continues iterating through all remaining keys and eventually writes the final validation result to `validChannel`. Since both channels are buffered with capacity 1, both sends succeed without blocking. The `select` statement then receives from whichever channel the Go runtime pseudo-randomly chooses (per Go specification, when multiple cases are ready simultaneously, selection is non-deterministic).
+- `x/staking/keeper/slash.go` lines 67-71 (panic on future infraction height) [3](#0-2) 
 
-**Exploitation path:**
-1. Transaction A writes to a key and gets re-executed, creating estimate values
-2. Transaction B's iterator validation encounters the estimate during validation replay
-3. `abortChannel` receives the abort signal but execution continues
-4. The goroutine completes iteration and sends result to `validChannel`
-5. Both channels now have values ready
-6. Different validator nodes execute the `select` at different times/states
-7. Some nodes' `select` reads from `abortChannel` (validation fails, transaction re-executes)
-8. Other nodes' `select` reads from `validChannel` (validation may pass, transaction marked as validated)
-9. Nodes have different sets of validated transactions
-10. Nodes produce different block states
-11. Consensus fails, chain splits
+**Intended Logic:**
+The evidence module should validate and reject evidence from future block heights before processing. The staking module explicitly documents this requirement via CONTRACT at lines 14-23 of slash.go, stating: "Infraction was committed at the current height or at a past height, not at a height in the future". [4](#0-3) 
 
-**Security guarantee broken:**
-Consensus determinism - the fundamental requirement that all honest nodes processing the same block with identical inputs must reach identical state transitions and validation decisions.
+The application is designed to defensively handle potentially malformed input from Tendermint, as documented in the code comment at lines 29-40 of infraction.go. [5](#0-4) 
+
+**Actual Logic:**
+When `infractionHeight > currentHeight`, the calculation `ageBlocks := ctx.BlockHeader().Height - infractionHeight` produces a negative value. The validation uses AND logic: `ageDuration > MaxAgeDuration && ageBlocks > MaxAgeNumBlocks`. Since a negative `ageBlocks` can never be greater than a positive `MaxAgeNumBlocks`, the condition evaluates to false and the evidence incorrectly passes validation.
+
+**Exploitation Path:**
+1. Evidence with future height enters via BeginBlocker from Tendermint's ByzantineValidators [6](#0-5) 
+
+2. Evidence is converted without height validation via FromABCIEvidence [7](#0-6) 
+
+3. Age validation fails to reject due to negative ageBlocks never exceeding positive MaxAgeNumBlocks
+
+4. distributionHeight is calculated as `infractionHeight - sdk.ValidatorUpdateDelay` (where ValidatorUpdateDelay = 1) [8](#0-7) 
+
+5. If infractionHeight is future, distributionHeight remains future (e.g., 200 - 1 = 199)
+
+6. The slashing keeper passes distributionHeight as infractionHeight to the staking keeper [9](#0-8) 
+
+7. The staking keeper's Slash function panics when `infractionHeight > ctx.BlockHeight()`
+
+8. Panic propagates through BeginBlock, crashing all nodes simultaneously
+
+**Security Guarantee Broken:**
+This violates the explicit CONTRACT requirement that infractions must be from current or past heights, and breaks the defensive validation design principle documented in the codebase. The panic during BeginBlock causes unrecoverable network failure.
 
 ## Impact Explanation
 
-This vulnerability causes different validator nodes to produce different validation results for the same transaction within the same block. When some nodes validate a transaction (marking it as final) while others reject it (causing re-execution), the nodes diverge on which transactions are included in the final state. This creates:
+When future-height evidence is processed during BeginBlock, all network nodes executing that block will panic simultaneously, resulting in:
+- **Complete network shutdown** - no new blocks can be produced
+- All nodes crash during consensus execution
+- Requires emergency intervention to restore operation
+- No transactions can be confirmed during the outage
+- Consensus is completely halted
 
-1. **Immediate consensus failure** - Validators cannot agree on the canonical chain
-2. **Permanent chain split** - The network partitions into incompatible forks
-3. **Requires hard fork to resolve** - No automatic recovery mechanism exists
-4. **Complete loss of transaction finality** - All state after the split becomes uncertain
-5. **Network-wide impact** - Affects all applications and users on the blockchain
-
-This is a critical consensus-breaking vulnerability that compromises the entire network's integrity.
+This matches the specified High severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Triggering conditions:**
-- Multiple concurrent transactions with overlapping key access (common in busy blocks)
-- Iterator usage by transactions (common for range queries, state migrations, deletions)
-- Transaction re-execution creating estimates (inherent to the OCC design)
-- No special privileges or adversarial behavior required
+While this requires evidence with future height to enter via Tendermint's consensus layer, the codebase explicitly demonstrates that defensive validation of Tendermint inputs is an expected design pattern. The application layer is designed to handle potentially malformed evidence from Tendermint and the simulator, as documented in the code comments.
 
-**Frequency:**
-The race condition window exists every time a validation iterator encounters an estimate. On a busy network with parallel transaction execution using optimistic concurrency control, this occurs regularly - potentially multiple times per block. The actual manifestation depends on Go runtime scheduling and is unpredictable but inevitable over time.
+**Triggering Conditions:**
+- A bug in Tendermint's evidence detection/reporting logic
+- Edge cases in evidence propagation through consensus
+- Simulator-generated evidence (as mentioned in comments)
 
-**Who can trigger:**
-Any user submitting normal transactions can inadvertently trigger this through the natural operation of the system. This is not an attack vector requiring malicious intent, but rather a fundamental non-determinism in the consensus-critical validation logic.
-
-The probability increases with higher transaction throughput, more complex transactions using iterators, and longer validation times.
+**Frequency:** While unlikely under normal operation, if triggered, the impact is immediate and affects 100% of network nodes. The existing test `TestSlashAtFutureHeight` confirms the panic behavior is enforced, demonstrating this is a real failure mode.
 
 ## Recommendation
 
-**Immediate fix:**
-Modify `validationIterator.Value()` to immediately stop execution after sending to `abortChannel`:
+Add explicit validation to reject future-height evidence before processing in `x/evidence/keeper/infraction.go`:
 
 ```go
-// In store/multiversion/memiterator.go, around line 115-117
-if val.IsEstimate() {
-    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-    panic(occtypes.NewEstimateAbort(val.Index())) // Immediately stop execution
+// After line 44, add:
+if infractionHeight > ctx.BlockHeader().Height {
+    logger.Info(
+        "ignored equivocation; evidence from future height",
+        "validator", consAddr,
+        "infraction_height", infractionHeight,
+        "current_height", ctx.BlockHeader().Height,
+    )
+    return
 }
 ```
 
-**Alternative fix:**
-Modify the validation goroutine to check for abort signals after each iteration step:
+Additionally, fix the age validation logic to properly handle negative values:
 
 ```go
-// In store/multiversion/store.go, inside the validation goroutine
-for ; mergeIterator.Valid(); mergeIterator.Next() {
-    select {
-    case <-abortChan:
-        returnChan <- false
-        return
-    default:
-    }
-    // ... rest of iteration logic
-}
+// Replace line 53 with:
+if ageBlocks < 0 || (ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks) {
 ```
-
-**Root cause fix:**
-Redesign the validation flow to ensure estimate detection always takes precedence and is checked before any result is written to `validChannel`. Consider using a single channel with typed responses or prioritized channel selection mechanisms.
 
 ## Proof of Concept
 
-**Conceptual PoC:**
-The provided test in the claim (`TestIteratorValidationNonDeterminism`) demonstrates the issue by:
+**File:** `x/evidence/keeper/infraction_test.go`
 
 **Setup:**
-1. Create a multiversion store with initial keys
-2. Transaction 2 writes to key2
-3. Transaction 5 creates an iterator including key2
-4. Invalidate transaction 2's writeset (creating estimates)
+1. Initialize context at block height 100
+2. Create validator with signing info
+3. Set standard consensus parameters (MaxAgeNumBlocks = 100000, MaxAgeDuration = 172800s)
 
 **Action:**
-Run `ValidateTransactionState(5)` multiple times (1000 iterations)
+Create evidence with `Height = 200` (future) and `Time` in the past (to bypass time-based check), then call `HandleEquivocationEvidence`
 
-**Expected result:**
-If the code were deterministic, all 1000 runs would return the same result (should be `false` due to estimate). 
+**Result:**
+The function panics with message: "impossible attempt to slash future infraction at height 199 but we are at height 100"
 
-**Actual result:**
-Due to the race condition, some runs return `true` (validChannel chosen) and some return `false` (abortChannel chosen), demonstrating non-deterministic behavior that would cause consensus failures across different nodes.
-
-The code structure definitively proves both channels can have values simultaneously:
-- [3](#0-2)  - `abortChannel` receives value
-- [4](#0-3)  - Execution continues
-- [5](#0-4)  - `validChannel` receives value
-- [6](#0-5)  - `select` randomly chooses
-
-This violates the fundamental blockchain requirement that validation must be deterministic across all nodes for consensus.
+The scenario confirms:
+- `ageBlocks = 100 - 200 = -100` (negative)
+- Validation check `ageBlocks > MaxAgeNumBlocks` evaluates to `-100 > 100000` = false
+- Evidence incorrectly proceeds to slashing logic
+- `distributionHeight = 200 - 1 = 199` (still future)
+- Slash function panics as evidenced by existing test `TestSlashAtFutureHeight`
 
 ## Notes
 
-This vulnerability is particularly critical because:
-1. It affects the core consensus mechanism used during block execution ( [7](#0-6) )
-2. It can be triggered through normal operation without any malicious intent
-3. There are no existing safeguards to prevent non-deterministic behavior
-4. The existing test suite ( [8](#0-7) ) expects deterministic behavior but doesn't verify it across multiple runs
-5. The impact matches the listed high-severity category: "Unintended permanent chain split requiring hard fork"
+This vulnerability represents a defense-in-depth failure where the application layer must validate all external inputs from the consensus layer but fails to do so for future-height evidence. The codebase's own comments and CONTRACT specifications indicate this validation is required but missing. The severity is High because exploitation results in total network shutdown affecting all nodes simultaneously.
 
 ### Citations
 
-**File:** store/multiversion/store.go (L262-318)
+**File:** x/evidence/keeper/infraction.go (L29-40)
 ```go
-func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
-	// collect items from multiversion store
-	sortedItems := s.CollectIteratorItems(index)
-	// add the iterationtracker writeset keys to the sorted items
-	for key := range tracker.writeset {
-		sortedItems.Set([]byte(key), []byte{})
+	if _, err := k.slashingKeeper.GetPubkey(ctx, consAddr.Bytes()); err != nil {
+		// Ignore evidence that cannot be handled.
+		//
+		// NOTE: We used to panic with:
+		// `panic(fmt.Sprintf("Validator consensus-address %v not found", consAddr))`,
+		// but this couples the expectations of the app to both Tendermint and
+		// the simulator.  Both are expected to provide the full range of
+		// allowable but none of the disallowed evidence types.  Instead of
+		// getting this coordination right, it is easier to relax the
+		// constraints and ignore evidence that cannot be handled.
+		return
 	}
-	validChannel := make(chan bool, 1)
-	abortChannel := make(chan occtypes.Abort, 1)
+```
 
-	// listen for abort while iterating
-	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
-		var parentIter types.Iterator
-		expectedKeys := iterationTracker.iteratedKeys
-		foundKeys := 0
-		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
-		if iterationTracker.ascending {
-			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
-		} else {
-			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
-		}
-		// create a new MVSMergeiterator
-		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
-		defer mergeIterator.Close()
-		for ; mergeIterator.Valid(); mergeIterator.Next() {
-			if (len(expectedKeys) - foundKeys) == 0 {
-				// if we have no more expected keys, then the iterator is invalid
-				returnChan <- false
-				return
-			}
-			key := mergeIterator.Key()
-			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
-			if _, ok := expectedKeys[string(key)]; !ok {
-				// if key isn't found
-				returnChan <- false
-				return
-			}
-			// remove from expected keys
-			foundKeys += 1
-			// delete(expectedKeys, string(key))
+**File:** x/evidence/keeper/infraction.go (L43-64)
+```go
+	infractionHeight := evidence.GetHeight()
+	infractionTime := evidence.GetTime()
+	ageDuration := ctx.BlockHeader().Time.Sub(infractionTime)
+	ageBlocks := ctx.BlockHeader().Height - infractionHeight
 
-			// if our iterator key was the early stop, then we can break
-			if bytes.Equal(key, iterationTracker.earlyStopKey) {
-				break
-			}
+	// Reject evidence if the double-sign is too old. Evidence is considered stale
+	// if the difference in time and number of blocks is greater than the allowed
+	// parameters defined.
+	cp := ctx.ConsensusParams()
+	if cp != nil && cp.Evidence != nil {
+		if ageDuration > cp.Evidence.MaxAgeDuration && ageBlocks > cp.Evidence.MaxAgeNumBlocks {
+			logger.Info(
+				"ignored equivocation; evidence too old",
+				"validator", consAddr,
+				"infraction_height", infractionHeight,
+				"max_age_num_blocks", cp.Evidence.MaxAgeNumBlocks,
+				"infraction_time", infractionTime,
+				"max_age_duration", cp.Evidence.MaxAgeDuration,
+			)
+			return
 		}
-		// return whether we found the exact number of expected keys
-		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
-	}(tracker, sortedItems, validChannel, abortChannel)
-	select {
-	case <-abortChannel:
-		// if we get an abort, then we know that the iterator is invalid
-		return false
-	case valid := <-validChannel:
-		return valid
+	}
+```
+
+**File:** x/evidence/keeper/infraction.go (L95-112)
+```go
+	// We need to retrieve the stake distribution which signed the block, so we
+	// subtract ValidatorUpdateDelay from the evidence height.
+	// Note, that this *can* result in a negative "distributionHeight", up to
+	// -ValidatorUpdateDelay, i.e. at the end of the
+	// pre-genesis block (none) = at the beginning of the genesis block.
+	// That's fine since this is just used to filter unbonding delegations & redelegations.
+	distributionHeight := infractionHeight - sdk.ValidatorUpdateDelay
+
+	// Slash validator. The `power` is the int64 power of the validator as provided
+	// to/by Tendermint. This value is validator.Tokens as sent to Tendermint via
+	// ABCI, and now received as evidence. The fraction is passed in to separately
+	// to slash unbonding and rebonding delegations.
+	k.slashingKeeper.Slash(
+		ctx,
+		consAddr,
+		k.slashingKeeper.SlashFractionDoubleSign(ctx),
+		evidence.GetValidatorPower(), distributionHeight,
+	)
+```
+
+**File:** x/staking/keeper/slash.go (L14-23)
+```go
+// CONTRACT:
+//    slashFactor is non-negative
+// CONTRACT:
+//    Infraction was committed equal to or less than an unbonding period in the past,
+//    so all unbonding delegations and redelegations from that height are stored
+// CONTRACT:
+//    Slash will not slash unbonded validators (for the above reason)
+// CONTRACT:
+//    Infraction was committed at the current height or at a past height,
+//    not at a height in the future
+```
+
+**File:** x/staking/keeper/slash.go (L67-71)
+```go
+	case infractionHeight > ctx.BlockHeight():
+		// Can't slash infractions in the future
+		panic(fmt.Sprintf(
+			"impossible attempt to slash future infraction at height %d but we are at height %d",
+			infractionHeight, ctx.BlockHeight()))
+```
+
+**File:** x/evidence/abci.go (L16-30)
+```go
+func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+
+	for _, tmEvidence := range req.ByzantineValidators {
+		switch tmEvidence.Type {
+		// It's still ongoing discussion how should we treat and slash attacks with
+		// premeditation. So for now we agree to treat them in the same way.
+		case abci.MisbehaviorType_DUPLICATE_VOTE, abci.MisbehaviorType_LIGHT_CLIENT_ATTACK:
+			evidence := types.FromABCIEvidence(tmEvidence)
+			k.HandleEquivocationEvidence(ctx, evidence.(*types.Equivocation))
+
+		default:
+			k.Logger(ctx).Error(fmt.Sprintf("ignored unknown evidence type: %s", tmEvidence.Type))
+		}
+	}
+```
+
+**File:** x/evidence/types/evidence.go (L91-104)
+```go
+func FromABCIEvidence(e abci.Evidence) exported.Evidence {
+	bech32PrefixConsAddr := sdk.GetConfig().GetBech32ConsensusAddrPrefix()
+	consAddr, err := sdk.Bech32ifyAddressBytes(bech32PrefixConsAddr, e.Validator.Address)
+	if err != nil {
+		panic(err)
+	}
+
+	return &Equivocation{
+		Height:           e.Height,
+		Power:            e.Validator.Power,
+		ConsensusAddress: consAddr,
+		Time:             e.Time,
 	}
 }
 ```
 
-**File:** store/multiversion/memiterator.go (L114-117)
+**File:** types/staking.go (L17-26)
 ```go
-	// if we have an estimate, write to abort channel
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-	}
+	// Delay, in blocks, between when validator updates are returned to the
+	// consensus-engine and when they are applied. For example, if
+	// ValidatorUpdateDelay is set to X, and if a validator set update is
+	// returned with new validators at the end of block 10, then the new
+	// validators are expected to sign blocks beginning at block 11+X.
+	//
+	// This value is constant as this should not change without a hard fork.
+	// For Tendermint this should be set to 1 block, for more details see:
+	// https://tendermint.com/docs/spec/abci/apps.html#endblock
+	ValidatorUpdateDelay int64 = 1
 ```
 
-**File:** store/multiversion/memiterator.go (L119-125)
+**File:** x/slashing/keeper/keeper.go (L66-79)
 ```go
-	// if we have a deleted value, return nil
-	if val.IsDeleted() {
-		vi.readCache[string(key)] = nil
-		return nil
-	}
-	vi.readCache[string(key)] = val.Value()
-	return val.Value()
-```
-
-**File:** tasks/scheduler.go (L284-352)
-```go
-func (s *scheduler) ProcessAll(ctx sdk.Context, reqs []*sdk.DeliverTxEntry) ([]types.ResponseDeliverTx, error) {
-	startTime := time.Now()
-	var iterations int
-	// initialize mutli-version stores if they haven't been initialized yet
-	s.tryInitMultiVersionStore(ctx)
-	// prefill estimates
-	// This "optimization" path is being disabled because we don't have a strong reason to have it given that it
-	// s.PrefillEstimates(reqs)
-	tasks, tasksMap := toTasks(reqs)
-	s.allTasks = tasks
-	s.allTasksMap = tasksMap
-	s.executeCh = make(chan func(), len(tasks))
-	s.validateCh = make(chan func(), len(tasks))
-	defer s.emitMetrics()
-
-	// default to number of tasks if workers is negative or 0 by this point
-	workers := s.workers
-	if s.workers < 1 || len(tasks) < s.workers {
-		workers = len(tasks)
-	}
-
-	workerCtx, cancel := context.WithCancel(ctx.Context())
-	defer cancel()
-
-	// execution tasks are limited by workers
-	start(workerCtx, s.executeCh, workers)
-
-	// validation tasks uses length of tasks to avoid blocking on validation
-	start(workerCtx, s.validateCh, len(tasks))
-
-	toExecute := tasks
-	for !allValidated(tasks) {
-		// if the max incarnation >= x, we should revert to synchronous
-		if iterations >= maximumIterations {
-			// process synchronously
-			s.synchronous = true
-			startIdx, anyLeft := s.findFirstNonValidated()
-			if !anyLeft {
-				break
-			}
-			toExecute = tasks[startIdx:]
-		}
-
-		// execute sets statuses of tasks to either executed or aborted
-		if err := s.executeAll(ctx, toExecute); err != nil {
-			return nil, err
-		}
-
-		// validate returns any that should be re-executed
-		// note this processes ALL tasks, not just those recently executed
-		var err error
-		toExecute, err = s.validateAll(ctx, tasks)
-		if err != nil {
-			return nil, err
-		}
-		// these are retries which apply to metrics
-		s.metrics.retries += len(toExecute)
-		iterations++
-	}
-
-	for _, mv := range s.multiVersionStores {
-		mv.WriteLatestToStore()
-	}
-	s.metrics.maxIncarnation = s.maxIncarnation
-
-	ctx.Logger().Info("occ scheduler", "height", ctx.BlockHeight(), "txs", len(tasks), "latency_ms", time.Since(startTime).Milliseconds(), "retries", s.metrics.retries, "maxIncarnation", s.maxIncarnation, "iterations", iterations, "sync", s.synchronous, "workers", s.workers)
-
-	return s.collectResponses(tasks), nil
-}
-```
-
-**File:** store/multiversion/store_test.go (L375-407)
-```go
-func TestMVSIteratorValidationWithEstimate(t *testing.T) {
-	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
-	mvs := multiversion.NewMultiVersionStore(parentKVStore)
-	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
-
-	parentKVStore.Set([]byte("key2"), []byte("value0"))
-	parentKVStore.Set([]byte("key3"), []byte("value3"))
-	parentKVStore.Set([]byte("key4"), []byte("value4"))
-	parentKVStore.Set([]byte("key5"), []byte("value5"))
-
-	writeset := make(multiversion.WriteSet)
-	writeset["key1"] = []byte("value1")
-	writeset["key2"] = []byte("value2")
-	writeset["key3"] = nil
-	mvs.SetWriteset(1, 2, writeset)
-
-	iter := vis.Iterator([]byte("key1"), []byte("key6"))
-	for ; iter.Valid(); iter.Next() {
-		// read value
-		iter.Value()
-	}
-	iter.Close()
-	vis.WriteToMultiVersionStore()
-
-	writeset2 := make(multiversion.WriteSet)
-	writeset2["key2"] = []byte("value2")
-	mvs.SetEstimatedWriteset(2, 2, writeset2)
-
-	// should be invalid
-	valid, conflicts := mvs.ValidateTransactionState(5)
-	require.False(t, valid)
-	require.Equal(t, []int{2}, conflicts)
+// Slash attempts to slash a validator. The slash is delegated to the staking
+// module to make the necessary validator changes.
+func (k Keeper) Slash(ctx sdk.Context, consAddr sdk.ConsAddress, fraction sdk.Dec, power, distributionHeight int64) {
+	ctx.EventManager().EmitEvent(
+		sdk.NewEvent(
+			types.EventTypeSlash,
+			sdk.NewAttribute(types.AttributeKeyAddress, consAddr.String()),
+			sdk.NewAttribute(types.AttributeKeyPower, fmt.Sprintf("%d", power)),
+			sdk.NewAttribute(types.AttributeKeyReason, types.AttributeValueDoubleSign),
+		),
+	)
+	telemetry.IncrValidatorSlashedCounter(consAddr.String(), types.AttributeValueDoubleSign)
+	k.sk.Slash(ctx, consAddr, distributionHeight, power, fraction)
 }
 ```

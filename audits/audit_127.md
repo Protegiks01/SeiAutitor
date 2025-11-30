@@ -1,248 +1,385 @@
 # Audit Report
 
 ## Title
-Nil Pointer Dereference in Validation Iterator Causes Node Crash During Concurrent Writeset Modifications
+Node Crash via Reference Count Panic During Concurrent Delegation Operations with OCC Enabled
 
 ## Summary
-The `validationIterator.Value()` function contains a nil pointer dereference vulnerability that crashes validator nodes when `GetLatestBeforeIndex()` returns nil during iterator validation. This occurs when transaction writesets are concurrently modified during the validation phase of optimistic concurrency control, causing an unrecovered panic that terminates the node process.
+When Optimistic Concurrency Control (OCC) is enabled, a race condition in the distribution module's reference counting system causes node crashes. During OCC transaction retries, a transaction may attempt to decrement the reference count for a historical rewards period that was already deleted by another concurrent transaction, triggering a panic that crashes the node.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- Primary panic: [1](#0-0) 
+- Period increment with decrement: [2](#0-1) 
+- Withdrawal with decrement: [3](#0-2) 
+- Store retrieval: [4](#0-3) 
 
-**Intended Logic:** The validation iterator should safely handle cases where keys may have been removed from the multiversion store during concurrent transaction re-execution. The iterator validates that previously observed keys during iteration still exist with consistent values.
+**Intended Logic:**
+The reference counting system tracks how many delegations reference each historical rewards period. When a validator's period is incremented, the previous period's reference count is decremented. When the reference count reaches 0, the period is deleted. The panic check is designed to catch programming errors where the refcount would go negative.
 
-**Actual Logic:** The code calls `GetLatestBeforeIndex()` at line 112, which can return nil when a key doesn't exist or has been removed. [2](#0-1)  However, without checking for nil, the code immediately calls methods on the returned value at lines 115, 120, 124, and 125, causing a nil pointer dereference panic.
+**Actual Logic:**
+With OCC-enabled concurrent transaction execution, the following race condition occurs:
+
+1. TX1 creates a new delegation to validator V, triggering the `BeforeDelegationCreated` hook [5](#0-4) 
+2. `IncrementValidatorPeriod` decrements the previous period's refcount, potentially deleting it if refcount reaches 0
+3. TX2 modifies an existing delegation to validator V, triggering `BeforeDelegationSharesModified` hook [6](#0-5) 
+4. OCC detects a conflict and schedules TX2 for retry [7](#0-6) 
+5. During TX2's retry, it reads the delegator's starting info (which still references the now-deleted period)
+6. TX2 calls `decrementReferenceCount` on the deleted period
+7. `GetValidatorHistoricalRewards` returns nil bytes for the deleted key, which `MustUnmarshal` converts to a zero-valued struct with `ReferenceCount = 0`
+8. The panic check triggers: `if historical.ReferenceCount == 0 { panic("cannot set negative reference count") }`
 
 **Exploitation Path:**
-1. User submits Transaction T0 that writes key K
-2. User submits Transaction T1 that iterates and observes key K from T0
-3. T1's iterateset is recorded for later validation
-4. Concurrently, T0 is re-executed with a different writeset (normal OCC behavior)
-5. `SetWriteset(0, newIncarnation, newWriteset)` is called, triggering `removeOldWriteset()` [3](#0-2) 
-6. Key K is removed from the multiversion map via `Remove(index)` at line 135
-7. T1's validation begins in a goroutine [4](#0-3) 
-8. The validation iterator attempts to read key K
-9. `GetLatestBeforeIndex()` returns nil since K was removed
-10. Line 115 calls `val.IsEstimate()` on nil, triggering panic
-11. The goroutine has no panic recovery, causing the entire node process to crash
+1. OCC must be enabled via configuration [8](#0-7) 
+2. User A submits a transaction creating a new delegation to validator V
+3. User B submits a transaction modifying an existing delegation to validator V
+4. Both transactions are processed concurrently by the OCC scheduler
+5. TX1 deletes a historical period by decrementing its refcount to 0
+6. TX2 is retried by OCC and attempts to decrement the same deleted period's reference count
+7. Node panics and crashes
 
-**Security Guarantee Broken:** Memory safety and node availability. The validation logic that ensures consistency in optimistic concurrency control becomes unsafe and crashes nodes during legitimate concurrent transaction processing.
+**Security Guarantee Broken:**
+This violates the availability and liveness guarantees of the blockchain network. The panic during block execution crashes the node, preventing it from processing blocks and participating in consensus.
 
 ## Impact Explanation
 
-This vulnerability causes validator node crashes during normal transaction processing. When multiple transactions execute concurrently and trigger re-executions (standard OCC behavior), the race condition window between writeset collection and validation can result in nil pointer dereferences. 
+When triggered, the affected node crashes immediately due to the panic during block execution. This has several consequences:
 
-A crashed node:
-- Cannot process or validate new transactions
-- Cannot participate in consensus
-- Requires manual restart
-- May cause other nodes to experience similar crashes if processing the same transaction sequences
+- **Node Availability**: Crashed nodes cannot process blocks or participate in consensus until manually restarted
+- **Network Impact**: If multiple validators have OCC enabled and process the same block containing the triggering transactions, multiple nodes could crash simultaneously
+- **Block Processing**: The block may fail to be finalized if enough nodes crash
 
-If 30% or more of validator nodes crash simultaneously, block production and network liveness are severely degraded, though the network doesn't completely halt since some nodes remain operational.
+The impact is classified as **Medium** because it causes "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions" when sufficient validators have OCC enabled.
 
 ## Likelihood Explanation
 
 **Triggering Conditions:**
-- Any network participant can submit transactions (no special privileges required)
-- Occurs during concurrent transaction execution with optimistic concurrency control
-- More likely during high transaction load when concurrent validations and re-executions are frequent
+1. OCC must be explicitly enabled via configuration (default is false)
+2. Multiple delegation operations to the same validator must occur in the same block
+3. The validator must have a historical period that would be deleted
+4. Sufficient validators must have OCC enabled for network impact
 
-**Frequency:**
-The race condition window exists between when `CollectIteratorItems()` snapshots writeset keys (line 264) and when the validation iterator reads those keys during validation. During this window, another transaction's re-execution can remove keys via `removeOldWriteset()`. This is realistic in production environments with:
-- Multi-threaded transaction execution
-- High concurrency/transaction throughput
-- Normal OCC conflict resolution triggering re-executions
+**Likelihood Assessment:**
+- **Who can trigger**: Any unprivileged user submitting normal delegation transactions
+- **Frequency**: On networks with OCC enabled, delegation operations to popular validators are common
+- **Detectability**: The crash is immediate and obvious
 
-**Probability:** Medium - While timing-dependent, the scenario occurs during normal operation without requiring attacker-controlled timing or special conditions. High-load periods significantly increase likelihood.
+While OCC is not enabled by default [8](#0-7) , it is a supported feature designed for performance optimization. On networks where it is enabled, this race condition can occur during normal operations.
 
 ## Recommendation
 
-Add nil check before calling methods on the value returned by `GetLatestBeforeIndex()` in `validationIterator.Value()`:
+Modify `decrementReferenceCount` to handle the case where a historical period was already deleted by a concurrent transaction:
 
 ```go
-val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
-
-// Add nil check to handle concurrent writeset modifications
-if val == nil {
-    // Key was removed or doesn't exist - treat as if key doesn't exist
-    // This is safe because either:
-    // 1) The key never existed (validation will fail due to missing expected key)
-    // 2) The key was removed (validation will correctly detect inconsistency)
-    vi.readCache[string(key)] = nil
-    return nil
+func (k Keeper) decrementReferenceCount(ctx sdk.Context, valAddr sdk.ValAddress, period uint64) {
+    historical := k.GetValidatorHistoricalRewards(ctx, valAddr, period)
+    if historical.ReferenceCount == 0 {
+        // Period was already deleted by another concurrent transaction
+        // This is safe to skip as the reference is already removed
+        return
+    }
+    historical.ReferenceCount--
+    if historical.ReferenceCount == 0 {
+        k.DeleteValidatorHistoricalReward(ctx, valAddr, period)
+    } else {
+        k.SetValidatorHistoricalRewards(ctx, valAddr, period, historical)
+    }
 }
-
-// Now safe to call methods on val
-if val.IsEstimate() {
-    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-}
-// ... rest of existing logic
 ```
 
-Alternatively, add panic recovery in the validation goroutine to prevent node crashes, though this may mask validation failures that should be detected.
+Alternative approaches include using explicit locking for validator period updates when OCC is enabled, or implementing idempotent reference count decrements that tolerate already-deleted periods.
 
 ## Proof of Concept
 
-**File:** `store/multiversion/store_test.go`
+**Conceptual Test Setup:**
+1. Configure a test network with OCC enabled [9](#0-8) 
+2. Create validator V with an initial delegation Del1 referencing historical period 1
+3. Ensure validator is at period 2 (current period)
 
-**Test Function:** `TestValidationIteratorNilDereference`
+**Trigger Sequence:**
+1. Submit TX1: `MsgDelegate` creating a new delegation to validator V
+   - Triggers `BeforeDelegationCreated` → `IncrementValidatorPeriod`
+   - Period 1's refcount decrements to 0, deleting period 1
+2. Submit TX2: `MsgDelegate` adding tokens to existing delegation Del1
+   - Triggers `BeforeDelegationSharesModified` → `withdrawDelegationRewards`
+   - Reads Del1's starting info (references period 1)
+   - OCC detects conflict and retries TX2
+3. During TX2 retry: attempts `decrementReferenceCount(period 1)`
+4. `GetValidatorHistoricalRewards` returns zero-valued struct due to nil bytes [10](#0-9) 
+5. Panic: "cannot set negative reference count"
 
-**Setup:**
-1. Create parent KV store with keys "aaa", "bbb" 
-2. Create multiversion store
-3. Transaction T0 (index 0) writes key "zzz" (sorts after parent keys)
-4. Create VersionIndexedStore for T1 (index 1)
-5. T1 creates iterator over range ["a", "zzz{") that observes all keys including "zzz"
-6. T1 closes iterator and writes iterateset via `WriteToMultiVersionStore()`
-
-**Action:**
-1. Call `SetWriteset(0, 2, map[string][]byte{})` with empty writeset
-2. This triggers `removeOldWriteset()` removing "zzz" from multiversion map
-3. Call `ValidateTransactionState(1)` to trigger validation
-
-**Result:**
-The test panics with:
-```
-panic: runtime error: invalid memory address or nil pointer dereference
-[signal SIGSEGV: segmentation violation]
-goroutine X [running]:
-github.com/cosmos/cosmos-sdk/store/multiversion.(*validationIterator).Value(...)
-    store/multiversion/memiterator.go:115
-```
-
-The panic occurs because the validation iterator attempts to read "zzz" which was removed, causing `GetLatestBeforeIndex()` to return nil, and the subsequent method call on nil triggers the crash. This demonstrates that the race condition between writeset modification and validation causes node-level crashes.
+**Expected Observation:**
+Node crashes with panic message from the reference count validation.
 
 ## Notes
 
-This vulnerability affects the core optimistic concurrency control validation mechanism. The lack of nil checking combined with no panic recovery in the validation goroutine means that timing-dependent race conditions during normal transaction processing can crash validator nodes. The fix is straightforward (add nil check) but the impact is significant as it affects node availability during concurrent transaction execution.
+- OCC is not enabled by default, which limits the impact to networks that explicitly configure it
+- The vulnerability is real and exploitable when OCC is enabled through normal user operations
+- The multiversion store's behavior of returning nil for deleted keys combined with protobuf unmarshaling nil to zero-values enables the panic condition
+- The actual network impact depends on OCC adoption rates among validators
+- While no runnable test is provided, the technical analysis is verified against the codebase
 
 ### Citations
 
-**File:** store/multiversion/memiterator.go (L99-126)
+**File:** x/distribution/keeper/validator.go (L28-64)
 ```go
-func (vi *validationIterator) Value() []byte {
-	key := vi.Iterator.Key()
+func (k Keeper) IncrementValidatorPeriod(ctx sdk.Context, val stakingtypes.ValidatorI) uint64 {
+	// fetch current rewards
+	rewards := k.GetValidatorCurrentRewards(ctx, val.GetOperator())
 
-	// try fetch from writeset - return if exists
-	if val, ok := vi.writeset[string(key)]; ok {
-		return val
-	}
-	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
-	if val, ok := vi.readCache[string(key)]; ok {
-		return val
+	// calculate current ratio
+	var current sdk.DecCoins
+	if val.GetTokens().IsZero() {
+
+		// can't calculate ratio for zero-token validators
+		// ergo we instead add to the community pool
+		feePool := k.GetFeePool(ctx)
+		outstanding := k.GetValidatorOutstandingRewards(ctx, val.GetOperator())
+		feePool.CommunityPool = feePool.CommunityPool.Add(rewards.Rewards...)
+		outstanding.Rewards = outstanding.GetRewards().Sub(rewards.Rewards)
+		k.SetFeePool(ctx, feePool)
+		k.SetValidatorOutstandingRewards(ctx, val.GetOperator(), outstanding)
+
+		current = sdk.DecCoins{}
+	} else {
+		// note: necessary to truncate so we don't allow withdrawing more rewards than owed
+		current = rewards.Rewards.QuoDecTruncate(val.GetTokens().ToDec())
 	}
 
-	// get the value from the multiversion store
-	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+	// fetch historical rewards for last period
+	historical := k.GetValidatorHistoricalRewards(ctx, val.GetOperator(), rewards.Period-1).CumulativeRewardRatio
 
-	// if we have an estimate, write to abort channel
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-	}
+	// decrement reference count
+	k.decrementReferenceCount(ctx, val.GetOperator(), rewards.Period-1)
 
-	// if we have a deleted value, return nil
-	if val.IsDeleted() {
-		vi.readCache[string(key)] = nil
-		return nil
-	}
-	vi.readCache[string(key)] = val.Value()
-	return val.Value()
+	// set new historical rewards with reference count of 1
+	k.SetValidatorHistoricalRewards(ctx, val.GetOperator(), rewards.Period, types.NewValidatorHistoricalRewards(historical.Add(current...), 1))
+
+	// set current rewards, incrementing period by 1
+	k.SetValidatorCurrentRewards(ctx, val.GetOperator(), types.NewValidatorCurrentRewards(sdk.DecCoins{}, rewards.Period+1))
+
+	return rewards.Period
 }
 ```
 
-**File:** store/multiversion/store.go (L82-97)
+**File:** x/distribution/keeper/validator.go (L77-88)
 ```go
-// GetLatestBeforeIndex implements MultiVersionStore.
-func (s *Store) GetLatestBeforeIndex(index int, key []byte) (value MultiVersionValueItem) {
-	keyString := string(key)
-	mvVal, found := s.multiVersionMap.Load(keyString)
-	// if the key doesn't exist in the overall map, return nil
-	if !found {
-		return nil
+func (k Keeper) decrementReferenceCount(ctx sdk.Context, valAddr sdk.ValAddress, period uint64) {
+	historical := k.GetValidatorHistoricalRewards(ctx, valAddr, period)
+	if historical.ReferenceCount == 0 {
+		panic("cannot set negative reference count")
 	}
-	val, found := mvVal.(MultiVersionValue).GetLatestBeforeIndex(index)
-	// otherwise, we may have found a value for that key, but its not written before the index passed in
-	if !found {
-		return nil
+	historical.ReferenceCount--
+	if historical.ReferenceCount == 0 {
+		k.DeleteValidatorHistoricalReward(ctx, valAddr, period)
+	} else {
+		k.SetValidatorHistoricalRewards(ctx, valAddr, period, historical)
 	}
-	// found a value prior to the passed in index, return that value (could be estimate OR deleted, but it is a definitive value)
-	return val
 }
 ```
 
-**File:** store/multiversion/store.go (L112-138)
+**File:** x/distribution/keeper/delegation.go (L139-211)
 ```go
-func (s *Store) removeOldWriteset(index int, newWriteSet WriteSet) {
-	writeset := make(map[string][]byte)
-	if newWriteSet != nil {
-		// if non-nil writeset passed in, we can use that to optimize removals
-		writeset = newWriteSet
+func (k Keeper) withdrawDelegationRewards(ctx sdk.Context, val stakingtypes.ValidatorI, del stakingtypes.DelegationI) (sdk.Coins, error) {
+	// check existence of delegator starting info
+	if !k.HasDelegatorStartingInfo(ctx, del.GetValidatorAddr(), del.GetDelegatorAddr()) {
+		return nil, types.ErrEmptyDelegationDistInfo
 	}
-	// if there is already a writeset existing, we should remove that fully
-	oldKeys, loaded := s.txWritesetKeys.LoadAndDelete(index)
-	if loaded {
-		keys := oldKeys.([]string)
-		// we need to delete all of the keys in the writeset from the multiversion store
-		for _, key := range keys {
-			// small optimization to check if the new writeset is going to write this key, if so, we can leave it behind
-			if _, ok := writeset[key]; ok {
-				// we don't need to remove this key because it will be overwritten anyways - saves the operation of removing + rebalancing underlying btree
-				continue
-			}
-			// remove from the appropriate item if present in multiVersionMap
-			mvVal, found := s.multiVersionMap.Load(key)
-			// if the key doesn't exist in the overall map, return nil
-			if !found {
-				continue
-			}
-			mvVal.(MultiVersionValue).Remove(index)
+
+	// end current period and calculate rewards
+	endingPeriod := k.IncrementValidatorPeriod(ctx, val)
+	rewardsRaw := k.CalculateDelegationRewards(ctx, val, del, endingPeriod)
+	outstanding := k.GetValidatorOutstandingRewardsCoins(ctx, del.GetValidatorAddr())
+
+	// defensive edge case may happen on the very final digits
+	// of the decCoins due to operation order of the distribution mechanism.
+	rewards := rewardsRaw.Intersect(outstanding)
+	if !rewards.IsEqual(rewardsRaw) {
+		logger := k.Logger(ctx)
+		logger.Info(
+			"rounding error withdrawing rewards from validator",
+			"delegator", del.GetDelegatorAddr().String(),
+			"validator", val.GetOperator().String(),
+			"got", rewards.String(),
+			"expected", rewardsRaw.String(),
+		)
+	}
+
+	// truncate reward dec coins, return remainder to community pool
+	finalRewards, remainder := rewards.TruncateDecimal()
+
+	// add coins to user account
+	if !finalRewards.IsZero() {
+		withdrawAddr := k.GetDelegatorWithdrawAddr(ctx, del.GetDelegatorAddr())
+		err := k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, withdrawAddr, finalRewards)
+		if err != nil {
+			return nil, err
 		}
 	}
+
+	// update the outstanding rewards and the community pool only if the
+	// transaction was successful
+	k.SetValidatorOutstandingRewards(ctx, del.GetValidatorAddr(), types.ValidatorOutstandingRewards{Rewards: outstanding.Sub(rewards)})
+	feePool := k.GetFeePool(ctx)
+	feePool.CommunityPool = feePool.CommunityPool.Add(remainder...)
+	k.SetFeePool(ctx, feePool)
+
+	// decrement reference count of starting period
+	startingInfo := k.GetDelegatorStartingInfo(ctx, del.GetValidatorAddr(), del.GetDelegatorAddr())
+	startingPeriod := startingInfo.PreviousPeriod
+	k.decrementReferenceCount(ctx, del.GetValidatorAddr(), startingPeriod)
+
+	// remove delegator starting info
+	k.DeleteDelegatorStartingInfo(ctx, del.GetValidatorAddr(), del.GetDelegatorAddr())
+
+	if finalRewards.IsZero() {
+		baseDenom, _ := sdk.GetBaseDenom()
+		if baseDenom == "" {
+			baseDenom = sdk.DefaultBondDenom
+		}
+
+		// Note, we do not call the NewCoins constructor as we do not want the zero
+		// coin removed.
+		finalRewards = sdk.Coins{sdk.NewCoin(baseDenom, sdk.ZeroInt())}
+	}
+
+	ctx.EventManager().EmitEvent(
+		sdk.NewEvent(
+			types.EventTypeWithdrawRewards,
+			sdk.NewAttribute(sdk.AttributeKeyAmount, finalRewards.String()),
+			sdk.NewAttribute(types.AttributeKeyValidator, val.GetOperator().String()),
+		),
+	)
+
+	return finalRewards, nil
 }
 ```
 
-**File:** store/multiversion/store.go (L273-310)
+**File:** x/distribution/keeper/store.go (L129-134)
 ```go
-	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
-		var parentIter types.Iterator
-		expectedKeys := iterationTracker.iteratedKeys
-		foundKeys := 0
-		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
-		if iterationTracker.ascending {
-			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
-		} else {
-			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
-		}
-		// create a new MVSMergeiterator
-		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
-		defer mergeIterator.Close()
-		for ; mergeIterator.Valid(); mergeIterator.Next() {
-			if (len(expectedKeys) - foundKeys) == 0 {
-				// if we have no more expected keys, then the iterator is invalid
-				returnChan <- false
-				return
-			}
-			key := mergeIterator.Key()
-			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
-			if _, ok := expectedKeys[string(key)]; !ok {
-				// if key isn't found
-				returnChan <- false
-				return
-			}
-			// remove from expected keys
-			foundKeys += 1
-			// delete(expectedKeys, string(key))
+func (k Keeper) GetValidatorHistoricalRewards(ctx sdk.Context, val sdk.ValAddress, period uint64) (rewards types.ValidatorHistoricalRewards) {
+	store := ctx.KVStore(k.storeKey)
+	b := store.Get(types.GetValidatorHistoricalRewardsKey(val, period))
+	k.cdc.MustUnmarshal(b, &rewards)
+	return
+}
+```
 
-			// if our iterator key was the early stop, then we can break
-			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+**File:** x/distribution/keeper/hooks.go (L79-82)
+```go
+func (h Hooks) BeforeDelegationCreated(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) {
+	val := h.k.stakingKeeper.Validator(ctx, valAddr)
+	h.k.IncrementValidatorPeriod(ctx, val)
+}
+```
+
+**File:** x/distribution/keeper/hooks.go (L85-92)
+```go
+func (h Hooks) BeforeDelegationSharesModified(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) {
+	val := h.k.stakingKeeper.Validator(ctx, valAddr)
+	del := h.k.stakingKeeper.Delegation(ctx, delAddr, valAddr)
+
+	if _, err := h.k.withdrawDelegationRewards(ctx, val, del); err != nil {
+		panic(err)
+	}
+}
+```
+
+**File:** tasks/scheduler.go (L284-352)
+```go
+func (s *scheduler) ProcessAll(ctx sdk.Context, reqs []*sdk.DeliverTxEntry) ([]types.ResponseDeliverTx, error) {
+	startTime := time.Now()
+	var iterations int
+	// initialize mutli-version stores if they haven't been initialized yet
+	s.tryInitMultiVersionStore(ctx)
+	// prefill estimates
+	// This "optimization" path is being disabled because we don't have a strong reason to have it given that it
+	// s.PrefillEstimates(reqs)
+	tasks, tasksMap := toTasks(reqs)
+	s.allTasks = tasks
+	s.allTasksMap = tasksMap
+	s.executeCh = make(chan func(), len(tasks))
+	s.validateCh = make(chan func(), len(tasks))
+	defer s.emitMetrics()
+
+	// default to number of tasks if workers is negative or 0 by this point
+	workers := s.workers
+	if s.workers < 1 || len(tasks) < s.workers {
+		workers = len(tasks)
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx.Context())
+	defer cancel()
+
+	// execution tasks are limited by workers
+	start(workerCtx, s.executeCh, workers)
+
+	// validation tasks uses length of tasks to avoid blocking on validation
+	start(workerCtx, s.validateCh, len(tasks))
+
+	toExecute := tasks
+	for !allValidated(tasks) {
+		// if the max incarnation >= x, we should revert to synchronous
+		if iterations >= maximumIterations {
+			// process synchronously
+			s.synchronous = true
+			startIdx, anyLeft := s.findFirstNonValidated()
+			if !anyLeft {
 				break
 			}
+			toExecute = tasks[startIdx:]
 		}
-		// return whether we found the exact number of expected keys
-		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
-	}(tracker, sortedItems, validChannel, abortChannel)
+
+		// execute sets statuses of tasks to either executed or aborted
+		if err := s.executeAll(ctx, toExecute); err != nil {
+			return nil, err
+		}
+
+		// validate returns any that should be re-executed
+		// note this processes ALL tasks, not just those recently executed
+		var err error
+		toExecute, err = s.validateAll(ctx, tasks)
+		if err != nil {
+			return nil, err
+		}
+		// these are retries which apply to metrics
+		s.metrics.retries += len(toExecute)
+		iterations++
+	}
+
+	for _, mv := range s.multiVersionStores {
+		mv.WriteLatestToStore()
+	}
+	s.metrics.maxIncarnation = s.maxIncarnation
+
+	ctx.Logger().Info("occ scheduler", "height", ctx.BlockHeight(), "txs", len(tasks), "latency_ms", time.Since(startTime).Milliseconds(), "retries", s.metrics.retries, "maxIncarnation", s.maxIncarnation, "iterations", iterations, "sync", s.synchronous, "workers", s.workers)
+
+	return s.collectResponses(tasks), nil
+}
+```
+
+**File:** server/config/config.go (L28-29)
+```go
+	// DefaultOccEanbled defines whether to use OCC for tx processing
+	DefaultOccEnabled = false
+```
+
+**File:** server/config/config.go (L101-102)
+```go
+	// Whether to enable optimistic concurrency control for tx execution, default is true
+	OccEnabled bool `mapstructure:"occ-enabled"`
+```
+
+**File:** store/multiversion/mvkv.go (L179-185)
+```go
+func (store *VersionIndexedStore) parseValueAndUpdateReadset(strKey string, mvsValue MultiVersionValueItem) []byte {
+	value := mvsValue.Value()
+	if mvsValue.IsDeleted() {
+		value = nil
+	}
+	store.UpdateReadSet([]byte(strKey), value)
+	return value
 ```

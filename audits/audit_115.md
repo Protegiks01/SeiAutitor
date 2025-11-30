@@ -1,197 +1,415 @@
 # Audit Report
 
 ## Title
-Network Halt Due to Insufficient Validation of Upgrade Plan Names Allowing Whitespace
+Deferred Fee Cache Never Flushed Leading to Permanent Loss of Transaction Fees
 
 ## Summary
-The `ValidateBasic()` function in the upgrade module only checks if the plan name has zero length but does not validate against whitespace-only names or names with leading/trailing whitespace. This allows governance proposals to schedule upgrades with malformed names that will cause a complete network halt when the exact string match fails during handler lookup at the upgrade height.
+The bank module's deferred cache mechanism collects transaction fees but fails to flush them to module accounts because the bank module lacks an EndBlock implementation. Fees are immediately deducted from users and stored in a memory-based deferred cache, but the distribution module queries only actual bank balances (excluding the deferred cache), resulting in zero fees being distributed and permanent loss of all transaction fees.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
 **Location:**
-- Validation: `x/upgrade/types/plan.go`, lines 28-30 [1](#0-0) 
-
-- Handler lookup: `x/upgrade/keeper/keeper.go`, lines 359-362 [2](#0-1) 
-
-- Panic trigger: `x/upgrade/abci.go`, lines 68-70 [3](#0-2) 
+- Primary: `x/bank/module.go` (lines 107-210) - missing EndBlock implementation [1](#0-0) 
+  
+- Fee deduction: `x/auth/ante/fee.go` (line 208) - uses DeferredSendCoinsFromAccountToModule [2](#0-1) 
+  
+- Cache write: `x/bank/keeper/keeper.go` (lines 408-432) - defers fees to cache [3](#0-2) 
+  
+- Never called: `x/bank/keeper/keeper.go` (lines 434-483) - WriteDeferredBalances exists but unreachable [4](#0-3) 
 
 **Intended Logic:**
-The validation should ensure that upgrade plan names are valid, non-empty identifiers that can reliably match registered upgrade handlers. When an upgrade height is reached, the system should successfully match the scheduled plan name with a registered handler and execute the upgrade.
+The code comment at line 406 explicitly states: "In the EndBlocker, it will then perform one deposit for each module account." [5](#0-4) 
+
+The intended flow should be:
+1. User pays fees → `DeferredSendCoinsFromAccountToModule` deducts from user and stores in cache
+2. EndBlock → bank module calls `WriteDeferredBalances` to flush cache to module accounts
+3. BeginBlock → distribution module retrieves and distributes fees
 
 **Actual Logic:**
-The current validation only checks `len(p.Name) == 0`, which rejects empty strings but accepts whitespace-only names (e.g., `" "`, `"  "`) and names with leading/trailing whitespace (e.g., `" v2.0"`, `"v2.0 "`). [1](#0-0) 
-
-The handler lookup performs exact string matching without any trimming or normalization. [2](#0-1) 
+1. Ante handler calls `DeferredSendCoinsFromAccountToModule` [2](#0-1) 
+   
+2. User balance is immediately reduced via `SubUnlockedCoins` (line 415), fees stored in deferred cache (line 426) [6](#0-5) [7](#0-6) 
+   
+3. Bank module has NO EndBlock method, so module manager skips it [8](#0-7) 
+   
+4. Fees remain in deferred cache (memory store persists across blocks) [9](#0-8) 
+   
+5. Distribution module calls `GetAllBalances` which only reads actual balances, not deferred cache [10](#0-9) [11](#0-10) 
+   
+6. Distribution sees zero balance and transfers nothing
 
 **Exploitation Path:**
-1. A governance proposal is submitted with an upgrade plan containing a name with whitespace (e.g., `" v2.0"` with leading space)
-2. The proposal passes `ValidateBasic()` because `len(" v2.0") = 5 ≠ 0` [4](#0-3) 
-3. The proposal goes through governance voting and passes
-4. The upgrade is scheduled via `ScheduleUpgrade()` which calls the insufficient `ValidateBasic()` [5](#0-4) 
-5. Developers register an upgrade handler using the trimmed name `"v2.0"` (standard practice) [6](#0-5) 
-6. At the upgrade height, `BeginBlocker()` checks if a handler exists for `" v2.0"` (with space)
-7. The `HasHandler()` lookup fails because `" v2.0" != "v2.0"` (exact string match in map lookup)
-8. All validator nodes call `panicUpgradeNeeded()` and halt [7](#0-6) 
-9. The entire network stops producing blocks
+No attacker action needed - this occurs automatically:
+1. Any user submits a transaction with fees (normal operation)
+2. Ante handler processes fee deduction
+3. User balance decreased, fee stored in deferred cache
+4. EndBlock executes but bank module skipped (no EndBlock method)
+5. BeginBlock distribution queries fee collector: balance = 0
+6. Fees permanently inaccessible in deferred cache
 
 **Security Guarantee Broken:**
-The availability guarantee of the blockchain is violated. The system enters a complete denial-of-service state where no transactions can be processed, requiring coordinated manual intervention by all validators to recover.
+Fundamental accounting invariant violated: `total_supply = sum(all_account_balances)`. User balances decrease but no account is credited, causing systemic fund loss equal to all transaction fees.
 
 ## Impact Explanation
 
-**Affected Process:** Network availability and block production
+**Direct Loss of Funds:** Every transaction fee is deducted from user accounts but never credited to the fee collector module account. The fees remain trapped in the deferred cache, which is:
+- Not included in balance queries (`GetAllBalances` bypasses it)
+- Never flushed to actual balances (no EndBlock to call `WriteDeferredBalances`)
+- Inaccessible for distribution to validators
 
-**Consequences:**
-When all validator nodes panic at the same block height due to the missing handler match, the blockchain cannot produce new blocks. This results in:
-- Complete halt of transaction processing
-- No new blocks produced
-- Requires coordinated manual intervention by all validators to recover (either skip the upgrade height or update binaries with matching handler names including whitespace)
-- Potential loss of user confidence and economic impact from network downtime
-
-This matches the impact category: "Network not being able to confirm new transactions (total network shutdown)" which is classified as Medium severity.
+**Cascading Effects:**
+- **Broken validator economics**: Validators receive no fee rewards, undermining network security incentives
+- **Accounting corruption**: Total supply tracking becomes incorrect as fees vanish from circulation
+- **Cumulative damage**: Problem compounds with every transaction across every block
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any participant who can submit governance proposals (requires deposit) and get them voted through the democratic governance process. This is not a privileged action.
+**Probability:** 100% - Occurs automatically on every transaction with fees
 
-**Conditions Required:**
-- A governance proposal with a plan name containing whitespace must be submitted
-- The proposal must pass the voting threshold
-- Developers must register handlers with different names (e.g., trimmed versions, which is standard practice)
-- The blockchain must reach the scheduled upgrade height
+**Who Can Trigger:** Any network participant submitting transactions (normal usage, not an attack)
 
-**Likelihood:**
-While governance upgrades happen infrequently, the risk of accidental whitespace introduction is non-trivial:
-- Copy-paste from documentation or chat messages can introduce invisible whitespace
-- Manual typing errors can add trailing/leading spaces
-- Different text editors may handle whitespace differently
-- The validation provides no warning that whitespace will cause issues
+**Conditions Required:** None - this is the default behavior during normal network operation
 
-Once triggered, it results in complete network halt every time.
+**Evidence from Tests:** Multiple test files explicitly call `WriteDeferredBalances` after using `DeferredSendCoinsFromAccountToModule`, proving this flush operation is required but missing in production code: [12](#0-11) [13](#0-12) [14](#0-13) 
+
+The test at lines 176-193 in `fee_test.go` explicitly demonstrates:
+- Fee collector balance remains unchanged after ante handler
+- Manual call to `WriteDeferredBalances` is required
+- Only after flush does the fee collector balance increase [15](#0-14) 
 
 ## Recommendation
 
-Add whitespace validation to the `ValidateBasic()` function in `x/upgrade/types/plan.go`:
+**Immediate Fix:**
+Implement EndBlock method in the bank module to flush the deferred cache. Add the following to `x/bank/module.go`:
 
 ```go
-func (p Plan) ValidateBasic() error {
-    if !p.Time.IsZero() {
-        return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
-    }
-    if p.UpgradedClientState != nil {
-        return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
-    }
-    
-    // Trim whitespace and validate
-    trimmedName := strings.TrimSpace(p.Name)
-    if len(trimmedName) == 0 {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty or contain only whitespace")
-    }
-    
-    // Reject names with leading/trailing whitespace
-    if trimmedName != p.Name {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot have leading or trailing whitespace")
-    }
-    
-    if p.Height <= 0 {
-        return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
-    }
-
-    return nil
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    am.keeper.WriteDeferredBalances(ctx)
+    return []abci.ValidatorUpdate{}
 }
 ```
+
+This will:
+1. Satisfy the `EndBlockAppModule` interface [16](#0-15) 
+   
+2. Ensure module manager calls bank's EndBlock (currently skipped at lines 647-650) [8](#0-7) 
+   
+3. Flush deferred fees to module accounts before distribution BeginBlock
+
+**Additional Measures:**
+- Add invariant checks to detect balance discrepancies between deferred cache and actual balances
+- The bank module is already in `OrderEndBlockers` but was being skipped - this fix activates that ordering [17](#0-16) 
+- Requires coordinated network upgrade to deploy
 
 ## Proof of Concept
 
-**File:** `x/upgrade/abci_test.go`
+The existing tests in the codebase demonstrate this vulnerability. A minimal reproduction:
 
 **Setup:**
-Use the existing `setupTest()` helper to initialize a test environment with the upgrade keeper.
+1. Initialize user account with balance
+2. Initialize fee collector module account
 
 **Action:**
-1. Create upgrade plans with whitespace-only names (e.g., `"   "`) and verify they incorrectly pass validation
-2. Create upgrade plans with leading/trailing whitespace (e.g., `" test-upgrade"`)
-3. Schedule an upgrade via governance handler with a name containing whitespace
-4. Register a handler with the trimmed version of the name (simulating standard developer practice)
-5. Advance context to the upgrade height
+1. Call `DeferredSendCoinsFromAccountToModule` to simulate fee deduction (as ante handler does)
+2. Do NOT call `WriteDeferredBalances` (mimicking production behavior)
 
 **Result:**
-The test demonstrates that:
-- Whitespace-only and whitespace-padded names incorrectly pass `ValidateBasic()`
-- When the handler is registered with a trimmed name, `BeginBlock()` panics at upgrade height
-- This panic would occur on all validator nodes simultaneously, causing complete network halt
-- Only when the handler name exactly matches (including whitespace) does the upgrade succeed
+1. User balance decreased by fee amount ✓
+2. Fee collector actual balance remains 0 ✓ (fees stuck in deferred cache)
+3. `GetAllBalances(feeCollector)` returns 0 ✓ (bypasses deferred cache)
+4. Distribution module sees 0 balance to distribute ✓
+5. Accounting invariant broken: fees permanently lost ✓
 
-The PoC can be run with: `go test -v -run TestWhitespaceNameCausesNetworkHalt ./x/upgrade/`
+The test evidence clearly shows that `WriteDeferredBalances` must be called manually in tests to avoid this exact problem, but production code has no such call because the bank module lacks an EndBlock implementation.
 
 ## Notes
 
-The report's technical analysis is accurate. The vulnerability is real and exploitable through normal governance processes. However, the correct severity classification according to the provided impact list is **Medium** (not High as originally claimed), as "Network not being able to confirm new transactions (total network shutdown)" is listed as a Medium-severity impact.
+This vulnerability is particularly severe because:
+1. The code comment explicitly documents the intended behavior ("In the EndBlocker") that was never implemented
+2. The deferred cache infrastructure exists and is used, but the critical flush operation is missing
+3. Memory stores persist across blocks, so fees accumulate indefinitely but remain permanently inaccessible
+4. This affects the core economic mechanism of the blockchain (fee collection and validator rewards)
+5. Every transaction with fees triggers this issue automatically - no attacker action required
 
 ### Citations
 
-**File:** x/upgrade/types/plan.go (L28-30)
+**File:** x/bank/module.go (L107-210)
 ```go
-	if len(p.Name) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
-	}
-```
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
 
-**File:** x/upgrade/keeper/keeper.go (L67-69)
-```go
-func (k Keeper) SetUpgradeHandler(name string, upgradeHandler types.UpgradeHandler) {
-	k.upgradeHandlers[name] = upgradeHandler
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
+}
+
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
+	}
+}
+
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
+
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
 }
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L177-180)
+**File:** x/auth/ante/fee.go (L208-208)
 ```go
-func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
-	if err := plan.ValidateBasic(); err != nil {
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+```
+
+**File:** x/bank/keeper/keeper.go (L406-406)
+```go
+// In the EndBlocker, it will then perform one deposit for each module account.
+```
+
+**File:** x/bank/keeper/keeper.go (L408-432)
+```go
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
 		return err
 	}
-```
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
+	}
 
-**File:** x/upgrade/keeper/keeper.go (L359-362)
-```go
-func (k Keeper) HasHandler(name string) bool {
-	_, ok := k.upgradeHandlers[name]
-	return ok
+	return nil
 }
 ```
 
-**File:** x/upgrade/abci.go (L68-70)
+**File:** x/bank/keeper/keeper.go (L434-483)
 ```go
-		if !k.HasHandler(plan.Name) {
-			panicUpgradeNeeded(k, ctx, plan)
+// WriteDeferredDepositsToModuleAccounts Iterates on all the deferred deposits and deposit them into the store
+func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+
+	// maps between bech32 stringified module account address and balance
+	moduleAddrBalanceMap := make(map[string]sdk.Coins)
+	// slice of modules to be sorted for consistent write order later
+	moduleList := []string{}
+
+	// iterate over deferred cache and accumulate totals per module
+	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
+		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
+		if !ok {
+			// add to list of modules
+			moduleList = append(moduleList, moduleAddr.String())
+			// set the map value
+			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
+			return false
+		}
+		// add to currCoins
+		newCoins := currCoins.Add(amount)
+		// update map
+		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
+		return false
+	})
+	// sort module list
+	sort.Strings(moduleList)
+
+	// iterate through module list and add the balance to module bank balances in sorted order
+	for _, moduleBech32Addr := range moduleList {
+		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
+		if !ok {
+			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
+			ctx.Logger().Error(err.Error())
+			panic(err)
+		}
+		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
+		if err != nil {
+			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
+			panic(err)
+		}
+	}
+
+	// clear deferred cache
+	k.deferredCache.Clear(ctx)
+	return ctx.EventManager().ABCIEvents()
+}
+```
+
+**File:** types/module/module.go (L226-229)
+```go
+type EndBlockAppModule interface {
+	AppModule
+	EndBlock(sdk.Context, abci.RequestEndBlock) []abci.ValidatorUpdate
+}
+```
+
+**File:** types/module/module.go (L647-650)
+```go
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
+			continue
 		}
 ```
 
-**File:** x/upgrade/abci.go (L101-112)
+**File:** store/mem/store.go (L20-21)
 ```go
-func panicUpgradeNeeded(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
-	// Write the upgrade info to disk. The UpgradeStoreLoader uses this info to perform or skip
-	// store migrations.
-	err := k.DumpUpgradeInfoWithInfoToDisk(ctx.BlockHeight(), plan.Name, plan.Info)
-	if err != nil {
-		panic(fmt.Errorf("unable to write upgrade info to filesystem: %s", err.Error()))
-	}
-
-	upgradeMsg := BuildUpgradeNeededMsg(plan)
-	ctx.Logger().Error(upgradeMsg)
-
-	panic(upgradeMsg)
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
 ```
 
-**File:** x/upgrade/types/proposal.go (L32-36)
+**File:** x/bank/keeper/view.go (L64-72)
 ```go
-func (sup *SoftwareUpgradeProposal) ValidateBasic() error {
-	if err := sup.Plan.ValidateBasic(); err != nil {
-		return err
-	}
-	return gov.ValidateAbstract(sup)
+func (k BaseViewKeeper) GetAllBalances(ctx sdk.Context, addr sdk.AccAddress) sdk.Coins {
+	balances := sdk.NewCoins()
+	k.IterateAccountBalances(ctx, addr, func(balance sdk.Coin) bool {
+		balances = append(balances, balance)
+		return false
+	})
+
+	return balances.Sort()
+}
+```
+
+**File:** x/distribution/keeper/allocation.go (L26-26)
+```go
+	feesCollectedInt := k.bankKeeper.GetAllBalances(ctx, feeCollector.GetAddress())
+```
+
+**File:** x/bank/keeper/keeper_test.go (L679-679)
+```go
+	app.BankKeeper.WriteDeferredBalances(ctx)
+```
+
+**File:** x/auth/ante/fee_test.go (L176-193)
+```go
+	resultFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+	suite.Assert().Equal(
+		expectedFeeCollectorBalance,
+		resultFeeCollectorBalance,
+	)
+
+	// Fee Collector actual account balance deposit coins into the fee collector account
+	suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
+
+	depositFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+
+	expectedAtomFee := feeAmount.AmountOf("usei")
+
+	suite.Assert().Equal(
+		// Called antehandler twice, expect fees to be deducted twice
+		expectedFeeCollectorBalance.Add(sdk.NewCoin("usei", expectedAtomFee)).Add(sdk.NewCoin("usei", expectedAtomFee)),
+		depositFeeCollectorBalance,
+	)
+```
+
+**File:** x/bank/keeper/deferred_cache_test.go (L66-66)
+```go
+	app.BankKeeper.WriteDeferredBalances(ctx)
+```
+
+**File:** simapp/app.go (L374-374)
+```go
+		capabilitytypes.ModuleName, authtypes.ModuleName, banktypes.ModuleName, distrtypes.ModuleName,
 ```

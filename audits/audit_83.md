@@ -1,275 +1,279 @@
 # Audit Report
 
 ## Title
-Deferred Balance Cache Accumulation Causes Invariant Violation and Chain Halt
+ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
 
 ## Summary
-The bank module's deferred balance system uses a MemoryStoreKey that persists data across blocks. When transactions pay fees through the ante handler, balances are deducted from users and stored in the deferred cache, but `WriteDeferredBalances` is never called to clear this cache or credit module accounts. This causes deferred balances to accumulate indefinitely across blocks. Eventually, the `TotalSupply` invariant detects that expectedTotal (which includes all accumulated deferred balances) exceeds the actual supply, triggering a panic that halts the entire chain.
+The `ClaimCapability` function in the Cosmos SDK capability module allows a single module to claim the same capability object multiple times under different names. This causes forward-mapping corruption that breaks authentication invariants and creates permanent orphaned state in both memory and persistent storage. [1](#0-0) 
 
 ## Impact
-High
+**Medium**
 
 ## Finding Description
 
-**Location:** 
-- Primary deferred send implementation: [1](#0-0) 
-- Ante handler usage: [2](#0-1) 
-- Memory store persistence: [3](#0-2) 
-- Missing cleanup mechanism: [4](#0-3) 
-- Invariant that fails: [5](#0-4) 
+**Location:** `x/capability/keeper/keeper.go`, function `ClaimCapability` (lines 287-314)
 
-**Intended Logic:**
-The deferred balance system was designed to batch balance transfers for efficiency. According to the code comment [6](#0-5) , when `DeferredSendCoinsFromAccountToModule` is called, it should: (1) deduct from sender immediately, (2) store the credit in a temporary cache, and (3) have `WriteDeferredBalances` called "In the EndBlocker" to credit module accounts and clear the cache for the next block.
+**Intended Logic:** The ClaimCapability function should enforce a one-to-one relationship between a module and capability pair. Each module should maintain exactly one forward mapping per capability to enable consistent authentication. The capability module's design assumes that `AuthenticateCapability` will reliably verify ownership based on the forward mapping.
 
-**Actual Logic:**
-The deferred cache uses a MemoryStoreKey [7](#0-6)  which persists between blocks [8](#0-7)  (unlike TransientStoreKey which resets on commit [9](#0-8) ). However, `WriteDeferredBalances` is never called because: (1) simapp doesn't configure a PreCommitHandler, (2) the bank module has no EndBlocker implementation (verified in x/bank/module.go), and (3) `WriteDeferredBalances` only clears the cache when explicitly invoked [10](#0-9) .
+**Actual Logic:** ClaimCapability only validates that the exact (module, name) tuple doesn't already exist in the owners set, but fails to check if the same module has already claimed the same capability under a different name. The vulnerability occurs because:
+
+1. Owner validation in `addOwner` checks for duplicate (module, name) pairs via `CapabilityOwners.Set`: [2](#0-1) 
+
+The owner key is constructed as "module/name", so Owner("foo", "channel-1") and Owner("foo", "channel-2") are treated as distinct owners.
+
+2. The forward mapping key uses only (module, capability) as the composite key: [3](#0-2) 
+
+This causes overwrites when the same module claims the same capability with a different name.
+
+3. Each reverse mapping is created independently without cleanup of previous mappings: [4](#0-3) 
 
 **Exploitation Path:**
-1. Any user submits a transaction that pays fees
-2. The ante handler calls `DeferredSendCoinsFromAccountToModule` [11](#0-10) 
-3. User's balance is deducted, amount stored in deferred cache (memory store)
-4. Block ends, memory store persists (no clearing occurs)
-5. Next block: more transactions accumulate additional deferred balances in the same cache
-6. Crisis module's EndBlocker runs invariant checks [12](#0-11) 
-7. The `TotalSupply` invariant counts all accumulated deferred balances from multiple blocks [13](#0-12) 
-8. Invariant detects expectedTotal (account_balances + accumulated_deferred_from_many_blocks) ≠ supply
-9. Invariant failure triggers panic [14](#0-13) 
-10. Chain halts deterministically across all nodes
 
-**Security Guarantee Broken:**
-The accounting invariant that total supply equals the sum of all account balances plus in-flight deferred transfers is violated. This breaks the fundamental assumption that the deferred cache only contains the current block's pending transfers, not accumulated transfers from multiple blocks.
+1. Module "foo" claims capability: `ClaimCapability(ctx, cap, "channel-1")`
+   - Forward map: `foo/fwd/0xCAP` → "channel-1"
+   - Reverse map: `foo/rev/channel-1` → index
+   - Owners: [("foo", "channel-1")]
+
+2. Module "foo" claims same capability again: `ClaimCapability(ctx, cap, "channel-2")`
+   - Owner validation passes (different name means different owner key)
+   - Forward map **OVERWRITES**: `foo/fwd/0xCAP` → "channel-2" 
+   - New reverse map created: `foo/rev/channel-2` → index
+   - Owners: [("foo", "channel-1"), ("foo", "channel-2")]
+
+3. Authentication breaks for the original name: [5](#0-4) 
+
+`AuthenticateCapability(ctx, cap, "channel-1")` returns false because `GetCapabilityName` now returns "channel-2" instead of "channel-1".
+
+4. Release creates permanent orphaned state: [6](#0-5) 
+
+`ReleaseCapability` only cleans up the current forward-mapped name ("channel-2"), leaving the "channel-1" reverse mapping and owner entry permanently orphaned.
+
+**Security Guarantee Broken:** The capability authentication invariant is violated—modules cannot authenticate capabilities they legitimately own, and the cleanup mechanism leaves permanent inconsistent state.
 
 ## Impact Explanation
 
-This vulnerability causes a complete network shutdown. When the invariant check fails, the chain panics and halts permanently. This affects:
-- All network validators cannot produce new blocks
-- All user transactions are blocked  
-- The chain requires manual intervention (emergency upgrade or hard fork) to recover
-- During the halt, no funds can move and the network is completely unavailable
+This vulnerability affects the capability module's core security mechanism used throughout the Cosmos SDK, particularly in IBC (Inter-Blockchain Communication):
 
-This is a protocol-level consensus failure that affects every node. The deterministic nature means all validators fail simultaneously at the same block height, making this a critical availability issue.
+1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it. `AuthenticateCapability` will fail, preventing legitimate IBC channel operations and other capability-protected actions from executing correctly.
+
+2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last claimed name is properly cleaned up. The reverse mappings and owner entries for earlier names remain permanently orphaned in both the memory store and persistent storage, creating inconsistent state that cannot be recovered without a chain upgrade.
+
+3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate in memory and on-chain storage, consuming resources that can never be reclaimed through normal operations.
+
+This fits the **Medium** severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk"—the capability module is core Cosmos SDK infrastructure that can cause module misbehavior, though funds are not directly at risk.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any user submitting normal transactions on the network. The issue occurs naturally through regular usage as every fee-paying transaction accumulates deferred balances.
+**Likelihood: Medium**
 
-**Conditions Required:**
-- The bank keeper is initialized with deferred cache support [7](#0-6)  (this is the default in simapp)
-- Transactions that pay fees occur over multiple blocks (normal network activity)
-- Sufficient accumulation of deferred balances to create a detectable invariant violation
-- Invariant checks are enabled and run periodically (controlled by invCheckPeriod)
+This vulnerability can be triggered during normal chain operations:
+- Buggy module logic that doesn't properly track claimed capabilities
+- Retry or error recovery mechanisms attempting to re-claim already-claimed capabilities
+- State confusion in complex IBC handshake scenarios (e.g., crossing hellos with retries)
+- Module implementations that don't verify capability ownership before claiming
 
-**Frequency:** This will occur deterministically once enough fee-paying transactions accumulate across blocks. The time to failure depends on transaction volume and the invariant check period. Given that every transaction paying fees contributes to the accumulation, this is highly likely to occur in an active network.
+The vulnerability requires specific conditions (claiming the same capability twice with different names), but:
+- No special privileges are required—any module can trigger this through normal operations
+- Can occur during legitimate operations if module code has edge-case handling issues
+- IBC channel handshakes involve complex state transitions where this could manifest
+- Once triggered, the corruption is permanent and cannot self-heal
 
 ## Recommendation
 
-Implement one of the following fixes:
+Add a check in `ClaimCapability` to verify that the calling module hasn't already claimed the capability under any name:
 
-**Option 1 (Recommended):** Add a PreCommitHandler in simapp initialization that calls `WriteDeferredBalances` before each block commit:
 ```go
-app.SetPreCommitHandler(func(ctx sdk.Context) error {
-    app.BankKeeper.WriteDeferredBalances(ctx)
-    return nil
-})
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+    // ... existing validation ...
+    
+    // Check if this module already owns this capability under any name
+    existingName := sk.GetCapabilityName(ctx, cap)
+    if existingName != "" {
+        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
+            "module %s already owns capability under name %s", sk.module, existingName)
+    }
+    
+    // ... rest of function ...
+}
 ```
-This should be added after line 447 in simapp/app.go.
 
-**Option 2:** Implement an EndBlocker for the bank module that calls `WriteDeferredBalances` as originally intended by the comment [15](#0-14) .
-
-**Option 3:** Change the deferred cache to use TransientStoreKey instead of MemoryStoreKey, which automatically resets between blocks [9](#0-8) . This would require refactoring to handle the per-block clearing differently.
+This prevents forward-map corruption by ensuring each module can only claim a given capability object once, regardless of the name used.
 
 ## Proof of Concept
 
-**Scenario Setup:**
-1. Initialize simapp with bank keeper configured with deferred cache (default configuration)
-2. Create test accounts with initial balances
-3. Configure crisis module with an invariant check period
+**Test Location:** `x/capability/keeper/keeper_test.go`
 
-**Trigger Sequence:**
-1. Block N: Execute transaction that calls `DeferredSendCoinsFromAccountToModule` (e.g., fee payment via ante handler)
-   - Sender balance is deducted
-   - Amount stored in deferred cache (memory store)
-2. Call EndBlock (no WriteDeferredBalances called)
-3. Commit occurs (memory store persists, cache NOT cleared)
-4. Block N+1: Execute another transaction with fee payment
-   - Another sender balance is deducted  
-   - Amount ADDED to existing deferred cache
-5. Block N+2 (or whenever invariant check runs): Crisis module runs TotalSupply invariant
-   - Invariant counts: expectedTotal = account_balances + (deferred_from_N + deferred_from_N+1)
-   - This exceeds actual supply (which only accounts for deducted balances)
-   - Invariant returns broken = true
-   - Chain panics and halts
+**Setup:**
+- Create a scoped keeper for a test module
+- Use `NewCapability` to create an initial capability with name "original"
 
-**Expected Result:**
-The invariant check detects that accumulated deferred balances from multiple blocks cause expectedTotal to exceed supply, triggering a panic that halts the chain.
+**Action:**
+1. Call `ClaimCapability(ctx, cap, "duplicate")` to claim the same capability object with a different name
+2. Verify that `AuthenticateCapability(ctx, cap, "original")` returns false (authentication broken)
+3. Call `ReleaseCapability(ctx, cap)`
+4. Verify that the "original" reverse mapping still exists in the memory store (orphaned state)
+5. Verify that Owner("module", "original") remains in the persistent owner set (state corruption)
 
-**Note:** While the PoC test function `TestDeferredCacheAccumulationCausesInvariantFailure` doesn't exist in the current codebase, the logical flow is verifiable through code inspection and matches the described vulnerability perfectly.
+**Result:**
+The vulnerability is confirmed by the code flow:
+- Forward map at line 303 uses only (module, cap) as key → overwrites on second claim
+- Reverse map at line 309 creates new entries without cleanup → accumulates orphaned mappings  
+- Authentication at line 279 relies on the overwritten forward map → fails for first name
+- Release at lines 323-340 only cleans up the last claimed name → leaves orphaned state
+
+**Notes:**
+
+The existing test suite does not cover this scenario: [7](#0-6) 
+
+The `TestClaimCapability` function only tests claiming with the same name by the same module (which correctly fails at line 165) and claiming by different modules (which correctly succeeds at line 166), but does not test the same module claiming with different names—the exact vulnerability scenario.
 
 ### Citations
 
-**File:** x/bank/keeper/keeper.go (L404-407)
+**File:** x/capability/keeper/keeper.go (L275-280)
 ```go
-// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
-// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
-// In the EndBlocker, it will then perform one deposit for each module account.
-// It will panic if the module account does not exist.
+func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
+	if strings.TrimSpace(name) == "" || cap == nil {
+		return false
+	}
+	return sk.GetCapabilityName(ctx, cap) == name
+}
 ```
 
-**File:** x/bank/keeper/keeper.go (L408-432)
+**File:** x/capability/keeper/keeper.go (L287-314)
 ```go
-func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
-	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
-) error {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
+func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
 	}
-	// Deducts Fees from the Sender Account
-	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
-	if err != nil {
+	if strings.TrimSpace(name) == "" {
+		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
+	}
+	// update capability owner set
+	if err := sk.addOwner(ctx, cap, name); err != nil {
 		return err
 	}
-	// get recipient module address
-	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
-	if moduleAcc == nil {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Set the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
+
+	// Set the reverse mapping between the module and capability name and the
+	// index in the in-memory store. Since marshalling and unmarshalling into a store
+	// will change memory address of capability, we simply store index as value here
+	// and retrieve the in-memory pointer to the capability from our map
+	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
+
+	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
+
+	return nil
+}
+```
+
+**File:** x/capability/keeper/keeper.go (L319-356)
+```go
+func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
 	}
-	// get txIndex
-	txIndex := ctx.TxIndex()
-	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
-	if err != nil {
-		return err
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	}
+
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
+
+	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
+	indexKey := types.IndexToKey(cap.GetIndex())
+
+	if len(capOwners.Owners) == 0 {
+		// remove capability owner set
+		prefixStore.Delete(indexKey)
+		// since no one owns capability, we can delete capability from map
+		delete(sk.capMap, cap.GetIndex())
+	} else {
+		// update capability owner set
+		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
 	}
 
 	return nil
 }
 ```
 
-**File:** x/bank/keeper/keeper.go (L480-481)
+**File:** x/capability/types/types.go (L46-58)
 ```go
-	// clear deferred cache
-	k.deferredCache.Clear(ctx)
-```
-
-**File:** x/auth/ante/fee.go (L203-214)
-```go
-func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
-	if !fees.IsValid() {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+func (co *CapabilityOwners) Set(owner Owner) error {
+	i, ok := co.Get(owner)
+	if ok {
+		// owner already exists at co.Owners[i]
+		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
 	}
 
-	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
-	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
-	}
+	// owner does not exist in the set of owners, so we insert at position i
+	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
+	copy(co.Owners[i+1:], co.Owners[i:])
+	co.Owners[i] = owner
 
 	return nil
+```
+
+**File:** x/capability/types/keys.go (L35-37)
+```go
+func RevCapabilityKey(module, name string) []byte {
+	return []byte(fmt.Sprintf("%s/rev/%s", module, name))
 }
 ```
 
-**File:** store/mem/store.go (L20-21)
+**File:** x/capability/types/keys.go (L41-50)
 ```go
-// Store implements an in-memory only KVStore. Entries are persisted between
-// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
-```
-
-**File:** store/mem/store.go (L54-55)
-```go
-// Commit performs a no-op as entries are persistent between commitments.
-func (s *Store) Commit(_ bool) (id types.CommitID) { return }
-```
-
-**File:** simapp/app.go (L264-266)
-```go
-	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
-		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
-	)
-```
-
-**File:** simapp/app.go (L442-447)
-```go
-	app.SetAnteHandler(anteHandler)
-	app.SetAnteDepGenerator(anteDepGenerator)
-	app.SetEndBlocker(app.EndBlocker)
-	app.SetPrepareProposalHandler(app.PrepareProposalHandler)
-	app.SetProcessProposalHandler(app.ProcessProposalHandler)
-	app.SetFinalizeBlocker(app.FinalizeBlocker)
-```
-
-**File:** x/bank/keeper/invariants.go (L59-104)
-```go
-func TotalSupply(k Keeper) sdk.Invariant {
-	return func(ctx sdk.Context) (string, bool) {
-		expectedTotal := sdk.Coins{}
-		weiTotal := sdk.NewInt(0)
-		supply, _, err := k.GetPaginatedTotalSupply(ctx, &query.PageRequest{Limit: query.MaxLimit})
-
-		if err != nil {
-			return sdk.FormatInvariant(types.ModuleName, "query supply",
-				fmt.Sprintf("error querying total supply %v", err)), false
-		}
-
-		k.IterateAllBalances(ctx, func(_ sdk.AccAddress, balance sdk.Coin) bool {
-			expectedTotal = expectedTotal.Add(balance)
-			return false
-		})
-		// also iterate over deferred balances
-		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
-			expectedTotal = expectedTotal.Add(coin)
-			return false
-		})
-		k.IterateAllWeiBalances(ctx, func(addr sdk.AccAddress, balance sdk.Int) bool {
-			weiTotal = weiTotal.Add(balance)
-			return false
-		})
-		weiInUsei, weiRemainder := SplitUseiWeiAmount(weiTotal)
-		if !weiRemainder.IsZero() {
-			return sdk.FormatInvariant(types.ModuleName, "total supply",
-				fmt.Sprintf(
-					"\twei remainder: %v\n",
-					weiRemainder)), true
-		}
-		baseDenom, err := sdk.GetBaseDenom()
-		if err == nil {
-			expectedTotal = expectedTotal.Add(sdk.NewCoin(baseDenom, weiInUsei))
-		} else if !weiInUsei.IsZero() {
-			return sdk.FormatInvariant(types.ModuleName, "total supply", "non-zero wei balance without base denom"), true
-		}
-
-		broken := !expectedTotal.IsEqual(supply)
-
-		return sdk.FormatInvariant(types.ModuleName, "total supply",
-			fmt.Sprintf(
-				"\tsum of accounts coins: %v\n"+
-					"\tsupply.Total:          %v\n",
-				expectedTotal, supply)), broken
+func FwdCapabilityKey(module string, cap *Capability) []byte {
+	// encode the key to a fixed length to avoid breaking consensus state machine
+	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
+	// the length 10 is picked so it's backward compatible on common architectures.
+	key := fmt.Sprintf("%#010p", cap)
+	if len(key) > 10 {
+		key = key[len(key)-10:]
 	}
-```
-
-**File:** store/transient/store.go (L24-28)
-```go
-// Commit cleans up Store.
-func (ts *Store) Commit(_ bool) (id types.CommitID) {
-	ts.Store = dbadapter.Store{DB: dbm.NewMemDB()}
-	return
+	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
 }
 ```
 
-**File:** x/crisis/abci.go (L13-21)
+**File:** x/capability/keeper/keeper_test.go (L156-178)
 ```go
-func EndBlocker(ctx sdk.Context, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyEndBlocker)
+func (suite *KeeperTestSuite) TestClaimCapability() {
+	sk1 := suite.keeper.ScopeToModule(banktypes.ModuleName)
+	sk2 := suite.keeper.ScopeToModule(stakingtypes.ModuleName)
+	sk3 := suite.keeper.ScopeToModule("foo")
 
-	if k.InvCheckPeriod() == 0 || ctx.BlockHeight()%int64(k.InvCheckPeriod()) != 0 {
-		// skip running the invariant check
-		return
-	}
-	k.AssertInvariants(ctx)
+	cap, err := sk1.NewCapability(suite.ctx, "transfer")
+	suite.Require().NoError(err)
+	suite.Require().NotNil(cap)
+
+	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
+	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
+
+	got, ok := sk1.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
+
+	got, ok = sk2.GetCapability(suite.ctx, "transfer")
+	suite.Require().True(ok)
+	suite.Require().Equal(cap, got)
+
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, cap, "  "))
+	suite.Require().Error(sk3.ClaimCapability(suite.ctx, nil, "transfer"))
 }
-```
-
-**File:** x/crisis/keeper/keeper.go (L83-85)
-```go
-			panic(fmt.Errorf("invariant broken: %s\n"+
-				"\tCRITICAL please submit the following transaction:\n"+
-				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
 ```

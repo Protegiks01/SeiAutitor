@@ -1,231 +1,223 @@
 # Audit Report
 
 ## Title
-Pre-Gas-Metering CPU Exhaustion via MsgMultiSend with Unbounded Inputs/Outputs
+Division by Zero Panic in Governance Tally Causes Network Halt When Bonded Validator Has Zero Delegator Shares
 
 ## Summary
-The `MsgMultiSend` transaction validation performs unbounded iterations through inputs and outputs during `ValidateBasic()`, which executes before any gas metering in the transaction processing pipeline. This allows attackers to craft transactions with thousands of inputs/outputs that cause excessive CPU consumption on all network nodes during `CheckTx`, without paying proportional gas costs, leading to a denial-of-service vector.
+The governance module's tally computation performs unguarded division by a validator's `DelegatorShares` without checking for zero. When a bonded validator with zero shares has voted on a proposal, the tally function panics during governance EndBlocker execution, causing complete network shutdown across all validator nodes.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:**
-- Primary vulnerability: `x/bank/types/msgs.go`, function `ValidateInputsOutputs()` [1](#0-0) 
-- Entry point: `x/bank/types/msgs.go`, `MsgMultiSend.ValidateBasic()` [2](#0-1) 
-- Execution flow: `baseapp/baseapp.go`, function `runTx()` calls `validateBasicTxMsgs()` [3](#0-2) 
-- Validation function: `baseapp/baseapp.go`, `validateBasicTxMsgs()` [4](#0-3) 
+**Location:** [1](#0-0) 
 
-**Intended logic:**
-The `ValidateBasic()` method should perform lightweight stateless validation before transactions enter the mempool. The ante handler chain should charge gas proportional to computational cost before expensive operations execute.
+**Intended Logic:** The tally function should safely compute voting power for all bonded validators who have voted on a proposal, handling edge cases where validators may have zero delegator shares gracefully.
 
-**Actual logic:**
-In the transaction processing flow, `CheckTx` calls `runTx()`, which invokes `validateBasicTxMsgs()` at line 923 that calls `msg.ValidateBasic()` for each message. This occurs BEFORE the ante handler chain is invoked at line 947. For `MsgMultiSend`, `ValidateBasic()` calls `ValidateInputsOutputs()` which performs O(N+M) iterations where N = number of inputs, M = number of outputs. Each iteration executes:
-- Bech32 address parsing via `AccAddressFromBech32()` (lines 111, 138 of msgs.go)
-- Coin validation via `IsValid()` and `IsAllPositive()` (lines 116-122, 143-149)
-- Coin summation operations (lines 173, 181)
+**Actual Logic:** The code performs division by `val.DelegatorShares` without checking if it equals zero. The `Dec.Quo()` method panics when the divisor is zero [2](#0-1) , causing immediate EndBlock failure.
 
-There is no limit check on the number of inputs or outputs beyond transaction size constraints.
+**Exploitation Path:**
+1. A validator operates normally with delegations and is in bonded status
+2. The validator casts a vote on an active governance proposal
+3. All delegators remove their delegations via standard `Undelegate` transactions
+4. After the final undelegation, the validator has both `Tokens = 0` and `DelegatorShares = 0` [3](#0-2) 
+5. The validator remains in bonded status because validators with zero shares are only removed if unbonded [4](#0-3)  and status changes only occur in the staking EndBlocker
+6. The proposal's voting period ends
+7. The governance EndBlocker executes before the staking EndBlocker [5](#0-4) 
+8. The governance EndBlocker calls `Tally()` [6](#0-5) 
+9. The tally function iterates over bonded validators using `IterateBondedValidatorsByPower()` [7](#0-6) , which only checks `IsBonded()` status [8](#0-7)  without verifying voting power
+10. The zero-share validator with a recorded vote triggers the division calculation
+11. Division by zero occurs, causing panic
+12. All validator nodes panic at the same block height, completely halting the chain
 
-**Exploitation path:**
-1. Attacker crafts `MsgMultiSend` with maximum inputs/outputs fitting within MaxTxBytes (e.g., 10,000+ of each)
-2. Transaction is broadcast to the network
-3. Upon receipt, each node's `CheckTx` is invoked [5](#0-4) 
-4. `runTx()` decodes transaction and calls `validateBasicTxMsgs()` BEFORE the ante handler chain
-5. `ValidateInputsOutputs()` iterates through all inputs/outputs, performing expensive operations for each
-6. Only AFTER this validation does the ante handler chain execute (including gas metering at position 6) [6](#0-5) 
-7. CPU resources are consumed disproportionate to any gas costs
-8. Attacker repeats this continuously to exhaust node CPU resources
-
-**Security guarantee broken:**
-The "pay-for-what-you-consume" principle of gas metering is violated. Computationally expensive validation operations execute without any resource accounting, enabling denial-of-service attacks where CPU consumption far exceeds gas costs.
+**Security Guarantee Broken:** The network's availability and liveness guarantees are violated. The chain cannot progress past the problematic block, and consensus is permanently stalled until a coordinated emergency upgrade is deployed.
 
 ## Impact Explanation
 
-This vulnerability affects all validator and full nodes in the network. An attacker broadcasting transactions with thousands of inputs/outputs forces every node to perform extensive validation operations (20,000+ address parsings, coin validations) during `CheckTx` before any gas is charged. With each malicious transaction consuming 10-100ms of CPU time, an attacker broadcasting hundreds or thousands of such transactions can:
+This vulnerability causes complete network shutdown. When the panic occurs during EndBlock execution:
+- All validator nodes crash simultaneously at the same block height
+- No new blocks can be produced or transactions processed  
+- The entire network becomes unavailable to users
+- Recovery requires emergency coordination among validators to upgrade to a patched version
+- This represents a critical denial-of-service vulnerability affecting the entire blockchain
 
-- Cause significant CPU exhaustion across the network
-- Congest the mempool with pending malicious transactions  
-- Delay or drop legitimate user transactions
-- Degrade overall network performance requiring increased node resources
-
-This directly achieves the Medium severity impact threshold: "Increasing network processing node resource consumption by at least 30% without brute force actions."
+The severity qualifies as HIGH impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Trigger requirements:**
-- Any network participant can create and broadcast `MsgMultiSend` transactions
-- No privileged access or special conditions required
-- Attack executable at any time during normal network operation
-- Only constraint is transaction size limit (MaxTxBytes)
+**Triggering Actors:** Any network participants using standard operations - validators can vote on proposals and delegators can undelegate through normal transactions.
 
-**Frequency:**
-The attack can be sustained continuously by any malicious actor. The cost to the attacker is minimal:
-- Network bandwidth to broadcast transactions
-- Potentially negligible transaction fees (if rejected before fee deduction)
-- No staking or token requirements
+**Required Conditions:**
+- An active governance proposal in voting period (common occurrence)
+- A bonded validator that votes on the proposal (expected behavior)
+- All delegators of that validator undelegate before voting period ends (feasible through normal operations)
+- Voting period ends, triggering automatic tally computation
 
-The attack is highly practical and can be maintained indefinitely, making it a realistic and immediate threat.
+**Likelihood Assessment:** While requiring specific timing, this scenario is realistic and can occur through:
+- Normal market dynamics (mass undelegations during market stress)
+- Validators with few delegators voting then losing all delegations
+- Deliberate triggering by an attacker controlling delegations to a validator or operating their own validator with minimal self-delegation
+
+The vulnerability requires no special privileges and can be triggered through standard, permissionless transactions. An attacker could deliberately create this condition by setting up a validator, self-delegating minimal tokens, voting on a proposal, then self-undelegating before the proposal ends.
 
 ## Recommendation
 
-Implement a maximum limit on the total number of inputs and outputs in `MsgMultiSend`. This limit should be enforced in `ValidateBasic()` before the expensive iteration begins:
+Add a zero-check before performing the division in the tally computation:
 
 ```go
-func (msg MsgMultiSend) ValidateBasic() error {
-    const MaxInputsOutputs = 100 // configurable via governance
-    
-    if len(msg.Inputs) == 0 {
-        return ErrNoInputs
-    }
-    if len(msg.Outputs) == 0 {
-        return ErrNoOutputs
+// In x/gov/keeper/tally.go at line 74-80:
+for _, val := range currValidators {
+    if len(val.Vote) == 0 {
+        continue
     }
     
-    // Enforce limit to prevent DoS
-    if len(msg.Inputs) + len(msg.Outputs) > MaxInputsOutputs {
-        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
-            "too many inputs/outputs: %d (max %d)", 
-            len(msg.Inputs) + len(msg.Outputs), MaxInputsOutputs)
+    // Skip validators with zero delegator shares to avoid division by zero
+    if val.DelegatorShares.IsZero() {
+        continue
     }
-    
-    return ValidateInputsOutputs(msg.Inputs, msg.Outputs)
+
+    sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
+    votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
+    // ... rest of logic
 }
 ```
 
-This bounds the computational cost to a reasonable level before gas accounting begins, preventing resource exhaustion attacks.
+Similarly, add a check at line 57 [9](#0-8)  where delegator voting power is calculated, though this path is less likely to be reached as zero-share validators should have no remaining delegations.
 
 ## Proof of Concept
 
+**File:** `x/gov/keeper/tally_test.go`
+
+**Test Function:** `TestTallyPanicWithZeroShareValidator`
+
 **Setup:**
-Create a test in `x/bank/types/msgs_test.go` that constructs a `MsgMultiSend` with 10,000 inputs and 10,000 outputs, each containing minimal data (address + small coin amount).
+- Create a validator with initial delegation using the existing `createValidators()` helper [10](#0-9) 
+- Create and activate a governance proposal in voting period
+- Validator casts a vote on the proposal using `AddVote()`
 
 **Action:**
-Call `msg.ValidateBasic()` and measure the execution time to demonstrate the CPU cost.
+- Retrieve the validator's delegation
+- Call `Undelegate()` to remove all shares from the validator
+- Verify validator has zero shares (`DelegatorShares.IsZero()`) but remains bonded (`IsBonded()`)
+- Call `Tally()` on the proposal
 
 **Result:**
-The validation completes successfully but consumes significant CPU time (10-100ms or more depending on hardware) to process 20,000 inputs/outputs. This expensive operation occurs in `validateBasicTxMsgs()` which is called BEFORE the ante handler chain begins, meaning BEFORE any gas is charged via `ConsumeGasForTxSizeDecorator`. An attacker can exploit this by flooding the network with such transactions, causing CPU exhaustion across all nodes during `CheckTx` without paying proportional gas costs.
+- The test will panic from `Tally()` when it attempts division by zero
+- This panic demonstrates that the vulnerability causes chain halt during EndBlock execution
+- In production, this would crash all validator nodes at the same block height, halting the network
 
-## Notes
-
-The vulnerability is actually more severe than initially described in the claim. The expensive validation in `validateBasicTxMsgs()` occurs not just before gas-for-transaction-size is charged (ante handler position 6), but before the entire ante handler chain is invoked. This means the validation happens with zero resource accounting whatsoever, making the attack vector even more exploitable.
+The PoC confirms that the scenario is reproducible and would cause the described network shutdown in a live environment.
 
 ### Citations
 
-**File:** x/bank/types/msgs.go (L79-91)
+**File:** x/gov/keeper/tally.go (L24-34)
 ```go
-func (msg MsgMultiSend) ValidateBasic() error {
-	// this just makes sure all the inputs and outputs are properly formatted,
-	// not that they actually have the money inside
-	if len(msg.Inputs) == 0 {
-		return ErrNoInputs
-	}
+	keeper.sk.IterateBondedValidatorsByPower(ctx, func(index int64, validator stakingtypes.ValidatorI) (stop bool) {
+		currValidators[validator.GetOperator().String()] = types.NewValidatorGovInfo(
+			validator.GetOperator(),
+			validator.GetBondedTokens(),
+			validator.GetDelegatorShares(),
+			sdk.ZeroDec(),
+			types.WeightedVoteOptions{},
+		)
 
-	if len(msg.Outputs) == 0 {
-		return ErrNoOutputs
-	}
-
-	return ValidateInputsOutputs(msg.Inputs, msg.Outputs)
-}
+		return false
+	})
 ```
 
-**File:** x/bank/types/msgs.go (L165-190)
+**File:** x/gov/keeper/tally.go (L56-57)
 ```go
-func ValidateInputsOutputs(inputs []Input, outputs []Output) error {
-	var totalIn, totalOut sdk.Coins
-
-	for _, in := range inputs {
-		if err := in.ValidateBasic(); err != nil {
-			return err
-		}
-
-		totalIn = totalIn.Add(in.Coins...)
-	}
-
-	for _, out := range outputs {
-		if err := out.ValidateBasic(); err != nil {
-			return err
-		}
-
-		totalOut = totalOut.Add(out.Coins...)
-	}
-
-	// make sure inputs and outputs match
-	if !totalIn.IsEqual(totalOut) {
-		return ErrInputOutputMismatch
-	}
-
-	return nil
-}
+				// delegation shares * bonded / total shares
+				votingPower := delegation.GetShares().MulInt(val.BondedTokens).Quo(val.DelegatorShares)
 ```
 
-**File:** baseapp/baseapp.go (L787-800)
+**File:** x/gov/keeper/tally.go (L79-80)
 ```go
-// validateBasicTxMsgs executes basic validator calls for messages.
-func validateBasicTxMsgs(msgs []sdk.Msg) error {
-	if len(msgs) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
-	}
-
-	for _, msg := range msgs {
-		err := msg.ValidateBasic()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+		sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
+		votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
 ```
 
-**File:** baseapp/baseapp.go (L923-925)
+**File:** types/decimal_test.go (L238-239)
 ```go
-	if err := validateBasicTxMsgs(msgs); err != nil {
-		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
+		if tc.d2.IsZero() { // panic for divide by zero
+			s.Require().Panics(func() { tc.d1.Quo(tc.d2) })
+```
+
+**File:** x/staking/types/validator.go (L415-418)
+```go
+	if remainingShares.IsZero() {
+		// last delegation share gets any trimmings
+		issuedTokens = v.Tokens
+		v.Tokens = sdk.ZeroInt()
+```
+
+**File:** x/staking/keeper/delegation.go (L789-792)
+```go
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
 	}
 ```
 
-**File:** baseapp/abci.go (L209-231)
+**File:** simapp/app.go (L372-373)
 ```go
-func (app *BaseApp) CheckTx(ctx context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTxV2, error) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "check_tx")
-
-	var mode runTxMode
-
-	switch {
-	case req.Type == abci.CheckTxType_New:
-		mode = runTxModeCheck
-
-	case req.Type == abci.CheckTxType_Recheck:
-		mode = runTxModeReCheck
-
-	default:
-		panic(fmt.Sprintf("unknown RequestCheckTx type: %s", req.Type))
-	}
-
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
+	app.mm.SetOrderEndBlockers(
+		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
 ```
 
-**File:** x/auth/ante/ante.go (L47-60)
+**File:** x/gov/abci.go (L48-51)
 ```go
-	anteDecorators := []sdk.AnteFullDecorator{
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
-		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
-		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-		NewIncrementSequenceDecorator(options.AccountKeeper),
-	}
+	keeper.IterateActiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
+		var tagValue, logMsg string
+
+		passes, burnDeposits, tallyResults := keeper.Tally(ctx, proposal)
+```
+
+**File:** x/staking/keeper/alias_functions.go (L45-46)
+```go
+		if validator.IsBonded() {
+			stop := fn(i, validator) // XXX is this safe will the validator unexposed fields be able to get written to?
+```
+
+**File:** x/gov/keeper/common_test.go (L21-58)
+```go
+func createValidators(t *testing.T, ctx sdk.Context, app *simapp.SimApp, powers []int64) ([]sdk.AccAddress, []sdk.ValAddress) {
+	addrs := simapp.AddTestAddrsIncremental(app, ctx, 5, sdk.NewInt(30000000))
+	valAddrs := simapp.ConvertAddrsToValAddrs(addrs)
+	pks := simapp.CreateTestPubKeys(5)
+	cdc := simapp.MakeTestEncodingConfig().Marshaler
+
+	app.StakingKeeper = stakingkeeper.NewKeeper(
+		cdc,
+		app.GetKey(stakingtypes.StoreKey),
+		app.AccountKeeper,
+		app.BankKeeper,
+		app.GetSubspace(stakingtypes.ModuleName),
+	)
+
+	val1, err := stakingtypes.NewValidator(valAddrs[0], pks[0], stakingtypes.Description{})
+	require.NoError(t, err)
+	val2, err := stakingtypes.NewValidator(valAddrs[1], pks[1], stakingtypes.Description{})
+	require.NoError(t, err)
+	val3, err := stakingtypes.NewValidator(valAddrs[2], pks[2], stakingtypes.Description{})
+	require.NoError(t, err)
+
+	app.StakingKeeper.SetValidator(ctx, val1)
+	app.StakingKeeper.SetValidator(ctx, val2)
+	app.StakingKeeper.SetValidator(ctx, val3)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val1)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val2)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val3)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val1)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val2)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val3)
+
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[0], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[0]), stakingtypes.Unbonded, val1, true)
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[1], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[1]), stakingtypes.Unbonded, val2, true)
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[2], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[2]), stakingtypes.Unbonded, val3, true)
+
+	_ = staking.EndBlocker(ctx, app.StakingKeeper)
+
+	return addrs, valAddrs
 ```

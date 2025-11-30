@@ -1,343 +1,269 @@
-Based on my thorough analysis of the codebase, I will validate this security claim.
-
-## Validation Analysis
-
-### Code Flow Verification
-
-I have verified each component of the claimed vulnerability:
-
-**1. Validation Weakness Confirmed**
-
-The `validateSignedBlocksWindow` function only checks if the value is positive with no upper bound: [1](#0-0) 
-
-**2. Memory Allocation Path Confirmed**
-
-The `ParseBitGroupsToBoolArray` function allocates a boolean array of size `window` without any bounds checking: [2](#0-1) 
-
-**3. Dual Allocation in Resize Confirmed**
-
-The `ResizeMissedBlockArray` function performs two large allocations when the window expands - first by calling `ParseBitGroupsToBoolArray`, then creating a new array: [3](#0-2) 
-
-**4. Automatic Triggering in BeginBlocker Confirmed**
-
-BeginBlocker processes all validators concurrently and triggers resize if window size changed: [4](#0-3) [5](#0-4) 
-
-**5. Governance Update Path Confirmed**
-
-Parameter changes flow through governance to `Subspace.Update`, which calls the weak validation function: [6](#0-5) [7](#0-6) 
-
-### Platform Acceptance Rules Evaluation
-
-While this requires governance action (a privileged role), the **exception clause applies**:
-
-> "unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority"
-
-**Why the exception applies:**
-1. Governance's intended authority is to adjust parameters within operational bounds, NOT to crash the network
-2. An accidental typo (e.g., "1000000000000" instead of "100000") can trigger total network shutdown
-3. Recovery requires a hard fork since the malicious parameter persists in chain state
-4. The impact (network shutdown) exceeds governance's intended authority scope
-5. Missing parameter bounds is a clear code defect that should be fixed
-
-### Impact Verification
-
-This matches the listed impact category:
-- **"Network not being able to confirm new transactions (total network shutdown)" - Medium**
-
-With `SignedBlocksWindow = 10^12`:
-- Each validator requires ~2 TB of memory allocation (two arrays of 10^12 bools)
-- With 100 validators processed concurrently: ~200 TB total memory requirement
-- All nodes will experience out-of-memory crashes
-- No new blocks can be produced
-- Requires hard fork to recover
-
----
-
 # Audit Report
 
 ## Title
-Unbounded Memory Allocation via SignedBlocksWindow Governance Parameter Enabling Total Network Shutdown
+Genesis Import Panic Due to Unvalidated StakeAuthorization Type Causing Total Network Shutdown
 
 ## Summary
-The `SignedBlocksWindow` parameter validation in the slashing module lacks an upper bound check, only verifying the value is positive. This allows governance to set arbitrarily large values that trigger massive memory allocations in BeginBlocker when resizing validator missed block arrays, causing all nodes to crash with out-of-memory errors and resulting in total network shutdown requiring a hard fork to recover.
+The authz module's `ValidateGenesis` function performs no validation on authorization grants, allowing a `StakeAuthorization` with `AUTHORIZATION_TYPE_UNSPECIFIED` to be included in genesis state. This causes all nodes to panic during `InitGenesis` when the authorization's `MsgTypeURL()` method is called, preventing the entire network from starting.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- Validation: `x/slashing/types/params.go`, function `validateSignedBlocksWindow` (lines 72-83)
-- Memory allocation: `x/slashing/keeper/signing_info.go`, function `ParseBitGroupsToBoolArray` (lines 109-116)  
-- Vulnerable execution: `x/slashing/keeper/infractions.go`, function `ResizeMissedBlockArray` (lines 157-181)
-- Automatic trigger: `x/slashing/abci.go`, function `BeginBlocker` (lines 24-66)
+**Location:**
+- Primary vulnerability: [1](#0-0) 
+- Panic trigger: [2](#0-1) 
+- Genesis initialization flow: [3](#0-2) 
 
-**Intended logic:** 
-The validation function should enforce reasonable upper bounds on `SignedBlocksWindow` to prevent resource exhaustion attacks or accidental misconfigurations. The parameter defines a sliding window for tracking validator liveness and should be limited to operationally feasible values (e.g., maximum of several months of blocks).
+**Intended Logic:**
+Genesis validation should verify that all authorization grants are valid before importing them into chain state. The `StakeAuthorization.ValidateBasic()` method explicitly checks that `AuthorizationType` is not `AUTHORIZATION_TYPE_UNSPECIFIED` [4](#0-3) . Other modules like feegrant properly implement this pattern by calling `ValidateBasic()` during genesis validation [5](#0-4) .
 
-**Actual logic:** 
-The validation only checks `v > 0` with no upper bound. When an extremely large value is set (e.g., 10^10 or higher), the system attempts to allocate massive boolean arrays:
-1. `ParseBitGroupsToBoolArray` allocates `make([]bool, window)` 
-2. `ResizeMissedBlockArray` allocates a second `make([]bool, window)` for the new array
-3. These allocations happen for each validator concurrently in BeginBlocker
-4. With 100 validators and window=10^12, this requires ~200 TB of memory
+**Actual Logic:**
+The `ValidateGenesis` function returns `nil` without performing any validation checks [1](#0-0) . During module initialization [6](#0-5) , the keeper loops through authorization entries and calls `SaveGrant` for each [3](#0-2) . The `SaveGrant` function invokes `authorization.MsgTypeURL()` to construct the storage key [7](#0-6) . For `StakeAuthorization`, `MsgTypeURL()` calls `normalizeAuthzType()` which returns an error for `AUTHORIZATION_TYPE_UNSPECIFIED`, causing a panic [2](#0-1)  via [8](#0-7) .
 
-**Exploitation path:**
-1. Submit governance parameter change proposal setting `SignedBlocksWindow` to a large value (e.g., 10^12)
-2. Proposal passes validation because `validateSignedBlocksWindow` only checks positivity
-3. Parameter is updated via `Subspace.Update` → `Validate` → weak validation passes
-4. Next block's BeginBlocker executes, processing all validators concurrently
-5. Each validator's `HandleValidatorSignatureConcurrent` detects window size change
-6. Calls `ResizeMissedBlockArray` which attempts massive allocations
-7. Nodes crash with out-of-memory errors
-8. Network halts as no nodes can produce blocks
+**Exploitation Path:**
+1. Genesis file contains a `StakeAuthorization` with `authorization_type` set to `AUTHORIZATION_TYPE_UNSPECIFIED` (value 0, the protobuf default) [9](#0-8) 
+2. Genesis passes through `ValidateGenesis` without error
+3. Module's `InitGenesis` is called during chain startup
+4. Keeper's `InitGenesis` loops through entries and calls `SaveGrant`
+5. `SaveGrant` calls `authorization.MsgTypeURL()`
+6. `MsgTypeURL()` panics when encountering invalid authorization type
+7. Panic propagates, causing genesis import to fail
+8. All nodes fail to start, resulting in complete network outage
 
-**Security guarantee broken:**
-The system fails to enforce safe bounds on governance parameters, allowing configurations that exceed physical resource constraints and cause denial-of-service through resource exhaustion. Governance should be able to adjust parameters safely without risking catastrophic network failure.
+**Security Guarantee Broken:**
+Network availability invariant is violated. The system fails to validate critical genesis state, allowing malformed data that causes deterministic panics across all nodes during initialization.
 
 ## Impact Explanation
 
-**Affected Components:**
-- All validator nodes and full nodes in the network
-- Block production and consensus mechanism  
-- Transaction processing and finality
+This vulnerability causes total network shutdown matching the explicitly listed impact category "Network not being able to confirm new transactions (total network shutdown)" classified as Medium severity. All nodes attempting to import the genesis state will panic and fail to start. The impact affects:
 
-**Severity of Impact:**
-- **Network shutdown**: All nodes crash attempting to allocate terabytes of memory
-- **Hard fork required**: Normal governance cannot fix the issue since the network is down and the malicious parameter persists in state
-- **Complete halt of transactions**: No new blocks can be produced or confirmed
-- **Accidental trigger risk**: A simple typo in a governance proposal (e.g., adding extra zeros) can trigger this
+- **New chain launch**: Network cannot initialize, preventing blockchain operations
+- **Network restart from genesis**: All nodes fail to restart, causing permanent unavailability until genesis is manually corrected
+- **Transaction confirmation**: No transactions can be confirmed since the network cannot start
+- **Node coverage**: 100% of network nodes are affected deterministically
 
 ## Likelihood Explanation
 
-**Who can trigger:**
-- Any participant who can submit and pass a governance proposal
-- Requires majority token holder votes, but governance is the standard mechanism for parameter updates
-- **Accidental misconfiguration** is a realistic scenario (typos, unit confusion, copy-paste errors in proposals)
+**Who Can Trigger:**
+Parties with genesis file creation authority:
+- Chain deployers/launchers creating initial genesis
+- Governance coordinators during network upgrades requiring genesis export/import
+- Network coordinators during hard fork or recovery scenarios
 
-**Conditions required:**
-1. Submit governance proposal with large `SignedBlocksWindow` value
-2. Proposal passes governance voting
-3. Next block automatically triggers the vulnerability
+**Conditions Required:**
+The malformed genesis file must be distributed to and used by network validators during new blockchain launches, hard fork upgrades, or network recovery scenarios.
 
-**Likelihood assessment:**
-- **Moderate**: While requiring governance approval, this is:
-  - The intended mechanism for parameter changes (not an attack vector)
-  - Vulnerable to human error in proposal submission
-  - Has catastrophic impact that exceeds governance's intended authority
-  - Lacks basic defensive validation that should exist
+**Frequency:**
+While genesis imports occur infrequently, they are critical events. The vulnerability is deterministic - any node importing the crafted genesis will panic. The issue could occur accidentally since `AUTHORIZATION_TYPE_UNSPECIFIED` is the default protobuf value (0).
 
-The vulnerability can be triggered accidentally through honest mistakes in governance proposals, not just malicious attacks.
+**Privileged Access Exception:**
+Although genesis file creation is privileged, the exception clause applies: even a trusted role inadvertently triggering this causes an unrecoverable security failure (complete network shutdown) beyond their intended authority (adding an authz grant, not causing DoS). The failure mode is disproportionate to the configuration error.
 
 ## Recommendation
 
-Add upper bound validation to `validateSignedBlocksWindow`:
+Implement proper validation in the `ValidateGenesis` function following the pattern used in the feegrant module [5](#0-4) :
 
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-    v, ok := i.(int64)
-    if !ok {
-        return fmt.Errorf("invalid parameter type: %T", i)
+func ValidateGenesis(data GenesisState) error {
+    for _, grant := range data.Authorization {
+        // Validate addresses
+        if _, err := sdk.AccAddressFromBech32(grant.Granter); err != nil {
+            return sdkerrors.Wrapf(err, "invalid granter address")
+        }
+        if _, err := sdk.AccAddressFromBech32(grant.Grantee); err != nil {
+            return sdkerrors.Wrapf(err, "invalid grantee address")
+        }
+        
+        // Validate authorization using ValidateBasic
+        auth := grant.Authorization.GetCachedValue()
+        if authorization, ok := auth.(Authorization); ok {
+            if err := authorization.ValidateBasic(); err != nil {
+                return sdkerrors.Wrapf(err, "invalid authorization")
+            }
+        }
     }
-
-    if v <= 0 {
-        return fmt.Errorf("signed blocks window must be positive: %d", v)
-    }
-
-    // Add maximum bound to prevent resource exhaustion
-    // Maximum value based on operational requirements and resource constraints
-    // For example: 1 year at 0.4s blocks = 365 * 24 * 3600 / 0.4 ≈ 78,840,000
-    const maxSignedBlocksWindow = int64(100_000_000) // ~1.5 years of blocks
-    if v > maxSignedBlocksWindow {
-        return fmt.Errorf("signed blocks window too large (max %d): %d", maxSignedBlocksWindow, v)
-    }
-
     return nil
 }
 ```
 
-This prevents arbitrarily large values while maintaining backward compatibility (default 108,000 is well below the limit).
+This leverages the existing `ValidateBasic()` method [10](#0-9)  which properly checks authorization validity.
 
 ## Proof of Concept
 
-**Test File:** `x/slashing/keeper/infractions_test.go`  
-**Function:** `TestExcessiveSignedBlocksWindowMemoryAllocation`
+**Test File:** `x/authz/keeper/genesis_test.go`
 
-**Setup:**
-- Create test application with validator
-- Set initial `SignedBlocksWindow` to normal value (e.g., 100)
-- Initialize validator signing info by running BeginBlocker once
+**Setup:** Use the existing `GenesisTestSuite` [11](#0-10)  which provides a configured keeper and context.
 
-**Action:**
-- Update parameter to large value (e.g., 1,000,000 for safe testing, or 10,000,000,000 to demonstrate actual crash)
-- Call BeginBlocker for next block height
+**Action:** 
+1. Create a `StakeAuthorization` with `AuthorizationType` set to `AUTHORIZATION_TYPE_UNSPECIFIED` (value 0)
+2. Pack it into a `GrantAuthorization` with valid granter/grantee addresses and expiration
+3. Create a `GenesisState` containing this authorization
+4. Call `ValidateGenesis` on the genesis state
+5. Call `InitGenesis` on the keeper with the genesis state
 
-**Result:**
-- For moderate values (1M): Significant memory allocation and slow processing demonstrating O(window) behavior
-- For extreme values (10B+): Out-of-memory crash or hang
-- Demonstrates vulnerability is triggered automatically on next block after parameter change
+**Result:** 
+1. `ValidateGenesis` incorrectly returns no error for the invalid authorization
+2. `InitGenesis` panics when attempting to save the grant because `MsgTypeURL()` panics on the invalid authorization type
 
-**Code outline:**
-```go
-func TestExcessiveSignedBlocksWindowMemoryAllocation(t *testing.T) {
-    app := simapp.Setup(false)
-    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-    
-    // Setup validator
-    // Set initial window = 100 and run BeginBlocker
-    
-    // Update to large value
-    params := app.SlashingKeeper.GetParams(ctx)
-    params.SignedBlocksWindow = 1_000_000 // Safe for testing
-    app.SlashingKeeper.SetParams(ctx, params)
-    
-    // Measure time/memory for next block
-    start := time.Now()
-    slashing.BeginBlocker(ctx, req, app.SlashingKeeper)
-    duration := time.Since(start)
-    
-    // Assert excessive duration indicating O(window) behavior
-    // Extrapolate: if 1M takes X ms, then 1B takes 1000*X ms
-}
-```
+The test demonstrates that invalid genesis state bypasses validation and causes a panic during initialization, proving the vulnerability exists and matches the claimed impact.
 
 ## Notes
 
-This vulnerability demonstrates a critical defensive programming failure. While governance is a trusted mechanism, the lack of sanity checks on parameter values exposes the system to:
-
-1. **Accidental misconfiguration**: Human errors in proposal creation (typos, unit confusion)
-2. **Social engineering attacks**: Malicious actors convincing token holders to approve dangerous parameters
-3. **Catastrophic impact beyond intended authority**: Governance should adjust parameters safely, not risk network shutdown
-
-The fix is straightforward and should be implemented to protect against both accidental and malicious scenarios. Parameter validation is a fundamental security practice in blockchain systems.
+The `Grant` type has a `ValidateBasic()` method that calls the authorization's `ValidateBasic()` [10](#0-9) , but this is never invoked during genesis validation. The feegrant module demonstrates the correct validation pattern [5](#0-4) , confirming this is an implementation gap rather than intentional design.
 
 ### Citations
 
-**File:** x/slashing/types/params.go (L72-83)
+**File:** x/authz/genesis.go (L15-17)
 ```go
-func validateSignedBlocksWindow(i interface{}) error {
-	v, ok := i.(int64)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
+func ValidateGenesis(data GenesisState) error {
+	return nil
+}
+```
 
-	if v <= 0 {
-		return fmt.Errorf("signed blocks window must be positive: %d", v)
+**File:** x/staking/types/authz.go (L41-47)
+```go
+func (a StakeAuthorization) MsgTypeURL() string {
+	authzType, err := normalizeAuthzType(a.AuthorizationType)
+	if err != nil {
+		panic(err)
+	}
+	return authzType
+}
+```
+
+**File:** x/staking/types/authz.go (L49-58)
+```go
+func (a StakeAuthorization) ValidateBasic() error {
+	if a.MaxTokens != nil && a.MaxTokens.IsNegative() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidCoins, "negative coin amount: %v", a.MaxTokens)
+	}
+	if a.AuthorizationType == AuthorizationType_AUTHORIZATION_TYPE_UNSPECIFIED {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "unknown authorization type")
 	}
 
 	return nil
 }
 ```
 
-**File:** x/slashing/keeper/signing_info.go (L109-116)
+**File:** x/staking/types/authz.go (L139-150)
 ```go
-func (k Keeper) ParseBitGroupsToBoolArray(bitGroups []uint64, window int64) []bool {
-	boolArray := make([]bool, window)
-
-	for i := int64(0); i < window; i++ {
-		boolArray[i] = k.GetBooleanFromBitGroups(bitGroups, i)
+func normalizeAuthzType(authzType AuthorizationType) (string, error) {
+	switch authzType {
+	case AuthorizationType_AUTHORIZATION_TYPE_DELEGATE:
+		return sdk.MsgTypeURL(&MsgDelegate{}), nil
+	case AuthorizationType_AUTHORIZATION_TYPE_UNDELEGATE:
+		return sdk.MsgTypeURL(&MsgUndelegate{}), nil
+	case AuthorizationType_AUTHORIZATION_TYPE_REDELEGATE:
+		return sdk.MsgTypeURL(&MsgBeginRedelegate{}), nil
+	default:
+		return "", sdkerrors.ErrInvalidType.Wrapf("unknown authorization type %T", authzType)
 	}
-	return boolArray
 }
 ```
 
-**File:** x/slashing/keeper/infractions.go (L52-54)
+**File:** x/authz/keeper/keeper.go (L144-160)
 ```go
-	if found && missedInfo.WindowSize != window {
-		missedInfo, signInfo, index = k.ResizeMissedBlockArray(missedInfo, signInfo, window, index)
-	}
-```
+func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
+	store := ctx.KVStore(k.storeKey)
 
-**File:** x/slashing/keeper/infractions.go (L157-181)
-```go
-func (k Keeper) ResizeMissedBlockArray(missedInfo types.ValidatorMissedBlockArray, signInfo types.ValidatorSigningInfo, window int64, index int64) (types.ValidatorMissedBlockArray, types.ValidatorSigningInfo, int64) {
-	// we need to resize the missed block array AND update the signing info accordingly
-	switch {
-	case missedInfo.WindowSize < window:
-		// missed block array too short, lets expand it
-		boolArray := k.ParseBitGroupsToBoolArray(missedInfo.MissedBlocks, missedInfo.WindowSize)
-		newArray := make([]bool, window)
-		copy(newArray[0:index], boolArray[0:index])
-		if index+1 < missedInfo.WindowSize {
-			// insert `0`s corresponding to the difference between the new window size and old window size
-			copy(newArray[index+(window-missedInfo.WindowSize):], boolArray[index:])
-		}
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newArray)
-		missedInfo.WindowSize = window
-	case missedInfo.WindowSize > window:
-		// if window size is reduced, we would like to make a clean state so that no validators are unexpectedly jailed due to more recent missed blocks
-		newMissedBlocks := make([]bool, window)
-		missedInfo.MissedBlocks = k.ParseBoolArrayToBitGroups(newMissedBlocks)
-		signInfo.MissedBlocksCounter = int64(0)
-		missedInfo.WindowSize = window
-		signInfo.IndexOffset = 0
-		index = 0
-	}
-	return missedInfo, signInfo, index
-}
-```
-
-**File:** x/slashing/abci.go (L36-50)
-```go
-	for i, _ := range allVotes {
-		wg.Add(1)
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
-			}
-		}(i)
-	}
-```
-
-**File:** x/params/types/subspace.go (L196-219)
-```go
-func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
-	attr, ok := s.table.m[string(key)]
-	if !ok {
-		panic(fmt.Sprintf("parameter %s not registered", string(key)))
-	}
-
-	ty := attr.ty
-	dest := reflect.New(ty).Interface()
-	s.GetIfExists(ctx, key, dest)
-
-	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+	grant, err := authz.NewGrant(authorization, expiration)
+	if err != nil {
 		return err
 	}
 
-	// destValue contains the dereferenced value of dest so validation function do
-	// not have to operate on pointers.
-	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
-	if err := s.Validate(ctx, key, destValue); err != nil {
-		return err
-	}
-
-	s.Set(ctx, key, dest)
-	return nil
+	bz := k.cdc.MustMarshal(&grant)
+	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
+	store.Set(skey, bz)
+	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
+		MsgTypeUrl: authorization.MsgTypeURL(),
+		Granter:    granter.String(),
+		Grantee:    grantee.String(),
+	})
 }
 ```
 
-**File:** x/params/proposal_handler.go (L26-39)
+**File:** x/authz/keeper/keeper.go (L245-260)
 ```go
-func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
-	for _, c := range p.Changes {
-		ss, ok := k.GetSubspace(c.Subspace)
+// InitGenesis new authz genesis
+func (k Keeper) InitGenesis(ctx sdk.Context, data *authz.GenesisState) {
+	for _, entry := range data.Authorization {
+		grantee := sdk.MustAccAddressFromBech32(entry.Grantee)
+		granter := sdk.MustAccAddressFromBech32(entry.Granter)
+		a, ok := entry.Authorization.GetCachedValue().(authz.Authorization)
 		if !ok {
-			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+			panic("expected authorization")
 		}
 
-		k.Logger(ctx).Info(
-			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
-		)
-
-		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
-			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		err := k.SaveGrant(ctx, grantee, granter, a, entry.Expiration)
+		if err != nil {
+			panic(err)
 		}
+	}
+}
+```
+
+**File:** x/feegrant/genesis.go (L17-29)
+```go
+func ValidateGenesis(data GenesisState) error {
+	for _, f := range data.Allowances {
+		grant, err := f.GetGrant()
+		if err != nil {
+			return err
+		}
+		err = grant.ValidateBasic()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+**File:** x/authz/module/module.go (L149-154)
+```go
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	var genesisState authz.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+```
+
+**File:** proto/cosmos/staking/v1beta1/authz.proto (L38-40)
+```text
+enum AuthorizationType {
+  // AUTHORIZATION_TYPE_UNSPECIFIED specifies an unknown authorization type
+  AUTHORIZATION_TYPE_UNSPECIFIED = 0;
+```
+
+**File:** x/authz/authorization_grant.go (L57-64)
+```go
+func (g Grant) ValidateBasic() error {
+	av := g.Authorization.GetCachedValue()
+	a, ok := av.(Authorization)
+	if !ok {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", (Authorization)(nil), av)
+	}
+	return a.ValidateBasic()
+}
+```
+
+**File:** x/authz/keeper/genesis_test.go (L17-30)
+```go
+type GenesisTestSuite struct {
+	suite.Suite
+
+	ctx    sdk.Context
+	keeper keeper.Keeper
+}
+
+func (suite *GenesisTestSuite) SetupTest() {
+	checkTx := false
+	app := simapp.Setup(checkTx)
+
+	suite.ctx = app.BaseApp.NewContext(checkTx, tmproto.Header{Height: 1})
+	suite.keeper = app.AuthzKeeper
+}
 ```

@@ -1,194 +1,231 @@
 # Audit Report
 
 ## Title
-Tombstoning Can Be Bypassed by Creating New Validator with Different Consensus Key
+State Desynchronization in ReleaseCapability Causes Node Panic on Transaction Rollback
 
 ## Summary
-A tombstoned validator operator can bypass permanent tombstoning by creating a new validator with a different consensus public key after their original validator is removed from state. This violates the fundamental security invariant that tombstoned validators should be permanently excluded from consensus participation.
+The `ReleaseCapability` function in the capability keeper performs a direct Go map deletion that is not protected by transaction semantics. When a transaction containing `ReleaseCapability` is rolled back, the cached store deletions are reverted but the map deletion persists, creating a state inconsistency that causes node panics when the capability is subsequently accessed.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-- **Location:** 
-  - `x/slashing/keeper/hooks.go` (AfterValidatorBonded function)
-  - `x/staking/keeper/msg_server.go` (CreateValidator function)
-  - `x/staking/keeper/validator.go` (RemoveValidator function)
-  - `x/evidence/keeper/infraction.go` (HandleEquivocationEvidence function)
+**Location:** [1](#0-0) 
 
-- **Intended Logic:** Tombstoning is designed as a permanent punishment mechanism. When a validator commits a severe consensus fault like double-signing, they should be permanently excluded from participating in consensus. The documentation explicitly states tombstoned validators "cannot be unjailed" [1](#0-0) 
+**Intended Logic:** When releasing a capability within a transaction context, all state modifications (persistent store, memory store, and in-memory map) should be atomic. If the transaction fails or is rolled back, all changes should revert together to maintain consistency across the three storage layers.
 
-- **Actual Logic:** Tombstoning is tied to the consensus address (derived from the consensus public key), not the operator address. When a validator is tombstoned, the signing info for that specific consensus address is marked with `Tombstoned=true` [2](#0-1) . When the validator completes unbonding and has zero delegations, it is removed from state [3](#0-2) , freeing the operator address. The operator can then create a new validator with a different consensus key, and when this validator bonds, `AfterValidatorBonded` creates fresh signing info with `Tombstoned=false` because no signing info exists for the new consensus address [4](#0-3) 
+**Actual Logic:** The function mixes transactional and non-transactional operations. The deletions from `memStore` (lines 332, 336) and `prefixStore` (line 347) operate on cached stores that participate in transaction semantics. However, the deletion from `capMap` at line 349 is a direct Go map operation that executes immediately and irreversibly, regardless of whether the surrounding transaction commits or rolls back. [2](#0-1) 
 
-- **Exploitation Path:**
-  1. Validator V1 with operator address O and consensus address A commits double-signing
-  2. Evidence handler tombstones V1 via `HandleEquivocationEvidence`, setting `SigningInfo.Tombstoned=true` for consensus address A [5](#0-4) 
-  3. V1 is jailed and begins unbonding
-  4. After all delegations are removed and unbonding completes, V1 is removed from state, freeing operator O [6](#0-5) 
-  5. Operator O creates new validator V2 with different consensus public key (new consensus address B)
-  6. `CreateValidator` only checks if operator already has an active validator and if the consensus pubkey is in use - it does not check if the operator was previously tombstoned [7](#0-6) 
-  7. When V2 bonds, no signing info exists for address B, so new info is created with `Tombstoned=false`
-  8. Operator O can now participate in consensus again
+The `capMap` is shared by reference across all scoped keepers [3](#0-2) , meaning modifications to it affect parent and cached contexts simultaneously.
 
-- **Security Guarantee Broken:** The permanent punishment invariant is violated. An operator who committed a consensus fault can re-enter the validator set, undermining the security assumption that tombstoned validators are permanently excluded from consensus participation.
+**Exploitation Path:**
+1. A module calls `ReleaseCapability` on the last owner of a capability within a transaction (creating a cached context via `CacheMultiStore()` [4](#0-3) )
+2. The function executes successfully, deleting from `capMap` (line 349) and from cached stores (lines 332, 336, 347)
+3. The transaction fails due to validation errors, gas exhaustion, or other errors
+4. The cached context is discarded without calling `Write()` - store deletions are reverted but the map deletion has already occurred [5](#0-4) 
+5. Result: `memStore` still contains the capability mappings (deletion was not written), but `capMap` no longer has the capability entry (deletion already happened)
+6. When `GetCapability` is called for this capability, the function retrieves the index from `memStore` [6](#0-5) , then looks it up in `capMap` which returns nil [7](#0-6) , triggering a panic [8](#0-7) 
+
+**Security Guarantee Broken:** Transaction atomicity and state consistency. The codebase explicitly acknowledges this class of issue in comments [9](#0-8) , which state "changes to go map do not automatically get reverted on tx failure" and reference issue #7805. However, the mitigation only handles the case where `NewCapability` adds to `capMap` but the transaction fails. The inverse case where `ReleaseCapability` removes from `capMap` but the transaction fails is not handled.
 
 ## Impact Explanation
 
-This vulnerability affects the fundamental security and integrity of the consensus mechanism. The slashing and tombstoning system is designed to permanently exclude validators who commit severe consensus violations like double-signing. By allowing tombstoned operators to bypass this permanent exclusion through consensus key rotation, the protocol:
+This vulnerability creates a permanent desynchronization between storage layers that causes denial of service:
 
-- Undermines the deterrent effect of tombstoning, as malicious validators know they can return
-- Allows repeat offenders to potentially commit the same consensus faults again
-- Violates the documented security guarantee that tombstoned validators cannot rejoin
-- Weakens overall consensus security by enabling previously-malicious actors to participate
+1. **State Inconsistency**: Creates permanent desynchronization between `memStore` and `capMap` until node restart, violating the invariant that these storage layers must remain synchronized
 
-While the operator loses their original delegations and must wait through the unbonding period, they can re-enter the validator set with fresh capital, potentially threatening consensus safety again.
+2. **Node Instability**: When `GetCapability` is called for the affected capability, the node panics. While transaction execution has panic recovery [10](#0-9) , the panic still causes transaction failures and potential node crashes if triggered in unrecovered code paths (e.g., BeginBlock/EndBlock operations)
 
-This qualifies as "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" - a Medium severity consensus layer security flaw.
+3. **Module Disruption**: Capabilities are fundamental to IBC port/channel management and inter-module authentication. The inconsistency prevents all capability-based operations for the affected capability, causing denial of service for critical network functionality
+
+4. **Multi-Node Impact**: If a transaction sequence triggering this condition is broadcast to the network, all nodes processing it similarly will experience the same inconsistency, potentially affecting a significant portion of the network simultaneously
+
+5. **Persistent Until Restart**: The inconsistency persists in memory until the node is restarted and `InitMemStore` rebuilds the `capMap` from persistent storage
+
+This qualifies as **Medium severity** under the impact criterion: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-- **Who Can Trigger:** Any validator operator who has been tombstoned can exploit this vulnerability
-- **Conditions Required:**
-  - The tombstoned validator must complete the unbonding period
-  - The validator must have zero remaining delegations (all delegations must unbond)
-  - The operator needs funds to create a new validator with minimum self-delegation
-  - The operator must generate new consensus keys
-- **Frequency:** This can be exploited whenever a validator is tombstoned and subsequently removed from state. While double-signing events are rare, they do occur in practice
-- **Ease of Exploitation:** Straightforward - the operator simply waits for validator removal, generates new consensus keys, and submits a standard `MsgCreateValidator` transaction. No complex attack vectors or timing requirements beyond the unbonding period.
+**Who Can Trigger:** Any module with capability ownership can trigger this by calling `ReleaseCapability` in a transaction that subsequently fails. No special privileges are required beyond normal capability ownership granted during module initialization.
+
+**Conditions Required:**
+1. A module releases the last owner of a capability via `ReleaseCapability`
+2. The transaction containing the release fails after `ReleaseCapability` executes but before commit
+3. A subsequent operation attempts to access the capability via `GetCapability`
+
+**Frequency:** The likelihood is moderate to high because:
+- Transaction failures are common occurrences (validation errors, gas limits, state conflicts)
+- Capability operations occur regularly during channel lifecycle management
+- The inconsistency persists, so any future access to the capability will trigger the panic
+- An attacker could deliberately craft transactions that call `ReleaseCapability` and then induce failure, intentionally creating this condition
+
+The design flaw is acknowledged in codebase comments, confirming it's a known architectural issue that hasn't been fully addressed.
 
 ## Recommendation
 
-Implement operator-level tombstoning to prevent previously tombstoned operators from creating new validators:
+Implement deferred cleanup for `capMap` modifications to ensure transactional consistency:
 
-1. Add a mapping in the slashing keeper from operator addresses to tombstoned status
-2. When tombstoning a validator via `Tombstone()`, also record the operator address as tombstoned
-3. In `CreateValidator`, add a check to query if the operator address has ever been tombstoned, and reject the creation if so
-4. Alternatively, modify `AfterValidatorBonded` to check if any previous validator for this operator was tombstoned and inherit that status
+**Recommended Approach:** Modify `ReleaseCapability` to not delete from `capMap` immediately. Instead:
+1. Mark capabilities for deletion in a separate tracking structure during transaction execution
+2. During `InitMemStore` or a periodic consistency check, verify `capMap` entries against persistent store
+3. Remove entries from `capMap` only when confirmed they don't exist in persistent storage
 
-The fix should ensure that once an operator's validator is tombstoned, that operator cannot create any future validators, regardless of consensus key changes. This preserves the permanent nature of tombstoning at the operator level, not just the consensus address level.
+Alternatively, add defensive handling in `GetCapability`: when `capMap[index]` returns nil but `memStore` has the mapping, attempt to reload the capability from persistent store or reconstruct it, instead of panicking. While this doesn't fix the root cause, it prevents the node crash.
+
+The safest fix is aligned with the existing initialization pattern where `capMap` is rebuilt from authoritative persistent store, ensuring consistency by treating persistent store as the source of truth.
 
 ## Proof of Concept
 
-**Test File:** `x/evidence/keeper/infraction_test.go`
+The vulnerability can be demonstrated with the following test in `x/capability/keeper/keeper_test.go`:
 
-**Setup:** Initialize a validator with staking and slashing parameters configured
+**Setup:**
+1. Initialize test suite with keeper and scoped keeper
+2. Create a new capability with one owner using `NewCapability`
 
 **Action:**
-1. Create validator V1 with operator O and consensus key PK1
-2. Submit double-sign evidence to tombstone V1 at consensus address A
-3. Verify V1 is tombstoned: `IsTombstoned(ctx, A)` returns true
-4. Undelegate all tokens from V1
-5. Advance time past unbonding period and process EndBlocker to remove V1
-6. Verify V1 no longer exists: `GetValidator(ctx, O)` returns not found
-7. Create new validator V2 with same operator O but different consensus key PK2 (new consensus address B)
-8. Process EndBlocker to bond V2
+1. Create a cached context using `ctx.MultiStore().CacheMultiStore()` to simulate transaction execution
+2. Create a new context with the cached multi-store
+3. Call `ReleaseCapability` in the cached context
+4. Do NOT call `msCache.Write()` to simulate transaction failure/rollback
 
 **Result:**
-- V2 is successfully created despite operator O being previously tombstoned
-- `IsTombstoned(ctx, B)` returns false for the new consensus address
-- The operator successfully bypasses permanent tombstoning
-- Demonstrates that tombstoning is not truly permanent and can be circumvented by changing consensus keys
+1. Call `GetCapability` from the original (parent) context
+2. The call panics with message "capability found in memstore is missing from map"
+3. This confirms the state mismatch: the parent context's `memStore` still has the capability mapping (because the cached deletion wasn't written), but the shared `capMap` no longer has the entry (because the direct deletion already happened)
 
-The provided PoC test code is comprehensive and would successfully demonstrate the vulnerability when added to the test suite.
-
-## Notes
-
-This is a design-level vulnerability where the implementation's behavior (tombstoning by consensus address) diverges from the documented intent (permanent exclusion of malicious validators). The security impact stems from violating the trust assumption that tombstoned entities cannot rejoin consensus, which is critical for maintaining network security and deterring malicious behavior.
+The panic demonstrates that the node experiences unintended behavior when attempting to access a capability after a transaction rollback during `ReleaseCapability`, validating the vulnerability.
 
 ### Citations
 
-**File:** x/slashing/spec/03_messages.md (L38-39)
-```markdown
-    if info.Tombstoned
-      fail with "Tombstoned validator cannot be unjailed"
+**File:** x/capability/keeper/keeper.go (L83-89)
+```go
+	return ScopedKeeper{
+		cdc:      k.cdc,
+		storeKey: k.storeKey,
+		memKey:   k.memKey,
+		capMap:   k.capMap,
+		module:   moduleName,
+	}
 ```
 
-**File:** x/slashing/keeper/signing_info.go (L143-155)
+**File:** x/capability/keeper/keeper.go (L319-356)
 ```go
-func (k Keeper) Tombstone(ctx sdk.Context, consAddr sdk.ConsAddress) {
-	signInfo, ok := k.GetValidatorSigningInfo(ctx, consAddr)
-	if !ok {
-		panic("cannot tombstone validator that does not have any signing information")
+func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	}
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
 	}
 
-	if signInfo.Tombstoned {
-		panic("cannot tombstone validator that is already tombstoned")
+	memStore := ctx.KVStore(sk.memKey)
+
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
+
+	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
+	indexKey := types.IndexToKey(cap.GetIndex())
+
+	if len(capOwners.Owners) == 0 {
+		// remove capability owner set
+		prefixStore.Delete(indexKey)
+		// since no one owns capability, we can delete capability from map
+		delete(sk.capMap, cap.GetIndex())
+	} else {
+		// update capability owner set
+		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
 	}
 
-	signInfo.Tombstoned = true
-	k.SetValidatorSigningInfo(ctx, consAddr, signInfo)
+	return nil
 }
 ```
 
-**File:** x/staking/keeper/validator.go (L441-444)
+**File:** x/capability/keeper/keeper.go (L367-369)
 ```go
-				val = k.UnbondingToUnbonded(ctx, val)
-				if val.GetDelegatorShares().IsZero() {
-					k.RemoveValidator(ctx, val.GetOperator())
-				}
+	key := types.RevCapabilityKey(sk.module, name)
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
 ```
 
-**File:** x/slashing/keeper/hooks.go (L12-26)
+**File:** x/capability/keeper/keeper.go (L372-377)
 ```go
-func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
-	// Update the signing info start height or create a new signing info
-	_, found := k.GetValidatorSigningInfo(ctx, address)
-	if !found {
-		signingInfo := types.NewValidatorSigningInfo(
-			address,
-			ctx.BlockHeight(),
-			0,
-			time.Unix(0, 0),
-			false,
-			0,
-		)
-		k.SetValidatorSigningInfo(ctx, address, signingInfo)
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+```
+
+**File:** x/capability/keeper/keeper.go (L382-382)
+```go
+	cap := sk.capMap[index]
+```
+
+**File:** x/capability/keeper/keeper.go (L383-385)
+```go
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
 	}
+```
+
+**File:** baseapp/baseapp.go (L836-851)
+```go
+func (app *BaseApp) cacheTxContext(ctx sdk.Context, checksum [32]byte) (sdk.Context, sdk.CacheMultiStore) {
+	ms := ctx.MultiStore()
+	// TODO: https://github.com/cosmos/cosmos-sdk/issues/2824
+	msCache := ms.CacheMultiStore()
+	if msCache.TracingEnabled() {
+		msCache = msCache.SetTracingContext(
+			sdk.TraceContext(
+				map[string]interface{}{
+					"txHash": fmt.Sprintf("%X", checksum),
+				},
+			),
+		).(sdk.CacheMultiStore)
+	}
+
+	return ctx.WithMultiStore(msCache), msCache
 }
 ```
 
-**File:** x/evidence/keeper/infraction.go (L107-122)
+**File:** baseapp/baseapp.go (L904-915)
 ```go
-	k.slashingKeeper.Slash(
-		ctx,
-		consAddr,
-		k.slashingKeeper.SlashFractionDoubleSign(ctx),
-		evidence.GetValidatorPower(), distributionHeight,
-	)
-
-	// Jail the validator if not already jailed. This will begin unbonding the
-	// validator if not already unbonding (tombstoned).
-	if !validator.IsJailed() {
-		k.slashingKeeper.Jail(ctx, consAddr)
-	}
-
-	k.slashingKeeper.JailUntil(ctx, consAddr, types.DoubleSignJailEndTime)
-	k.slashingKeeper.Tombstone(ctx, consAddr)
-	k.SetEvidence(ctx, evidence)
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
+		}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
 ```
 
-**File:** x/staking/keeper/delegation.go (L789-792)
+**File:** baseapp/baseapp.go (L1008-1017)
 ```go
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
-	}
-```
+	runMsgCtx, msCache := app.cacheTxContext(ctx, checksum)
 
-**File:** x/staking/keeper/msg_server.go (L42-54)
-```go
-	// check to see if the pubkey or sender has been registered before
-	if _, found := k.GetValidator(ctx, valAddr); found {
-		return nil, types.ErrValidatorOwnerExists
-	}
+	// Attempt to execute all messages and only update state if all messages pass
+	// and we're in DeliverTx. Note, runMsgs will never return a reference to a
+	// Result if any single message fails or does not have a registered Handler.
+	result, err = app.runMsgs(runMsgCtx, msgs, mode)
 
-	pk, ok := msg.Pubkey.GetCachedValue().(cryptotypes.PubKey)
-	if !ok {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "Expecting cryptotypes.PubKey, got %T", pk)
-	}
-
-	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
-		return nil, types.ErrValidatorPubKeyExists
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
 	}
 ```

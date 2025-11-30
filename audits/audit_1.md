@@ -1,75 +1,65 @@
-Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**. Let me provide my validation:
+Based on my thorough investigation of the codebase, I have validated the technical claims and found this to be a **valid vulnerability** with important corrections needed.
 
-## Audit Report
+# Audit Report
 
 ## Title
-Nested Messages in MsgExec Bypass Validation During CheckTx Leading to Mempool Pollution and Resource Exhaustion
+Nested Messages in MsgExec Bypass ValidateBasic During CheckTx Leading to Mempool Pollution
 
 ## Summary
-The `MsgExec.ValidateBasic()` function does not recursively validate nested messages during the CheckTx phase, allowing transactions with invalid nested messages to enter the mempool, propagate across the network, and waste node resources before failing during DeliverTx execution. [1](#0-0) 
+The `MsgExec.ValidateBasic()` function does not validate nested messages, allowing transactions with stateless validation errors in nested messages to enter the mempool. This bypasses the standard validation pattern evidenced by `MsgSubmitProposal`, which does validate its nested content. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
+**Location:**
 - Primary: `x/authz/msgs.go` lines 221-232 (MsgExec.ValidateBasic)
-- Related: `baseapp/baseapp.go` lines 788-801 (validateBasicTxMsgs)
-- Related: `baseapp/baseapp.go` lines 1086-1089 (CheckTx execution skip)
+- Related: `baseapp/baseapp.go` lines 788-801 (validateBasicTxMsgs)  
+- Precedent: `x/gov/types/msgs.go` lines 101-110 (MsgSubmitProposal validates nested content)
 
-**Intended Logic:** 
-All messages in a transaction should undergo stateless validation via `ValidateBasic()` during CheckTx to prevent invalid transactions from entering the mempool. This is the standard Cosmos SDK pattern for early rejection of malformed transactions.
+**Intended Logic:**
+All messages should undergo stateless validation via `ValidateBasic()` during CheckTx to prevent malformed transactions from entering the mempool. The codebase establishes this pattern in `MsgSubmitProposal`, which validates its nested content. [2](#0-1) 
 
-**Actual Logic:** 
-The validation has a gap: `validateBasicTxMsgs` only calls `ValidateBasic()` on top-level messages [2](#0-1) . For `MsgExec`, its `ValidateBasic()` only validates the grantee address and checks for non-empty messages array, but does NOT validate the nested messages themselves [1](#0-0) . During CheckTx mode, message execution is skipped entirely [3](#0-2) , so nested messages are never validated until DeliverTx when handlers invoke them.
+**Actual Logic:**
+`MsgExec.ValidateBasic()` only validates the grantee address and checks for a non-empty messages array, but does NOT call `ValidateBasic()` on nested messages. During CheckTx, message execution is skipped, so nested message validation never occurs until DeliverTx. [3](#0-2) 
 
 **Exploitation Path:**
-1. Attacker crafts a `MsgExec` transaction with valid outer structure (valid grantee address, non-empty messages array)
-2. Includes nested messages with invalid fields (e.g., `MsgSend` with malformed addresses or zero/negative amounts)
-3. Transaction passes CheckTx because `MsgExec.ValidateBasic()` doesn't inspect nested messages
-4. Transaction enters mempool and propagates to all network nodes
-5. Each node stores the transaction, consuming mempool resources
-6. Transaction is gossiped across the network, consuming bandwidth
-7. When block production attempts to include the transaction, it fails during DeliverTx execution
-8. Process repeats as attacker submits more invalid transactions
+1. Attacker creates `MsgExec` with valid outer structure but invalid nested messages (e.g., `MsgSend` with malformed addresses)
+2. Transaction passes `validateBasicTxMsgs` since it only validates top-level messages [4](#0-3) 
+3. Transaction enters mempool and propagates across network
+4. Transaction is included in a block and fails during DeliverTx when nested message validation occurs [5](#0-4) 
+5. Attack can be repeated continuously
 
 **Security Guarantee Broken:**
-The mempool filtering invariant is violated. CheckTx validation is supposed to ensure that only well-formed transactions enter the mempool, preventing resource waste on obviously invalid transactions.
+The mempool filtering invariant that only well-formed transactions (passing stateless validation) should enter the mempool is violated.
 
 ## Impact Explanation
 
-This vulnerability enables network-wide resource exhaustion:
-- **Mempool pollution**: Invalid transactions occupy mempool slots that should be available for legitimate transactions
-- **Bandwidth waste**: Invalid transactions are gossiped to all peer nodes before being discovered as invalid
-- **CPU/Memory waste**: All nodes process, store, and attempt to execute invalid transactions
-- **Transaction throughput degradation**: Legitimate transactions may be crowded out or delayed
+This vulnerability causes network-wide resource waste:
+- **Mempool pollution**: Invalid transactions occupy mempool slots, potentially crowding out legitimate transactions
+- **Bandwidth waste**: Invalid transactions are gossiped to all peer nodes before discovery
+- **Processing overhead**: All nodes store and process transactions that will inevitably fail
 
-The attack is particularly effective because:
-- Cost to attacker is minimal (only CheckTx gas, typically low or zero)
-- Impact multiplies across all network nodes
-- No DeliverTx gas is charged since transactions fail before execution
-- Attack can be sustained continuously
+**Important Correction**: The attacker DOES pay full transaction fees during DeliverTx (fees are deducted in the AnteHandler even when the transaction fails). This limits but does not eliminate the attack vector, as the attacker can still cause disproportionate network-wide resource consumption relative to their cost.
 
-This matches the Medium severity impact category: "Causing network processing nodes to process transactions from the mempool beyond set parameters" - the validation parameters (ValidateBasic checks) are bypassed, allowing nodes to process invalid transactions that should have been rejected.
+This matches the Medium severity impact: "Causing network processing nodes to process transactions from the mempool beyond set parameters" - the ValidateBasic validation parameter is bypassed for nested messages.
 
 ## Likelihood Explanation
 
-**Likelihood: High**
+**Likelihood: Medium-to-High**
 
-This vulnerability is trivially exploitable:
-- **No privileges required**: Any user can submit transactions
-- **No special conditions**: Works during normal network operation
-- **No race conditions**: Attack is deterministic
-- **Minimal cost**: Only pays CheckTx gas fees
-- **Continuous exploitation**: Can submit invalid transactions with every block
-- **Scalable**: Can include multiple invalid nested messages per transaction
+The vulnerability is easily exploitable:
+- No privileges required
+- Simple to construct invalid nested messages
+- Can be executed repeatedly
+- Works during normal network operation
 
-An attacker can continuously flood the mempool with hundreds of invalid `MsgExec` transactions per block, each containing multiple invalid nested messages. The attack scales with the number of peer nodes and the frequency of transaction submission.
+However, the attacker must pay transaction fees, which increases cost and reduces likelihood of sustained large-scale attacks compared to a zero-cost exploit.
 
 ## Recommendation
 
-Modify `MsgExec.ValidateBasic()` to recursively validate all nested messages:
+Modify `MsgExec.ValidateBasic()` to validate nested messages, following the pattern established by `MsgSubmitProposal`:
 
 ```go
 func (msg MsgExec) ValidateBasic() error {
@@ -98,37 +88,33 @@ func (msg MsgExec) ValidateBasic() error {
 }
 ```
 
-This ensures nested messages undergo stateless validation during CheckTx, preventing invalid transactions from entering the mempool.
-
 ## Proof of Concept
 
-**File:** `x/authz/msgs_test.go` (add new test)
-
-**Setup:**
-Create a `MsgExec` with an invalid nested `MsgSend` (malformed recipient address):
+**Setup**: Create `MsgExec` with invalid nested `MsgSend` (malformed address):
 ```go
 invalidMsgSend := &banktypes.MsgSend{
     FromAddress: "cosmos1granter",
-    ToAddress:   "invalid_address", // Invalid bech32 address
+    ToAddress:   "invalid_address",
     Amount:      sdk.NewCoins(sdk.NewInt64Coin("stake", 100)),
 }
 msgExec := authz.NewMsgExec(granteeAddr, []sdk.Msg{invalidMsgSend})
 ```
 
-**Action:**
-Call `ValidateBasic()` on the `MsgExec`:
+**Action**: Call `ValidateBasic()`:
 ```go
 err := msgExec.ValidateBasic()
 ```
 
-**Result:**
-Current behavior returns NO error, demonstrating that `MsgExec.ValidateBasic()` does not validate nested messages. The invalid transaction would pass CheckTx and enter the mempool, only to fail during DeliverTx execution when the nested message's `ValidateBasic()` is called by the handler [4](#0-3) .
-
-Expected behavior would be to return an error during the `ValidateBasic()` call, preventing the invalid transaction from entering the mempool.
+**Result**: Returns NO error (invalid), allowing malformed transaction to enter mempool. Expected behavior: should return validation error preventing mempool admission. [6](#0-5) 
 
 ## Notes
 
-The vulnerability is confirmed by examining the existing test suite [5](#0-4) , which only tests `MsgExec` with valid nested messages. There are no tests that verify invalid nested messages are properly rejected, indicating this validation gap was overlooked during development.
+The vulnerability is confirmed by:
+1. Code inspection showing `MsgExec.ValidateBasic()` lacks nested validation
+2. Precedent in `MsgSubmitProposal` showing nested content SHOULD be validated
+3. Existing test suite only tests valid nested messages, indicating oversight
+
+The original report overstated the cost advantage to attackers by incorrectly claiming no DeliverTx fees are charged. In reality, full transaction fees ARE deducted during the AnteHandler even when transactions fail, making the attack more expensive than claimed but still viable for causing network-wide resource waste.
 
 ### Citations
 
@@ -146,6 +132,20 @@ func (msg MsgExec) ValidateBasic() error {
 
 	return nil
 }
+```
+
+**File:** x/gov/types/msgs.go (L101-110)
+```go
+	content := m.GetContent()
+	if content == nil {
+		return sdkerrors.Wrap(ErrInvalidProposalContent, "missing content")
+	}
+	if !IsValidProposalType(content.ProposalType()) {
+		return sdkerrors.Wrap(ErrInvalidProposalType, content.ProposalType())
+	}
+	if err := content.ValidateBasic(); err != nil {
+		return err
+	}
 ```
 
 **File:** baseapp/baseapp.go (L788-801)

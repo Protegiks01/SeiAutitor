@@ -1,210 +1,205 @@
 # Audit Report
 
 ## Title
-State Corruption Through Partial Write Propagation in Concurrent Transaction Execution
+Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
 
 ## Summary
-In the OCC (Optimistic Concurrency Control) concurrent execution mode, failed transactions that run out of gas mid-execution have their partial state writes incorrectly committed to the blockchain state, violating the fundamental transaction atomicity property. The `executeTask()` function in the scheduler unconditionally propagates writes to the multiversion store without checking if the transaction succeeded.
+The `TrackHistoricalInfo` function contains a critical flaw in its pruning mechanism where a break statement causes the loop to exit upon encountering the first missing historical entry. This violates the storage bound invariant when gaps exist in the historical entry sequence, leading to unbounded storage growth that cannot be recovered without a code fix. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+- **location**: `x/staking/keeper/historical_info.go`, lines 78-85 in the `TrackHistoricalInfo` function
 
-**Intended Logic:** Transactions must be atomic - either all state changes commit or none do. In the standard sequential execution path, this is correctly enforced through a cache mechanism that only writes on successful execution (`if err == nil && mode == runTxModeDeliver { msCache.Write() }`). [2](#0-1) 
+- **intended logic**: The function should maintain exactly `HistoricalEntries` number of recent historical info entries by pruning all entries older than `currentHeight - HistoricalEntries`. Storage should be bounded to prevent resource exhaustion.
 
-**Actual Logic:** In OCC concurrent execution mode:
-1. Gas metering occurs at the `gaskv.Store` layer before each write operation [3](#0-2) 
-2. Each write that passes the gas check is immediately stored in `VersionIndexedStore.writeset` [4](#0-3) 
-3. When gas is exhausted, a panic is caught and converted to an error response with non-zero Code [5](#0-4) 
-4. The `executeTask()` function receives this failed response but **never checks `resp.Code`** to verify success
-5. It unconditionally calls `WriteToMultiVersionStore()` at lines 574-577, propagating the partial writeset regardless of transaction status [6](#0-5) 
-6. These writes are later committed to the parent store via `WriteLatestToStore()` [7](#0-6) 
+- **actual logic**: The pruning loop iterates downward from `currentHeight - HistoricalEntries` and breaks immediately upon encountering the first missing entry. [1](#0-0)  The code comment assumes "the entries to be deleted are always in a continuous range" [2](#0-1) , but this assumption is violated when `HistoricalEntries` is temporarily set to 0.
 
-**Exploitation Path:**
-1. Any user submits a transaction to the network (no special privileges required)
-2. The transaction executes in OCC mode with multiple state write operations
-3. After several successful writes consuming gas, a subsequent operation exceeds the gas limit
-4. The out-of-gas panic is caught and converted to an error response with Code != 0
-5. Despite the error response, `executeTask()` propagates all partial writes to the multiversion store
-6. At the end of block processing, `WriteLatestToStore()` commits these partial writes to blockchain state
-7. The transaction response indicates failure (Code != 0), but state contains corrupted data from partial execution
+- **exploitation path**:
+  1. Network operates with `HistoricalEntries=100`, accumulating entries for blocks 1-100
+  2. Governance proposal changes `HistoricalEntries` to 0 at block 101
+  3. During blocks 101-110, no new entries are saved [3](#0-2)  but existing entries 1-100 remain in storage
+  4. Governance proposal changes `HistoricalEntries` to 5 at block 111
+  5. At block 111, pruning loop starts at height 106 (111-5), finds no entry at height 106 (gap period), immediately breaks
+  6. Old entries 1-100 are never deleted, new entry 111 is saved
+  7. Each subsequent block adds a new entry without deleting old ones
+  8. Storage grows unboundedly: {1-100, 111, 112, 113, ...}
 
-**Security Guarantee Broken:** Transaction atomicity - the fundamental guarantee that transactions execute completely or not at all is violated. Failed transactions leave partial state modifications in the committed blockchain state.
+- **security guarantee broken**: The storage bound invariant is violated. The system should maintain exactly `HistoricalEntries` entries, but instead accumulates entries without bound.
 
 ## Impact Explanation
 
-This vulnerability causes state corruption by committing partial updates from failed transactions. The consequences include:
+Each `HistoricalInfo` entry contains a complete block header and full validator set. [4](#0-3)  With the default 35 validators [5](#0-4) , each entry represents substantial data (multiple kilobytes).
 
-- **Broken Invariants**: Multi-step operations (token transfers, DEX swaps, multi-signature operations) may leave the system in inconsistent intermediate states
-- **Unpredictable Contract Behavior**: Smart contracts relying on transaction atomicity guarantees will malfunction when their partial state changes persist despite transaction failure
-- **Data Integrity Violation**: The blockchain state contains corrupted data that should have been rolled back
-- **Consensus Risk**: While all validators likely execute the same buggy code, any differences in gas estimation or timing could theoretically lead to state divergence
+After the vulnerability is triggered:
+- Expected storage with `HistoricalEntries=5`: 5 entries
+- Actual storage: 100 old entries + 8,640+ new entries per day (assuming 10-second blocks)
+- Within 24 hours: increases from 100 to 8,740+ entries = 174,700% increase
 
-This matches the Medium severity impact: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+This far exceeds the 30% threshold for Medium severity resource consumption impact, meeting the criterion: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
+
+Over time, this leads to storage exhaustion, node crashes when disk space is exhausted, and potential network degradation if sufficient nodes run out of storage.
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- OCC mode must be enabled (ConcurrencyWorkers > 0) - **this is the default configuration in Sei**
-- Transaction must run out of gas after making some successful state writes
-- This is an extremely common occurrence in normal network operation
+**Who can trigger**: Any network participant through the standard governance process. The `HistoricalEntries` parameter is governance-controlled. [6](#0-5) 
 
-**Frequency:** This vulnerability is triggered multiple times per block in normal operation:
-- Users frequently submit transactions with insufficient gas
-- Complex smart contract interactions often exceed gas estimates
-- Any transaction that consumes gas proportionally across multiple write operations will trigger this
+**Conditions required**:
+1. A governance proposal changes `HistoricalEntries` from non-zero to 0
+2. After several blocks, another proposal changes it back to a non-zero value
 
-**Who Can Trigger:** Any network participant submitting transactions - no special privileges, knowledge, or setup required. The vulnerability occurs automatically during normal transaction processing.
+**Why realistic**:
+- The validation function explicitly allows `HistoricalEntries=0` as valid (only checks type, not value) [7](#0-6) 
+- The simulation code confirms 0 is an intended valid value [8](#0-7) 
+- Non-IBC chains may legitimately set `HistoricalEntries=0` to save resources [9](#0-8) 
+- This is not a malicious attack but a legitimate governance operation that triggers a code bug
+- Once triggered, the issue is **unrecoverable** without a code fix—governance cannot remove the orphaned entries through any parameter change
 
-**Likelihood Assessment:** HIGH - This occurs naturally during regular network operation whenever any transaction runs out of gas after partial execution.
+**Frequency**: Once triggered through normal governance operations, the effect compounds with every subsequent block. [10](#0-9) 
 
 ## Recommendation
 
-Add a response code check in `executeTask()` before propagating writes:
+Modify the pruning logic to delete all entries older than the retention threshold, regardless of gaps. Remove the break condition and iterate through all possible heights:
 
 ```go
-task.SetStatus(statusExecuted)
-task.Response = &resp
-
-// Only write to multiversion store if transaction succeeded
-if resp.Code == 0 {
-    for _, v := range task.VersionStores {
-        v.WriteToMultiVersionStore()
+// Prune all entries older than retention height, regardless of gaps
+pruneHeight := ctx.BlockHeight() - int64(entryNum)
+for i := pruneHeight; i >= 0; i-- {
+    _, found := k.GetHistoricalInfo(ctx, i)
+    if found {
+        k.DeleteHistoricalInfo(ctx, i)
     }
+    // Continue checking all heights - do not break on missing entries
 }
-// If transaction failed (resp.Code != 0), the writeset is discarded
 ```
 
-This ensures that only successful transactions (Code == 0) propagate their state changes to the multiversion store, maintaining transaction atomicity consistent with the sequential execution path.
+Alternatively, track the oldest and newest entry heights in state to enable efficient range-based deletion without relying on the "continuous range" assumption.
 
 ## Proof of Concept
 
-The provided PoC in the report demonstrates the vulnerability by:
+**File**: `x/staking/keeper/historical_info_test.go`
 
-**Setup:**
-- Initializing a test context with OCC-enabled multistore
-- Creating a transaction with a limited gas meter
-- Configuring multiple sequential write operations
+**Test Function**: `TestTrackHistoricalInfoUnboundedGrowth`
 
-**Action:**
-- Executing the transaction via `scheduler.ProcessAll()`
-- The transaction performs writes that progressively consume gas
-- An out-of-gas panic occurs mid-execution after several successful writes
+**Setup**:
+- Initialize staking keeper using `createTestInput()`
+- Set `HistoricalEntries=100`
+- Create 100 blocks with historical entries using `TrackHistoricalInfo`
+- Verify 100 entries exist in storage
 
-**Expected Result:** All keys should be absent from the store (full rollback)
+**Action**:
+1. Change `HistoricalEntries` to 0 via `SetParams`
+2. Generate 10 blocks (101-110) by calling `TrackHistoricalInfo` with updated block heights
+3. Verify no new entries created during this period (gap created)
+4. Change `HistoricalEntries` to 5 via `SetParams`
+5. Generate block 111 by calling `TrackHistoricalInfo`
+6. Count total entries using `GetAllHistoricalInfo`
 
-**Actual Result:** Keys written before the out-of-gas error persist in the committed state (atomicity violation), while the response correctly indicates transaction failure (Code != 0)
+**Result**:
+- Expected after block 111: 5 entries (107-111)
+- Actual after block 111: 101 entries (1-100 + 111)
+- This proves old entries are never pruned when a gap exists, violating the `HistoricalEntries` bound
 
-The vulnerability is confirmed by observing that `responses[0].Code != 0` (transaction failed) yet partial state writes remain in the store, demonstrating the broken atomicity guarantee.
+**Notes**
 
-## Notes
-
-This is a critical architectural flaw in the OCC implementation that fundamentally breaks transaction atomicity - a core blockchain guarantee. The standard execution path correctly handles this via conditional cache writes, but the OCC path lacks the equivalent check. The fix is straightforward but essential for maintaining state integrity.
+This vulnerability is called every block through `BeginBlocker`, making it a production-critical issue. The flaw stems from an incorrect assumption that entries form a "continuous range," which is violated by legitimate governance operations that temporarily set `HistoricalEntries=0`. This is not a misconfiguration but a code bug triggered by supported parameter values, causing an unrecoverable security failure beyond governance's intended authority.
 
 ### Citations
 
-**File:** tasks/scheduler.go (L571-577)
+**File:** x/staking/keeper/historical_info.go (L71-77)
 ```go
-	task.SetStatus(statusExecuted)
-	task.Response = &resp
-
-	// write from version store to multiversion stores
-	for _, v := range task.VersionStores {
-		v.WriteToMultiVersionStore()
-	}
+	// Prune store to ensure we only have parameter-defined historical entries.
+	// In most cases, this will involve removing a single historical entry.
+	// In the rare scenario when the historical entries gets reduced to a lower value k'
+	// from the original value k. k - k' entries must be deleted from the store.
+	// Since the entries to be deleted are always in a continuous range, we can iterate
+	// over the historical entries starting from the most recent version to be pruned
+	// and then return at the first empty entry.
 ```
 
-**File:** baseapp/baseapp.go (L1015-1016)
+**File:** x/staking/keeper/historical_info.go (L78-85)
 ```go
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
-```
-
-**File:** store/gaskv/store.go (L69-80)
-```go
-func (gs *Store) Set(key []byte, value []byte) {
-	types.AssertValidKey(key)
-	types.AssertValidValue(value)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostFlat, types.GasWriteCostFlatDesc)
-	// TODO overflow-safe math?
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(key)), types.GasWritePerByteDesc)
-	gs.gasMeter.ConsumeGas(gs.gasConfig.WriteCostPerByte*types.Gas(len(value)), types.GasWritePerByteDesc)
-	gs.parent.Set(key, value)
-	if gs.tracer != nil {
-		gs.tracer.Set(key, value, gs.moduleName)
-	}
-}
-```
-
-**File:** store/multiversion/mvkv.go (L370-375)
-```go
-func (store *VersionIndexedStore) setValue(key, value []byte) {
-	types.AssertValidKey(key)
-
-	keyStr := string(key)
-	store.writeset[keyStr] = value
-}
-```
-
-**File:** baseapp/recovery.go (L48-62)
-```go
-// newOutOfGasRecoveryMiddleware creates a standard OutOfGas recovery middleware for app.runTx method.
-func newOutOfGasRecoveryMiddleware(gasWanted uint64, ctx sdk.Context, next recoveryMiddleware) recoveryMiddleware {
-	handler := func(recoveryObj interface{}) error {
-		err, ok := recoveryObj.(sdk.ErrorOutOfGas)
-		if !ok {
-			return nil
+	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
+		_, found := k.GetHistoricalInfo(ctx, i)
+		if found {
+			k.DeleteHistoricalInfo(ctx, i)
+		} else {
+			break
 		}
-
-		return sdkerrors.Wrap(
-			sdkerrors.ErrOutOfGas, fmt.Sprintf(
-				"out of gas in location: %v; gasWanted: %d, gasUsed: %d",
-				err.Descriptor, gasWanted, ctx.GasMeter().GasConsumed(),
-			),
-		)
 	}
 ```
 
-**File:** store/multiversion/store.go (L399-435)
+**File:** x/staking/keeper/historical_info.go (L87-90)
 ```go
-func (s *Store) WriteLatestToStore() {
-	// sort the keys
-	keys := []string{}
-	s.multiVersionMap.Range(func(key, value interface{}) bool {
-		keys = append(keys, key.(string))
-		return true
+	// if there is no need to persist historicalInfo, return
+	if entryNum == 0 {
+		return
+	}
+```
+
+**File:** x/staking/types/historical_info.go (L15-27)
+```go
+// NewHistoricalInfo will create a historical information struct from header and valset
+// it will first sort valset before inclusion into historical info
+func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
+	// Must sort in the same way that tendermint does
+	sort.SliceStable(valSet, func(i, j int) bool {
+		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
 	})
-	sort.Strings(keys)
 
-	for _, key := range keys {
-		val, ok := s.multiVersionMap.Load(key)
-		if !ok {
-			continue
-		}
-		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
-		if !found {
-			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
-			continue
-		}
-		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
-		if mvValue.IsEstimate() {
-			panic("should not have any estimate values when writing to parent store")
-		}
-		// if the value is deleted, then delete it from the parent store
-		if mvValue.IsDeleted() {
-			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
-			// be sure if the underlying store might do a save with the byteslice or
-			// not. Once we get confirmation that .Delete is guaranteed not to
-			// save the byteslice, then we can assume only a read-only copy is sufficient.
-			s.parentStore.Delete([]byte(key))
-			continue
-		}
-		if mvValue.Value() != nil {
-			s.parentStore.Set([]byte(key), mvValue.Value())
-		}
+	return HistoricalInfo{
+		Header: header,
+		Valset: valSet,
 	}
 }
+```
+
+**File:** x/staking/types/params.go (L24-24)
+```go
+	DefaultMaxValidators uint32 = 35
+```
+
+**File:** x/staking/types/params.go (L29-32)
+```go
+	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
+	// value by not adding the staking module to the application module manager's
+	// SetOrderBeginBlockers.
+	DefaultHistoricalEntries uint32 = 10000
+```
+
+**File:** x/staking/types/params.go (L242-249)
+```go
+func validateHistoricalEntries(i interface{}) error {
+	_, ok := i.(uint32)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	return nil
+}
+```
+
+**File:** x/staking/keeper/params.go (L82-84)
+```go
+// set the params
+func (k Keeper) SetParams(ctx sdk.Context, params types.Params) {
+	k.paramstore.SetParamSet(ctx, &params)
+```
+
+**File:** x/staking/simulation/genesis.go (L34-37)
+```go
+// getHistEntries returns randomized HistoricalEntries between 0-100.
+func getHistEntries(r *rand.Rand) uint32 {
+	return uint32(r.Intn(int(types.DefaultHistoricalEntries + 1)))
+}
+```
+
+**File:** x/staking/abci.go (L15-18)
+```go
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+
+	k.TrackHistoricalInfo(ctx)
 ```

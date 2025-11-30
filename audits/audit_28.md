@@ -1,251 +1,313 @@
-After thorough analysis of the codebase, I have validated this security claim. Here is my assessment:
-
 # Audit Report
 
 ## Title
-Capability Ownership Bypass Through Forged Capability Struct Cloning
+Non-Deterministic Iterator Validation Due to Race Condition in Channel Selection
 
 ## Summary
-The `ClaimCapability` function in the capability keeper does not validate that the capability pointer provided is the canonical pointer stored in `capMap`. This allows any module to forge a capability struct with a known index and successfully claim ownership of capabilities they never legitimately received, completely bypassing the object-capability security model.
+The `validateIterator` function in the multi-version store contains a critical race condition where encountering an estimate value during iterator validation sends an abort signal to `abortChannel` but allows execution to continue, eventually sending a result to `validChannel`. When both buffered channels contain values, Go's `select` statement uses non-deterministic random selection, causing different validator nodes to reach different conclusions about transaction validity during consensus, leading to permanent chain splits.
 
 ## Impact
-**High**
+High
 
 ## Finding Description
 
-**Location:** [1](#0-0) [2](#0-1) 
+**Location:**
+- Primary issue: [1](#0-0) 
+- Contributing code: [2](#0-1) 
+- Call path: [3](#0-2) 
 
-**Intended Logic:** 
-The capability system implements an object-capability model where capabilities can only be obtained through legitimate channels: creating them via `NewCapability`, receiving them from another module that passes the canonical pointer, or retrieving previously claimed capabilities via `GetCapability`. The security relies on pointer identity - each capability has a unique memory address that serves as its unforgeable identifier. [3](#0-2) 
+**Intended logic:**
+When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically abort and return `false` consistently across all validator nodes.
 
-**Actual Logic:** 
-The `ClaimCapability` function only validates that the capability is not nil and the name is not empty. It then calls `addOwner` which uses `cap.GetIndex()` to identify the capability and update the persistent owner set. There is no validation that the provided capability pointer matches the canonical pointer stored in `capMap[cap.GetIndex()]`. The `NewCapability` function is public and allows anyone to create a capability struct with any index. [4](#0-3) 
+**Actual logic:**
+When `validationIterator.Value()` encounters an estimate, it sends an abort to `abortChannel` but does not terminate execution. [4](#0-3)  The method continues executing and returns a value normally. [5](#0-4)  The validation goroutine continues iterating and eventually sends the final result to `validChannel`. [6](#0-5)  Both channels are buffered with capacity 1, [7](#0-6)  allowing both sends to succeed without blocking. The `select` statement randomly chooses between the two ready channels according to Go's specification, [8](#0-7)  introducing non-determinism.
 
-**Exploitation Path:**
-1. Module A creates a capability with index N (canonical pointer at 0xAAA)
-2. Malicious Module M observes index N (indices are sequential and stored in state)
-3. Module M creates forged capability: `forged := types.NewCapability(N)` at memory address 0xBBB
-4. Module M calls `ClaimCapability(ctx, forged, "stolen")`
-5. `addOwner` adds Module M to the persistent owner set using only the index
-6. Forward mapping `FwdCapabilityKey("moduleM", 0xBBB)` is set to "stolen"
-7. Reverse mapping `RevCapabilityKey("moduleM", "stolen")` is set to index N
-8. Module M calls `GetCapability(ctx, "stolen")` which returns `capMap[N]` - the canonical pointer
-9. Module M now has full access to the capability and is listed as a legitimate owner [5](#0-4) 
+**Exploitation path:**
+1. Block execution begins via `DeliverTxBatch` [9](#0-8) 
+2. Scheduler processes transactions and calls validation via `findConflicts` [10](#0-9) 
+3. Validation calls `ValidateTransactionState` which invokes `checkIteratorAtIndex` [11](#0-10) 
+4. This calls `validateIterator` for each iterator [12](#0-11) 
+5. During validation, `mergeIterator.Valid()` is called [13](#0-12) 
+6. This internally calls `skipUntilExistsOrInvalid()` which calls `cache.Value()` [14](#0-13) 
+7. The `validationIterator.Value()` method retrieves a value that is an estimate
+8. An abort is sent to `abortChannel` but execution continues
+9. The goroutine completes iteration and sends the result to `validChannel`
+10. Both channels now have values, and Go's `select` randomly chooses which to read
+11. Different validator nodes get different results, causing consensus disagreement
 
-**Security Guarantee Broken:** 
-The fundamental invariant that "capabilities can only be obtained through legitimate channels" is violated. The object-capability authorization model that underpins IBC security is completely bypassed.
+**Security guarantee broken:**
+This violates the fundamental determinism requirement for blockchain consensus. All validator nodes must reach identical conclusions about transaction validity when processing the same block with identical state.
 
 ## Impact Explanation
 
-This vulnerability has critical implications for IBC protocol security:
-
-- **IBC Port/Channel Hijacking**: Malicious modules can claim ownership of IBC ports and channels they were never authorized to access, enabling them to send unauthorized packets, bind to sensitive ports, or impersonate legitimate modules.
-
-- **Cross-chain Asset Theft**: Unauthorized IBC operations could enable direct theft of funds through unauthorized cross-chain transfers or manipulation of IBC-connected assets.
-
-- **Complete Security Model Bypass**: The capability system is the foundation of access control in IBC. Its compromise affects all protocols and modules that depend on it for security. [6](#0-5) 
-
-The severity is HIGH because it enables direct loss of funds through unauthorized IBC operations and completely undermines the security architecture of the system.
+This race condition causes different validator nodes processing the same block to reach different conclusions about transaction validity. When validators disagree on which transactions are valid, they compute different application state hashes. This triggers a consensus failure where the network cannot reach agreement on the canonical chain state, resulting in a permanent network partition that requires a hard fork to resolve. All transactions and state changes after the divergence point become uncertain, compromising the finality guarantees of the blockchain and disrupting all economic activity on the chain.
 
 ## Likelihood Explanation
 
-**High Likelihood:**
-- Any module running on the chain can exploit this vulnerability
-- Capability indices are sequential (0, 1, 2, ...) and easily discoverable by iterating or observing state
-- The attack requires no special privileges beyond having a ScopedKeeper, which all modules receive
-- Third-party modules are common in Cosmos SDK chains (IBC apps, DeFi protocols, etc.)
-- A single compromised or buggy third-party module can exploit this
-- The attack can be executed during normal chain operation
+**Triggering conditions:**
+- Concurrent transactions with overlapping key access (common in busy blocks)
+- Transactions using iterators (range queries, deletions, migrations)
+- Transaction re-execution creating estimate values (inherent to OCC design)
 
-The barrier to exploitation is simply having a module deployed on the chain, which is a realistic scenario given the prevalence of third-party modules in production Cosmos SDK chains.
+**Who can trigger:**
+Any user submitting normal transactions can inadvertently trigger this through the natural operation of the optimistic concurrency control system. No special privileges or malicious intent required.
+
+**Frequency:**
+The race condition window exists every time a validation iterator encounters an estimate. On a busy network with parallel transaction execution, this occurs frequently. The actual manifestation depends on Go runtime scheduling variations across nodes. Given sufficient transaction volume, consensus disagreement is inevitable.
 
 ## Recommendation
 
-Add validation in `ClaimCapability` to ensure the capability pointer is the canonical one from `capMap`:
+**Immediate fix:**
+Modify `validationIterator.Value()` to immediately terminate execution after sending to `abortChannel`:
 
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-    if cap == nil {
-        return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-    }
-    
-    // Validate capability pointer is canonical
-    canonicalCap := sk.capMap[cap.GetIndex()]
-    if canonicalCap == nil {
-        return sdkerrors.Wrap(types.ErrCapabilityNotFound, "capability does not exist")
-    }
-    if canonicalCap != cap {
-        return sdkerrors.Wrap(types.ErrInvalidCapability, "capability pointer is not canonical")
-    }
-    
-    if strings.TrimSpace(name) == "" {
-        return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-    }
-    
-    // ... rest of existing logic
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+    panic(occtypes.NewEstimateAbort(val.Index()))
 }
 ```
 
-This ensures only legitimate capability pointers (those stored in the canonical `capMap`) can be claimed, preventing forged capabilities from bypassing the security model.
+**Alternative fix:**
+Add abort checking in the validation goroutine loop:
+
+```go
+for ; mergeIterator.Valid(); mergeIterator.Next() {
+    select {
+    case <-abortChan:
+        returnChan <- false
+        return
+    default:
+    }
+    // ... rest of iteration logic
+}
+```
+
+**Root cause fix:**
+Redesign the validation flow to ensure estimate detection always takes precedence before writing to `validChannel`, or use a single channel with a result type that includes abort information.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
+**Test approach:**
+Extend the existing test in `store/multiversion/store_test.go` [15](#0-14) 
 
-**Setup:** 
-- Create two scoped keepers for different modules (sk1 for "bank", sk2 for "staking")
-- sk1 creates a legitimate capability with some index N
-- sk1 NEVER passes this capability to sk2
+**Setup:**
+1. Create parent store with initial keys
+2. Create writeset for transaction 2 including key "key2"
+3. Have transaction 5 create an iterator that includes key "key2"
+4. Call `SetEstimatedWriteset(2, 2, writeset2)` to mark transaction 2's writes as estimates
 
 **Action:**
-- sk2 creates a forged capability: `forged := types.NewCapability(N)`
-- sk2 calls `ClaimCapability(ctx, forged, "stolen")`
+1. Call `ValidateTransactionState(5)` repeatedly (e.g., 1000 times in a loop)
+2. During each validation, the iterator encounters the estimate from transaction 2
+3. Both `abortChannel` and `validChannel` receive values
+4. The `select` statement randomly chooses which to read
 
-**Result:**
-- The claim succeeds (no error returned) - proving no validation exists
-- sk2 is now listed as an owner in persistent storage - proving unauthorized ownership was granted
-- sk2 can authenticate the forged capability - proving the forward mapping was created
-- sk2 can call `GetCapability("stolen")` to retrieve the canonical pointer - proving full access [7](#0-6) 
-
-The existing test at line 125-127 demonstrates that developers were aware of forged capability risks and tested that authentication fails for unclaimed forged capabilities. However, they did not test or prevent the claiming attack vector, which is the core vulnerability.
+**Expected result:**
+If the race condition exists, running validation multiple times will produce non-deterministic results - sometimes returning `true`, sometimes `false` for the same state. The code structure definitively proves both channels can have values simultaneously, enabling non-deterministic selection per Go's specification.
 
 ## Notes
 
-The capability system's entire purpose is to provide isolation between modules through object-capability security. The fact that any module can bypass this isolation by forging capability structs represents a fundamental failure in the security design. While modules are typically added through governance, the security model should not assume all modules are perfectly trustworthy - defense in depth requires that even if a malicious or buggy module exists, it cannot compromise capabilities owned by other modules. This vulnerability enables exactly that compromise.
+This vulnerability qualifies as "Unintended permanent chain split requiring hard fork" (High severity impact). The race condition is inherent in the code structure where estimate handling sends to `abortChannel` without stopping goroutine execution, allowing both channels to receive values simultaneously and triggering Go's random selection in the `select` statement.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
 	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
+
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
+		return false
+	case valid := <-validChannel:
+		return valid
 	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
-		return err
-	}
-
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L361-388)
+**File:** store/multiversion/store.go (L329-329)
 ```go
-func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
-	if strings.TrimSpace(name) == "" {
-		return nil, false
+		iteratorValid := s.validateIterator(index, *iterationTracker)
+```
+
+**File:** store/multiversion/store.go (L392-392)
+```go
+	iteratorValid := s.checkIteratorAtIndex(index)
+```
+
+**File:** store/multiversion/memiterator.go (L99-126)
+```go
+func (vi *validationIterator) Value() []byte {
+	key := vi.Iterator.Key()
+
+	// try fetch from writeset - return if exists
+	if val, ok := vi.writeset[string(key)]; ok {
+		return val
 	}
-	memStore := ctx.KVStore(sk.memKey)
-
-	key := types.RevCapabilityKey(sk.module, name)
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-
-	if len(indexBytes) == 0 {
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-
-		return nil, false
-	}
-
-	cap := sk.capMap[index]
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
+	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
+	if val, ok := vi.readCache[string(key)]; ok {
+		return val
 	}
 
-	return cap, true
+	// get the value from the multiversion store
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	}
+
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L453-467)
+**File:** store/multiversion/mergeiterator.go (L218-263)
 ```go
-func (sk ScopedKeeper) addOwner(ctx sdk.Context, cap *types.Capability, name string) error {
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
+func (iter *mvsMergeIterator) skipUntilExistsOrInvalid() bool {
+	for {
+		// If parent is invalid, fast-forward cache.
+		if !iter.parent.Valid() {
+			iter.skipCacheDeletes(nil)
+			return iter.cache.Valid()
+		}
+		// Parent is valid.
+		if !iter.cache.Valid() {
+			return true
+		}
+		// Parent is valid, cache is valid.
 
-	capOwners := sk.getOwners(ctx, cap)
+		// Compare parent and cache.
+		keyP := iter.parent.Key()
+		keyC := iter.cache.Key()
 
-	if err := capOwners.Set(types.NewOwner(sk.module, name)); err != nil {
-		return err
+		switch iter.compare(keyP, keyC) {
+		case -1: // parent < cache.
+			return true
+
+		case 0: // parent == cache.
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.parent.Next()
+				iter.cache.Next()
+
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		case 1: // cache < parent
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.skipCacheDeletes(keyP)
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		}
 	}
-
-	// update capability owner set
-	prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
-
-	return nil
 }
 ```
 
-**File:** docs/architecture/adr-003-dynamic-capability-store.md (L10-20)
-```markdown
-Full implementation of the [IBC specification](https://github.com/cosmos/ibs) requires the ability to create and authenticate object-capability keys at runtime (i.e., during transaction execution),
-as described in [ICS 5](https://github.com/cosmos/ibc/tree/master/spec/core/ics-005-port-allocation#technical-specification). In the IBC specification, capability keys are created for each newly initialised
-port & channel, and are used to authenticate future usage of the port or channel. Since channels and potentially ports can be initialised during transaction execution, the state machine must be able to create
-object-capability keys at this time.
-
-At present, the Cosmos SDK does not have the ability to do this. Object-capability keys are currently pointers (memory addresses) of `StoreKey` structs created at application initialisation in `app.go` ([example](https://github.com/cosmos/gaia/blob/dcbddd9f04b3086c0ad07ee65de16e7adedc7da4/app/app.go#L132))
-and passed to Keepers as fixed arguments ([example](https://github.com/cosmos/gaia/blob/dcbddd9f04b3086c0ad07ee65de16e7adedc7da4/app/app.go#L160)). Keepers cannot create or store capability keys during transaction execution — although they could call `NewKVStoreKey` and take the memory address
-of the returned struct, storing this in the Merklised store would result in a consensus fault, since the memory address will be different on each machine (this is intentional — were this not the case, the keys would be predictable and couldn't serve as object capabilities).
-
-Keepers need a way to keep a private map of store keys which can be altered during transaction execution, along with a suitable mechanism for regenerating the unique memory addresses (capability keys) in this map whenever the application is started or restarted, along with a mechanism to revert capability creation on tx failure.
-This ADR proposes such an interface & mechanism.
-```
-
-**File:** x/capability/types/types.go (L14-16)
+**File:** baseapp/abci.go (L266-267)
 ```go
-func NewCapability(index uint64) *Capability {
-	return &Capability{Index: index}
-}
+	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
+	txRes, err := scheduler.ProcessAll(ctx, req.TxEntries)
 ```
 
-**File:** docs/ibc/custom.md (L75-93)
-```markdown
-    counterpartyVersion string,
-) error {
-    // Module may have already claimed capability in OnChanOpenInit in the case of crossing hellos
-    // (ie chainA and chainB both call ChanOpenInit before one of them calls ChanOpenTry)
-    // If the module can already authenticate the capability then the module already owns it so we don't need to claim
-    // Otherwise, module does not have channel capability and we must claim it from IBC
-    if !k.AuthenticateCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)) {
-        // Only claim channel capability passed back by IBC module if we do not already own it
-        if err := k.scopedKeeper.ClaimCapability(ctx, chanCap, host.ChannelCapabilityPath(portID, channelID)); err != nil {
-            return err
-        }
-    }
-
-    // ... do custom initialization logic
-
-    // Use above arguments to determine if we want to abort handshake
-    err := checkArguments(args)
-    return err
-}
-```
-
-**File:** x/capability/keeper/keeper_test.go (L125-127)
+**File:** tasks/scheduler.go (L365-365)
 ```go
-	forgedCap := types.NewCapability(cap1.Index) // index should be the same index as the first capability
-	suite.Require().False(sk1.AuthenticateCapability(suite.ctx, forgedCap, "transfer"))
-	suite.Require().False(sk2.AuthenticateCapability(suite.ctx, forgedCap, "transfer"))
+		if valid, conflicts := s.findConflicts(task); !valid {
+```
+
+**File:** store/multiversion/store_test.go (L375-407)
+```go
+func TestMVSIteratorValidationWithEstimate(t *testing.T) {
+	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
+	mvs := multiversion.NewMultiVersionStore(parentKVStore)
+	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
+
+	parentKVStore.Set([]byte("key2"), []byte("value0"))
+	parentKVStore.Set([]byte("key3"), []byte("value3"))
+	parentKVStore.Set([]byte("key4"), []byte("value4"))
+	parentKVStore.Set([]byte("key5"), []byte("value5"))
+
+	writeset := make(multiversion.WriteSet)
+	writeset["key1"] = []byte("value1")
+	writeset["key2"] = []byte("value2")
+	writeset["key3"] = nil
+	mvs.SetWriteset(1, 2, writeset)
+
+	iter := vis.Iterator([]byte("key1"), []byte("key6"))
+	for ; iter.Valid(); iter.Next() {
+		// read value
+		iter.Value()
+	}
+	iter.Close()
+	vis.WriteToMultiVersionStore()
+
+	writeset2 := make(multiversion.WriteSet)
+	writeset2["key2"] = []byte("value2")
+	mvs.SetEstimatedWriteset(2, 2, writeset2)
+
+	// should be invalid
+	valid, conflicts := mvs.ValidateTransactionState(5)
+	require.False(t, valid)
+	require.Equal(t, []int{2}, conflicts)
+}
 ```

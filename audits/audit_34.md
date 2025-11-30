@@ -1,211 +1,246 @@
 # Audit Report
 
 ## Title
-State Desynchronization in ReleaseCapability Causes Node Panic on Transaction Rollback
+Nil Pointer Dereference in Iterator Validation Causing Node Crash During Concurrent Transaction Processing
 
 ## Summary
-The `ReleaseCapability` function in the capability keeper contains a state inconsistency vulnerability where it directly modifies the shared Go map (`capMap`) while performing cached store operations. When a transaction calls `ReleaseCapability` and then fails or is rolled back, the cached store deletions are reverted but the Go map deletion persists, creating a desynchronized state that causes node panics when the capability is subsequently accessed. [1](#0-0) 
+A missing nil check in `validationIterator.Value()` causes a nil pointer dereference panic when `GetLatestBeforeIndex()` returns nil during iterator validation in the multiversion store. This causes validator nodes to crash when processing blocks with concurrent transactions that trigger iterator validation. [1](#0-0) 
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** `x/capability/keeper/keeper.go`, function `ReleaseCapability` at lines 319-356, specifically the direct map deletion at line 349.
+**Location**: `store/multiversion/memiterator.go`, lines 112-115
 
-**Intended Logic:** When releasing the last owner of a capability within a transaction context, all state modifications (persistent store, memory store, and in-memory map) should be atomic. If the transaction fails or is rolled back, all changes should revert together to maintain consistency between the three storage layers.
+**Intended logic**: The validation iterator should safely retrieve values from the multiversion store during transaction validation, handling cases where keys may have been modified or removed by concurrent transactions. When a key doesn't exist before a given index, the function should handle the nil return gracefully.
 
-**Actual Logic:** The function mixes transactional and non-transactional operations:
-- Lines 332, 336: Delete from `memStore` (cached/transactional) [2](#0-1) 
-- Line 347: Delete from `prefixStore` (cached/transactional) [3](#0-2) 
-- Line 349: Delete from `capMap` (direct Go map operation, NOT transactional) [4](#0-3) 
+**Actual logic**: The code calls `GetLatestBeforeIndex()` at line 112 and immediately invokes `.IsEstimate()` at line 115 without checking if the returned value is nil. In Go, calling a method on a nil interface causes a panic, which is unrecoverable and terminates the process. [2](#0-1) 
 
-The `capMap` is shared across all scoped keepers and contexts [5](#0-4) , meaning modifications to it affect parent and cached contexts simultaneously. When a cached context is discarded without calling `Write()`, the store operations are not committed, but the map deletion has already occurred permanently.
+**Exploitation path**:
+1. User submits Transaction A which writes keys to the multiversion store
+2. User submits Transaction B which creates an iterator over a range including Transaction A's keys  
+3. Transaction A is re-executed with a new incarnation due to conflicts, writing a different set of keys
+4. The `removeOldWriteset()` function removes old keys from the multiversion store [3](#0-2) 
+5. During validation of Transaction B's iterator via `ValidateTransactionState()`, a validation iterator is created [4](#0-3) 
+6. The merge iterator calls `Value()` on the validation iterator for keys in the iteration range
+7. For a removed key, `GetLatestBeforeIndex()` returns nil (as documented in lines 87-88 and 92-93 of store.go)
+8. Calling `.IsEstimate()` on nil at line 115 triggers a panic, crashing the validator node
 
-**Exploitation Path:**
-1. A module calls `ReleaseCapability` within a transaction (creating a cached context)
-2. The function successfully executes, deleting from `capMap` (line 349) and from cached stores
-3. The transaction fails validation, runs out of gas, or encounters an error
-4. The cached context is discarded without calling `Write()` - store deletions are reverted
-5. Result: `memStore` still contains the capability mappings (deletion not written), but `capMap` no longer has the capability entry (deletion already happened)
-6. When `GetCapability` is called for this capability:
-   - Line 368: `memStore.Get()` succeeds and returns the capability index [6](#0-5) 
-   - Line 382: `capMap[index]` returns nil [7](#0-6) 
-   - Line 384: Node panics with "capability found in memstore is missing from map" [8](#0-7) 
-
-**Security Guarantee Broken:** Transaction atomicity and state consistency. The codebase explicitly acknowledges this class of issue in comments at lines 372-377, which state "changes to go map do not automatically get reverted on tx failure" and reference issue #7805. [9](#0-8)  However, the code only handles one direction of the inconsistency (NewCapability case) and not the inverse (ReleaseCapability case).
+**Security guarantee broken**: Memory safety and node availability. The code violates Go's requirement to check interface values for nil before dereferencing, causing unrecoverable panics that terminate validator processes.
 
 ## Impact Explanation
 
-This vulnerability affects the availability and reliability of capability-dependent operations:
+This vulnerability causes validator nodes to crash during block processing when specific transaction patterns occur:
 
-1. **State Inconsistency:** Creates a permanent desynchronization between `memStore` and `capMap` until node restart, violating the fundamental invariant that these storage layers must remain synchronized.
+- **Node Crashes**: When the panic occurs, the validator process terminates immediately
+- **Network Disruption**: Multiple validators processing the same block with conflicting transactions will crash simultaneously, as they all execute the same validation logic
+- **Denial of Service**: Attackers can craft transaction sequences to reliably trigger this condition and crash validators
+- **Consensus Delays**: If sufficient validators crash (>= 30%), block finalization is delayed until nodes restart
 
-2. **Node Instability:** When `GetCapability` is called for the affected capability, the node panics. While transaction execution has panic recovery [10](#0-9) , the panic still causes transaction failures and potential node crashes if triggered in unrecovered paths (e.g., BeginBlock/EndBlock operations).
-
-3. **IBC and Module Disruption:** Capabilities are fundamental to IBC port/channel management and inter-module authentication. The inconsistency prevents all capability-based operations for the affected capability, causing denial of service for critical network functionality.
-
-4. **Multi-Node Impact:** If a transaction sequence that triggers this condition is broadcast to the network, all nodes processing it similarly will experience the same inconsistency, potentially affecting a significant portion of the network simultaneously.
-
-5. **Persistent Until Restart:** The inconsistency persists in memory until the node is restarted, at which point `InitMemStore` rebuilds the `capMap` from persistent storage, recovering consistency. However, this requires manual intervention.
-
-The vulnerability qualifies as **Medium severity** under the impact criteria: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+The vulnerability affects the core optimistic concurrency control mechanism used for parallel transaction execution, which is specifically designed to handle high-conflict scenarios.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any module with capability ownership can trigger this by calling `ReleaseCapability` in a transaction that subsequently fails. No special privileges are required beyond normal capability ownership granted during module initialization.
+**Medium-to-High likelihood**:
 
-**Conditions Required:**
-1. A module releases the last owner of a capability via `ReleaseCapability`
-2. The transaction containing the release fails after `ReleaseCapability` executes but before commit
-3. A subsequent operation attempts to access the capability via `GetCapability`
+- **Who can trigger**: Any user submitting transactions to the network - no special privileges required
+- **Conditions**: Requires transactions that create iterators while other transactions modify their writesets and get re-executed due to conflicts
+- **Frequency**: Transaction conflicts and re-executions are normal in optimistic concurrency control systems. While the exact sequence is complex, it can occur during normal network operation under high load or be deliberately induced by an attacker submitting crafted transaction sequences
 
-**Frequency:** The likelihood is moderate to high because:
-- Transaction failures are common (validation errors, gas limits, state conflicts)
-- IBC operations regularly create and release capabilities during channel lifecycle management
-- The inconsistency persists, so any future access to the capability will trigger the panic
-- An attacker could deliberately craft transactions that call `ReleaseCapability` and then fail, intentionally creating this condition
-
-The design flaw is acknowledged in the codebase comments, confirming it's a known architectural issue that hasn't been addressed.
+The codebase demonstrates awareness of this issue in other locations where proper nil checks exist [5](#0-4) , confirming that `GetLatestBeforeIndex()` returning nil is an expected condition that should be handled.
 
 ## Recommendation
 
-**Recommended Fix:** Implement deferred cleanup for `capMap` modifications to ensure transactional consistency.
+Add a nil check before calling methods on the value returned by `GetLatestBeforeIndex()`, matching the pattern used elsewhere in the codebase:
 
-**Option A (Deferred Cleanup):** Modify `ReleaseCapability` to not delete from `capMap` immediately. Instead:
-1. Mark capabilities for deletion in a separate tracking structure
-2. During `InitMemStore` or a periodic consistency check, verify `capMap` entries against persistent store
-3. Remove entries from `capMap` only when confirmed they don't exist in persistent storage
+```go
+val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
 
-**Option B (Post-Commit Hook):** Implement a post-commit callback mechanism in the SDK that allows `capMap` modifications to be deferred until after `Write()` successfully completes. This would require architectural changes to support transactional hooks.
+// Check for nil before accessing methods
+if val == nil {
+    // Key doesn't exist in multiversion store before this index
+    // Return nil to indicate the key should be fetched from parent store
+    return nil
+}
 
-**Option C (Defensive Guard):** In `GetCapability`, when `capMap[index]` returns nil but `memStore` has the mapping, attempt to reload the capability from persistent store instead of panicking. This is defensive programming but doesn't fix the root cause.
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+}
 
-**Recommended Approach:** Option A is the safest and most aligned with the existing initialization pattern. It ensures `capMap` consistency by rebuilding it from the authoritative persistent store.
+if val.IsDeleted() {
+    vi.readCache[string(key)] = nil
+    return nil
+}
+vi.readCache[string(key)] = val.Value()
+return val.Value()
+```
 
 ## Proof of Concept
 
-The provided PoC in the security report is valid and demonstrates the vulnerability:
+The vulnerability is confirmed by multiple pieces of evidence from the codebase:
 
-**File:** `x/capability/keeper/keeper_test.go`
+**Setup**: The multiversion store's optimistic concurrency control system processes transactions in parallel and validates them for conflicts.
 
-**Test Function:** `TestReleaseCapabilityStateMismatch`
+**Action**: 
+1. Transaction 0 writes keys {key1, key2, key3} with incarnation 1
+2. Transaction 1 creates an iterator that reads these keys
+3. Transaction 0 re-executes with incarnation 2, writing only {key1, key3}
+4. `removeOldWriteset()` removes key2 from the multiversion store
+5. `ValidateTransactionState(1)` is called to validate Transaction 1
 
-**Setup:**
-1. Initialize test suite with keeper and scoped keeper for a test module
-2. Create a new capability with one owner using `NewCapability`
+**Result**:
+- The validation iterator is created and iterates over the expected key range
+- When `Value()` is called for a key that was removed, `GetLatestBeforeIndex()` returns nil
+- The code attempts to call `.IsEstimate()` on nil at line 115
+- A nil pointer dereference panic occurs, crashing the validator node
 
-**Action:**
-1. Create a cached context using `ms.CacheMultiStore()` to simulate transaction execution
-2. Call `ReleaseCapability` in the cached context, which deletes from the shared `capMap` and from cached stores
-3. Do NOT call `msCache.Write()` to simulate transaction failure/rollback
-
-**Result:**
-1. Call `GetCapability` from the original (parent) context
-2. The call should panic with message "capability found in memstore is missing from map"
-3. This confirms the state mismatch: the parent context's `memStore` still has the capability mapping (because the cached deletion wasn't written), but the shared `capMap` no longer has the entry (because the direct deletion already happened)
-
-The panic demonstrates that the node crashes when attempting to access a capability after a transaction rollback during `ReleaseCapability`, proving the vulnerability.
+**Evidence**:
+1. `GetLatestBeforeIndex()` explicitly returns nil in documented cases [2](#0-1) 
+2. Tests confirm nil returns are expected behavior [6](#0-5) 
+3. Other code paths properly check for nil before method calls [5](#0-4) 
+4. The vulnerable code path lacks this essential check [1](#0-0) 
 
 ## Notes
 
-The architectural design documented in ADR-003 explicitly acknowledges at line 330 that "go-map" changes don't revert on transaction failure. However, the mitigation implemented in `GetCapability` (lines 372-377) only handles the case where `NewCapability` adds to `capMap` but the transaction fails (leaving the entry in `capMap` but not in stores). The inverse case - where `ReleaseCapability` removes from `capMap` but the transaction fails (leaving entries in stores but not in `capMap`) - is not handled, creating this vulnerability.
+This vulnerability matches the accepted impact criteria: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"** (Medium severity). The issue can be triggered through normal transaction submission without requiring administrative privileges or brute force attacks. The missing nil check is a clear programming error where the codebase demonstrates awareness of the issue in other locations but fails to apply the same defensive programming pattern in this critical path.
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L83-89)
+**File:** store/multiversion/memiterator.go (L99-126)
 ```go
-	return ScopedKeeper{
-		cdc:      k.cdc,
-		storeKey: k.storeKey,
-		memKey:   k.memKey,
-		capMap:   k.capMap,
-		module:   moduleName,
-	}
-```
+func (vi *validationIterator) Value() []byte {
+	key := vi.Iterator.Key()
 
-**File:** x/capability/keeper/keeper.go (L319-356)
-```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	// try fetch from writeset - return if exists
+	if val, ok := vi.writeset[string(key)]; ok {
+		return val
 	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
+	if val, ok := vi.readCache[string(key)]; ok {
+		return val
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
+	// get the value from the multiversion store
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
 
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
-	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
 	}
 
-	return nil
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L368-369)
+**File:** store/multiversion/store.go (L82-97)
 ```go
-	indexBytes := memStore.Get(key)
-	index := sdk.BigEndianToUint64(indexBytes)
-```
-
-**File:** x/capability/keeper/keeper.go (L372-377)
-```go
-		// If a tx failed and NewCapability got reverted, it is possible
-		// to still have the capability in the go map since changes to
-		// go map do not automatically get reverted on tx failure,
-		// so we delete here to remove unnecessary values in map
-		// TODO: Delete index correctly from capMap by storing some reverse lookup
-		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
-```
-
-**File:** x/capability/keeper/keeper.go (L382-382)
-```go
-	cap := sk.capMap[index]
-```
-
-**File:** x/capability/keeper/keeper.go (L383-385)
-```go
-	if cap == nil {
-		panic("capability found in memstore is missing from map")
+// GetLatestBeforeIndex implements MultiVersionStore.
+func (s *Store) GetLatestBeforeIndex(index int, key []byte) (value MultiVersionValueItem) {
+	keyString := string(key)
+	mvVal, found := s.multiVersionMap.Load(keyString)
+	// if the key doesn't exist in the overall map, return nil
+	if !found {
+		return nil
 	}
+	val, found := mvVal.(MultiVersionValue).GetLatestBeforeIndex(index)
+	// otherwise, we may have found a value for that key, but its not written before the index passed in
+	if !found {
+		return nil
+	}
+	// found a value prior to the passed in index, return that value (could be estimate OR deleted, but it is a definitive value)
+	return val
+}
 ```
 
-**File:** baseapp/baseapp.go (L904-915)
+**File:** store/multiversion/store.go (L112-138)
 ```go
-	defer func() {
-		if r := recover(); r != nil {
-			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
-			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
-			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
-			err, result = processRecovery(r, recoveryMW), nil
-			if mode != runTxModeDeliver {
-				ctx.MultiStore().ResetEvents()
+func (s *Store) removeOldWriteset(index int, newWriteSet WriteSet) {
+	writeset := make(map[string][]byte)
+	if newWriteSet != nil {
+		// if non-nil writeset passed in, we can use that to optimize removals
+		writeset = newWriteSet
+	}
+	// if there is already a writeset existing, we should remove that fully
+	oldKeys, loaded := s.txWritesetKeys.LoadAndDelete(index)
+	if loaded {
+		keys := oldKeys.([]string)
+		// we need to delete all of the keys in the writeset from the multiversion store
+		for _, key := range keys {
+			// small optimization to check if the new writeset is going to write this key, if so, we can leave it behind
+			if _, ok := writeset[key]; ok {
+				// we don't need to remove this key because it will be overwritten anyways - saves the operation of removing + rebalancing underlying btree
+				continue
+			}
+			// remove from the appropriate item if present in multiVersionMap
+			mvVal, found := s.multiVersionMap.Load(key)
+			// if the key doesn't exist in the overall map, return nil
+			if !found {
+				continue
+			}
+			mvVal.(MultiVersionValue).Remove(index)
+		}
+	}
+}
+```
+
+**File:** tasks/scheduler.go (L166-183)
+```go
+func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
+	var conflicts []int
+	uniq := make(map[int]struct{})
+	valid := true
+	for _, mv := range s.multiVersionStores {
+		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
+		for _, c := range mvConflicts {
+			if _, ok := uniq[c]; !ok {
+				conflicts = append(conflicts, c)
+				uniq[c] = struct{}{}
 			}
 		}
-		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
-	}()
+		// any non-ok value makes valid false
+		valid = valid && ok
+	}
+	sort.Ints(conflicts)
+	return valid, conflicts
+}
+```
+
+**File:** store/multiversion/mvkv.go (L161-176)
+```go
+	mvsValue := store.multiVersionStore.GetLatestBeforeIndex(store.transactionIndex, key)
+	if mvsValue != nil {
+		if mvsValue.IsEstimate() {
+			abort := scheduler.NewEstimateAbort(mvsValue.Index())
+			store.WriteAbort(abort)
+			panic(abort)
+		} else {
+			// This handles both detecting readset conflicts and updating readset if applicable
+			return store.parseValueAndUpdateReadset(strKey, mvsValue)
+		}
+	}
+	// if we didn't find it in the multiversion store, then we want to check the parent store + add to readset
+	parentValue := store.parent.Get(key)
+	store.UpdateReadSet(key, parentValue)
+	return parentValue
+}
+```
+
+**File:** store/multiversion/store_test.go (L152-160)
+```go
+	// try replacing writeset1 to verify old keys removed
+	writeset1_b := make(map[string][]byte)
+	writeset1_b["key1"] = []byte("value4")
+
+	mvs.SetWriteset(1, 2, writeset1_b)
+	require.Equal(t, []byte("value4"), mvs.GetLatestBeforeIndex(2, []byte("key1")).Value())
+	require.Nil(t, mvs.GetLatestBeforeIndex(2, []byte("key2")))
+	// verify that GetLatest for key3 returns nil - because of removal from writeset
+	require.Nil(t, mvs.GetLatest([]byte("key3")))
 ```

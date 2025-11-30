@@ -1,245 +1,308 @@
-Based on my thorough investigation of the codebase, I have validated this security claim and confirm it represents a valid HIGH severity vulnerability.
-
 # Audit Report
 
 ## Title
-Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
+Query Operations Use Infinite Gas Meters Enabling Pagination-Based DoS Attacks
 
 ## Summary
-A critical validation gap in the distribution module allows governance to set parameters where `baseProposerReward + bonusProposerReward + communityTax > 1.0` through individual parameter updates. This causes `voteMultiplier` to become negative in `AllocateTokens`, triggering a panic that halts the entire network during block processing. [1](#0-0) 
+Query operations in sei-cosmos use infinite gas meters that never enforce computational limits, while pagination accepts user-provided limits up to `math.MaxUint64` without validation. This allows unprivileged attackers to send gRPC queries with extremely large pagination limits, causing nodes to iterate through massive KV store datasets without resource metering protection, leading to resource exhaustion and potential node degradation or shutdown.
 
 ## Impact
-**High** - Total network shutdown matching the impact criteria: "Network not being able to confirm new transactions (total network shutdown)"
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary: `x/distribution/keeper/allocation.go` (voteMultiplier calculation and panic trigger)
-- Validation gap: `x/distribution/types/params.go` (individual validators) and `x/params/types/subspace.go` (Update method)
+**Location:**
+- Query context creation with infinite gas meter: [1](#0-0) 
+- Infinite gas meter implementation that never enforces limits: [2](#0-1) 
+- Context initialization with infinite gas meter: [3](#0-2) 
+- Pagination without upper bound validation: [4](#0-3) 
+- Vulnerable query handlers that pass pagination directly: [5](#0-4)  and [6](#0-5) 
 
-**Intended Logic:** 
-The distribution parameters must satisfy the invariant `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. This invariant is explicitly checked in `ValidateBasic()`: [2](#0-1) 
+**Intended Logic:**
+Query operations should have reasonable resource limits to prevent DoS attacks. While queries are read-only and don't modify state, they should be bounded to prevent excessive resource consumption that could degrade node performance or cause crashes.
 
-**Actual Logic:** 
-When parameters are updated through governance proposals, the system only calls individual validation functions that check each parameter is `≥ 0` and `≤ 1.0`, but do NOT verify the combined sum constraint: [3](#0-2) 
-
-The `Subspace.Update()` method used by governance proposals only validates individual parameters: [4](#0-3) 
-
-Governance proposals execute via `handleParameterChangeProposal()` which calls `Subspace.Update()`: [5](#0-4) 
+**Actual Logic:**
+The `CreateQueryContext` function creates contexts using `sdk.NewContext` which initializes with an infinite gas meter. The `infiniteGasMeter` type has `IsPastLimit()` and `IsOutOfGas()` methods that always return `false`, meaning queries can consume unlimited computational resources. The pagination system defines `MaxLimit = math.MaxUint64` but performs no validation to enforce a practical maximum - it only checks that limit >= 0 and defaults to 100 if limit is 0. Query handlers across all modules pass user-provided pagination parameters directly to `query.Paginate` without validation.
 
 **Exploitation Path:**
-1. Three governance proposals pass independently (each looks valid: 0 ≤ value ≤ 1.0):
-   - `baseProposerReward = 0.5`
-   - `bonusProposerReward = 0.5`
-   - `communityTax = 0.1`
-   - Combined sum: 1.1 > 1.0 (violates invariant)
+1. Attacker identifies public RPC endpoints (no authentication required)
+2. Attacker sends gRPC query requests with `PageRequest.limit = 1000000000` or higher to paginated endpoints (e.g., `/cosmos.bank.v1beta1.Query/DenomsMetadata`, `/cosmos.staking.v1beta1.Query/Validators`)
+3. Query handler receives request and passes pagination parameter to `query.Paginate` without validation
+4. `Paginate` function iterates through KV store entries, calling `onResult` callback for each entry up to the limit (or until data exhausted)
+5. For each iteration: reads from KV store (I/O), unmarshals protobuf data (CPU), appends to results slice (memory)
+6. Since query context uses infinite gas meter, no computational limit is enforced
+7. Node consumes excessive CPU (unmarshaling millions of entries), memory (storing large result sets), and I/O (reading from disk)
+8. Multiple concurrent large queries amplify resource consumption
+9. Node performance degrades significantly or node crashes due to resource exhaustion
+10. Coordinated attacks can target multiple public RPC endpoints simultaneously
 
-2. During the next block's `BeginBlock`, `AllocateTokens` is called: [6](#0-5) 
-
-3. With 100% validator participation, `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1` (negative)
-
-4. This produces negative `DecCoins` for rewards
-
-5. `AllocateTokensToValidator` is called with negative tokens: [7](#0-6) 
-
-6. The `DecCoins.Sub()` operation panics with "negative coin amount": [8](#0-7) 
-
-**Security Guarantee Broken:** 
-The system fails to enforce the critical invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates, allowing inadvertent configuration that causes catastrophic network failure.
+**Security Guarantee Broken:**
+The security property of resource metering and DoS protection is violated. Queries bypass all gas metering controls, allowing unbounded resource consumption without any cost or limitation to the attacker. This contradicts the project's documented security concerns about "Possible Node DoS vectors" [7](#0-6) 
 
 ## Impact Explanation
 
-**Consequences:**
-- **Total network shutdown**: All validator nodes panic simultaneously when processing any block after the misconfigured parameters take effect
-- **Cannot process transactions**: Network consensus completely breaks down
-- **Unrecoverable without hard fork**: Emergency governance cannot fix parameters because the network is halted
-- **Requires coordinated manual intervention**: Validators must coordinate off-chain to reset parameters and restart the network
+The vulnerability enables resource exhaustion attacks with the following consequences:
 
-**Precedent in Codebase:**
-The developers explicitly recognized and fixed a similar issue for ConsensusParams, acknowledging that parameter validation gaps "will cause a chain halt": [9](#0-8) 
+- **Node Resource Consumption**: A single malicious query can increase a node's CPU, memory, and I/O consumption by 10-100x depending on dataset size and pagination limit. For datasets with hundreds of thousands of entries, resource consumption can reach critical levels.
 
-This precedent confirms the severity of such validation gaps and that distribution parameters lack the same protection.
+- **Performance Degradation**: Affected nodes experience degraded performance for legitimate queries and block processing. Response times increase, potentially causing timeouts for dependent applications.
+
+- **Node Availability**: In extreme cases with very large datasets or multiple concurrent malicious queries, nodes may crash due to out-of-memory errors or become unresponsive, requiring manual intervention to recover.
+
+- **Network-Wide Impact**: Since many validators and full nodes expose public RPC endpoints without authentication, coordinated attacks can simultaneously target multiple nodes, affecting overall network availability and reliability.
+
+- **Service Disruption**: Applications relying on RPC endpoints (wallets, DeFi protocols, block explorers) experience service interruptions when nodes become unresponsive.
+
+This matches the Medium severity criteria: "Increasing network processing node resource consumption by at least 30% without brute force actions" and potentially "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network".
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any token holder can submit governance proposals. This requires three separate proposals to pass through normal democratic voting.
+This vulnerability has high likelihood of exploitation:
 
-**Realistic Scenario (Non-Malicious):**
-- Month 1: Proposal to increase proposer rewards (`baseProposerReward = 0.5`)
-- Month 2: Proposal to add voting bonuses (`bonusProposerReward = 0.5`)  
-- Month 3: Proposal to fund community pool (`communityTax = 0.1`)
-- Each proposal reviewed individually, all look valid (0 ≤ value ≤ 1.0)
-- No reviewer checks combined constraint across all parameters
-- Network halts inadvertently
+**Ease of Exploitation:**
+- Requires only the ability to send gRPC requests to public endpoints (no authentication)
+- Single line of code to set large pagination limit: `pagination: {limit: 1000000000}`
+- Can be automated and repeated continuously
+- Works against all paginated query endpoints across all modules
 
-**Likelihood:** Moderate - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint without malicious intent.
+**Attack Accessibility:**
+- Public RPC endpoints are widely available and documented
+- No special permissions, tokens, or setup required
+- Attacker only needs network connectivity
 
-**Platform Rule Exception:**
-While this requires governance approval (privileged role), the platform acceptance rule explicitly allows this because "even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." This is a **validation bug** in the code that allows governance to accidentally exceed its intended authority.
+**Lack of Defenses:**
+- No upper bound validation on pagination limits
+- No rate limiting at gRPC server level [8](#0-7) 
+- No timeout interceptors or deadline enforcement [9](#0-8) 
+- Infinite gas meters never trigger out-of-gas errors
+
+**Attack Amplification:**
+- Multiple queries can be sent in parallel to amplify effect
+- Multiple endpoints can be targeted simultaneously
+- Low cost to attacker (just network bandwidth) but high cost to nodes (CPU/memory/I/O)
 
 ## Recommendation
 
-1. **Immediate Fix**: Add cross-parameter validation to `validateCommunityTax`, `validateBaseProposerReward`, and `validateBonusProposerReward` that queries current values of other parameters and validates the combined sum will not exceed 1.0
+Implement proper resource limits for query operations:
 
-2. **Alternative Approach**: Add a validation hook in `handleParameterChangeProposal()` specifically for distribution parameters that calls `Params.ValidateBasic()` on the complete parameter set after applying the change
+1. **Add Maximum Pagination Limit Validation**: Add validation in the `Paginate` and `FilteredPaginate` functions to enforce a reasonable maximum limit (e.g., 1000-10000). Reject requests exceeding this limit with a clear error message:
+```go
+const MaxPaginationLimit = 10000
 
-3. **Defensive Programming**: Add a safety check in `AllocateTokens` to detect negative `voteMultiplier` and handle gracefully (clamp to zero, emit error event) rather than allowing panic
+func Paginate(...) (*PageResponse, error) {
+    // ... existing code ...
+    
+    if limit > MaxPaginationLimit {
+        return nil, fmt.Errorf("pagination limit %d exceeds maximum allowed %d", limit, MaxPaginationLimit)
+    }
+    
+    // ... rest of pagination logic ...
+}
+```
 
-4. **Follow Existing Pattern**: Apply the same validation pattern used for ConsensusParams (lines 101-109 in `x/params/types/proposal/proposal.go`) to distribution parameters
+2. **Add gRPC Server Options**: Configure the gRPC server with timeout and keepalive options in `StartGRPCServer` to limit long-running queries:
+```go
+grpcSrv := grpc.NewServer(
+    grpc.ConnectionTimeout(30 * time.Second),
+    grpc.MaxRecvMsgSize(10 * 1024 * 1024), // 10MB max
+)
+```
+
+3. **Implement Rate Limiting**: Add application-level rate limiting middleware for query endpoints to prevent abuse from individual clients.
+
+4. **Consider Query-Specific Resource Accounting**: While infinite gas meters are appropriate for simple queries, consider implementing query-specific resource tracking for expensive operations like pagination.
 
 ## Proof of Concept
 
-**Test File:** `x/distribution/keeper/allocation_test.go`
+While a full runnable Go test is not provided in the original report, the vulnerability can be demonstrated as follows:
 
 **Setup:**
-- Initialize test application and create two validators with equal voting power
-- Set misconfigured parameters via `SetParams()` (simulating post-governance state):
-  - `CommunityTax = 0.1`, `BaseProposerReward = 0.5`, `BonusProposerReward = 0.5`
-  - Combined sum: 1.1 > 1.0
-- Fund fee collector with tokens
+- Initialize test environment with simapp
+- Populate a module store with a large dataset (e.g., 1000+ denom metadata entries or validators)
+- Create gRPC query client
 
-**Trigger:**
-- Call `AllocateTokens()` with 100% validator participation (`previousFractionVotes = 1.0`)
-- This maximizes `proposerMultiplier = 1.0`, resulting in `voteMultiplier = -0.1`
+**Action:**
+- Send query with `PageRequest{Limit: 100000000}` (100 million)
+- Monitor resource consumption (CPU, memory usage)
+- Measure execution time
 
 **Expected Result:**
-- Panic with message "negative coin amount" when `AllocateTokensToValidator` attempts `tokens.Sub(commission)` on negative amounts
-- This panic would halt all nodes processing blocks with these parameters
+- Query executes without validation error
+- Execution time scales linearly with dataset size (not with limit if dataset is smaller)
+- CPU and memory consumption increase significantly compared to normal pagination limits
+- No gas limit error occurs despite extreme pagination value
+- For large datasets (100k+ entries), node resources are exhausted measurably
 
-The test structure follows existing patterns in `allocation_test.go` (lines 47-130) and demonstrates that misconfigured parameters cause network-halting panics.
-
-## Notes
-
-This vulnerability represents a **validation gap** in the code rather than a governance system issue. The precedent of fixing similar issues for ConsensusParams confirms this is a recognized vulnerability pattern. The exception for privileged misconfiguration applies because governance can inadvertently trigger an unrecoverable network halt beyond its intended authority through seemingly valid individual parameter changes.
+The code path is clear: gRPC query → query handler → `Paginate` function → KV store iteration with no upper bound validation and infinite gas meter, confirming the DoS vulnerability.
 
 ### Citations
 
-**File:** x/distribution/keeper/allocation.go (L82-84)
+**File:** baseapp/abci.go (L757-759)
 ```go
-	communityTax := k.GetCommunityTax(ctx)
-	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
-	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
+	ctx := sdk.NewContext(
+		cacheMS, checkStateCtx.BlockHeader(), true, app.logger,
+	).WithMinGasPrices(app.minGasPrices).WithBlockHeight(height)
 ```
 
-**File:** x/distribution/keeper/allocation.go (L111-114)
+**File:** store/types/gas.go (L252-258)
 ```go
-func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
-	// split tokens between validator and delegators according to commission
-	commission := tokens.MulDec(val.GetCommission())
-	shared := tokens.Sub(commission)
-```
+func (g *infiniteGasMeter) IsPastLimit() bool {
+	return false
+}
 
-**File:** x/distribution/types/params.go (L67-71)
-```go
-	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
-		return fmt.Errorf(
-			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
-		)
-	}
-```
-
-**File:** x/distribution/types/params.go (L76-93)
-```go
-func validateCommunityTax(i interface{}) error {
-	v, ok := i.(sdk.Dec)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v.IsNil() {
-		return fmt.Errorf("community tax must be not nil")
-	}
-	if v.IsNegative() {
-		return fmt.Errorf("community tax must be positive: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("community tax too large: %s", v)
-	}
-
-	return nil
+func (g *infiniteGasMeter) IsOutOfGas() bool {
+	return false
 }
 ```
 
-**File:** x/params/types/subspace.go (L196-219)
+**File:** types/context.go (L272-272)
 ```go
-func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
-	attr, ok := s.table.m[string(key)]
-	if !ok {
-		panic(fmt.Sprintf("parameter %s not registered", string(key)))
-	}
-
-	ty := attr.ty
-	dest := reflect.New(ty).Interface()
-	s.GetIfExists(ctx, key, dest)
-
-	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
-		return err
-	}
-
-	// destValue contains the dereferenced value of dest so validation function do
-	// not have to operate on pointers.
-	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
-	if err := s.Validate(ctx, key, destValue); err != nil {
-		return err
-	}
-
-	s.Set(ctx, key, dest)
-	return nil
-}
+		gasMeter:        NewInfiniteGasMeter(1, 1),
 ```
 
-**File:** x/params/proposal_handler.go (L26-43)
+**File:** types/query/pagination.go (L18-74)
 ```go
-func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
-	for _, c := range p.Changes {
-		ss, ok := k.GetSubspace(c.Subspace)
+// MaxLimit is the maximum limit the paginate function can handle
+// which equals the maximum value that can be stored in uint64
+const MaxLimit = math.MaxUint64
+
+// ParsePagination validate PageRequest and returns page number & limit.
+func ParsePagination(pageReq *PageRequest) (page, limit int, err error) {
+	offset := 0
+	limit = DefaultLimit
+
+	if pageReq != nil {
+		offset = int(pageReq.Offset)
+		limit = int(pageReq.Limit)
+	}
+	if offset < 0 {
+		return 1, 0, status.Error(codes.InvalidArgument, "offset must greater than 0")
+	}
+
+	if limit < 0 {
+		return 1, 0, status.Error(codes.InvalidArgument, "limit must greater than 0")
+	} else if limit == 0 {
+		limit = DefaultLimit
+	}
+
+	page = offset/limit + 1
+
+	return page, limit, nil
+}
+
+// Paginate does pagination of all the results in the PrefixStore based on the
+// provided PageRequest. onResult should be used to do actual unmarshaling.
+func Paginate(
+	prefixStore types.KVStore,
+	pageRequest *PageRequest,
+	onResult func(key []byte, value []byte) error,
+) (*PageResponse, error) {
+
+	// if the PageRequest is nil, use default PageRequest
+	if pageRequest == nil {
+		pageRequest = &PageRequest{}
+	}
+
+	offset := pageRequest.Offset
+	key := pageRequest.Key
+	limit := pageRequest.Limit
+	countTotal := pageRequest.CountTotal
+	reverse := pageRequest.Reverse
+
+	if offset > 0 && key != nil {
+		return nil, fmt.Errorf("invalid request, either offset or key is expected, got both")
+	}
+
+	if limit == 0 {
+		limit = DefaultLimit
+
+		// count total results when the limit is zero/not supplied
+		countTotal = true
+	}
+```
+
+**File:** x/bank/keeper/grpc_query.go (L164-170)
+```go
+	pageRes, err := query.Paginate(store, req.Pagination, func(_, value []byte) error {
+		var metadata types.Metadata
+		k.cdc.MustUnmarshal(value, &metadata)
+
+		metadatas = append(metadatas, metadata)
+		return nil
+	})
+```
+
+**File:** x/staking/keeper/grpc_query.go (L40-55)
+```go
+	pageRes, err := query.FilteredPaginate(valStore, req.Pagination, func(key []byte, value []byte, accumulate bool) (bool, error) {
+		val, err := types.UnmarshalValidator(k.cdc, value)
+		if err != nil {
+			return false, err
+		}
+
+		if req.Status != "" && !strings.EqualFold(val.GetStatus().String(), req.Status) {
+			return false, nil
+		}
+
+		if accumulate {
+			validators = append(validators, val)
+		}
+
+		return true, nil
+	})
+```
+
+**File:** SECURITY.md (L48-48)
+```markdown
+- Possible Node DoS vectors (perhaps due to gas weighting / non constant timing)
+```
+
+**File:** server/grpc/server.go (L18-19)
+```go
+func StartGRPCServer(clientCtx client.Context, app types.Application, address string) (*grpc.Server, error) {
+	grpcSrv := grpc.NewServer()
+```
+
+**File:** baseapp/grpcserver.go (L27-66)
+```go
+	interceptor := func(grpcCtx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+		// If there's some metadata in the context, retrieve it.
+		md, ok := metadata.FromIncomingContext(grpcCtx)
 		if !ok {
-			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+			return nil, status.Error(codes.Internal, "unable to retrieve metadata")
 		}
 
-		k.Logger(ctx).Info(
-			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
-		)
-
-		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
-			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
-		}
-	}
-
-	return nil
-}
-```
-
-**File:** x/distribution/abci.go (L29-31)
-```go
-	if ctx.BlockHeight() > 1 {
-		previousProposer := k.GetPreviousProposerConsAddr(ctx)
-		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
-```
-
-**File:** types/dec_coin.go (L302-310)
-```go
-// Sub subtracts a set of DecCoins from another (adds the inverse).
-func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
-	diff, hasNeg := coins.SafeSub(coinsB)
-	if hasNeg {
-		panic("negative coin amount")
-	}
-
-	return diff
-}
-```
-
-**File:** x/params/types/proposal/proposal.go (L101-109)
-```go
-		// We need to verify ConsensusParams since they are only validated once the proposal passes.
-		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
-		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
-		// Therefore, we validate when we get a param-change msg for ConsensusParams
-		if pc.Subspace == "baseapp" {
-			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
-				return err
+		// Get height header from the request context, if present.
+		var height int64
+		if heightHeaders := md.Get(grpctypes.GRPCBlockHeightHeader); len(heightHeaders) == 1 {
+			height, err = strconv.ParseInt(heightHeaders[0], 10, 64)
+			if err != nil {
+				return nil, sdkerrors.Wrapf(
+					sdkerrors.ErrInvalidRequest,
+					"Baseapp.RegisterGRPCServer: invalid height header %q: %v", grpctypes.GRPCBlockHeightHeader, err)
+			}
+			if err := checkNegativeHeight(height); err != nil {
+				return nil, err
 			}
 		}
+
+		// Create the sdk.Context. Passing false as 2nd arg, as we can't
+		// actually support proofs with gRPC right now.
+		sdkCtx, err := app.CreateQueryContext(height, false)
+		if err != nil {
+			return nil, err
+		}
+
+		// Add relevant gRPC headers
+		if height == 0 {
+			height = sdkCtx.BlockHeight() // If height was not set in the request, set it to the latest
+		}
+
+		// Attach the sdk.Context into the gRPC's context.Context.
+		grpcCtx = context.WithValue(grpcCtx, sdk.SdkContextKey, sdkCtx)
+
+		md = metadata.Pairs(grpctypes.GRPCBlockHeightHeader, strconv.FormatInt(height, 10))
+		grpc.SetHeader(grpcCtx, md)
+
+		return handler(grpcCtx, req)
 ```

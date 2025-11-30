@@ -1,166 +1,291 @@
-# Audit Report
+# NoVulnerability found for this question.
 
-## Title
-EVM Transaction State Persistence Despite Revert Error
+## Analysis
 
-## Summary
-The baseapp transaction processing code commits state changes for EVM transactions that revert, violating EVM atomicity guarantees. When `runTx` checks whether to commit state via `msCache.Write()`, it only verifies `err == nil` without checking `result.EvmError`, while hook execution correctly checks both conditions. This inconsistency allows reverted EVM transactions to persist state modifications while being marked as failed.
+After thorough investigation of the codebase, I confirm the report's conclusion is **correct**. While there is indeed a technical gap in memo size validation during gentx collection, this does NOT constitute a valid security vulnerability under the strict validation criteria.
 
-## Impact
-Medium
+## Key Findings
 
-## Finding Description
+### 1. Technical Gap Confirmed
 
-**Location:** 
-- Primary issue: `baseapp/baseapp.go`, lines 1015-1017 in `runTx` function
-- Secondary issue: `baseapp/baseapp.go`, line 1149 in `runMsgs` function  
-- Related handling: `baseapp/abci.go`, lines 329-333 in `DeliverTx` function [1](#0-0) 
+The validation gap exists as described:
+- `CollectTxs` only checks for empty memo [1](#0-0) 
+- Normal transactions have memo size validation against `MaxMemoCharacters` (default 256) [2](#0-1) 
+- The ante handler chain includes `ValidateMemoDecorator` for regular transactions [3](#0-2) 
 
-**Intended Logic:**
-According to EVM semantics and the code comment at lines 280-281 of `baseapp/abci.go`, state should only persist if all messages execute successfully. For EVM transactions that revert, all state changes should be rolled back atomically, with only gas consumption persisting. [2](#0-1) 
+### 2. Critical Failure: Requires Malicious Privileged Actor
 
-**Actual Logic:**
-The codebase exhibits an inconsistency in how it handles EVM errors:
+The scenario **explicitly requires**:
+- A genesis validator (trusted, privileged role selected for genesis ceremony)
+- **Intentional malicious modification** of gentx JSON files after generation
+- Manual file editing to insert large memo (cannot happen inadvertently)
 
-1. In `runMsgs`, message handlers can return `err = nil` with `msgResult.EvmError` populated when EVM execution reverts
-2. At line 1149, `msgMsCache.Write()` commits message state changes without checking `EvmError`
-3. `runMsgs` returns with `result.EvmError` set and `err = nil`
-4. In `runTx` at line 1015-1016, the condition checks only `err == nil` before calling `msCache.Write()`, committing all cached state to delivery state
-5. At line 1027, hooks correctly check BOTH `err == nil` AND `result.EvmError == ""` before execution
-6. In `DeliverTx` at lines 329-333, transactions with `result.EvmError != ""` are marked as failed [3](#0-2) [4](#0-3) [5](#0-4) 
+The `gentx` command automatically generates memos in standard format (node ID + IP address) [4](#0-3) , which are well under 256 characters. Creating a large memo requires deliberate post-generation file manipulation.
 
-**Exploitation Path:**
-1. User submits an EVM transaction that performs state modifications (storage writes, balance changes)
-2. The EVM message handler executes, applying state changes to the message cache
-3. The transaction reverts (via REVERT opcode or error condition)
-4. Handler returns `err = nil` with `result.EvmError` populated
-5. `msgMsCache.Write()` commits state to parent cache (line 1149)
-6. `msCache.Write()` commits all changes to delivery state (line 1016)
-7. Transaction is marked as failed in ABCI response (lines 329-333)
-8. State modifications persist despite transaction failure
+### 3. Platform Rules Violation
 
-**Security Guarantee Broken:**
-EVM atomicity invariant - reverted transactions should have ALL state changes rolled back. The codebase breaks this by committing state for transactions marked as failed, creating a mismatch between transaction status and actual state modifications.
+Per the strict validation criteria:
+- **"No credit for scenarios that require malicious privileged actors"** (Code4rena rule)
+- **"Assume privileged roles are trusted"** - Genesis validators are explicitly trusted roles
+- Exception clause requires **inadvertent** triggering causing **unrecoverable** failure - this scenario is neither
 
-## Impact Explanation
+### 4. No Concrete Proof of Concept
 
-This vulnerability results in unintended smart contract behavior where EVM transactions marked as failed can still modify blockchain state. The impact includes:
+- No Go test demonstrating actual crashes, memory exhaustion, or DoS
+- Speculative impact without demonstration
+- Test file shown only validates directory handling [5](#0-4) 
 
-- **Smart contract security assumptions violated**: Contracts using revert for access control or state protection would have their state modified even when access is denied
-- **State inconsistency**: The blockchain state differs from what clients expect based on transaction receipts showing "failed" status
-- **Broken atomicity**: Fundamental EVM execution guarantee that "all or nothing" state changes are enforced is violated
+### 5. Does Not Meet Required Impact Criteria
 
-This fits the impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity).
+Evaluating against required impacts:
+- ❌ Not "Direct loss of funds" (no network running yet)
+- ❌ Not "Network shutdown" (network hasn't started)
+- ❌ Not "Node resource consumption" (during one-time initialization only)
+- ❌ Not "Permanent chain split" (genesis can be recreated)
 
-The vulnerability is demonstrated by the explicit inconsistency in the code - hooks check for `EvmError` (line 1027) but state writes do not (lines 1016 and 1149), showing that the pattern of `err = nil` with `EvmError != ""` is expected and supported by the architecture. [6](#0-5) [7](#0-6) 
+Even if large memos caused issues, the genesis ceremony can be **restarted with corrected gentx files** - this is fully recoverable.
 
-## Likelihood Explanation
+### 6. Minimal Validation Checklist Failures
 
-**Trigger Conditions:**
-- Any user can submit EVM transactions (no special privileges required)
-- EVM message handlers return `err = nil` with `result.EvmError` when reverts occur
-- The existence of the hook check at line 1027 that explicitly handles `(!ctx.IsEVM() || result.EvmError == "")` is strong evidence this pattern is expected in the architecture
-
-**Frequency:**
-This would occur on every EVM transaction that reverts, which are common in EVM execution:
-- Failed token transfers
-- Access control violations  
-- Require statement failures
-- Explicit revert calls
-- Out-of-gas conditions handled at EVM level
-
-The inconsistency between hook execution (which checks `EvmError`) and state commits (which don't) indicates this is an oversight rather than intentional design.
-
-## Recommendation
-
-Modify the state write condition in `runTx` to check for EVM errors before committing state, consistent with the hook execution pattern:
-
-```go
-// In baseapp/baseapp.go, replace lines 1015-1017:
-if err == nil && (!ctx.IsEVM() || result.EvmError == "") && mode == runTxModeDeliver {
-    msCache.Write()
-}
-```
-
-Similarly, consider applying the same check in `runMsgs` at line 1149 before `msgMsCache.Write()` to maintain consistency at the message level.
-
-This ensures:
-1. Non-EVM transactions continue normal behavior (write on `err == nil`)
-2. EVM transactions only commit state when both `err == nil` AND `result.EvmError == ""`  
-3. Logic is consistent with hook execution check at line 1027
-4. EVM atomicity guarantees are preserved
-
-## Proof of Concept
-
-**File:** `baseapp/deliver_tx_test.go` (test to be added)
-
-**Setup:**
-1. Create BaseApp with test EVM message handler that writes to store then returns `err = nil` with `result.EvmError = "execution reverted"`
-2. Initialize chain and delivery state
-
-**Action:**
-1. Create transaction with EVM context (`ctx.WithIsEVM(true)`)
-2. Call `DeliverTx` with this transaction
-3. Handler writes value to store, then returns with `EvmError` set
-
-**Result:**
-- Transaction response shows `IsOK() == false` (marked as failed)
-- Response contains `EvmTxInfo.VmError` with revert reason
-- **Bug**: Store contains the value written by handler, despite transaction being marked as failed
-- **Expected**: Store should NOT contain the value, as state should be rolled back for reverted EVM transactions
-
-The inconsistency is demonstrated by comparing line 1027 (hooks check `EvmError`) with line 1016 (state write doesn't check `EvmError`).
+- ✅ Confirm Flow - Flow exists
+- ❌ **Realistic Inputs** - Requires manual malicious JSON editing by trusted party
+- ❌ **Impact Verification** - No concrete proof of adverse effects
+- ❌ **Reproducible PoC** - No PoC provided
+- ❌ **No Special Privileges Needed** - **CRITICAL FAILURE**: Requires genesis validator (privileged role) + intentional malicious action
+- ❌ **Out-of-Scope** - Occurs only during one-time genesis initialization, not normal operation
 
 ## Notes
 
-The vulnerability assessment is based on the clear code inconsistency where hook execution properly checks `result.EvmError` but state writes do not. The infrastructure for handling EVM errors (`EvmError` field, error wrapping, context flags) is extensively present throughout the codebase, indicating this is an expected execution pattern. While the actual EVM message handlers are in a separate repository (likely sei-chain), the sei-cosmos SDK fork has been specifically designed to support the pattern where handlers return `err = nil` with `result.EvmError` set, as evidenced by the explicit conditional logic for EVM transactions in hook processing.
+The default `MaxMemoCharacters` is 256 characters [6](#0-5) . The ante handler test confirms memos exceeding this limit trigger `ErrMemoTooLarge` during normal transaction processing [7](#0-6) .
+
+However, the fundamental issue remains: **exploiting this requires a malicious trusted insider (genesis validator) intentionally sabotaging the genesis ceremony**, which is explicitly out of scope for vulnerability bounties and security audits.
 
 ### Citations
 
-**File:** baseapp/baseapp.go (L1015-1017)
+**File:** x/genutil/collect.go (L130-133)
 ```go
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
-	}
-```
-
-**File:** baseapp/baseapp.go (L1027-1027)
-```go
-	if err == nil && (!ctx.IsEVM() || result.EvmError == "") {
-```
-
-**File:** baseapp/baseapp.go (L1149-1153)
-```go
-		msgMsCache.Write()
-
-		if msgResult.EvmError != "" {
-			evmError = msgResult.EvmError
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
 		}
 ```
 
-**File:** baseapp/abci.go (L280-281)
+**File:** x/auth/ante/basic.go (L62-68)
 ```go
-// State only gets persisted if all messages are valid and get executed successfully.
-// Otherwise, the ResponseDeliverTx will contain relevant error information.
+	memoLength := len(memoTx.GetMemo())
+	if uint64(memoLength) > params.MaxMemoCharacters {
+		return ctx, sdkerrors.Wrapf(sdkerrors.ErrMemoTooLarge,
+			"maximum number of characters is %d but received %d characters",
+			params.MaxMemoCharacters, memoLength,
+		)
+	}
 ```
 
-**File:** baseapp/abci.go (L329-333)
+**File:** x/auth/ante/ante.go (L52-52)
 ```go
-		if result.EvmError != "" {
-			evmErr := sdkerrors.Wrap(sdkerrors.ErrEVMVMError, result.EvmError)
-			res.Codespace, res.Code, res.Log = sdkerrors.ABCIInfo(evmErr, app.trace)
-			resultStr = "failed"
-			return
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
 ```
 
-**File:** proto/cosmos/base/abci/v1beta1/abci.proto (L106-107)
-```text
-  // EVM VM error during execution
-  string evmError = 4;
+**File:** x/genutil/client/cli/gentx.go (L58-204)
+```go
+		RunE: func(cmd *cobra.Command, args []string) error {
+			serverCtx := server.GetServerContextFromCmd(cmd)
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+			cdc := clientCtx.Codec
+
+			config := serverCtx.Config
+			config.SetRoot(clientCtx.HomeDir)
+
+			nodeID, valPubKey, err := genutil.InitializeNodeValidatorFiles(serverCtx.Config)
+			if err != nil {
+				return errors.Wrap(err, "failed to initialize node validator files")
+			}
+
+			// read --nodeID, if empty take it from priv_validator.json
+			if nodeIDString, _ := cmd.Flags().GetString(cli.FlagNodeID); nodeIDString != "" {
+				nodeID = nodeIDString
+			}
+
+			// read --pubkey, if empty take it from priv_validator.json
+			if pkStr, _ := cmd.Flags().GetString(cli.FlagPubKey); pkStr != "" {
+				if err := clientCtx.Codec.UnmarshalInterfaceJSON([]byte(pkStr), &valPubKey); err != nil {
+					return errors.Wrap(err, "failed to unmarshal validator public key")
+				}
+			}
+
+			genDoc, err := tmtypes.GenesisDocFromFile(config.GenesisFile())
+			if err != nil {
+				return errors.Wrapf(err, "failed to read genesis doc file %s", config.GenesisFile())
+			}
+
+			var genesisState map[string]json.RawMessage
+			if err = json.Unmarshal(genDoc.AppState, &genesisState); err != nil {
+				return errors.Wrap(err, "failed to unmarshal genesis state")
+			}
+
+			if err = mbm.ValidateGenesis(cdc, txEncCfg, genesisState); err != nil {
+				return errors.Wrap(err, "failed to validate genesis state")
+			}
+
+			inBuf := bufio.NewReader(cmd.InOrStdin())
+
+			name := args[0]
+			key, err := clientCtx.Keyring.Key(name)
+			if err != nil {
+				return errors.Wrapf(err, "failed to fetch '%s' from the keyring", name)
+			}
+
+			moniker := config.Moniker
+			if m, _ := cmd.Flags().GetString(cli.FlagMoniker); m != "" {
+				moniker = m
+			}
+
+			// set flags for creating a gentx
+			createValCfg, err := cli.PrepareConfigForTxCreateValidator(cmd.Flags(), moniker, nodeID, genDoc.ChainID, valPubKey)
+			if err != nil {
+				return errors.Wrap(err, "error creating configuration to create validator msg")
+			}
+
+			amount := args[1]
+			coins, err := sdk.ParseCoinsNormalized(amount)
+			if err != nil {
+				return errors.Wrap(err, "failed to parse coins")
+			}
+
+			err = genutil.ValidateAccountInGenesis(genesisState, genBalIterator, key.GetAddress(), coins, cdc)
+			if err != nil {
+				return errors.Wrap(err, "failed to validate account in genesis")
+			}
+
+			txFactory := tx.NewFactoryCLI(clientCtx, cmd.Flags())
+			if err != nil {
+				return errors.Wrap(err, "error creating tx builder")
+			}
+
+			clientCtx = clientCtx.WithInput(inBuf).WithFromAddress(key.GetAddress())
+
+			// The following line comes from a discrepancy between the `gentx`
+			// and `create-validator` commands:
+			// - `gentx` expects amount as an arg,
+			// - `create-validator` expects amount as a required flag.
+			// ref: https://github.com/cosmos/cosmos-sdk/issues/8251
+			// Since gentx doesn't set the amount flag (which `create-validator`
+			// reads from), we copy the amount arg into the valCfg directly.
+			//
+			// Ideally, the `create-validator` command should take a validator
+			// config file instead of so many flags.
+			// ref: https://github.com/cosmos/cosmos-sdk/issues/8177
+			createValCfg.Amount = amount
+
+			// create a 'create-validator' message
+			txBldr, msg, err := cli.BuildCreateValidatorMsg(clientCtx, createValCfg, txFactory, true)
+			if err != nil {
+				return errors.Wrap(err, "failed to build create-validator message")
+			}
+
+			if key.GetType() == keyring.TypeOffline || key.GetType() == keyring.TypeMulti {
+				cmd.PrintErrln("Offline key passed in. Use `tx sign` command to sign.")
+				return authclient.PrintUnsignedStdTx(txBldr, clientCtx, []sdk.Msg{msg})
+			}
+
+			// write the unsigned transaction to the buffer
+			w := bytes.NewBuffer([]byte{})
+			clientCtx = clientCtx.WithOutput(w)
+
+			if err = msg.ValidateBasic(); err != nil {
+				return err
+			}
+
+			if err = authclient.PrintUnsignedStdTx(txBldr, clientCtx, []sdk.Msg{msg}); err != nil {
+				return errors.Wrap(err, "failed to print unsigned std tx")
+			}
+
+			// read the transaction
+			stdTx, err := readUnsignedGenTxFile(clientCtx, w)
+			if err != nil {
+				return errors.Wrap(err, "failed to read unsigned gen tx file")
+			}
+
+			// sign the transaction and write it to the output file
+			txBuilder, err := clientCtx.TxConfig.WrapTxBuilder(stdTx)
+			if err != nil {
+				return fmt.Errorf("error creating tx builder: %w", err)
+			}
+
+			err = authclient.SignTx(txFactory, clientCtx, name, txBuilder, true, true)
+			if err != nil {
+				return errors.Wrap(err, "failed to sign std tx")
+			}
+
+			outputDocument, _ := cmd.Flags().GetString(flags.FlagOutputDocument)
+			if outputDocument == "" {
+				outputDocument, err = makeOutputFilepath(config.RootDir, nodeID)
+				if err != nil {
+					return errors.Wrap(err, "failed to create output file path")
+				}
+			}
+
+			if err := writeSignedGenTx(clientCtx, outputDocument, stdTx); err != nil {
+				return errors.Wrap(err, "failed to write signed gen tx")
+			}
+
+			cmd.PrintErrf("Genesis transaction written to %q\n", outputDocument)
+			return nil
+		},
 ```
 
-**File:** types/errors/errors.go (L159-160)
+**File:** x/genutil/collect_test.go (L39-68)
 ```go
-	// ErrEVMVMError defines an error for an evm vm error (eg. revert)
-	ErrEVMVMError = Register(RootCodespace, 45, "evm reverted")
+// a directory during traversal of the first level. See issue https://github.com/cosmos/cosmos-sdk/issues/6788.
+func TestCollectTxsHandlesDirectories(t *testing.T) {
+	testDir, err := ioutil.TempDir(os.TempDir(), "testCollectTxs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testDir)
+
+	// 1. We'll insert a directory as the first element before JSON file.
+	subDirPath := filepath.Join(testDir, "_adir")
+	if err := os.MkdirAll(subDirPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	txDecoder := types.TxDecoder(func(txBytes []byte) (types.Tx, error) {
+		return nil, nil
+	})
+
+	// 2. Ensure that we don't encounter any error traversing the directory.
+	srvCtx := server.NewDefaultContext()
+	_ = srvCtx
+	cdc := codec.NewProtoCodec(cdctypes.NewInterfaceRegistry())
+	gdoc := tmtypes.GenesisDoc{AppState: []byte("{}")}
+	balItr := new(doNothingIterator)
+
+	dnc := &doNothingUnmarshalJSON{cdc}
+	if _, _, err := genutil.CollectTxs(dnc, txDecoder, "foo", testDir, gdoc, balItr); err != nil {
+		t.Fatal(err)
+	}
+}
+```
+
+**File:** x/auth/types/params.go (L13-13)
+```go
+	DefaultMaxMemoCharacters      uint64 = 256
+```
+
+**File:** x/auth/ante/ante_test.go (L562-571)
+```go
+			"memo too large",
+			func() {
+				feeAmount = sdk.NewCoins(sdk.NewInt64Coin("usei", 0))
+				gasLimit = 60000
+				suite.txBuilder.SetMemo(strings.Repeat("01234567890", 500))
+			},
+			false,
+			false,
+			sdkerrors.ErrMemoTooLarge,
+		},
 ```

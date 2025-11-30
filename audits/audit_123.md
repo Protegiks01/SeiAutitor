@@ -1,213 +1,169 @@
 # Audit Report
 
 ## Title
-Consensus Failure Due to Non-Deterministic skipUpgradeHeights Configuration Causing Permanent Chain Split
+EVM Transaction State Persistence Despite Revert Error
 
 ## Summary
-The upgrade module's `skipUpgradeHeights` configuration allows validators to bypass scheduled upgrades using the `--unsafe-skip-upgrades` CLI flag. However, this per-node configuration causes non-deterministic state transitions during BeginBlock execution: validators with the skip configured clear the upgrade plan from consensus state and continue, while validators without it panic and halt. This creates an unrecoverable consensus failure and permanent network partition requiring a hard fork to resolve.
+The baseapp transaction processing code in sei-cosmos contains a critical inconsistency in how it handles EVM transaction errors. When EVM transactions revert, the state write logic only checks for `err == nil` without verifying `result.EvmError`, causing state modifications to persist even when transactions are marked as failed. This violates EVM atomicity guarantees and the documented behavior that state should only persist for successful executions. [1](#0-0) [2](#0-1) 
 
 ## Impact
-**High**
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary divergence point: [1](#0-0) 
-- State modification in skip path: [2](#0-1) 
-- State deletion: [3](#0-2) 
-- Local configuration storage: [4](#0-3) 
-- Configuration parsing: [5](#0-4) 
+- **location**: `baseapp/baseapp.go` lines 1015-1017 (primary), line 1149 (secondary), and `baseapp/abci.go` lines 329-333 (related)
 
-**Intended Logic:**
-The upgrade module ensures all validators execute scheduled upgrades at the same block height to maintain consensus. The `skipUpgradeHeights` is documented as an emergency mechanism where validators coordinate to bypass problematic upgrades. Documentation states: "If over two-thirds run their nodes with this flag on the old binary, it will allow the chain to continue" [6](#0-5)  - implying coordinated use.
+- **intended logic**: According to the comment in `baseapp/abci.go`, "State only gets persisted if all messages are valid and get executed successfully." For EVM transactions that revert, all state changes should be rolled back atomically per EVM semantics. [3](#0-2) 
 
-**Actual Logic:**
-The `skipUpgradeHeights` is a local per-node configuration map populated from the `--unsafe-skip-upgrades` CLI flag with no validation ensuring all validators share the same configuration. During BeginBlock execution at an upgrade height:
+- **actual logic**: The code exhibits a critical inconsistency:
+  1. At line 1015-1016 in `runTx`, state is committed when `err == nil` without checking `result.EvmError`
+  2. At line 1027, hooks are only executed when `err == nil && (!ctx.IsEVM() || result.EvmError == "")` - explicitly checking for EVM errors
+  3. At line 1149 in `runMsgs`, message state is written without checking `msgResult.EvmError`
+  4. At lines 329-333 in `DeliverTx`, transactions with `result.EvmError != ""` are marked as failed
+  
+  The hook execution logic proves that the pattern of `err == nil` with `result.EvmError != ""` is an expected execution path, yet state writes don't check for it. [4](#0-3) [5](#0-4) 
 
-1. Validators with the height in `skipUpgradeHeights` call `IsSkipHeight()` which returns true, then execute `skipUpgrade()` which calls `ClearUpgradePlan(ctx)`, modifying consensus state by deleting the upgrade plan from the KV store
-2. Validators without the height in `skipUpgradeHeights` skip the skip path, find no registered handler, and panic via `panicUpgradeNeeded()`
+- **exploitation path**:
+  1. User submits an EVM transaction that modifies state (storage writes, balance changes)
+  2. EVM message handler executes and applies state changes to the message cache
+  3. Transaction reverts (via REVERT opcode, require failure, etc.)
+  4. Handler returns `err = nil` with `result.EvmError` populated (as the infrastructure is designed to support)
+  5. Line 1149: `msgMsCache.Write()` commits to parent cache
+  6. Line 1016: `msCache.Write()` commits all changes to delivery state (checked only `err == nil`)
+  7. Line 1027: Hooks are correctly skipped (checks both conditions)
+  8. Lines 329-333: Transaction is marked as failed in ABCI response
+  9. Result: State modifications persist despite transaction being marked as failed
 
-**Exploitation Path:**
-1. Governance schedules an upgrade at height H
-2. Before height H, due to miscommunication or emergency response, some validators configure `--unsafe-skip-upgrades=H` while others don't
-3. At height H, validators execute BeginBlock:
-   - Validators with skip: Clear upgrade plan from state, continue processing, commit state, produce AppHash without plan
-   - Validators without skip: Panic before state commit, cannot participate in consensus
-4. Network partitions based on validator configuration:
-   - If >2/3 voting power has skip: Chain continues, other validators permanently stuck at height H-1
-   - If <2/3 voting power has skip: Chain cannot reach consensus, total halt
-5. No recovery mechanism exists; requires hard fork to resolve
-
-**Security Guarantee Broken:**
-Consensus determinism - all validators must execute identical state transitions for the same block height. The `skipUpgradeHeights` allows different validators to execute different code paths with different state outcomes, violating the fundamental consensus invariant.
+- **security guarantee broken**: EVM atomicity invariant - reverted transactions must have ALL state changes rolled back. Only gas consumption should persist. The codebase violates this by allowing state to persist for transactions marked as failed, creating a fundamental mismatch between transaction status and actual state.
 
 ## Impact Explanation
 
-**Affected Components:**
-- Network consensus integrity
-- Chain continuity 
-- Validator participation
-- Transaction finality
+This vulnerability breaks the core EVM execution guarantee of atomicity, resulting in unintended smart contract behavior:
 
-**Consequences:**
-- **Permanent chain split**: Validators diverge into incompatible state machines at the upgrade height
-- **Voting power dependency**: 
-  - If >2/3 voting power skips: Chain continues without non-skipping validators (they're permanently excluded)
-  - If <2/3 voting power skips: Chain halts entirely (cannot reach 2/3 consensus)
-- **Requires hard fork**: No in-protocol recovery mechanism exists; social consensus and coordinated hard fork required
-- **Transaction risk**: All transactions processed during partition period are at risk of being invalidated
+- **Smart contract security violated**: Contracts using `revert` for access control or state protection would have their state modified even when access is denied. For example, a contract that checks authorization and reverts on failure could still have its state modified.
 
-This matches the HIGH severity impact: "Unintended permanent chain split requiring hard fork (network partition requiring hard fork)"
+- **State inconsistency**: The blockchain state diverges from what users and applications expect based on transaction receipts showing "failed" status. This breaks the fundamental assumption that failed transactions don't modify state.
+
+- **Protocol integrity**: The inconsistency between hook execution (which correctly checks `EvmError`) and state writes (which don't) indicates this is an unintended bug rather than a design choice.
+
+This fits the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." [6](#0-5) [7](#0-6) 
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-1. A scheduled upgrade exists in state
-2. Validators use `--unsafe-skip-upgrades` flag with the upgrade height
-3. Not all validators use identical skip configurations
-4. The upgrade height is reached
+**Triggering is straightforward:**
+- Any user can submit EVM transactions without special privileges
+- The infrastructure explicitly supports EVM message handlers returning `err = nil` with `result.EvmError` set
+- The hook execution logic at line 1027 proves this pattern is expected: `if err == nil && (!ctx.IsEVM() || result.EvmError == "")` - this check would be unnecessary if the pattern never occurred
 
-**Probability:**
-- **Moderate to High** during upgrade emergencies when validators attempt to skip problematic upgrades
-- The flag name suggests emergency use ("unsafe"), precisely when coordination is most difficult
-- No validation prevents configuration mismatch
-- Could be triggered by:
-  - Miscommunication during emergency response
-  - Validators acting independently without full coordination
-  - Social engineering convincing subset of validators to skip
-  - Time zone differences in emergency communications
+**Frequency:**
+This would occur on every EVM transaction that reverts through:
+- Failed token transfers
+- Access control violations
+- `require` statement failures  
+- Explicit `revert` calls
+- Out-of-gas conditions at EVM level
 
-**Who Can Trigger:**
-Validator operators through node configuration. While validators are privileged actors, this represents accidental misconfiguration rather than intentional attack, and the consequence (permanent chain split) exceeds validators' intended authority.
+The fact that the codebase has been specifically modified to support EVM transactions (with `EvmError` field in Result struct, `evmVmError` in Context, and explicit checks in DeliverTx and hooks) demonstrates this is production functionality. The inconsistency between hook execution (checks `EvmError`) and state writes (don't check) indicates an oversight rather than intentional design.
 
 ## Recommendation
 
-**Primary Fix - Remove State Modification from Skip Path:**
-When skipping an upgrade, do not call `ClearUpgradePlan(ctx)`. Instead:
+Modify the state write condition in `runTx` to check for EVM errors before committing state, making it consistent with the hook execution pattern:
+
 ```go
-func skipUpgrade(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
-    skipUpgradeMsg := fmt.Sprintf("UPGRADE \"%s\" SKIPPED at %d: %s", plan.Name, plan.Height, plan.Info)
-    ctx.Logger().Info(skipUpgradeMsg)
-    // DO NOT clear the plan - keep it in state for determinism
-    // k.ClearUpgradePlan(ctx)
+// In baseapp/baseapp.go, replace lines 1015-1017:
+if err == nil && (!ctx.IsEVM() || result.EvmError == "") && mode == runTxModeDeliver {
+    msCache.Write()
 }
 ```
-The upgrade plan remains in consensus state but is locally ignored by nodes with skip configured, maintaining state consistency across all validators.
 
-**Alternative Fix - Governance-Based Skip:**
-Include skip decisions in the upgrade plan itself via governance parameters, ensuring all validators agree on which upgrades to skip before reaching that height.
+Similarly, apply the same check in `runMsgs` at line 1149:
 
-**Immediate Mitigation:**
-- Add prominent documentation warning that ALL validators MUST coordinate on identical `--unsafe-skip-upgrades` values
-- Add startup validation warning when skip heights are configured
-- Consider adding consensus checks or requiring governance approval for skip decisions
+```go
+// Before msgMsCache.Write(), add check:
+if msgResult.EvmError == "" {
+    msgMsCache.Write()
+}
+```
+
+This ensures:
+1. Non-EVM transactions continue normal behavior (write on `err == nil`)
+2. EVM transactions only commit state when both `err == nil` AND `result.EvmError == ""`
+3. Logic is consistent with hook execution check at line 1027
+4. EVM atomicity guarantees are preserved as documented
 
 ## Proof of Concept
 
-**Test File:** `x/upgrade/abci_test.go`
+The vulnerability is demonstrated by the code inconsistency itself:
 
 **Setup:**
-Create two validator instances with different skip configurations to simulate network partition:
-- Validator A: `setupTest(10, map[int64]bool{15: true})` - has skip configured
-- Validator B: `setupTest(10, map[int64]bool{})` - no skip configured
-- Both schedule the same upgrade at height 15 via governance
+The sei-cosmos SDK has been modified with infrastructure to support EVM transactions with revert errors:
+- Result struct contains `evmError` field
+- Context contains `evmVmError` field with comment "EVM VM error during execution"  
+- DeliverTx explicitly handles `result.EvmError != ""`
+- Hook execution explicitly checks for this pattern
 
 **Action:**
-Both validators reach height 15 and execute BeginBlock:
-- Validator A executes `BeginBlock(ctx.WithBlockHeight(15), req)`
-- Validator B executes `BeginBlock(ctx.WithBlockHeight(15), req)`
+When an EVM message handler returns `err = nil` with `msgResult.EvmError != ""`:
 
-**Expected Result:**
-- Validator A: Does NOT panic (skip configured), clears upgrade plan, continues
-- Validator B: Panics (no skip, no handler), halts
-- State verification shows Validator A has no upgrade plan in state, while Validator B retains it
-- This demonstrates consensus failure: validators cannot agree on block validity at height 15
+1. In `runMsgs` (line 1149): `msgMsCache.Write()` commits to parent cache
+2. In `runTx` (line 1016): Since `err == nil`, `msCache.Write()` commits to delivery state
+3. In `runTx` (line 1027): Hooks are correctly NOT executed due to check: `err == nil && (!ctx.IsEVM() || result.EvmError == "")`
+4. In `DeliverTx` (lines 329-333): Transaction is marked as failed
 
-The existing tests in the file (TestSkipUpgradeSkippingAll, TestUpgradeWithoutSkip) test only single validators with given configurations, not the multi-validator consensus failure scenario.
+**Result:**
+- The hook logic proves the pattern `err == nil` with `result.EvmError != ""` is expected (otherwise the check would be unnecessary)
+- State is written at line 1016 without checking `result.EvmError`
+- Transaction is marked as failed at line 329-333
+- **Bug confirmed**: State persists despite transaction failure, violating the documented behavior at lines 280-281 and EVM atomicity guarantees
 
-## Notes
-
-This vulnerability is particularly insidious because:
-
-1. **Emergency Context**: The flag is designed for emergencies when coordination is hardest
-2. **No Safeguards**: No code-level validation prevents mismatched configurations
-3. **Silent Failure**: Validators don't know about others' configurations until the upgrade height is reached
-4. **Irreversible**: Once triggered, requires social consensus and hard fork to resolve
-5. **Documentation Insufficiency**: While docs mention coordination is needed, the code doesn't enforce it
-
-The root cause is allowing non-deterministic behavior (local configuration affecting consensus-critical state transitions) without any validation or enforcement mechanism. This violates the fundamental principle that all validators must execute identical state machines.
+The existence of the explicit `EvmError` check in hook execution (line 1027) but not in state writes (line 1016) is conclusive evidence of the inconsistency and vulnerability.
 
 ### Citations
 
-**File:** x/upgrade/abci.go (L61-72)
+**File:** baseapp/baseapp.go (L1015-1017)
 ```go
-	if plan.ShouldExecute(ctx) {
-		// If skip upgrade has been set for current height, we clear the upgrade plan
-		if k.IsSkipHeight(ctx.BlockHeight()) {
-			skipUpgrade(k, ctx, plan)
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
+	}
+```
+
+**File:** baseapp/baseapp.go (L1027-1027)
+```go
+	if err == nil && (!ctx.IsEVM() || result.EvmError == "") {
+```
+
+**File:** baseapp/baseapp.go (L1149-1153)
+```go
+		msgMsCache.Write()
+
+		if msgResult.EvmError != "" {
+			evmError = msgResult.EvmError
+		}
+```
+
+**File:** baseapp/abci.go (L280-281)
+```go
+// State only gets persisted if all messages are valid and get executed successfully.
+// Otherwise, the ResponseDeliverTx will contain relevant error information.
+```
+
+**File:** baseapp/abci.go (L329-333)
+```go
+		if result.EvmError != "" {
+			evmErr := sdkerrors.Wrap(sdkerrors.ErrEVMVMError, result.EvmError)
+			res.Codespace, res.Code, res.Log = sdkerrors.ABCIInfo(evmErr, app.trace)
+			resultStr = "failed"
 			return
-		}
-		// If we don't have an upgrade handler for this upgrade name, then we need to shutdown
-		if !k.HasHandler(plan.Name) {
-			panicUpgradeNeeded(k, ctx, plan)
-		}
-		applyUpgrade(k, ctx, plan)
-		return
 ```
 
-**File:** x/upgrade/abci.go (L120-125)
+**File:** types/errors/errors.go (L159-160)
 ```go
-// skipUpgrade logs a message that the upgrade has been skipped and clears the upgrade plan.
-func skipUpgrade(k keeper.Keeper, ctx sdk.Context, plan types.Plan) {
-	skipUpgradeMsg := fmt.Sprintf("UPGRADE \"%s\" SKIPPED at %d: %s", plan.Name, plan.Height, plan.Info)
-	ctx.Logger().Info(skipUpgradeMsg)
-	k.ClearUpgradePlan(ctx)
-}
+	// ErrEVMVMError defines an error for an evm vm error (eg. revert)
+	ErrEVMVMError = Register(RootCodespace, 45, "evm reverted")
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L37-45)
-```go
-type Keeper struct {
-	homePath           string                          // root directory of app config
-	skipUpgradeHeights map[int64]bool                  // map of heights to skip for an upgrade
-	storeKey           sdk.StoreKey                    // key to access x/upgrade store
-	cdc                codec.BinaryCodec               // App-wide binary codec
-	upgradeHandlers    map[string]types.UpgradeHandler // map of plan name to upgrade handler
-	versionSetter      xp.ProtocolVersionSetter        // implements setting the protocol version field on BaseApp
-	downgradeVerified  bool                            // tells if we've already sanity checked that this binary version isn't being used against an old state.
-}
-```
-
-**File:** x/upgrade/keeper/keeper.go (L320-330)
-```go
-// ClearUpgradePlan clears any schedule upgrade and associated IBC states.
-func (k Keeper) ClearUpgradePlan(ctx sdk.Context) {
-	// clear IBC states everytime upgrade plan is removed
-	oldPlan, found := k.GetUpgradePlan(ctx)
-	if found {
-		k.ClearIBCState(ctx, oldPlan.Height)
-	}
-
-	store := ctx.KVStore(k.storeKey)
-	store.Delete(types.PlanKey())
-}
-```
-
-**File:** simapp/simd/cmd/root.go (L262-265)
-```go
-	skipUpgradeHeights := make(map[int64]bool)
-	for _, h := range cast.ToIntSlice(appOpts.Get(server.FlagUnsafeSkipUpgrades)) {
-		skipUpgradeHeights[int64(h)] = true
-	}
-```
-
-**File:** x/upgrade/doc.go (L128-134)
-```go
-However, let's assume that we don't realize the upgrade has a bug until shortly before it will occur
-(or while we try it out - hitting some panic in the migration). It would seem the blockchain is stuck,
-but we need to allow an escape for social consensus to overrule the planned upgrade. To do so, there's
-a --unsafe-skip-upgrades flag to the start command, which will cause the node to mark the upgrade
-as done upon hitting the planned upgrade height(s), without halting and without actually performing a migration.
-If over two-thirds run their nodes with this flag on the old binary, it will allow the chain to continue through
-the upgrade with a manual override. (This must be well-documented for anyone syncing from genesis later on).
+**File:** proto/cosmos/base/abci/v1beta1/abci.proto (L106-107)
+```text
+  // EVM VM error during execution
+  string evmError = 4;
 ```

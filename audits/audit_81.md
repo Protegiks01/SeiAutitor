@@ -1,307 +1,322 @@
 # Audit Report
 
 ## Title
-Deferred Balance Cache Accumulation Causes Invariant Violation and Chain Halt
+Lack of Zero Voting Power Validation in Validator Set Updates Allows Complete Network Halt
 
 ## Summary
-The bank module's deferred balance system uses a MemoryStoreKey that persists data across blocks. Since `WriteDeferredBalances` is never called in the production block processing flow, and transaction indices reset per block, deferred balances accumulate incorrectly in the cache. This eventually causes the `TotalSupply` invariant to detect accounting inconsistencies, triggering a deterministic chain-wide panic and halt. [1](#0-0) 
+The `ApplyAndReturnValidatorSetUpdates` function in the staking module fails to validate that total voting power remains above zero before setting it. When all validators are simultaneously jailed due to mass downtime, the function sets total power to zero without validation, resulting in complete network shutdown as Tendermint/CometBFT cannot reach consensus with zero voting power. [1](#0-0) 
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Deferred send implementation: `x/bank/keeper/keeper.go` lines 408-432
-- Memory store persistence: `store/mem/store.go` lines 20-21 and 54-55
-- Missing cleanup in simapp: `simapp/app.go` lines 442-447
-- Invariant check: `x/bank/keeper/invariants.go` lines 59-104
+**Location:** `x/staking/keeper/val_state_change.go`, lines 217-219 where total power is set without validation
 
-**Intended Logic:**
-The deferred balance system should batch balance transfers for optimization. When `DeferredSendCoinsFromAccountToModule` is called during transaction processing, it deducts from the sender immediately and stores the credit in a cache indexed by (moduleAddress, txIndex). At block finalization, `WriteDeferredBalances` should credit all module accounts with accumulated amounts and clear the cache for the next block. [2](#0-1) 
+**Intended Logic:** The validator set update mechanism should maintain at least one validator with positive voting power to ensure the network can continue producing blocks and reaching consensus. The system should prevent scenarios where the entire validator set becomes powerless.
 
-**Actual Logic:**
-The system has three critical flaws working together:
-
-1. **Memory Store Persistence**: The deferred cache uses MemoryStoreKey which explicitly persists between commits and blocks, unlike TransientStoreKey which resets. [3](#0-2) [4](#0-3) 
-
-2. **Missing Cleanup**: `WriteDeferredBalances` is never called in production because:
-   - No PreCommitHandler is configured in simapp [5](#0-4) 
-   - The bank module has no EndBlocker
-   - The cache Clear function is only invoked from WriteDeferredBalances [6](#0-5) 
-
-3. **TxIndex Accumulation Bug**: Transaction indices reset to 0 for each new block. The cache uses (moduleAddress, txIndex) as keys, and `UpsertBalance` adds to existing entries. This causes accumulation: [7](#0-6) [8](#0-7) 
+**Actual Logic:** The function initializes `totalPower` to zero and only accumulates power from validators found in the power store iterator. When validators are jailed, they are removed from the power store via `DeleteValidatorByPowerIndex`. [2](#0-1)  If all validators are jailed simultaneously, the power store becomes empty, the iterator yields no validators, and `totalPower` remains at zero. The function then sets `totalPower` to zero without any validation check.
 
 **Exploitation Path:**
-1. Any user submits transactions that pay fees (triggers `DeferredSendCoinsFromAccountToModule` via ante handler) [9](#0-8) 
-2. Sender accounts are debited, amounts stored in deferred cache with key (feeCollector, txIndex)
-3. Block commits without clearing cache (MemoryStore persists)
-4. Next block's transactions reuse same txIndex values (0, 1, 2...), adding to accumulated cache entries
-5. Crisis module periodically runs invariant checks [10](#0-9) 
-6. The TotalSupply invariant counts all deferred balances (including accumulated old ones) when calculating expected total [11](#0-10) 
-7. Eventually the accumulated deferred balances create a discrepancy between expected and actual totals
-8. Invariant failure triggers panic, halting all nodes deterministically [12](#0-11) 
+1. Network-wide outage or mass validator downtime occurs (e.g., cloud provider failure, software bug, network partition)
+2. All validators miss blocks beyond the `maxMissed` threshold [3](#0-2) 
+3. All validators are jailed via `k.sk.Jail(ctx, consAddr)` [4](#0-3) 
+4. Each jailed validator is removed from the power store
+5. In the next EndBlock, `ApplyAndReturnValidatorSetUpdates` is called
+6. The power store iterator finds no validators (all removed when jailed)
+7. The loop doesn't accumulate any power, leaving `totalPower` at zero
+8. Previously bonded validators receive zero-power updates
+9. The function sets `totalPower` to zero and returns zero-power validator set to Tendermint
+10. Tendermint cannot reach consensus with zero total voting power (requires >2/3)
+11. Network halts completely - no new blocks can be produced
 
-**Security Guarantee Broken:**
-The accounting invariant that total supply equals the sum of all balances is violated. This causes a deterministic consensus failure as all nodes execute the same invariant check and panic at the same block height.
+**Security Guarantee Broken:** The fundamental consensus availability invariant is violated. A Proof-of-Stake blockchain must maintain at least one active validator with positive voting power to function.
 
 ## Impact Explanation
 
-When the `TotalSupply` invariant detects the accumulated deferred balance discrepancy, it returns `broken = true`, causing the crisis module's `AssertInvariants` to panic. This results in:
+This vulnerability results in complete network shutdown with the following consequences:
 
-- **Total network shutdown**: All validators halt at the same block height
-- **No new transactions processed**: The chain cannot progress until manual intervention
-- **Requires hard fork or emergency upgrade**: Normal recovery mechanisms cannot resolve a panicked chain state
-- **Complete fund freeze**: During the halt, no transfers, staking operations, or governance actions can occur
+1. **No Block Production**: With zero total voting power, Tendermint/CometBFT cannot select a proposer or reach consensus on new blocks
+2. **Transaction Halt**: All pending and new transactions cannot be confirmed or executed  
+3. **State Freeze**: The blockchain state becomes permanently frozen at the last successfully committed block
+4. **Unrecoverable Without Hard Fork**: Since no transactions can execute (including unjail transactions), validators cannot recover themselves. Recovery requires coordinated manual intervention such as a hard fork with validator set restoration
+5. **Economic Damage**: Extended downtime causes loss of user confidence, potential loss of network value, and damage to ecosystem projects
 
-This matches the High severity impact category: "Network not being able to confirm new transactions (total network shutdown)".
+The impact matches the accepted category: "Network not being able to confirm new transactions (total network shutdown)" - Medium severity.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any network user submitting transactions. The issue occurs through normal protocol operation whenever transactions pay fees.
+**Who Can Trigger:** This is triggered by operational conditions affecting all validators simultaneously:
+- Infrastructure failures: Cloud provider outages, ISP failures
+- Software issues: Bugs in validator software affecting all nodes running the same version
+- Network conditions: Widespread DDoS attacks, network partitions
+- Operational errors: Misconfigured chain upgrades
 
 **Conditions Required:**
-- Bank keeper initialized with deferred cache support (confirmed in simapp) [13](#0-12) [14](#0-13) 
-- Multiple blocks with fee-paying transactions
-- Sufficient accumulation for invariant to detect (depends on transaction volume and invariant check period)
+- All validators must simultaneously exceed the downtime slashing threshold
+- Can realistically occur during network-wide infrastructure failures or software bugs
+- No privileged access or malicious intent required
 
-**Frequency:** This will occur deterministically once enough deferred operations accumulate across blocks. With any reasonable transaction volume, the accumulation will grow until the next periodic invariant check detects the mismatch. The time to failure depends on the `InvCheckPeriod` configuration in the crisis module. [15](#0-14) 
+**Frequency:**
+- Low probability under normal operations with geographically distributed, diverse validator infrastructure
+- Higher probability during major cloud provider outages, chain upgrades with bugs, or network-level attacks
+
+While the likelihood is low, the catastrophic impact (complete network halt requiring hard fork) makes this a critical vulnerability. Defense-in-depth principles dictate that the application layer should validate its own invariants rather than relying solely on operational best practices.
 
 ## Recommendation
 
-Implement one of the following fixes (in order of preference):
+Add validation in `ApplyAndReturnValidatorSetUpdates` to prevent zero total voting power:
 
-**Option 1 (Recommended):** Add a PreCommitHandler in simapp initialization that calls `WriteDeferredBalances` before each block commit:
 ```go
-app.SetPreCommitHandler(func(ctx sdk.Context) error {
-    app.BankKeeper.WriteDeferredBalances(ctx)
-    return nil
-})
+// set total power on lookup index if there are any updates
+if len(updates) > 0 {
+    if totalPower.IsZero() {
+        return nil, fmt.Errorf("total voting power cannot be zero: this would halt the network")
+    }
+    k.SetLastTotalPower(ctx, totalPower)
+}
 ```
-This should be added after line 447 in `simapp/app.go`.
 
-**Option 2:** Add an EndBlocker to the bank module that calls `WriteDeferredBalances` to properly flush and clear the cache at the end of each block.
-
-**Option 3:** Change the deferred cache store key from MemoryStoreKey to TransientStoreKey, which automatically resets between blocks (similar to how params module uses TransientStoreKey). This would require updating line 230 in `simapp/app.go`: [16](#0-15) 
+Additional recommendations:
+1. **Genesis Validation**: Add checks during chain initialization to ensure at least one validator with positive power exists
+2. **Minimum Validator Check**: Consider adding a configurable minimum number of active validators required
+3. **Emergency Recovery Mechanism**: Document and implement emergency validator set recovery procedures
+4. **Monitoring and Alerting**: Implement alerts when total voting power drops below critical thresholds
 
 ## Proof of Concept
 
-**Test Setup:**
-1. Initialize simapp with bank keeper using deferred cache (as in production)
-2. Create test accounts with initial balances  
-3. Fund accounts and module accounts appropriately
-4. Configure crisis module with `InvCheckPeriod = 1` for immediate invariant checking
+**Setup:**
+1. Initialize test application with multiple validators having bonded status and positive voting power
+2. Apply initial validator set updates to establish the bonded validator set
+3. Verify the network has positive total voting power
 
-**Trigger Sequence:**
-1. Block N: Execute transaction that calls `DeferredSendCoinsFromAccountToModule` to transfer 100 tokens from sender to fee collector
-2. Verify: sender debited 100, cache[(feeCollector, 0)] = 100, module balance = 0
-3. Call EndBlock WITHOUT calling `WriteDeferredBalances`
-4. Commit block (MemoryStore persists, cache not cleared)
-5. Block N+1: Execute another transaction transferring 200 tokens via same mechanism
-6. Verify: sender debited 200, cache[(feeCollector, 0)] = 300 (accumulated!), module balance = 0
-7. Run TotalSupply invariant check directly
+**Action:**
+1. Simulate mass jailing by setting all validators' `Jailed` flag to true
+2. Remove all validators from the power index via `DeleteValidatorByPowerIndex`
+3. Call `ApplyAndReturnValidatorSetUpdates` to process validator set changes
 
-**Expected Result:**
-The invariant should detect that the deferred cache contains accumulated amounts from multiple blocks. While immediate invariant failure depends on the specific accounting implementation, the core bug (cache accumulation without clearing) is demonstrated, which will eventually cause invariant violations as the accumulated amounts diverge from actual debits.
+**Result:**
+1. The function returns successfully without error
+2. All validator updates have zero power
+3. `GetLastTotalPower` returns zero
+4. This zero-power validator set would be sent to Tendermint, causing network halt
+
+The test would follow patterns in `x/staking/keeper/validator_test.go` using the `applyValidatorSetUpdates` helper function. [5](#0-4) 
 
 ## Notes
 
-The vulnerability requires the bank keeper to be initialized with deferred cache support, which is confirmed in the simapp configuration. The issue is particularly insidious because:
-
-1. It manifests gradually over multiple blocks rather than immediately
-2. The failure is deterministic across all nodes (consensus failure, not a single-node crash)
-3. Normal testing might not catch it if WriteDeferredBalances is called manually in tests
-4. The MemoryStoreKey persistence behavior is documented but easy to overlook when it should have used TransientStoreKey
-
-The fix is straightforward but critical for network stability.
+This vulnerability has been validated through code analysis:
+- No validation exists in `SetLastTotalPower` [6](#0-5) 
+- No minimum validator checks in genesis validation [7](#0-6) 
+- The panic at line 133 ("should never retrieve a jailed validator from the power store") confirms jailed validators are removed from power store, but there's no safeguard for when ALL validators are jailed simultaneously
 
 ### Citations
 
-**File:** x/bank/keeper/keeper.go (L408-432)
+**File:** x/staking/keeper/val_state_change.go (L108-222)
 ```go
-func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
-	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
-) error {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
-	}
-	// Deducts Fees from the Sender Account
-	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+func (k Keeper) ApplyAndReturnValidatorSetUpdates(ctx sdk.Context) (updates []abci.ValidatorUpdate, err error) {
+	params := k.GetParams(ctx)
+	maxValidators := params.MaxValidators
+	powerReduction := k.PowerReduction(ctx)
+	totalPower := sdk.ZeroInt()
+	amtFromBondedToNotBonded, amtFromNotBondedToBonded := sdk.ZeroInt(), sdk.ZeroInt()
+
+	// Retrieve the last validator set.
+	// The persistent set is updated later in this function.
+	// (see LastValidatorPowerKey).
+	last, err := k.getLastValidatorsByAddr(ctx)
 	if err != nil {
-		return err
-	}
-	// get recipient module address
-	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
-	if moduleAcc == nil {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
-	}
-	// get txIndex
-	txIndex := ctx.TxIndex()
-	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
-	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
-}
-```
+	// Iterate over validators, highest power to lowest.
+	iterator := k.ValidatorsPowerStoreIterator(ctx)
+	defer iterator.Close()
 
-**File:** x/bank/keeper/keeper.go (L434-483)
-```go
-// WriteDeferredDepositsToModuleAccounts Iterates on all the deferred deposits and deposit them into the store
-func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
-	}
-	ctx = ctx.WithEventManager(sdk.NewEventManager())
+	for count := 0; iterator.Valid() && count < int(maxValidators); iterator.Next() {
+		// everything that is iterated in this loop is becoming or already a
+		// part of the bonded validator set
+		valAddr := sdk.ValAddress(iterator.Value())
+		validator := k.mustGetValidator(ctx, valAddr)
 
-	// maps between bech32 stringified module account address and balance
-	moduleAddrBalanceMap := make(map[string]sdk.Coins)
-	// slice of modules to be sorted for consistent write order later
-	moduleList := []string{}
-
-	// iterate over deferred cache and accumulate totals per module
-	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
-		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
-		if !ok {
-			// add to list of modules
-			moduleList = append(moduleList, moduleAddr.String())
-			// set the map value
-			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
-			return false
+		if validator.Jailed {
+			panic("should never retrieve a jailed validator from the power store")
 		}
-		// add to currCoins
-		newCoins := currCoins.Add(amount)
-		// update map
-		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
-		return false
-	})
-	// sort module list
-	sort.Strings(moduleList)
 
-	// iterate through module list and add the balance to module bank balances in sorted order
-	for _, moduleBech32Addr := range moduleList {
-		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
-		if !ok {
-			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
-			ctx.Logger().Error(err.Error())
-			panic(err)
+		// if we get to a zero-power validator (which we don't bond),
+		// there are no more possible bonded validators
+		if validator.PotentialConsensusPower(k.PowerReduction(ctx)) == 0 {
+			break
 		}
-		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
+
+		// apply the appropriate state change if necessary
+		switch {
+		case validator.IsUnbonded():
+			validator, err = k.unbondedToBonded(ctx, validator)
+			if err != nil {
+				return
+			}
+			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
+		case validator.IsUnbonding():
+			validator, err = k.unbondingToBonded(ctx, validator)
+			if err != nil {
+				return
+			}
+			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
+		case validator.IsBonded():
+			// no state change
+		default:
+			panic("unexpected validator status")
+		}
+
+		// fetch the old power bytes
+		valAddrStr, err := sdk.Bech32ifyAddressBytes(sdk.GetConfig().GetBech32ValidatorAddrPrefix(), valAddr)
 		if err != nil {
-			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
-			panic(err)
+			return nil, err
+		}
+		oldPowerBytes, found := last[valAddrStr]
+		newPower := validator.ConsensusPower(powerReduction)
+		newPowerBytes := k.cdc.MustMarshal(&gogotypes.Int64Value{Value: newPower})
+
+		// update the validator set if power has changed
+		if !found || !bytes.Equal(oldPowerBytes, newPowerBytes) {
+			updates = append(updates, validator.ABCIValidatorUpdate(powerReduction))
+
+			k.SetLastValidatorPower(ctx, valAddr, newPower)
+		}
+
+		delete(last, valAddrStr)
+		count++
+
+		totalPower = totalPower.Add(sdk.NewInt(newPower))
+	}
+
+	noLongerBonded, err := sortNoLongerBonded(last)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, valAddrBytes := range noLongerBonded {
+		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
+		validator, err = k.bondedToUnbonding(ctx, validator)
+		if err != nil {
+			return
+		}
+		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
+		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
+		updates = append(updates, validator.ABCIValidatorUpdateZero())
+	}
+
+	// Update the pools based on the recent updates in the validator set:
+	// - The tokens from the non-bonded candidates that enter the new validator set need to be transferred
+	// to the Bonded pool.
+	// - The tokens from the bonded validators that are being kicked out from the validator set
+	// need to be transferred to the NotBonded pool.
+	switch {
+	// Compare and subtract the respective amounts to only perform one transfer.
+	// This is done in order to avoid doing multiple updates inside each iterator/loop.
+	case amtFromNotBondedToBonded.GT(amtFromBondedToNotBonded):
+		k.notBondedTokensToBonded(ctx, amtFromNotBondedToBonded.Sub(amtFromBondedToNotBonded))
+	case amtFromNotBondedToBonded.LT(amtFromBondedToNotBonded):
+		k.bondedTokensToNotBonded(ctx, amtFromBondedToNotBonded.Sub(amtFromNotBondedToBonded))
+	default: // equal amounts of tokens; no update required
+	}
+
+	// set total power on lookup index if there are any updates
+	if len(updates) > 0 {
+		k.SetLastTotalPower(ctx, totalPower)
+	}
+
+	return updates, err
+}
+```
+
+**File:** x/staking/keeper/val_state_change.go (L260-268)
+```go
+func (k Keeper) jailValidator(ctx sdk.Context, validator types.Validator) {
+	if validator.Jailed {
+		panic(fmt.Sprintf("cannot jail already jailed validator, validator: %v\n", validator))
+	}
+
+	validator.Jailed = true
+	k.SetValidator(ctx, validator)
+	k.DeleteValidatorByPowerIndex(ctx, validator)
+}
+```
+
+**File:** x/slashing/keeper/infractions.go (L96-122)
+```go
+	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+		validator := k.sk.ValidatorByConsAddr(ctx, consAddr)
+		if validator != nil && !validator.IsJailed() {
+			// Downtime confirmed: slash and jail the validator
+			// We need to retrieve the stake distribution which signed the block, so we subtract ValidatorUpdateDelay from the evidence height,
+			// and subtract an additional 1 since this is the LastCommit.
+			// Note that this *can* result in a negative "distributionHeight" up to -ValidatorUpdateDelay-1,
+			// i.e. at the end of the pre-genesis block (none) = at the beginning of the genesis block.
+			// That's fine since this is just used to filter unbonding delegations & redelegations.
+			shouldSlash = true
+			distributionHeight := height - sdk.ValidatorUpdateDelay - 1
+			slashInfo = SlashInfo{
+				height:             height,
+				power:              power,
+				distributionHeight: distributionHeight,
+				minHeight:          minHeight,
+				minSignedPerWindow: minSignedPerWindow,
+			}
+			// This value is passed back and the validator is slashed and jailed appropriately
+		} else {
+			// validator was (a) not found or (b) already jailed so we do not slash
+			logger.Info(
+				"validator would have been slashed for downtime, but was either not found in store or already jailed",
+				"validator", consAddr.String(),
+			)
 		}
 	}
+```
 
-	// clear deferred cache
-	k.deferredCache.Clear(ctx)
-	return ctx.EventManager().ABCIEvents()
+**File:** x/staking/keeper/slash.go (L145-151)
+```go
+// jail a validator
+func (k Keeper) Jail(ctx sdk.Context, consAddr sdk.ConsAddress) {
+	validator := k.mustGetValidatorByConsAddr(ctx, consAddr)
+	k.jailValidator(ctx, validator)
+	logger := k.Logger(ctx)
+	logger.Info("validator jailed", "validator", consAddr)
 }
 ```
 
-**File:** store/mem/store.go (L20-21)
+**File:** x/staking/keeper/validator_test.go (L1108-1120)
 ```go
-// Store implements an in-memory only KVStore. Entries are persisted between
-// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
-```
-
-**File:** store/mem/store.go (L54-55)
-```go
-// Commit performs a no-op as entries are persistent between commitments.
-func (s *Store) Commit(_ bool) (id types.CommitID) { return }
-```
-
-**File:** simapp/app.go (L230-230)
-```go
-	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
-```
-
-**File:** simapp/app.go (L264-266)
-```go
-	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
-		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
-	)
-```
-
-**File:** simapp/app.go (L442-447)
-```go
-	app.SetAnteHandler(anteHandler)
-	app.SetAnteDepGenerator(anteDepGenerator)
-	app.SetEndBlocker(app.EndBlocker)
-	app.SetPrepareProposalHandler(app.PrepareProposalHandler)
-	app.SetProcessProposalHandler(app.ProcessProposalHandler)
-	app.SetFinalizeBlocker(app.FinalizeBlocker)
-```
-
-**File:** simapp/app.go (L518-519)
-```go
-	for i, tx := range req.Txs {
-		ctx = ctx.WithContext(context.WithValue(ctx.Context(), ante.ContextKeyTxIndexKey, i))
-```
-
-**File:** x/bank/keeper/deferred_cache.go (L62-71)
-```go
-func (d *DeferredCache) upsertBalance(ctx sdk.Context, moduleAddr sdk.AccAddress, txIndex uint64, balance sdk.Coin) error {
-	if !balance.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, balance.String())
+func applyValidatorSetUpdates(t *testing.T, ctx sdk.Context, k keeper.Keeper, expectedUpdatesLen int) []abci.ValidatorUpdate {
+	updates, err := k.ApplyAndReturnValidatorSetUpdates(ctx)
+	require.NoError(t, err)
+	if expectedUpdatesLen >= 0 {
+		require.Equal(t, expectedUpdatesLen, len(updates), "%v", updates)
 	}
-
-	currBalance := d.GetBalance(ctx, moduleAddr, txIndex, balance.Denom)
-	newBalance := currBalance.Add(balance)
-
-	return d.setBalance(ctx, moduleAddr, txIndex, newBalance)
+	return utils.Map(updates, func(v abci.ValidatorUpdate) abci.ValidatorUpdate {
+		return abci.ValidatorUpdate{
+			PubKey: v.PubKey,
+			Power:  v.Power,
+		}
+	})
 }
 ```
 
-**File:** x/auth/ante/fee.go (L203-213)
+**File:** x/staking/keeper/keeper.go (L95-98)
 ```go
-func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
-	if !fees.IsValid() {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+func (k Keeper) SetLastTotalPower(ctx sdk.Context, power sdk.Int) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&sdk.IntProto{Int: power})
+	store.Set(types.LastTotalPowerKey, bz)
+```
+
+**File:** x/staking/genesis.go (L230-235)
+```go
+func ValidateGenesis(data *types.GenesisState) error {
+	if err := validateGenesisStateValidators(data.Validators); err != nil {
+		return err
 	}
 
-	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
-	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
-	}
-
-	return nil
-```
-
-**File:** x/crisis/abci.go (L13-21)
-```go
-func EndBlocker(ctx sdk.Context, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyEndBlocker)
-
-	if k.InvCheckPeriod() == 0 || ctx.BlockHeight()%int64(k.InvCheckPeriod()) != 0 {
-		// skip running the invariant check
-		return
-	}
-	k.AssertInvariants(ctx)
-}
-```
-
-**File:** x/bank/keeper/invariants.go (L75-78)
-```go
-		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
-			expectedTotal = expectedTotal.Add(coin)
-			return false
-		})
-```
-
-**File:** x/crisis/keeper/keeper.go (L83-85)
-```go
-			panic(fmt.Errorf("invariant broken: %s\n"+
-				"\tCRITICAL please submit the following transaction:\n"+
-				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
-```
-
-**File:** store/transient/store.go (L24-28)
-```go
-// Commit cleans up Store.
-func (ts *Store) Commit(_ bool) (id types.CommitID) {
-	ts.Store = dbadapter.Store{DB: dbm.NewMemDB()}
-	return
-}
+	return data.Params.Validate()
 ```

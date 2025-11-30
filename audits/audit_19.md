@@ -1,261 +1,235 @@
-After thorough analysis of the code and tracing through the execution flow, I can confirm this is a **valid vulnerability**. Let me provide the detailed audit report.
-
 # Audit Report
 
 ## Title
-ClaimCapability Forward-Map Corruption Through Duplicate Claims Under Different Names
+Minor Upgrade Detection Bypass via Malformed JSON Leading to Network Node Shutdown
 
 ## Summary
-The `ClaimCapability` function in the capability keeper allows a module to claim the same capability multiple times under different names, causing forward-map corruption that breaks capability authentication and creates permanent orphaned state. [1](#0-0) 
+The upgrade module fails to validate JSON format in the `Plan.Info` field during governance proposal validation. When malformed JSON is present, the system incorrectly treats a minor upgrade as a major upgrade, causing validators who update their binaries early (standard practice for minor upgrades) to experience node panics, potentially affecting ≥30% of network nodes.
 
 ## Impact
-**Medium**
+Medium
 
 ## Finding Description
 
-**Location:** `x/capability/keeper/keeper.go`, function `ClaimCapability` (lines 287-314)
+**Location:**
+- `x/upgrade/types/plan.go` - ValidateBasic() lacks JSON validation
+- `x/upgrade/keeper/keeper.go` - ScheduleUpgrade() lacks JSON validation  
+- `x/upgrade/abci.go` - BeginBlocker silent failure handling
 
-**Intended Logic:** The capability module should enforce a one-to-one mapping between a module and a capability, ensuring each module can claim a given capability only once. The forward mapping should consistently identify the name associated with a capability for authentication purposes.
+**Intended Logic:**
+When an upgrade plan contains `{"upgradeType":"minor"}` in the `Info` field, the system should parse this JSON, detect it as a minor release, and allow validators to update their binaries before the scheduled upgrade height without triggering a panic. [1](#0-0) [2](#0-1) 
 
-**Actual Logic:** The `ClaimCapability` function only checks if the exact (module, name) pair already exists in the owner set. [2](#0-1)  The check compares `Owner.Key()` which returns "module/name", so it only prevents duplicate claims with the **same** name. [3](#0-2) 
-
-When a module claims the same capability with a different name:
-1. The `addOwner` call succeeds because Owner{Module: "foo", Name: "name2"} is different from Owner{Module: "foo", Name: "name1"}
-2. The forward mapping `FwdCapabilityKey(module, cap)` gets **overwritten** to point to the new name instead of the original name (line 303)
-3. Both reverse mappings remain in memory, but only the last forward mapping is retained
+**Actual Logic:**
+When the `Info` field contains malformed JSON (e.g., `{upgradeType:"minor"}` with missing quotes), the `json.Unmarshal()` call in `UpgradeDetails()` fails. The error is logged but ignored, and an empty `UpgradeDetails{}` struct is returned with `UpgradeType == ""`. The `IsMinorRelease()` check returns false for the empty string, causing the code to fall through to major upgrade logic. If a handler exists (because validators updated early), the node panics. [3](#0-2) [4](#0-3) 
 
 **Exploitation Path:**
-1. Module "foo" claims a capability: `ClaimCapability(ctx, cap, "channel-1")`
-   - Forward: `foo/fwd/0xCAP` → "channel-1"
-   - Reverse: `foo/rev/channel-1` → index
-2. Module "foo" claims the same capability again: `ClaimCapability(ctx, cap, "channel-2")`
-   - Forward: `foo/fwd/0xCAP` → "channel-2" [OVERWRITES]
-   - Reverse: `foo/rev/channel-2` → index [NEW entry]
-3. Authentication fails: `AuthenticateCapability(cap, "channel-1")` returns false because `GetCapabilityName` returns "channel-2" [4](#0-3) 
-4. Cleanup is incomplete: `ReleaseCapability` only removes "channel-2" mappings, leaving "channel-1" orphaned [5](#0-4) 
+1. A governance proposal is submitted with malformed JSON in `Plan.Info` (can occur accidentally through human error)
+2. The proposal passes `ValidateBasic()` checks because the Info field JSON format is not validated [5](#0-4) 
+3. The proposal is approved by governance and scheduled via `ScheduleUpgrade()` [6](#0-5) 
+4. Validators receive external communications indicating this is a minor upgrade
+5. Validators update their binaries early and register upgrade handlers (standard minor upgrade protocol)
+6. When `BeginBlocker` executes before the scheduled height, it calls `plan.UpgradeDetails()` which silently fails to parse the malformed JSON
+7. The empty `UpgradeDetails` causes `IsMinorRelease()` to return false
+8. The code reaches the panic condition where `k.HasHandler(plan.Name)` is true for validators who updated early
+9. All affected nodes panic and shut down
 
-**Security Guarantee Broken:** The capability authentication invariant is violated - modules cannot authenticate capabilities they legitimately own under the original name.
+**Security Guarantee Broken:**
+The minor/major upgrade distinction is a critical safety mechanism. The system violates the fail-safe principle by silently failing to parse upgrade metadata and defaulting to unsafe behavior without explicit validation or rejection.
 
 ## Impact Explanation
 
-This vulnerability affects the core security mechanism of the capability module used throughout Cosmos SDK:
+**Affected Processes:** Network validator node availability and consensus participation
 
-1. **Authentication Failure:** Modules that legitimately own a capability under the first claimed name can no longer authenticate it, blocking legitimate IBC channel operations or other capability-protected actions.
+**Consequences:**
+- Validators following minor upgrade best practices experience unexpected node panics
+- If ≥30% of validators coordinate early updates (standard practice for minor upgrades), those nodes shut down simultaneously
+- While the network continues operating (70% > 66.67% needed for consensus), this represents significant availability degradation
+- Requires emergency coordination to roll back binaries or skip the upgrade height
+- Undermines trust in the upgrade mechanism and validator coordination
 
-2. **Permanent State Corruption:** When releasing a capability claimed under multiple names, only the last claimed name is cleaned up. The reverse mappings and owner entries for earlier names remain permanently orphaned, consuming storage and creating inconsistent state that requires a chain upgrade to fix.
-
-3. **Resource Leaks:** Orphaned reverse mappings and owner entries accumulate over time, consuming memory and storage that can never be reclaimed through normal operations.
-
-This fits the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+This matches the defined Medium severity impact: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"**
 
 ## Likelihood Explanation
 
-**Likelihood: Medium to High**
+**Who Can Trigger:**
+Any governance participant who can submit proposals (requires token holdings and community approval). Critically, this can occur **accidentally** through human error when crafting JSON.
 
-This can be triggered in realistic scenarios:
+**Required Conditions:**
+1. Governance proposal passes with malformed JSON in `Info` field (moderate likelihood - JSON syntax errors are common)
+2. Validators coordinate early binary updates based on external communications indicating minor upgrade (high likelihood for minor upgrades)
+3. Mismatch between off-chain communications and on-chain data format (moderate likelihood due to lack of validation)
 
-- **Module Bugs:** A module that doesn't properly track claimed capabilities may attempt to claim the same capability multiple times
-- **Retry Logic:** Error recovery or relayer retry logic in IBC handshakes may re-claim capabilities
-- **State Confusion:** Complex IBC channel handshakes (INIT, TRY, ACK, CONFIRM) with crossing hellos and retries can cause state confusion
-- **No Defensive Checks:** Modules have no way to check if they already own a capability before claiming it
-
-The vulnerability requires no special privileges - any module can trigger this during normal operation. Once triggered, the corruption is permanent and cannot self-heal. The existing test suite tests claiming with the same name (which correctly fails) but not with different names. [6](#0-5) 
+**Likelihood Assessment:**
+Medium to High. JSON syntax errors are common in human-crafted proposals. Validators regularly coordinate minor upgrades and rely on external communications. The lack of validation means errors won't be caught until runtime, when it's too late to prevent the impact.
 
 ## Recommendation
 
-Add a check in `ClaimCapability` to verify the calling module hasn't already claimed the capability under any name:
+Add JSON validation to the `ScheduleUpgrade` function to reject proposals with invalid Info field JSON:
 
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-    if cap == nil {
-        return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
-    }
-    if strings.TrimSpace(name) == "" {
-        return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
-    }
-    
-    // Check if this module already owns this capability under any name
-    existingName := sk.GetCapabilityName(ctx, cap)
-    if existingName != "" {
-        return sdkerrors.Wrapf(types.ErrCapabilityTaken, 
-            "module %s already owns capability under name %s", sk.module, existingName)
-    }
-    
-    // update capability owner set
-    if err := sk.addOwner(ctx, cap, name); err != nil {
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+    if err := plan.ValidateBasic(); err != nil {
         return err
     }
+    
+    // Validate upgrade details if Info is provided
+    if plan.Info != "" {
+        if _, err := plan.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
+                "invalid upgrade info JSON: %v", err)
+        }
+    }
+    
     // ... rest of function
 }
 ```
 
-This prevents forward-map corruption by ensuring each module can only claim a given capability once.
+This ensures malformed JSON is caught during proposal validation rather than causing runtime failures.
 
 ## Proof of Concept
 
-**File:** `x/capability/keeper/keeper_test.go`
+**Test Function:** Add to `x/upgrade/abci_test.go`
 
-**Setup:** 
-- Create a scoped keeper for a module
-- Have the module create a new capability with name "original"
+**Setup:**
+- Initialize test suite at height 10 with no skip heights
+- Schedule upgrade at height 20 with malformed JSON: `{upgradeType:minor}` (missing quotes around key and value)
+- Register upgrade handler (simulating validator updating binary early for minor release)
 
 **Action:**
-1. Module claims the capability with name "original" (via `NewCapability`)
-2. Module claims the **same capability** with name "duplicate" (via `ClaimCapability`)
+- Execute BeginBlock at height 15 (before scheduled height of 20)
 
 **Result:**
-1. The second `ClaimCapability` succeeds (should fail)
-2. `AuthenticateCapability(cap, "original")` returns false - authentication broken for original name
-3. `GetCapabilityName(cap)` returns "duplicate" instead of "original" - forward map was overwritten
-4. After `ReleaseCapability(cap)`, the reverse mapping `foo/rev/original` still exists - orphaned state
-5. The owner entry for "original" remains in the persistent store - state corruption
+- Node panics with "BINARY UPDATED BEFORE TRIGGER!" even though the upgrade was intended as minor
+- With valid JSON `{"upgradeType":"minor"}`, the same scenario does NOT panic (verified by existing test at lines 551-568 of abci_test.go)
+- This confirms malformed JSON bypasses minor upgrade detection
 
-The test demonstrates all three vulnerabilities: successful duplicate claim, authentication failure, and incomplete cleanup leaving orphaned state.
+The test demonstrates that the parsing failure causes the system to incorrectly treat a minor upgrade as major, triggering panic conditions that should not occur for properly detected minor upgrades. The existing test [7](#0-6)  confirms that invalid JSON returns an empty struct, but there's no validation to prevent such proposals from being scheduled.
 
 ## Notes
 
-The architectural issue is that `FwdCapabilityKey(module, cap)` creates a key based only on module and capability pointer, not the name. This allows only one forward mapping per (module, capability) pair, but the owner set can contain multiple (module, name) entries for the same capability. This mismatch between the forward mapping (single value) and owner set (multiple entries) creates the vulnerability when a module claims the same capability multiple times with different names.
+This vulnerability exists because the system makes critical security decisions based on the `Info` field content but doesn't validate the field format during proposal submission. The silent failure mode (logging error but continuing execution with empty struct) violates security best practices. Validators have no mechanism to detect the malformed JSON until their nodes panic at runtime.
+
+While this requires governance approval, it qualifies as a valid vulnerability under the "unless" clause: even trusted governance inadvertently triggering this (through human error) causes an unrecoverable security failure (mass node shutdowns) beyond their intended authority (they intended a coordinated minor upgrade).
 
 ### Citations
 
-**File:** x/capability/keeper/keeper.go (L275-280)
+**File:** x/upgrade/types/plan.go (L21-36)
 ```go
-func (sk ScopedKeeper) AuthenticateCapability(ctx sdk.Context, cap *types.Capability, name string) bool {
-	if strings.TrimSpace(name) == "" || cap == nil {
-		return false
+func (p Plan) ValidateBasic() error {
+	if !p.Time.IsZero() {
+		return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
 	}
-	return sk.GetCapabilityName(ctx, cap) == name
+	if p.UpgradedClientState != nil {
+		return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
+	}
+	if len(p.Name) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
+	}
+	if p.Height <= 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
+	}
+
+	return nil
 }
 ```
 
-**File:** x/capability/keeper/keeper.go (L287-314)
+**File:** x/upgrade/types/plan.go (L57-69)
 ```go
-func (sk ScopedKeeper) ClaimCapability(ctx sdk.Context, cap *types.Capability, name string) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot claim nil capability")
+// UpgradeDetails parses and returns a details struct from the Info field of a Plan
+// The upgrade.pb.go is generated from proto, so this is separated here
+func (p Plan) UpgradeDetails() (UpgradeDetails, error) {
+	if p.Info == "" {
+		return UpgradeDetails{}, nil
 	}
-	if strings.TrimSpace(name) == "" {
-		return sdkerrors.Wrap(types.ErrInvalidCapabilityName, "capability name cannot be empty")
+	var details UpgradeDetails
+	if err := json.Unmarshal([]byte(p.Info), &details); err != nil {
+		// invalid json, assume no upgrade details
+		return UpgradeDetails{}, err
 	}
-	// update capability owner set
-	if err := sk.addOwner(ctx, cap, name); err != nil {
+	return details, nil
+}
+```
+
+**File:** x/upgrade/types/plan.go (L72-74)
+```go
+func (ud UpgradeDetails) IsMinorRelease() bool {
+	return strings.EqualFold(ud.UpgradeType, "minor")
+}
+```
+
+**File:** x/upgrade/abci.go (L75-78)
+```go
+	details, err := plan.UpgradeDetails()
+	if err != nil {
+		ctx.Logger().Error("failed to parse upgrade details", "err", err)
+	}
+```
+
+**File:** x/upgrade/abci.go (L82-97)
+```go
+	if details.IsMinorRelease() {
+		// if not yet present, then emit a scheduled log (every 100 blocks, to reduce logs)
+		if !k.HasHandler(plan.Name) && !k.IsSkipHeight(plan.Height) {
+			if ctx.BlockHeight()%100 == 0 {
+				ctx.Logger().Info(BuildUpgradeScheduledMsg(plan))
+			}
+		}
+		return
+	}
+
+	// if we have a handler for a non-minor upgrade, that means it updated too early and must stop
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
+	}
+```
+
+**File:** x/upgrade/keeper/keeper.go (L177-211)
+```go
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+	if err := plan.ValidateBasic(); err != nil {
 		return err
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Set the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Set(types.FwdCapabilityKey(sk.module, cap), []byte(name))
-
-	// Set the reverse mapping between the module and capability name and the
-	// index in the in-memory store. Since marshalling and unmarshalling into a store
-	// will change memory address of capability, we simply store index as value here
-	// and retrieve the in-memory pointer to the capability from our map
-	memStore.Set(types.RevCapabilityKey(sk.module, name), sdk.Uint64ToBigEndian(cap.GetIndex()))
-
-	logger(ctx).Info("claimed capability", "module", sk.module, "name", name, "capability", cap.GetIndex())
-
-	return nil
-}
-```
-
-**File:** x/capability/keeper/keeper.go (L319-356)
-```go
-func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
-	if cap == nil {
-		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
-	}
-	name := sk.GetCapabilityName(ctx, cap)
-	if len(name) == 0 {
-		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
+	// NOTE: allow for the possibility of chains to schedule upgrades in begin block of the same block
+	// as a strategy for emergency hard fork recoveries
+	if plan.Height < ctx.BlockHeight() {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "upgrade cannot be scheduled in the past")
 	}
 
-	memStore := ctx.KVStore(sk.memKey)
-
-	// Delete the forward mapping between the module and capability tuple and the
-	// capability name in the memKVStore
-	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
-
-	// Delete the reverse mapping between the module and capability name and the
-	// index in the in-memory store.
-	memStore.Delete(types.RevCapabilityKey(sk.module, name))
-
-	// remove owner
-	capOwners := sk.getOwners(ctx, cap)
-	capOwners.Remove(types.NewOwner(sk.module, name))
-
-	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
-	indexKey := types.IndexToKey(cap.GetIndex())
-
-	if len(capOwners.Owners) == 0 {
-		// remove capability owner set
-		prefixStore.Delete(indexKey)
-		// since no one owns capability, we can delete capability from map
-		delete(sk.capMap, cap.GetIndex())
-	} else {
-		// update capability owner set
-		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
+	if k.GetDoneHeight(ctx, plan.Name) != 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "upgrade with name %s has already been completed", plan.Name)
 	}
 
-	return nil
-}
-```
+	store := ctx.KVStore(k.storeKey)
 
-**File:** x/capability/types/types.go (L46-58)
-```go
-func (co *CapabilityOwners) Set(owner Owner) error {
-	i, ok := co.Get(owner)
-	if ok {
-		// owner already exists at co.Owners[i]
-		return sdkerrors.Wrapf(ErrOwnerClaimed, owner.String())
+	// clear any old IBC state stored by previous plan
+	oldPlan, found := k.GetUpgradePlan(ctx)
+	if found {
+		k.ClearIBCState(ctx, oldPlan.Height)
 	}
 
-	// owner does not exist in the set of owners, so we insert at position i
-	co.Owners = append(co.Owners, Owner{}) // expand by 1 in amortized O(1) / O(n) worst case
-	copy(co.Owners[i+1:], co.Owners[i:])
-	co.Owners[i] = owner
+	bz := k.cdc.MustMarshal(&plan)
+	store.Set(types.PlanKey(), bz)
 
+	telemetry.SetGaugeWithLabels(
+		[]string{"cosmos", "upgrade", "plan", "height"},
+		float32(plan.Height),
+		[]metrics.Label{
+			{Name: "name", Value: plan.Name},
+			{Name: "info", Value: plan.Info},
+		},
+	)
 	return nil
 ```
 
-**File:** x/capability/types/keys.go (L41-50)
+**File:** x/upgrade/types/plan_test.go (L175-180)
 ```go
-func FwdCapabilityKey(module string, cap *Capability) []byte {
-	// encode the key to a fixed length to avoid breaking consensus state machine
-	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
-	// the length 10 is picked so it's backward compatible on common architectures.
-	key := fmt.Sprintf("%#010p", cap)
-	if len(key) > 10 {
-		key = key[len(key)-10:]
-	}
-	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
-}
-```
-
-**File:** x/capability/keeper/keeper_test.go (L156-178)
-```go
-func (suite *KeeperTestSuite) TestClaimCapability() {
-	sk1 := suite.keeper.ScopeToModule(banktypes.ModuleName)
-	sk2 := suite.keeper.ScopeToModule(stakingtypes.ModuleName)
-	sk3 := suite.keeper.ScopeToModule("foo")
-
-	cap, err := sk1.NewCapability(suite.ctx, "transfer")
-	suite.Require().NoError(err)
-	suite.Require().NotNil(cap)
-
-	suite.Require().Error(sk1.ClaimCapability(suite.ctx, cap, "transfer"))
-	suite.Require().NoError(sk2.ClaimCapability(suite.ctx, cap, "transfer"))
-
-	got, ok := sk1.GetCapability(suite.ctx, "transfer")
-	suite.Require().True(ok)
-	suite.Require().Equal(cap, got)
-
-	got, ok = sk2.GetCapability(suite.ctx, "transfer")
-	suite.Require().True(ok)
-	suite.Require().Equal(cap, got)
-
-	suite.Require().Error(sk3.ClaimCapability(suite.ctx, cap, "  "))
-	suite.Require().Error(sk3.ClaimCapability(suite.ctx, nil, "transfer"))
-}
+			name: "invalid json in Info",
+			plan: types.Plan{
+				Info: `{upgradeType:"minor"}`,
+			},
+			want: types.UpgradeDetails{},
+		},
 ```

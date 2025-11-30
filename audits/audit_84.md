@@ -1,275 +1,350 @@
 # Audit Report
 
 ## Title
-Deferred Balance Cache Accumulation Causes Invariant Violation and Chain Halt
+Privilege Escalation Through Unrestricted MsgExec Authorization Enabling Unauthorized Transitive Delegation
 
 ## Summary
-The bank module's deferred balance system uses a MemoryStoreKey that persists data across blocks. When transactions pay fees through the ante handler, balances are deducted from users and stored in the deferred cache, but `WriteDeferredBalances` is never called to clear this cache or credit module accounts. This causes deferred balances to accumulate indefinitely across blocks. Eventually, the `TotalSupply` invariant detects that expectedTotal (which includes all accumulated deferred balances) exceeds the actual supply, triggering a panic that halts the entire chain.
+The authz module's `Grant` method lacks validation to prevent granting authorization for `MsgExec` message types, enabling privilege escalation through delegation chains. When combined with `GenericAuthorization` and the recursive nature of `MsgExec` execution, this allows grantees to re-delegate authorizations to unauthorized third parties, resulting in direct loss of funds.
 
 ## Impact
 High
 
 ## Finding Description
 
-**Location:** 
-- Primary deferred send implementation: [1](#0-0) 
-- Ante handler usage: [2](#0-1) 
-- Memory store persistence: [3](#0-2) 
-- Missing cleanup mechanism: [4](#0-3) 
-- Invariant that fails: [5](#0-4) 
+- **location**: [1](#0-0)  (Grant method) and [2](#0-1)  (DispatchActions method)
 
-**Intended Logic:**
-The deferred balance system was designed to batch balance transfers for efficiency. According to the code comment [6](#0-5) , when `DeferredSendCoinsFromAccountToModule` is called, it should: (1) deduct from sender immediately, (2) store the credit in a temporary cache, and (3) have `WriteDeferredBalances` called "In the EndBlocker" to credit module accounts and clear the cache for the next block.
+- **intended logic**: Authorizations should be explicit and non-transitive. When Alice grants Bob authorization to perform actions on her behalf, only Bob should be able to execute those actions, not arbitrary third parties that Bob chooses to delegate to. The authorization model assumes a direct trust relationship between granter and grantee.
 
-**Actual Logic:**
-The deferred cache uses a MemoryStoreKey [7](#0-6)  which persists between blocks [8](#0-7)  (unlike TransientStoreKey which resets on commit [9](#0-8) ). However, `WriteDeferredBalances` is never called because: (1) simapp doesn't configure a PreCommitHandler, (2) the bank module has no EndBlocker implementation (verified in x/bank/module.go), and (3) `WriteDeferredBalances` only clears the cache when explicitly invoked [10](#0-9) .
+- **actual logic**: The `Grant` method only validates that an authorization is present and a handler exists for the message type [3](#0-2) . There is no check preventing authorization of `MsgExec` itself. The `GenericAuthorization.Accept()` method accepts any message without validation [4](#0-3) . The `MsgExec.GetSigners()` returns the grantee field [5](#0-4) , which when combined with `DispatchActions` creates a recursive execution path that enables transitive delegation chains.
 
-**Exploitation Path:**
-1. Any user submits a transaction that pays fees
-2. The ante handler calls `DeferredSendCoinsFromAccountToModule` [11](#0-10) 
-3. User's balance is deducted, amount stored in deferred cache (memory store)
-4. Block ends, memory store persists (no clearing occurs)
-5. Next block: more transactions accumulate additional deferred balances in the same cache
-6. Crisis module's EndBlocker runs invariant checks [12](#0-11) 
-7. The `TotalSupply` invariant counts all accumulated deferred balances from multiple blocks [13](#0-12) 
-8. Invariant detects expectedTotal (account_balances + accumulated_deferred_from_many_blocks) ≠ supply
-9. Invariant failure triggers panic [14](#0-13) 
-10. Chain halts deterministically across all nodes
+- **exploitation path**: 
+  1. Alice grants Bob a `SendAuthorization` for 100 tokens
+  2. Bob grants Charlie a `GenericAuthorization` for `MsgExec` type URL
+  3. Charlie constructs nested `MsgExec` messages: outer `MsgExec` with grantee=Charlie containing inner `MsgExec` with grantee=Bob containing `MsgSend` from Alice
+  4. When the outer `MsgExec` is processed by the `Exec` handler [6](#0-5) , it calls `DispatchActions` with grantee=Charlie
+  5. `DispatchActions` extracts the signer from the inner `MsgExec` (which returns Bob via `GetSigners()`) and validates Charlie's authorization from Bob for `MsgExec` type
+  6. The handler recursively calls `Exec` for the inner `MsgExec`, which then calls `DispatchActions` with grantee=Bob
+  7. This validates Bob's authorization from Alice for `MsgSend` and executes the transfer
+  8. Alice's funds are transferred without Alice ever authorizing Charlie
 
-**Security Guarantee Broken:**
-The accounting invariant that total supply equals the sum of all account balances plus in-flight deferred transfers is violated. This breaks the fundamental assumption that the deferred cache only contains the current block's pending transfers, not accumulated transfers from multiple blocks.
+- **security guarantee broken**: The principle that authorizations are personal and non-transferable is violated. The authz module design in ADR-030 [7](#0-6)  describes granting privileges "from one account (the _granter_) to another account (the _grantee_)" with no mention of transitive delegation capabilities.
 
 ## Impact Explanation
-
-This vulnerability causes a complete network shutdown. When the invariant check fails, the chain panics and halts permanently. This affects:
-- All network validators cannot produce new blocks
-- All user transactions are blocked  
-- The chain requires manual intervention (emergency upgrade or hard fork) to recover
-- During the halt, no funds can move and the network is completely unavailable
-
-This is a protocol-level consensus failure that affects every node. The deterministic nature means all validators fail simultaneously at the same block height, making this a critical availability issue.
+This vulnerability results in **direct loss of funds**. Unauthorized parties can gain access to and steal funds from accounts they were never authorized to access. The trust relationship between granter and grantee is fundamentally broken as grantees can re-delegate to arbitrary third parties without the original granter's knowledge or consent. This affects all assets that can be controlled through authorizations including tokens, staking positions, and governance votes. In the described scenario, Charlie can drain Alice's account despite Alice only trusting Bob.
 
 ## Likelihood Explanation
-
-**Who Can Trigger:** Any user submitting normal transactions on the network. The issue occurs naturally through regular usage as every fee-paying transaction accumulates deferred balances.
-
-**Conditions Required:**
-- The bank keeper is initialized with deferred cache support [7](#0-6)  (this is the default in simapp)
-- Transactions that pay fees occur over multiple blocks (normal network activity)
-- Sufficient accumulation of deferred balances to create a detectable invariant violation
-- Invariant checks are enabled and run periodically (controlled by invCheckPeriod)
-
-**Frequency:** This will occur deterministically once enough fee-paying transactions accumulate across blocks. The time to failure depends on transaction volume and the invariant check period. Given that every transaction paying fees contributes to the accumulation, this is highly likely to occur in an active network.
+Any user who receives any authorization grant can exploit this vulnerability. The only conditions required are: (1) an initial authorization grant exists between Alice and Bob, and (2) Bob creates a grant for `MsgExec` to Charlie using `GenericAuthorization`. This is trivially achievable through normal transaction submission with no special conditions, race conditions, or timing requirements. No administrative privileges or special access is needed. The vulnerability is persistent and can be exploited at any time after the authorization chain is established.
 
 ## Recommendation
+Add validation in the `Grant` method to explicitly reject authorization grants for `MsgExec` and `MsgGrant` message types:
 
-Implement one of the following fixes:
-
-**Option 1 (Recommended):** Add a PreCommitHandler in simapp initialization that calls `WriteDeferredBalances` before each block commit:
 ```go
-app.SetPreCommitHandler(func(ctx sdk.Context) error {
-    app.BankKeeper.WriteDeferredBalances(ctx)
-    return nil
-})
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+    // ... existing code ...
+    
+    t := authorization.MsgTypeURL()
+    
+    // Prevent recursive delegation chains
+    if t == sdk.MsgTypeURL(&authz.MsgExec{}) || t == sdk.MsgTypeURL(&authz.MsgGrant{}) {
+        return nil, sdkerrors.ErrUnauthorized.Wrap("cannot grant authorization for MsgExec or MsgGrant to prevent delegation chains")
+    }
+    
+    if k.router.HandlerByTypeURL(t) == nil {
+        return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+    }
+    
+    // ... rest of existing code ...
+}
 ```
-This should be added after line 447 in simapp/app.go.
 
-**Option 2:** Implement an EndBlocker for the bank module that calls `WriteDeferredBalances` as originally intended by the comment [15](#0-14) .
-
-**Option 3:** Change the deferred cache to use TransientStoreKey instead of MemoryStoreKey, which automatically resets between blocks [9](#0-8) . This would require refactoring to handle the per-block clearing differently.
+Alternatively, the validation could be added in `MsgGrant.ValidateBasic()` [8](#0-7)  to reject such grants earlier in the transaction processing pipeline.
 
 ## Proof of Concept
 
-**Scenario Setup:**
-1. Initialize simapp with bank keeper configured with deferred cache (default configuration)
-2. Create test accounts with initial balances
-3. Configure crisis module with an invariant check period
+Following the pattern in `TestKeeperFees` [9](#0-8) , a test can be constructed:
 
-**Trigger Sequence:**
-1. Block N: Execute transaction that calls `DeferredSendCoinsFromAccountToModule` (e.g., fee payment via ante handler)
-   - Sender balance is deducted
-   - Amount stored in deferred cache (memory store)
-2. Call EndBlock (no WriteDeferredBalances called)
-3. Commit occurs (memory store persists, cache NOT cleared)
-4. Block N+1: Execute another transaction with fee payment
-   - Another sender balance is deducted  
-   - Amount ADDED to existing deferred cache
-5. Block N+2 (or whenever invariant check runs): Crisis module runs TotalSupply invariant
-   - Invariant counts: expectedTotal = account_balances + (deferred_from_N + deferred_from_N+1)
-   - This exceeds actual supply (which only accounts for deducted balances)
-   - Invariant returns broken = true
-   - Chain panics and halts
+**Setup**:
+- Initialize three accounts: Alice (addrs[0]), Bob (addrs[1]), Charlie (addrs[2])
+- Fund Alice with 10,000 steak tokens using `simapp.FundAccount`
+- Set expiration time from `ctx.BlockHeader().Time`
 
-**Expected Result:**
-The invariant check detects that accumulated deferred balances from multiple blocks cause expectedTotal to exceed supply, triggering a panic that halts the chain.
+**Action**:
+```go
+// 1. Alice grants Bob SendAuthorization with 100 token limit
+app.AuthzKeeper.SaveGrant(ctx, Bob, Alice, 
+    &banktypes.SendAuthorization{SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("steak", 100))}, 
+    expiration)
 
-**Note:** While the PoC test function `TestDeferredCacheAccumulationCausesInvariantFailure` doesn't exist in the current codebase, the logical flow is verifiable through code inspection and matches the described vulnerability perfectly.
+// 2. Bob grants Charlie GenericAuthorization for MsgExec
+app.AuthzKeeper.SaveGrant(ctx, Charlie, Bob,
+    &authz.GenericAuthorization{Msg: sdk.MsgTypeURL(&authz.MsgExec{})},
+    expiration)
+
+// 3. Charlie constructs nested MsgExec
+innerMsgExec := authz.NewMsgExec(Bob, []sdk.Msg{
+    &banktypes.MsgSend{
+        Amount:      sdk.NewCoins(sdk.NewInt64Coin("steak", 100)),
+        FromAddress: Alice.String(),
+        ToAddress:   Recipient.String(),
+    },
+})
+
+outerMsgExec := authz.NewMsgExec(Charlie, []sdk.Msg{&innerMsgExec})
+
+// 4. Execute the nested MsgExec
+msgs, _ := outerMsgExec.GetMessages()
+result, err := app.AuthzKeeper.DispatchActions(ctx, Charlie, msgs)
+```
+
+**Result**:
+- Transaction succeeds (`err == nil`, `result != nil`)
+- 100 steak tokens are transferred from Alice to Recipient
+- Alice never authorized Charlie, only Bob
+- This demonstrates unauthorized transitive delegation
 
 ### Citations
 
-**File:** x/bank/keeper/keeper.go (L404-407)
+**File:** x/authz/keeper/msg_server.go (L14-42)
 ```go
-// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
-// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
-// In the EndBlocker, it will then perform one deposit for each module account.
-// It will panic if the module account does not exist.
-```
-
-**File:** x/bank/keeper/keeper.go (L408-432)
-```go
-func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
-	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
-) error {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
-	}
-	// Deducts Fees from the Sender Account
-	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
 	if err != nil {
-		return err
-	}
-	// get recipient module address
-	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
-	if moduleAcc == nil {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
-	}
-	// get txIndex
-	txIndex := ctx.TxIndex()
-	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
-	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
+	}
+
+	authorization := msg.GetAuthorization()
+	if authorization == nil {
+		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
+	}
+
+	t := authorization.MsgTypeURL()
+	if k.router.HandlerByTypeURL(t) == nil {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+	}
+
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgGrantResponse{}, nil
 }
 ```
 
-**File:** x/bank/keeper/keeper.go (L480-481)
+**File:** x/authz/keeper/msg_server.go (L65-82)
 ```go
-	// clear deferred cache
-	k.deferredCache.Clear(ctx)
-```
-
-**File:** x/auth/ante/fee.go (L203-214)
-```go
-func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
-	if !fees.IsValid() {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
-	}
-
-	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
 	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
+		return nil, err
 	}
 
-	return nil
-}
+	msgs, err := msg.GetMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := k.DispatchActions(ctx, grantee, msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgExecResponse{Results: results}, nil
 ```
 
-**File:** store/mem/store.go (L20-21)
+**File:** x/authz/keeper/keeper.go (L76-139)
 ```go
-// Store implements an in-memory only KVStore. Entries are persisted between
-// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
-```
+func (k Keeper) DispatchActions(ctx sdk.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
+	results := make([][]byte, len(msgs))
 
-**File:** store/mem/store.go (L54-55)
-```go
-// Commit performs a no-op as entries are persistent between commitments.
-func (s *Store) Commit(_ bool) (id types.CommitID) { return }
-```
+	for i, msg := range msgs {
+		signers := msg.GetSigners()
+		if len(signers) != 1 {
+			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
+		}
 
-**File:** simapp/app.go (L264-266)
-```go
-	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
-		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
-	)
-```
+		granter := signers[0]
 
-**File:** simapp/app.go (L442-447)
-```go
-	app.SetAnteHandler(anteHandler)
-	app.SetAnteDepGenerator(anteDepGenerator)
-	app.SetEndBlocker(app.EndBlocker)
-	app.SetPrepareProposalHandler(app.PrepareProposalHandler)
-	app.SetProcessProposalHandler(app.ProcessProposalHandler)
-	app.SetFinalizeBlocker(app.FinalizeBlocker)
-```
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
 
-**File:** x/bank/keeper/invariants.go (L59-104)
-```go
-func TotalSupply(k Keeper) sdk.Invariant {
-	return func(ctx sdk.Context) (string, bool) {
-		expectedTotal := sdk.Coins{}
-		weiTotal := sdk.NewInt(0)
-		supply, _, err := k.GetPaginatedTotalSupply(ctx, &query.PageRequest{Limit: query.MaxLimit})
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
 
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
+
+		handler := k.router.Handler(msg)
+		if handler == nil {
+			return nil, sdkerrors.ErrUnknownRequest.Wrapf("unrecognized message route: %s", sdk.MsgTypeURL(msg))
+		}
+
+		msgResp, err := handler(ctx, msg)
 		if err != nil {
-			return sdk.FormatInvariant(types.ModuleName, "query supply",
-				fmt.Sprintf("error querying total supply %v", err)), false
+			return nil, sdkerrors.Wrapf(err, "failed to execute message; message %v", msg)
 		}
 
-		k.IterateAllBalances(ctx, func(_ sdk.AccAddress, balance sdk.Coin) bool {
-			expectedTotal = expectedTotal.Add(balance)
-			return false
-		})
-		// also iterate over deferred balances
-		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
-			expectedTotal = expectedTotal.Add(coin)
-			return false
-		})
-		k.IterateAllWeiBalances(ctx, func(addr sdk.AccAddress, balance sdk.Int) bool {
-			weiTotal = weiTotal.Add(balance)
-			return false
-		})
-		weiInUsei, weiRemainder := SplitUseiWeiAmount(weiTotal)
-		if !weiRemainder.IsZero() {
-			return sdk.FormatInvariant(types.ModuleName, "total supply",
-				fmt.Sprintf(
-					"\twei remainder: %v\n",
-					weiRemainder)), true
-		}
-		baseDenom, err := sdk.GetBaseDenom()
-		if err == nil {
-			expectedTotal = expectedTotal.Add(sdk.NewCoin(baseDenom, weiInUsei))
-		} else if !weiInUsei.IsZero() {
-			return sdk.FormatInvariant(types.ModuleName, "total supply", "non-zero wei balance without base denom"), true
+		results[i] = msgResp.Data
+
+		// emit the events from the dispatched actions
+		events := msgResp.Events
+		sdkEvents := make([]sdk.Event, 0, len(events))
+		for _, event := range events {
+			e := event
+			e.Attributes = append(e.Attributes, abci.EventAttribute{Key: []byte("authz_msg_index"), Value: []byte(strconv.Itoa(i))})
+
+			sdkEvents = append(sdkEvents, sdk.Event(e))
 		}
 
-		broken := !expectedTotal.IsEqual(supply)
-
-		return sdk.FormatInvariant(types.ModuleName, "total supply",
-			fmt.Sprintf(
-				"\tsum of accounts coins: %v\n"+
-					"\tsupply.Total:          %v\n",
-				expectedTotal, supply)), broken
+		ctx.EventManager().EmitEvents(sdkEvents)
 	}
-```
 
-**File:** store/transient/store.go (L24-28)
-```go
-// Commit cleans up Store.
-func (ts *Store) Commit(_ bool) (id types.CommitID) {
-	ts.Store = dbadapter.Store{DB: dbm.NewMemDB()}
-	return
+	return results, nil
 }
 ```
 
-**File:** x/crisis/abci.go (L13-21)
+**File:** x/authz/generic_authorization.go (L23-26)
 ```go
-func EndBlocker(ctx sdk.Context, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyEndBlocker)
-
-	if k.InvCheckPeriod() == 0 || ctx.BlockHeight()%int64(k.InvCheckPeriod()) != 0 {
-		// skip running the invariant check
-		return
-	}
-	k.AssertInvariants(ctx)
+// Accept implements Authorization.Accept.
+func (a GenericAuthorization) Accept(ctx sdk.Context, msg sdk.Msg) (AcceptResponse, error) {
+	return AcceptResponse{Accept: true}, nil
 }
 ```
 
-**File:** x/crisis/keeper/keeper.go (L83-85)
+**File:** x/authz/msgs.go (L54-68)
 ```go
-			panic(fmt.Errorf("invariant broken: %s\n"+
-				"\tCRITICAL please submit the following transaction:\n"+
-				"\t\t tx crisis invariant-broken %s %s", res, ir.ModuleName, ir.Route))
+func (msg MsgGrant) ValidateBasic() error {
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
+	}
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid granter address")
+	}
+
+	if granter.Equals(grantee) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "granter and grantee cannot be same")
+	}
+	return msg.Grant.ValidateBasic()
+}
+```
+
+**File:** x/authz/msgs.go (L212-218)
+```go
+func (msg MsgExec) GetSigners() []sdk.AccAddress {
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		panic(err)
+	}
+	return []sdk.AccAddress{grantee}
+}
+```
+
+**File:** docs/architecture/adr-030-authz-module.md (L40-43)
+```markdown
+We will create a module named `authz` which provides functionality for
+granting arbitrary privileges from one account (the _granter_) to another account (the _grantee_). Authorizations
+must be granted for a particular `Msg` service methods one by one using an implementation
+of `Authorization` interface.
+```
+
+**File:** x/authz/keeper/keeper_test.go (L126-197)
+```go
+func (s *TestSuite) TestKeeperFees() {
+	app, addrs := s.app, s.addrs
+
+	granterAddr := addrs[0]
+	granteeAddr := addrs[1]
+	recipientAddr := addrs[2]
+	s.Require().NoError(simapp.FundAccount(app.BankKeeper, s.ctx, granterAddr, sdk.NewCoins(sdk.NewInt64Coin("steak", 10000))))
+	now := s.ctx.BlockHeader().Time
+	s.Require().NotNil(now)
+
+	smallCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 20))
+	someCoin := sdk.NewCoins(sdk.NewInt64Coin("steak", 123))
+
+	msgs := authz.NewMsgExec(granteeAddr, []sdk.Msg{
+		&banktypes.MsgSend{
+			Amount:      sdk.NewCoins(sdk.NewInt64Coin("steak", 2)),
+			FromAddress: granterAddr.String(),
+			ToAddress:   recipientAddr.String(),
+		},
+	})
+
+	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
+
+	s.T().Log("verify dispatch fails with invalid authorization")
+	executeMsgs, err := msgs.GetMessages()
+	s.Require().NoError(err)
+	result, err := app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
+
+	s.Require().Nil(result)
+	s.Require().NotNil(err)
+
+	s.T().Log("verify dispatch executes with correct information")
+	// grant authorization
+	err = app.AuthzKeeper.SaveGrant(s.ctx, granteeAddr, granterAddr, &banktypes.SendAuthorization{SpendLimit: smallCoin}, now)
+	s.Require().NoError(err)
+	authorization, _ := app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
+	s.Require().NotNil(authorization)
+
+	s.Require().Equal(authorization.MsgTypeURL(), bankSendAuthMsgType)
+
+	executeMsgs, err = msgs.GetMessages()
+	s.Require().NoError(err)
+
+	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
+	s.Require().NoError(err)
+	s.Require().NotNil(result)
+
+	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
+	s.Require().NotNil(authorization)
+
+	s.T().Log("verify dispatch fails with overlimit")
+	// grant authorization
+
+	msgs = authz.NewMsgExec(granteeAddr, []sdk.Msg{
+		&banktypes.MsgSend{
+			Amount:      someCoin,
+			FromAddress: granterAddr.String(),
+			ToAddress:   recipientAddr.String(),
+		},
+	})
+
+	s.Require().NoError(msgs.UnpackInterfaces(app.AppCodec()))
+	executeMsgs, err = msgs.GetMessages()
+	s.Require().NoError(err)
+
+	result, err = app.AuthzKeeper.DispatchActions(s.ctx, granteeAddr, executeMsgs)
+	s.Require().Nil(result)
+	s.Require().NotNil(err)
+
+	authorization, _ = app.AuthzKeeper.GetCleanAuthorization(s.ctx, granteeAddr, granterAddr, bankSendAuthMsgType)
+	s.Require().NotNil(authorization)
+}
 ```

@@ -1,172 +1,272 @@
-Based on my thorough investigation of the codebase, I can confirm this is a **valid vulnerability**. Let me provide my validation:
-
-## Technical Flow Confirmation
-
-I've verified the complete execution path:
-
-1. **Validator Removal**: When `RemoveValidator` is called, it deletes the `ValidatorByConsAddrKey` index [1](#0-0) , then calls the `AfterValidatorRemoved` hook [2](#0-1) 
-
-2. **Incomplete Cleanup**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation [3](#0-2)  but does NOT delete `ValidatorSigningInfo` or `ValidatorMissedBlockArray`
-
-3. **Reuse Allowed**: When creating a new validator, the system checks if a validator with that consensus key exists using `GetValidatorByConsAddr` [4](#0-3) . Since this index was deleted, the check passes and a new validator can be created with the same consensus key
-
-4. **State Inheritance**: When the new validator bonds, `AfterValidatorBonded` checks if signing info exists [5](#0-4) . Since the old signing info was never deleted, it's found and reused, causing the new validator to inherit the stale `MissedBlocksCounter`
-
-5. **Unfair Slashing**: The inherited counter causes premature slashing when combined with new missed blocks [6](#0-5) 
-
-## Impact Verification
-
-- No function exists to delete `ValidatorSigningInfo` (I confirmed this through grep search)
-- The slashing threshold calculation uses the persisted counter, causing validators to be slashed after missing fewer blocks than the protocol parameters specify
-- This violates the invariant that each validator lifecycle should have independent liveness tracking
-
-## Validation Against Criteria
-
-This matches the Medium severity impact: **"A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk"**
-
-The vulnerability:
-- ✅ Occurs in layer 1 blockchain code (Cosmos SDK)
-- ✅ Can be triggered through normal validator operations (no special privileges needed)
-- ✅ Results in unintended behavior (incorrect slashing threshold)
-- ✅ Has concrete impact (validators unfairly penalized, potential fund loss through slashing)
-- ✅ Is reproducible with a test case
-- ✅ Is not a known issue or intentional behavior (the spec only mentions removing the consensus key, not preserving signing info)
-
----
-
-Audit Report
+# Audit Report
 
 ## Title
-Stale Missed Block Data Persists After Validator Removal and Re-Addition Leading to Unfair Slashing
+Unvalidated Empty AccessOps Array Causes Chain Halt via Governance Proposals
 
 ## Summary
-When a validator is removed via `RemoveValidator`, the slashing module's `AfterValidatorRemoved` hook only deletes the address-pubkey relation but fails to delete `ValidatorSigningInfo` and `ValidatorMissedBlockArray`. If the same consensus address later creates a new validator, the old missed block data persists, causing the new validator to inherit stale liveness tracking state and face premature slashing.
+The `ValidateAccessOps` function accesses an array element without bounds checking, causing a panic when an empty `AccessOps` array is provided. This can be triggered through governance proposals due to insufficient validation in `ValidateBasic`, leading to simultaneous node crashes and complete network shutdown during proposal execution.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
-- **location**: [3](#0-2) 
-- **intended logic**: When a validator is completely removed from the validator set, all associated slashing state (signing info and missed block arrays) should be cleaned up so that if the same consensus address later creates a new validator, it starts with fresh liveness tracking state (MissedBlocksCounter=0, fresh StartHeight, empty missed blocks array)
-- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation but does NOT delete the `ValidatorSigningInfo` stored via `ValidatorSigningInfoKey` or the `ValidatorMissedBlockArray` stored via `ValidatorMissedBlockBitArrayKey`. When a validator with the same consensus address bonds again, `AfterValidatorBonded` checks if signing info exists and only creates new info if not found. Since the old signing info persists, it is reused with its stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
-- **exploitation path**: 
-  1. Validator A accumulates missed blocks (e.g., 200 out of 1000-block window)
-  2. Validator A's operator unbonds all delegations, triggering removal [7](#0-6) 
-  3. `RemoveValidator` deletes the `ValidatorByConsAddrKey` index [1](#0-0)  and calls `AfterValidatorRemoved` hook [2](#0-1) 
-  4. Hook executes but only deletes pubkey relation, leaving signing info intact
-  5. Later, same consensus address creates new validator (passes check at [4](#0-3)  because `ValidatorByConsAddr` was deleted)
-  6. New validator bonds, triggering `AfterValidatorBonded` [8](#0-7) 
-  7. Signing info exists, so no new info created - validator inherits stale `MissedBlocksCounter`
-  8. Validator gets slashed/jailed after missing fewer blocks than protocol parameters specify
-- **security guarantee broken**: The protocol invariant that each validator lifecycle has independent liveness tracking is violated. Validators cannot trust that creating a new validator with the same consensus key starts with a clean slate.
+
+- **location**: 
+  - Primary vulnerability: [1](#0-0) 
+  - Insufficient validation: [2](#0-1) 
+  - Execution handler: [3](#0-2) 
+
+- **intended logic**: The `ValidateAccessOps` function should validate that AccessOps arrays are non-empty before accessing elements and verify they end with a COMMIT operation. Governance proposal validation should ensure all proposal contents are valid before allowing voting.
+
+- **actual logic**: The function directly accesses `accessOps[len(accessOps)-1]` without checking if the slice is empty. When `len(accessOps)` is 0, the expression `len(accessOps)-1` wraps to a large unsigned value, causing an index out-of-bounds panic. The `ValidateBasic()` method only validates title and description via `govtypes.ValidateAbstract(p)` [4](#0-3) , completely bypassing validation of the `MessageDependencyMapping` contents.
+
+- **exploitation path**:
+  1. A governance proposal containing `MessageDependencyMapping` with an empty `AccessOps` array is submitted
+  2. The proposal passes `ValidateBasic` validation (only checks title/description fields)
+  3. The proposal proceeds through the voting period and is approved by governance
+  4. During `EndBlock` execution [5](#0-4) , the approved proposal handler is invoked at line 74
+  5. `HandleMsgUpdateResourceDependencyMappingProposal` calls `k.SetResourceDependencyMapping` [6](#0-5) 
+  6. This invokes `types.ValidateMessageDependencyMapping` at line 95, which calls `ValidateAccessOps`
+  7. The panic occurs when accessing the non-existent array element
+  8. Since `EndBlock` has no panic recovery mechanism, the node crashes
+  9. All validator nodes execute the same `EndBlock` at the same block height, causing simultaneous crashes across the network
+  10. The chain halts completely with no blocks being produced
+
+- **security guarantee broken**: Network availability and liveness. The blockchain should gracefully handle invalid inputs by returning validation errors, not crashing all nodes through unrecovered panics.
 
 ## Impact Explanation
-Validators who reuse consensus keys after full unbonding inherit stale missed block counters, causing them to be slashed and jailed after missing significantly fewer blocks than the configured threshold (e.g., 301 blocks instead of 501 with default parameters). This results in:
-- Unfair economic penalties (slashing of validator stake)
-- Validators being incorrectly jailed and removed from the active set
-- Undermined fairness and predictability of the slashing mechanism
-- Potential discouragement of validator participation due to unexpected behavior
+
+When the malformed governance proposal executes during `EndBlock`, all validator nodes crash simultaneously because they deterministically process the same proposal at the same block height. This results in:
+
+- **Complete network shutdown**: No validator nodes are running to produce new blocks
+- **Transaction processing halt**: No transactions can be confirmed or executed
+- **Consensus failure**: The network cannot reach consensus on new blocks
+- **Recovery complexity**: Requires coordinated manual intervention across all validators, potentially requiring a coordinated restart or software patch deployment
+
+The uncontrolled panic propagates through the application layer without being caught, terminating the node process entirely. This is a complete denial-of-service affecting the entire network.
 
 ## Likelihood Explanation
-This can occur whenever validators cycle through: bonding → accumulating downtime → full unbonding → re-bonding with the same consensus key. While not frequent, this is a realistic scenario that affects:
-- Validators performing maintenance or infrastructure upgrades who fully unbond temporarily
-- Validators who reuse existing consensus keys (common practice for operational simplicity)
-- Any validator operator who accumulates missed blocks before removal (normal during network issues)
 
-The conditions required are all legitimate validator operations, making this a realistic edge case rather than requiring malicious intent.
+**Who can trigger**: Any participant who can submit and get governance proposals passed (requires community/validator support for voting).
+
+**Conditions required**:
+- Governance proposal with empty `AccessOps` is submitted (requires deposit)
+- Proposal receives sufficient votes to pass (requires governance participation)
+- Proposal executes after voting period ends
+
+**Likelihood factors**:
+1. While governance approval is required, this is fundamentally a **validation bug** not a governance attack
+2. Proposals created with buggy tooling, scripts, or simple human error could inadvertently contain empty arrays
+3. The validation failure is subtle - validators reviewing proposals may not notice the empty array
+4. No validation at submission or voting time prevents this; the crash only occurs at execution
+5. Once executed, the impact is immediate and deterministic across all nodes
+
+This represents a critical validation gap where well-intentioned governance participants could accidentally halt the network through a programming error in proposal creation tooling or manual mistakes.
 
 ## Recommendation
-Modify the `AfterValidatorRemoved` hook in the slashing keeper to clean up all validator-related slashing state:
+
+**Immediate fix**: Add bounds checking in `ValidateAccessOps`:
 
 ```go
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-    // Clean up signing info
-    store := ctx.KVStore(k.storeKey)
-    store.Delete(types.ValidatorSigningInfoKey(address))
-    // Clean up missed blocks array  
-    store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
+func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
+    if len(accessOps) == 0 {
+        return ErrNoCommitAccessOp
+    }
+    lastAccessOp := accessOps[len(accessOps)-1]
+    if lastAccessOp != *CommitAccessOp() {
+        return ErrNoCommitAccessOp
+    }
+    // ... rest of validation
 }
 ```
 
-This ensures that when a validator is removed, all liveness tracking data is cleared, allowing a fresh start if the consensus address is reused.
+**Additional improvements**:
+
+1. Enhance `MsgUpdateResourceDependencyMappingProposal.ValidateBasic()` to validate mapping contents before governance voting:
+```go
+func (p *MsgUpdateResourceDependencyMappingProposal) ValidateBasic() error {
+    err := govtypes.ValidateAbstract(p)
+    if err != nil {
+        return err
+    }
+    for _, mapping := range p.MessageDependencyMapping {
+        if err := ValidateMessageDependencyMapping(mapping); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+2. Fix `ValidateGenesis` in module.go to use the full validation: [7](#0-6)  should call `types.ValidateGenesis(data)` [8](#0-7)  instead of only `data.Params.Validate()`.
 
 ## Proof of Concept
-**File**: `x/slashing/keeper/keeper_test.go` (new test to add)
-**Function**: `TestValidatorRemovalClearsMissedBlocks`
 
-**Setup**:
-1. Initialize test app with slashing parameters (SignedBlocksWindow=1000, MinSignedPerWindow=500)
-2. Create validator A with consensus pubkey and self-delegate tokens
-3. Run EndBlocker to activate validator
+**Test location**: Can be added to `x/accesscontrol/types/message_dependency_mapping_test.go`
 
-**Action**:
-1. Simulate 1000 blocks where validator signs correctly
-2. Simulate 200 blocks where validator does NOT sign (accumulate MissedBlocksCounter=200)
-3. Verify signing info shows MissedBlocksCounter=200
-4. Undelegate all tokens and complete unbonding period
-5. Verify validator is removed from state
-6. Create new validator with SAME consensus pubkey
-7. Run EndBlocker to bond new validator
+**Setup**: 
+```go
+import (
+    "testing"
+    acltypes "github.com/cosmos/cosmos-sdk/types/accesscontrol"
+    "github.com/cosmos/cosmos-sdk/x/accesscontrol/types"
+)
+```
 
-**Result**:
-Query signing info for consensus address - it incorrectly shows MissedBlocksCounter=200 (inherited from removed validator) instead of 0, proving the bug. When the new validator then misses 301 more blocks, it gets jailed at threshold 501, whereas a fresh validator should need to miss 501 blocks from scratch.
+**Action**: Call `ValidateAccessOps` with empty slice:
+```go
+func TestValidateAccessOps_EmptyArray_ShouldPanic(t *testing.T) {
+    emptyAccessOps := []acltypes.AccessOperation{}
+    
+    // This will panic with "runtime error: index out of range [-1]"
+    defer func() {
+        if r := recover(); r == nil {
+            t.Errorf("Expected panic but got none")
+        }
+    }()
+    
+    types.ValidateAccessOps(emptyAccessOps)
+}
+```
+
+**Result**: The function panics with "runtime error: index out of range" instead of returning a proper error. The panic occurs because accessing `accessOps[len(accessOps)-1]` when the slice is empty attempts to access an invalid memory location.
+
+**Complete execution path verification**: A governance proposal test demonstrating the full exploit path would iterate through proposal submission, voting, and execution in EndBlock, confirming the node crash occurs during execution phase.
+
+## Notes
+
+This vulnerability represents a critical validation gap in the access control governance proposal flow. While governance approval is required, the issue stems from insufficient input validation that allows accidentally malformed proposals to crash the entire network. The lack of panic recovery in the `EndBlock` execution path ( [5](#0-4) ) means this panic propagates to the node process level, causing immediate termination. This is not about malicious governance but about a programming error that transforms routine validation mistakes into catastrophic network failures.
 
 ### Citations
 
-**File:** x/staking/keeper/validator.go (L176-176)
+**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-36)
 ```go
-	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
-```
-
-**File:** x/staking/keeper/validator.go (L180-180)
-```go
-	k.AfterValidatorRemoved(ctx, valConsAddr, validator.GetOperator())
-```
-
-**File:** x/slashing/keeper/hooks.go (L12-26)
-```go
-func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
-	// Update the signing info start height or create a new signing info
-	_, found := k.GetValidatorSigningInfo(ctx, address)
-	if !found {
-		signingInfo := types.NewValidatorSigningInfo(
-			address,
-			ctx.BlockHeight(),
-			0,
-			time.Unix(0, 0),
-			false,
-			0,
-		)
-		k.SetValidatorSigningInfo(ctx, address, signingInfo)
+func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
+	lastAccessOp := accessOps[len(accessOps)-1]
+	if lastAccessOp != *CommitAccessOp() {
+		return ErrNoCommitAccessOp
 	}
+```
+
+**File:** x/accesscontrol/types/gov.go (L42-45)
+```go
+func (p *MsgUpdateResourceDependencyMappingProposal) ValidateBasic() error {
+	err := govtypes.ValidateAbstract(p)
+	return err
 }
 ```
 
-**File:** x/slashing/keeper/hooks.go (L40-43)
+**File:** x/accesscontrol/handler.go (L12-20)
 ```go
-// AfterValidatorRemoved deletes the address-pubkey relation when a validator is removed,
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+func HandleMsgUpdateResourceDependencyMappingProposal(ctx sdk.Context, k *keeper.Keeper, p *types.MsgUpdateResourceDependencyMappingProposal) error {
+	for _, resourceDepMapping := range p.MessageDependencyMapping {
+		err := k.SetResourceDependencyMapping(ctx, resourceDepMapping)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 ```
 
-**File:** x/staking/keeper/msg_server.go (L52-54)
+**File:** x/gov/types/content.go (L37-54)
 ```go
-	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
-		return nil, types.ErrValidatorPubKeyExists
+func ValidateAbstract(c Content) error {
+	title := c.GetTitle()
+	if len(strings.TrimSpace(title)) == 0 {
+		return sdkerrors.Wrap(ErrInvalidProposalContent, "proposal title cannot be blank")
 	}
+	if len(title) > MaxTitleLength {
+		return sdkerrors.Wrapf(ErrInvalidProposalContent, "proposal title is longer than max length of %d", MaxTitleLength)
+	}
+
+	description := c.GetDescription()
+	if len(description) == 0 {
+		return sdkerrors.Wrap(ErrInvalidProposalContent, "proposal description cannot be blank")
+	}
+	if len(description) > MaxDescriptionLength {
+		return sdkerrors.Wrapf(ErrInvalidProposalContent, "proposal description is longer than max length of %d", MaxDescriptionLength)
+	}
+
+	return nil
 ```
 
-**File:** x/slashing/keeper/infractions.go (L96-96)
+**File:** x/gov/abci.go (L67-92)
 ```go
-	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+		if passes {
+			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
+			cacheCtx, writeCache := ctx.CacheContext()
+
+			// The proposal handler may execute state mutating logic depending
+			// on the proposal content. If the handler fails, no state mutation
+			// is written and the error message is logged.
+			err := handler(cacheCtx, proposal.GetContent())
+			if err == nil {
+				proposal.Status = types.StatusPassed
+				tagValue = types.AttributeValueProposalPassed
+				logMsg = "passed"
+
+				// The cached context is created with a new EventManager. However, since
+				// the proposal handler execution was successful, we want to track/keep
+				// any events emitted, so we re-emit to "merge" the events into the
+				// original Context's EventManager.
+				ctx.EventManager().EmitEvents(cacheCtx.EventManager().Events())
+
+				// write state to the underlying multi-store
+				writeCache()
+			} else {
+				proposal.Status = types.StatusFailed
+				tagValue = types.AttributeValueProposalFailed
+				logMsg = fmt.Sprintf("passed, but failed on execution: %s", err)
+			}
 ```
 
-**File:** x/staking/keeper/delegation.go (L789-792)
+**File:** x/accesscontrol/keeper/keeper.go (L91-104)
 ```go
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
+func (k Keeper) SetResourceDependencyMapping(
+	ctx sdk.Context,
+	dependencyMapping acltypes.MessageDependencyMapping,
+) error {
+	err := types.ValidateMessageDependencyMapping(dependencyMapping)
+	if err != nil {
+		return err
 	}
+	store := ctx.KVStore(k.storeKey)
+	b := k.cdc.MustMarshal(&dependencyMapping)
+	resourceKey := types.GetResourceDependencyKey(types.MessageKey(dependencyMapping.GetMessageKey()))
+	store.Set(resourceKey, b)
+	return nil
+}
+```
+
+**File:** x/accesscontrol/module.go (L62-69)
+```go
+func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
+	var data types.GenesisState
+	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
+		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
+	}
+
+	return data.Params.Validate()
+}
+```
+
+**File:** x/accesscontrol/types/genesis.go (L28-43)
+```go
+// ValidateGenesis validates the oracle genesis state
+func ValidateGenesis(data GenesisState) error {
+	for _, mapping := range data.MessageDependencyMapping {
+		err := ValidateMessageDependencyMapping(mapping)
+		if err != nil {
+			return err
+		}
+	}
+	for _, mapping := range data.WasmDependencyMappings {
+		err := ValidateWasmDependencyMapping(mapping)
+		if err != nil {
+			return err
+		}
+	}
+	return data.Params.Validate()
+}
 ```

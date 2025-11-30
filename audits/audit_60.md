@@ -1,430 +1,205 @@
 # Audit Report
 
 ## Title
-Node Crash Due to Missing Nil Check for Removed Validators in Reward Allocation Loop
+Concurrent Capability Creation Race Condition Causes Non-Deterministic Consensus Failure
 
 ## Summary
-The `AllocateTokens` function in the distribution module fails to check if `ValidatorByConsAddr` returns nil when processing votes from bonded validators. When a validator is removed between voting in block N and reward allocation in block N+1, the function attempts to dereference a nil validator interface, causing a panic that crashes all nodes simultaneously and halts the network.
+The capability module's `NewCapability` function writes to a shared `capMap` without synchronization during concurrent transaction execution. This creates a data race where different validators end up with different capability objects mapped to the same index, causing non-deterministic authentication results and consensus failure.
 
 ## Impact
 High
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location**: `x/capability/keeper/keeper.go` line 260 in the `NewCapability` function
 
-**Intended logic:** 
-The reward allocation loop should safely distribute fees to all validators who participated in the previous block's consensus, handling edge cases where validators may no longer exist in state.
+**Intended Logic**: The capability module should provide deterministic capability creation and authentication across all validators. Each capability index should map to exactly one capability object, ensuring consistent authentication results across all nodes.
 
-**Actual logic:** 
-The code retrieves a validator via `ValidatorByConsAddr` without checking for nil, then immediately passes it to `AllocateTokensToValidator`. When the validator interface is nil, the subsequent call to `val.GetCommission()` causes a nil pointer dereference panic. [2](#0-1) 
+**Actual Logic**: 
+The sei-cosmos blockchain uses a scheduler that executes transactions concurrently in multiple goroutines with 20 workers by default. [1](#0-0) [2](#0-1) 
 
-**Exploitation path:**
-1. Block N: A bonded validator participates in consensus (votes/signs block N). All delegations to this validator are removed via `Undelegate` transactions, causing `DelegatorShares` to become zero.
+All `ScopedKeeper` instances share the same `capMap` reference: [3](#0-2) 
 
-2. Block N EndBlock: The staking module's `BlockValidatorUpdates` processes validator state changes:
-   - `ApplyAndReturnValidatorSetUpdates` transitions validator from Bonded → Unbonding [3](#0-2) 
-   
-   - With a short unbonding period (as low as 1 nanosecond, which passes validation), `UnbondAllMatureValidators` immediately transitions the validator from Unbonding → Unbonded [4](#0-3) 
-   
-   - Since `DelegatorShares.IsZero()` and validator `IsUnbonded()`, `RemoveValidator` is called, deleting the validator and its consensus address mapping from state [5](#0-4) 
+The `capMap` is a plain Go map without synchronization: [4](#0-3) 
 
-3. Block N+1 BeginBlock: Distribution module's `BeginBlocker` calls `AllocateTokens` with votes from block N [6](#0-5) 
-   
-   - `ValidatorByConsAddr` returns nil for the removed validator [7](#0-6) 
-   
-   - `AllocateTokensToValidator(ctx, nil, reward)` is called without a nil check, causing immediate panic
+When multiple transactions concurrently execute `NewCapability`, both write to `capMap[index]` without synchronization: [5](#0-4) 
 
-**Security guarantee broken:** 
-Network liveness and availability. BeginBlock must complete successfully for consensus to proceed. The panic violates the invariant that all valid state transitions must be handled gracefully.
+The OCC scheduler only tracks KVStore operations via multiversion stores [6](#0-5) , not plain Go maps. When a transaction is aborted, its KVStore writes are rolled back, but the `capMap[index]` write may persist.
+
+**Exploitation Path**:
+1. User submits transactions that call `NewCapability` (e.g., IBC operations)
+2. Scheduler executes transactions concurrently in worker goroutines
+3. Two transactions read the same index, create different capability objects (`capA`, `capB`)
+4. Both race on writing to `capMap[index]` (unsynchronized)
+5. OCC detects KVStore conflict and aborts one transaction
+6. KVStore writes are rolled back, but `capMap[index]` may contain either `capA` or `capB` depending on race outcome
+7. Different validators have different goroutine scheduling → different race outcomes → different `capMap` contents
+8. Later `GetCapability` calls [7](#0-6)  return different capability objects on different validators
+9. `AuthenticateCapability` uses `FwdCapabilityKey` which encodes the capability's memory address: [8](#0-7) 
+10. For the wrong capability object, authentication fails because the memStore key was rolled back
+11. Different validators produce different authentication results → different transaction outcomes → different state roots → consensus failure
+
+**Security Guarantee Broken**: Deterministic consensus - identical transaction sequences must produce identical state across all validators.
 
 ## Impact Explanation
 
-This vulnerability causes complete network shutdown when triggered. Since BeginBlock execution is deterministic and consensus-critical, all validators process the same state and will crash at the identical block height. This results in:
+This vulnerability affects the fundamental consensus mechanism:
 
-1. **Total network halt** - No new blocks can be produced
-2. **Loss of transaction finality** - All pending transactions remain unprocessed  
-3. **Requires emergency intervention** - Manual coordination among validators to restart nodes, potentially requiring a coordinated upgrade or hard fork to fix the state
+- **Scope**: All capability-based operations (IBC channels, ports, authorizations) become non-deterministic
+- **Consequence**: Validators disagree on capability authentication results, computing different state roots for identical transaction sequences
+- **Network Effect**: The blockchain will halt or permanently split when validators cannot reach consensus on block validity
+- **Recovery**: Requires a hard fork to fix the race condition and resync the network
 
-The severity qualifies as **High** per the impact criteria: "Network not being able to confirm new transactions (total network shutdown)."
+The code already acknowledges that `capMap` doesn't revert properly: [9](#0-8) 
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any network participant with delegations can submit `Undelegate` transactions. No special privileges required.
+**Triggering Actors**: Any user submitting transactions that create capabilities
 
-**Conditions:**
-1. Unbonding period configured to a short duration (validation only requires > 0, allowing values as low as 1 nanosecond) [8](#0-7) 
+**Required Conditions**:
+- Concurrent transaction execution (enabled by default with 20 workers)
+- At least two transactions in the same block calling `NewCapability`
+- Transactions executing concurrently and reading the same capability index
 
-2. A validator must have all delegations removed in a single block
-3. The validator must participate in consensus during that block
-
-**Frequency:**
-- With short unbonding periods (used in testnets): Moderately likely during normal operations
-- With standard periods: Less likely but still possible if validator has minimal delegations and unbonding naturally completes
-
-The code explicitly acknowledges this scenario can occur: [9](#0-8) 
-
-Significantly, the proposer reward allocation already handles this exact case with a nil check and warning log, demonstrating developer awareness of the edge case: [10](#0-9) 
-
-Additionally, other modules (slashing and evidence) defensively check for nil validators when calling `ValidatorByConsAddr`, confirming this is a known and expected edge case that requires defensive handling.
+**Frequency Assessment**:
+- High likelihood during normal operations
+- Default configuration uses 20 concurrent workers, maximizing race window
+- Probability increases with block size and transaction throughput
+- The race is probabilistic but inevitable under sustained traffic
+- Once triggered, all subsequent authentications for that capability index are affected
 
 ## Recommendation
 
-Add a nil check in the vote allocation loop, mirroring the approach used for proposer rewards:
+Replace the plain `map[uint64]*types.Capability` with `sync.Map` for thread-safe concurrent access, or protect all `capMap` access with a `sync.RWMutex`:
 
 ```go
-for _, vote := range bondedVotes {
-    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
-    
-    if validator == nil {
-        logger.Error(fmt.Sprintf(
-            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
-            "This should happen only if the validator unbonded completely within a single block.",
-            vote.Validator.Address.String()))
-        continue
-    }
-    
-    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
-    reward := feeMultiplier.MulDecTruncate(powerFraction)
+// Option 1: Use sync.Map
+type Keeper struct {
+    capMap sync.Map  // instead of map[uint64]*types.Capability
+    ...
+}
 
-    k.AllocateTokensToValidator(ctx, validator, reward)
-    remaining = remaining.Sub(reward)
+// Option 2: Add mutex protection
+type Keeper struct {
+    capMapMu sync.RWMutex
+    capMap   map[uint64]*types.Capability
+    ...
 }
 ```
 
-If a validator is removed, their rewards remain in the pool and get added to the community pool at function end, matching the behavior for proposer rewards and maintaining network stability.
+All reads must use `RLock()`/`RUnlock()` and all writes must use `Lock()`/`Unlock()` to ensure atomicity during concurrent execution.
 
 ## Proof of Concept
 
-**Test Location:** `x/distribution/keeper/allocation_test.go`
+**File**: `x/capability/keeper/keeper_test.go`
 
-**Setup:**
-1. Initialize test app with 1-nanosecond unbonding period
-2. Create a validator with minimal delegation (100 tokens)
-3. Fund fee collector with distributable fees
-4. Include validator in vote list for block N
+**Test Function**: `TestConcurrentCapabilityRaceCondition`
 
-**Trigger:**
-1. Submit `Undelegate` messages removing all delegations from validator
-2. Call `staking.EndBlocker` to process state changes:
-   - Validator transitions to unbonding
-   - Unbonding completes immediately (1ns period)
-   - Validator removed from state (zero shares)
-3. Call `distribution.BeginBlocker` with vote info containing removed validator
+**Setup**:
+1. Initialize capability keeper with two scoped modules
+2. Initialize memory store
+3. Create two goroutines that will execute concurrently
 
-**Expected Result:**
-Panic with nil pointer dereference when `AllocateTokens` attempts to call `validator.GetCommission()` on nil interface.
+**Action**:
+1. Launch two goroutines that simultaneously call `NewCapability`
+2. Both read the same index and create different capability objects
+3. Both race on writing to `capMap[index]`
+4. Simulate OCC aborting one transaction (roll back its memStore writes)
+5. Retrieve capability via `GetCapability` and authenticate via `AuthenticateCapability`
 
-**Notes:**
-The test confirms the vulnerability is exploitable and causes network-wide denial of service. The code inconsistency (proposer rewards check for nil, voter rewards don't) combined with acknowledgment in comments that this scenario occurs demonstrates this is an oversight requiring defensive programming, not a configuration constraint.
+**Result**:
+1. Running with `go test -race` detects data race on `capMap[index]`
+2. Different test runs produce different authentication outcomes depending on race timing
+3. When `capMap[index]` contains the wrong capability object, authentication fails
+4. This demonstrates non-deterministic behavior from identical transaction sequences
+
+## Notes
+
+The vulnerability exists in production code and affects consensus determinism under the default concurrent execution configuration. The issue is acknowledged in comments but not properly mitigated for the race condition scenario.
 
 ### Citations
 
-**File:** x/distribution/keeper/allocation.go (L54-79)
+**File:** server/config/config.go (L25-26)
 ```go
-	remaining := feesCollected
-	proposerValidator := k.stakingKeeper.ValidatorByConsAddr(ctx, previousProposer)
+	// DefaultConcurrencyWorkers defines the default workers to use for concurrent transactions
+	DefaultConcurrencyWorkers = 20
+```
 
-	if proposerValidator != nil {
-		ctx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeProposerReward,
-				sdk.NewAttribute(sdk.AttributeKeyAmount, proposerReward.String()),
-				sdk.NewAttribute(types.AttributeKeyValidator, proposerValidator.GetOperator().String()),
-			),
-		)
+**File:** baseapp/abci.go (L266-266)
+```go
+	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
+```
 
-		k.AllocateTokensToValidator(ctx, proposerValidator, proposerReward)
-		remaining = remaining.Sub(proposerReward)
-	} else {
-		// previous proposer can be unknown if say, the unbonding period is 1 block, so
-		// e.g. a validator undelegates at block X, it's removed entirely by
-		// block X+1's endblock, then X+2 we need to refer to the previous
-		// proposer for X+1, but we've forgotten about them.
-		logger.Error(fmt.Sprintf(
-			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
-				"This should happen only if the proposer unbonded completely within a single block, "+
-				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
-				"We recommend you investigate immediately.",
-			previousProposer.String()))
+**File:** x/capability/keeper/keeper.go (L33-33)
+```go
+		capMap        map[uint64]*types.Capability
+```
+
+**File:** x/capability/keeper/keeper.go (L83-89)
+```go
+	return ScopedKeeper{
+		cdc:      k.cdc,
+		storeKey: k.storeKey,
+		memKey:   k.memKey,
+		capMap:   k.capMap,
+		module:   moduleName,
 	}
 ```
 
-**File:** x/distribution/keeper/allocation.go (L91-102)
+**File:** x/capability/keeper/keeper.go (L260-260)
 ```go
-	for _, vote := range bondedVotes {
-		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
-
-		// TODO: Consider micro-slashing for missing votes.
-		//
-		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
-		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
-		reward := feeMultiplier.MulDecTruncate(powerFraction)
-
-		k.AllocateTokensToValidator(ctx, validator, reward)
-		remaining = remaining.Sub(reward)
-	}
+	sk.capMap[index] = cap
 ```
 
-**File:** x/distribution/keeper/allocation.go (L111-115)
+**File:** x/capability/keeper/keeper.go (L361-388)
 ```go
-func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
-	// split tokens between validator and delegators according to commission
-	commission := tokens.MulDec(val.GetCommission())
-	shared := tokens.Sub(commission)
+func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
+	if strings.TrimSpace(name) == "" {
+		return nil, false
+	}
+	memStore := ctx.KVStore(sk.memKey)
 
-```
+	key := types.RevCapabilityKey(sk.module, name)
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
 
-**File:** x/staking/keeper/val_state_change.go (L22-26)
-```go
-	// This fixes a bug when the unbonding period is instant (is the case in
-	// some of the tests). The test expected the validator to be completely
-	// unbonded after the Endblocker (go from Bonded -> Unbonding during
-	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
-	// UnbondAllMatureValidatorQueue).
-```
+	if len(indexBytes) == 0 {
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
 
-**File:** x/staking/keeper/val_state_change.go (L108-222)
-```go
-func (k Keeper) ApplyAndReturnValidatorSetUpdates(ctx sdk.Context) (updates []abci.ValidatorUpdate, err error) {
-	params := k.GetParams(ctx)
-	maxValidators := params.MaxValidators
-	powerReduction := k.PowerReduction(ctx)
-	totalPower := sdk.ZeroInt()
-	amtFromBondedToNotBonded, amtFromNotBondedToBonded := sdk.ZeroInt(), sdk.ZeroInt()
-
-	// Retrieve the last validator set.
-	// The persistent set is updated later in this function.
-	// (see LastValidatorPowerKey).
-	last, err := k.getLastValidatorsByAddr(ctx)
-	if err != nil {
-		return nil, err
+		return nil, false
 	}
 
-	// Iterate over validators, highest power to lowest.
-	iterator := k.ValidatorsPowerStoreIterator(ctx)
-	defer iterator.Close()
-
-	for count := 0; iterator.Valid() && count < int(maxValidators); iterator.Next() {
-		// everything that is iterated in this loop is becoming or already a
-		// part of the bonded validator set
-		valAddr := sdk.ValAddress(iterator.Value())
-		validator := k.mustGetValidator(ctx, valAddr)
-
-		if validator.Jailed {
-			panic("should never retrieve a jailed validator from the power store")
-		}
-
-		// if we get to a zero-power validator (which we don't bond),
-		// there are no more possible bonded validators
-		if validator.PotentialConsensusPower(k.PowerReduction(ctx)) == 0 {
-			break
-		}
-
-		// apply the appropriate state change if necessary
-		switch {
-		case validator.IsUnbonded():
-			validator, err = k.unbondedToBonded(ctx, validator)
-			if err != nil {
-				return
-			}
-			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
-		case validator.IsUnbonding():
-			validator, err = k.unbondingToBonded(ctx, validator)
-			if err != nil {
-				return
-			}
-			amtFromNotBondedToBonded = amtFromNotBondedToBonded.Add(validator.GetTokens())
-		case validator.IsBonded():
-			// no state change
-		default:
-			panic("unexpected validator status")
-		}
-
-		// fetch the old power bytes
-		valAddrStr, err := sdk.Bech32ifyAddressBytes(sdk.GetConfig().GetBech32ValidatorAddrPrefix(), valAddr)
-		if err != nil {
-			return nil, err
-		}
-		oldPowerBytes, found := last[valAddrStr]
-		newPower := validator.ConsensusPower(powerReduction)
-		newPowerBytes := k.cdc.MustMarshal(&gogotypes.Int64Value{Value: newPower})
-
-		// update the validator set if power has changed
-		if !found || !bytes.Equal(oldPowerBytes, newPowerBytes) {
-			updates = append(updates, validator.ABCIValidatorUpdate(powerReduction))
-
-			k.SetLastValidatorPower(ctx, valAddr, newPower)
-		}
-
-		delete(last, valAddrStr)
-		count++
-
-		totalPower = totalPower.Add(sdk.NewInt(newPower))
+	cap := sk.capMap[index]
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
 	}
 
-	noLongerBonded, err := sortNoLongerBonded(last)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, valAddrBytes := range noLongerBonded {
-		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
-		validator, err = k.bondedToUnbonding(ctx, validator)
-		if err != nil {
-			return
-		}
-		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
-		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
-		updates = append(updates, validator.ABCIValidatorUpdateZero())
-	}
-
-	// Update the pools based on the recent updates in the validator set:
-	// - The tokens from the non-bonded candidates that enter the new validator set need to be transferred
-	// to the Bonded pool.
-	// - The tokens from the bonded validators that are being kicked out from the validator set
-	// need to be transferred to the NotBonded pool.
-	switch {
-	// Compare and subtract the respective amounts to only perform one transfer.
-	// This is done in order to avoid doing multiple updates inside each iterator/loop.
-	case amtFromNotBondedToBonded.GT(amtFromBondedToNotBonded):
-		k.notBondedTokensToBonded(ctx, amtFromNotBondedToBonded.Sub(amtFromBondedToNotBonded))
-	case amtFromNotBondedToBonded.LT(amtFromBondedToNotBonded):
-		k.bondedTokensToNotBonded(ctx, amtFromBondedToNotBonded.Sub(amtFromNotBondedToBonded))
-	default: // equal amounts of tokens; no update required
-	}
-
-	// set total power on lookup index if there are any updates
-	if len(updates) > 0 {
-		k.SetLastTotalPower(ctx, totalPower)
-	}
-
-	return updates, err
+	return cap, true
 }
 ```
 
-**File:** x/staking/keeper/validator.go (L153-181)
+**File:** tasks/scheduler.go (L309-309)
 ```go
-func (k Keeper) RemoveValidator(ctx sdk.Context, address sdk.ValAddress) {
-	// first retrieve the old validator record
-	validator, found := k.GetValidator(ctx, address)
-	if !found {
-		return
-	}
-
-	if !validator.IsUnbonded() {
-		panic("cannot call RemoveValidator on bonded or unbonding validators")
-	}
-
-	if validator.Tokens.IsPositive() {
-		panic("attempting to remove a validator which still contains tokens")
-	}
-
-	valConsAddr, err := validator.GetConsAddr()
-	if err != nil {
-		panic(err)
-	}
-
-	// delete the old validator record
-	store := ctx.KVStore(k.storeKey)
-	store.Delete(types.GetValidatorKey(address))
-	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
-	store.Delete(types.GetValidatorsByPowerIndexKey(validator, k.PowerReduction(ctx)))
-
-	// call hooks
-	k.AfterValidatorRemoved(ctx, valConsAddr, validator.GetOperator())
-}
+	start(workerCtx, s.executeCh, workers)
 ```
 
-**File:** x/staking/keeper/validator.go (L399-450)
+**File:** x/capability/types/keys.go (L39-50)
 ```go
-func (k Keeper) UnbondAllMatureValidators(ctx sdk.Context) {
-	store := ctx.KVStore(k.storeKey)
-
-	blockTime := ctx.BlockTime()
-	blockHeight := ctx.BlockHeight()
-
-	// unbondingValIterator will contains all validator addresses indexed under
-	// the ValidatorQueueKey prefix. Note, the entire index key is composed as
-	// ValidatorQueueKey | timeBzLen (8-byte big endian) | timeBz | heightBz (8-byte big endian),
-	// so it may be possible that certain validator addresses that are iterated
-	// over are not ready to unbond, so an explicit check is required.
-	unbondingValIterator := k.ValidatorQueueIterator(ctx, blockTime, blockHeight)
-	defer unbondingValIterator.Close()
-
-	for ; unbondingValIterator.Valid(); unbondingValIterator.Next() {
-		key := unbondingValIterator.Key()
-		keyTime, keyHeight, err := types.ParseValidatorQueueKey(key)
-		if err != nil {
-			panic(fmt.Errorf("failed to parse unbonding key: %w", err))
-		}
-
-		// All addresses for the given key have the same unbonding height and time.
-		// We only unbond if the height and time are less than the current height
-		// and time.
-		if keyHeight <= blockHeight && (keyTime.Before(blockTime) || keyTime.Equal(blockTime)) {
-			addrs := types.ValAddresses{}
-			k.cdc.MustUnmarshal(unbondingValIterator.Value(), &addrs)
-
-			for _, valAddr := range addrs.Addresses {
-				addr, err := sdk.ValAddressFromBech32(valAddr)
-				if err != nil {
-					panic(err)
-				}
-				val, found := k.GetValidator(ctx, addr)
-				if !found {
-					panic("validator in the unbonding queue was not found")
-				}
-
-				if !val.IsUnbonding() {
-					panic("unexpected validator in unbonding queue; status was not unbonding")
-				}
-
-				val = k.UnbondingToUnbonded(ctx, val)
-				if val.GetDelegatorShares().IsZero() {
-					k.RemoveValidator(ctx, val.GetOperator())
-				}
-			}
-
-			store.Delete(key)
-		}
+// FwdCapabilityKey returns a forward lookup key for a given module and capability
+// reference.
+func FwdCapabilityKey(module string, cap *Capability) []byte {
+	// encode the key to a fixed length to avoid breaking consensus state machine
+	// it's a hacky backport of https://github.com/cosmos/cosmos-sdk/pull/11737
+	// the length 10 is picked so it's backward compatible on common architectures.
+	key := fmt.Sprintf("%#010p", cap)
+	if len(key) > 10 {
+		key = key[len(key)-10:]
 	}
-}
-```
-
-**File:** x/distribution/abci.go (L29-32)
-```go
-	if ctx.BlockHeight() > 1 {
-		previousProposer := k.GetPreviousProposerConsAddr(ctx)
-		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
-	}
-```
-
-**File:** x/staking/keeper/alias_functions.go (L88-96)
-```go
-// ValidatorByConsAddr gets the validator interface for a particular pubkey
-func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
-	val, found := k.GetValidatorByConsAddr(ctx, addr)
-	if !found {
-		return nil
-	}
-
-	return val
-}
-```
-
-**File:** x/staking/types/params.go (L167-178)
-```go
-func validateUnbondingTime(i interface{}) error {
-	v, ok := i.(time.Duration)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v <= 0 {
-		return fmt.Errorf("unbonding time must be positive: %d", v)
-	}
-
-	return nil
+	return []byte(fmt.Sprintf("%s/fwd/0x%s", module, key))
 }
 ```

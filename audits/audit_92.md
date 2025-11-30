@@ -1,241 +1,297 @@
 # Audit Report
 
 ## Title
-Chain Halt Due to Orphaned Missed Blocks Imported Through Malicious Genesis File
+State Inconsistency Between Transactional memStore and Non-Transactional capMap Leading to Permanent Capability Corruption and Fund Freezing
 
 ## Summary
-The slashing module's `ValidateGenesis` function fails to verify that all missed blocks entries have corresponding signing info entries. This validation gap allows a malicious genesis file to import orphaned missed blocks, which causes the chain to panic and halt when those validators participate in consensus. The issue is exacerbated when `Exported: true` is set in the staking genesis, preventing hooks from auto-creating missing signing info.
+The capability keeper maintains state in both a transactional KVStore (`memStore`) and a non-transactional Go map (`capMap`). When `ReleaseCapability` is called within a transaction that subsequently fails, memStore changes are rolled back but capMap modifications persist, creating a permanent state inconsistency that renders the capability unusable and can freeze funds locked in IBC channels. [1](#0-0) 
 
 ## Impact
 High
 
 ## Finding Description
 
-**Location:**
-- Primary validation gap: [1](#0-0) 
-- Import without cross-validation: [2](#0-1) 
-- Panic trigger: [3](#0-2) 
-- Hook bypass mechanism: [4](#0-3) 
+**Location:** 
+- `ReleaseCapability` function at lines 319-356
+- `GetCapability` function at lines 361-388 in `x/capability/keeper/keeper.go` [2](#0-1) 
 
-**Intended Logic:**
-Genesis validation should enforce the invariant that missed blocks entries can only exist for validators with corresponding signing info. According to the specification [5](#0-4) , the system should use a 0-value default signing info if not present, rather than panicking.
+**Intended Logic:** 
+The capability system should maintain atomic consistency between two storage layers:
+1. `memStore` - A transactional KVStore that automatically reverts on transaction failure
+2. `capMap` - An in-memory Go map for fast lookups
 
-**Actual Logic:**
-1. `ValidateGenesis` only validates slashing parameters (slash fractions, windows, jail durations) but does NOT validate the relationship between `MissedBlocks` and `SigningInfos` [1](#0-0) 
+Both stores must remain synchronized to ensure capabilities remain accessible.
 
-2. `InitGenesis` imports signing infos and missed blocks independently without any cross-validation [6](#0-5) 
+**Actual Logic:** 
+In `ReleaseCapability`:
+- Lines 332, 336: Delete capability mappings from `memStore` (transactional, will revert on tx failure)
+- Line 349: Delete capability from `capMap` via `delete(sk.capMap, cap.GetIndex())` (non-transactional, persists even on tx failure) [3](#0-2) 
 
-3. When `Exported: true` is set in staking genesis, validator creation hooks are skipped [4](#0-3) , preventing automatic signing info creation via the `AfterValidatorBonded` hook [7](#0-6) 
+When a transaction calling `ReleaseCapability` fails, the memStore deletions are reverted but the capMap deletion persists, creating a permanent inconsistency.
 
-4. When a validator with orphaned missed blocks participates in consensus, `HandleValidatorSignatureConcurrent` panics because it expects signing info to exist [3](#0-2) 
+In `GetCapability`:
+- Line 368: Retrieves capability index from memStore  
+- Line 382: Looks up capability in capMap using that index
+- Lines 383-385: Panics if capability is nil with message "capability found in memstore is missing from map" [4](#0-3) 
 
 **Exploitation Path:**
-1. Attacker crafts a genesis file with `ValidatorMissedBlockArray` entries but no corresponding `SigningInfo` entries, and sets `Exported: true` in staking genesis
-2. Genesis validation passes because `ValidateGenesis` only checks parameters
-3. Chain operators initialize the chain using `InitGenesis`, which imports the orphaned missed blocks
-4. When the validator participates in consensus, `BeginBlocker` invokes `HandleValidatorSignatureConcurrent` [8](#0-7) 
-5. The function panics with "Expected signing info for validator %s but not found"
-6. Entire chain halts due to consensus failure
+1. User creates a capability as sole owner (e.g., IBC channel with funds in escrow)
+2. User submits a transaction that calls `ReleaseCapability` (e.g., channel close)
+3. Transaction fails after `ReleaseCapability` executes (out-of-gas, panic, or other error)
+4. Transaction reverts: memStore changes roll back, but capMap deletion persists
+5. Capability is now permanently corrupted - index exists in memStore but not in capMap
+6. All subsequent attempts to `GetCapability` for this capability:
+   - Find the index in memStore
+   - Get nil from capMap
+   - Panic (recovered in transaction execution causing transaction failure)
+7. The capability becomes permanently unusable
+8. Any funds locked in escrow for an IBC channel using this capability are permanently frozen
 
-**Security Guarantee Broken:**
-The system fails to maintain the critical invariant that missed blocks can only exist for validators with signing info. This violates the assumption that genesis state is validated for consistency before import.
+**Security Guarantee Broken:** 
+The atomicity and consistency of the capability storage system is violated. The permanent corruption breaks the availability of the capability and can cause permanent fund freezing.
 
 ## Impact Explanation
 
-This vulnerability causes **total network shutdown** - a HIGH severity impact explicitly listed in the acceptance criteria as "Network not being able to confirm new transactions (total network shutdown)."
+While the claim suggests node crashes, transaction execution has panic recovery that prevents node crashes during normal operation. [5](#0-4) 
 
-When the panic occurs:
-- The entire blockchain network halts immediately when `BeginBlocker` panics during consensus
-- No new blocks can be produced or transactions confirmed
-- The network remains down until all validators coordinate to restart with a corrected genesis file
-- Recovery requires complex coordination and potentially a hard fork
+However, the actual impact is more severe in terms of fund loss:
 
-The panic happens in the consensus-critical path (`BeginBlocker`), making it impossible for the network to continue operation. Unlike application-level errors that might affect individual transactions, this is a consensus-breaking failure that impacts the entire network simultaneously.
+1. **Permanent Capability Corruption**: The capability becomes permanently unusable - the inconsistent state persists until manual intervention (state export/import or code fix).
+
+2. **Transaction Failures**: Any transaction attempting to use the corrupted capability will panic and fail. The panic is recovered by the transaction execution framework, but the transaction consistently fails.
+
+3. **IBC Fund Freezing**: If the corrupted capability is an IBC channel capability:
+   - No packets can be sent or received on that channel
+   - Funds locked in escrow for that channel cannot be released
+   - This represents **permanent freezing of funds** requiring a hard fork to resolve
+
+4. **Denial of Service**: The corrupted capability effectively disables whatever functionality it was protecting (e.g., an entire IBC connection).
+
+This matches the impact criteria: **"Permanent freezing of funds (fix requires hard fork)"** - High severity.
 
 ## Likelihood Explanation
 
 **Who Can Trigger:**
-Someone who can influence genesis file creation during chain launch or network restart. This includes:
-- Participants in multi-party genesis file creation (common for new blockchain launches)
-- Attackers who compromise genesis generation tooling
-- Social engineering attacks during chain coordination
+- Any user who can own a capability (creating IBC channels is permissionless in most chains)
+- Can be triggered intentionally or accidentally through buggy module code
 
-**Required Conditions:**
-1. Malicious genesis file must be used during chain initialization
-2. The validator addresses in orphaned missed blocks must eventually participate in consensus
-3. `Exported: true` must be set in staking genesis to prevent automatic signing info creation
+**Conditions Required:**
+1. User must be the sole or last owner of a capability
+2. Must trigger a transaction that calls `ReleaseCapability`
+3. Must cause the transaction to fail after the release
 
-**Likelihood Assessment:**
-While this requires involvement during genesis creation, it's realistic because:
-- Multi-party genesis coordination is standard for blockchain launches
-- The validation gap makes it easy to miss this inconsistency during review
-- Genesis files passing `ValidateGenesis` gives false confidence of correctness
-- Once imported, the issue persists indefinitely as a "time bomb"
-- There's a discrepancy between the specification (which says to handle missing signing info gracefully) and implementation (which panics), suggesting this is an overlooked edge case
+**Realistic Attack Vectors:**
+- **Out-of-gas attack**: User carefully sets gas limit to run out immediately after `ReleaseCapability` executes - this is highly reliable and doesn't require finding buggy code paths
+- **Exploiting module bugs**: Finding code paths that release capabilities before operations that might fail
+- **Accidental triggering**: Buggy module code that releases capabilities and then encounters errors
 
-The exception clause for privileged roles applies here: even a trusted genesis creator can inadvertently create this state (since validation doesn't catch it), causing an unrecoverable security failure (total chain halt) beyond their intended authority (setting genesis state shouldn't create chain-halting time bombs).
+**Frequency:**
+- Can be triggered on-demand by an attacker
+- Each exploitation corrupts one capability
+- High-value targets include IBC channels with significant funds in escrow
+- Permanent until manual state correction
+
+The out-of-gas scenario is particularly realistic as users have complete control over their transaction gas limits.
 
 ## Recommendation
 
-**Fix 1: Add Validation in ValidateGenesis**
-Add cross-validation to ensure all missed blocks have corresponding signing info:
+**Immediate Mitigation - Defensive GetCapability:**
+
+Modify `GetCapability` to handle inconsistency gracefully instead of panicking:
 
 ```go
-// In x/slashing/types/genesis.go, add after line 56:
-
-// Validate that all missed blocks have corresponding signing info
-signingInfoAddrs := make(map[string]bool)
-for _, info := range data.SigningInfos {
-    signingInfoAddrs[info.Address] = true
-}
-
-for _, missedBlock := range data.MissedBlocks {
-    if !signingInfoAddrs[missedBlock.Address] {
-        return fmt.Errorf("missed blocks found for address %s without corresponding signing info", missedBlock.Address)
-    }
+cap := sk.capMap[index]
+if cap == nil {
+    // Inconsistency detected - clean up stale memStore entries
+    memStore.Delete(types.RevCapabilityKey(sk.module, name))
+    return nil, false
 }
 ```
 
-**Fix 2: Implement Graceful Handling (Defense-in-Depth)**
-Align implementation with specification by creating default signing info instead of panicking:
+**Long-term Solution - Transaction-Aware capMap:**
 
-```go
-// In x/slashing/keeper/infractions.go, replace lines 33-36:
+Implement a transaction-aware wrapper around `capMap` that tracks changes in a cache layer and can revert changes when transactions fail, similar to how KVStores work with CacheMultiStore.
 
-signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
-if !found {
-    // Create default signing info as documented in spec
-    signInfo = types.NewValidatorSigningInfo(consAddr, height, 0, time.Unix(0, 0), false, 0)
-    k.SetValidatorSigningInfo(ctx, consAddr, signInfo)
-}
-```
+**Alternative Solution - Deferred capMap Updates:**
 
-**Recommended Approach:** Implement both fixes for defense-in-depth:
-- Fix 1 prevents the issue at genesis validation time (fail-fast)
-- Fix 2 aligns implementation with specification and provides fallback protection
+Only update capMap after transaction commit by using hooks or post-processing, ensuring capMap changes are never made speculatively during transaction execution.
 
 ## Proof of Concept
 
-The report provides a comprehensive Go test demonstrating the vulnerability:
+The vulnerability can be reproduced by adding this test to `x/capability/keeper/keeper_test.go`: [6](#0-5) 
 
-**File:** `x/slashing/genesis_test.go`
-**Function:** `TestOrphanedMissedBlocksCausesPanic`
+**Test Function:** `TestReleaseCapabilityInconsistencyOnRevert`
 
 **Setup:**
-- Create a genesis state with orphaned missed blocks (missed blocks without signing info)
-- Verify the malformed genesis passes `ValidateGenesis`
-- Import the genesis via `InitGenesis`
+1. Create a capability in main context: `cap, err := sk.NewCapability(suite.ctx, "channel-0")`
+2. Verify retrievable: `got, ok := sk.GetCapability(suite.ctx, "channel-0")`
+3. Create cached context: `msCache := suite.ctx.MultiStore().CacheMultiStore()` and `cacheCtx := suite.ctx.WithMultiStore(msCache)`
 
 **Action:**
-- Trigger `BeginBlocker` with a validator vote for the address with orphaned missed blocks
-- The validator has missed blocks data but no signing info
+1. Release in cached context: `err := sk.ReleaseCapability(cacheCtx, cap)`
+2. Verify not retrievable in cache: `got, ok := sk.GetCapability(cacheCtx, "channel-0")` (should be false)
+3. **Do NOT call `msCache.Write()`** - simulating transaction failure
+4. Attempt to retrieve in original context: `got, ok := sk.GetCapability(suite.ctx, "channel-0")`
 
 **Result:**
-- The test asserts that `BeginBlocker` panics with "Expected signing info for validator %s but not found"
-- This demonstrates that the validation gap allows importing invalid state that causes chain halt
-
-The PoC can be run with:
-```bash
-cd x/slashing
-go test -v -run TestOrphanedMissedBlocksCausesPanic
-```
+- The test will panic with message "capability found in memstore is missing from map"
+- This confirms: memStore still has the mapping (cache not written), but capMap doesn't have the capability (deletion persisted)
+- The panic demonstrates the permanent state inconsistency
 
 ## Notes
 
-This vulnerability represents a critical gap in genesis validation that violates the documented behavior. The specification clearly states that missing signing info should be handled gracefully with default values, but the implementation panics instead. This discrepancy, combined with the incomplete validation, creates a scenario where trusted parties can inadvertently create genesis files that cause total network shutdown - an impact far beyond their intended authority of setting initial chain state.
+The existing TODO comment at line 376 acknowledges Go map transaction issues but only addresses the `NewCapability` revert scenario, not the `ReleaseCapability` revert scenario. [7](#0-6) 
+
+The developers are aware of the general issue category but the specific panic-inducing case for `ReleaseCapability` with fund-freezing implications is not handled.
 
 ### Citations
 
-**File:** x/slashing/types/genesis.go (L32-58)
+**File:** x/capability/keeper/keeper.go (L29-50)
 ```go
-func ValidateGenesis(data GenesisState) error {
-	downtime := data.Params.SlashFractionDowntime
-	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
+	Keeper struct {
+		cdc           codec.BinaryCodec
+		storeKey      sdk.StoreKey
+		memKey        sdk.StoreKey
+		capMap        map[uint64]*types.Capability
+		scopedModules map[string]struct{}
+		sealed        bool
 	}
 
-	dblSign := data.Params.SlashFractionDoubleSign
-	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
+	// ScopedKeeper defines a scoped sub-keeper which is tied to a single specific
+	// module provisioned by the capability keeper. Scoped keepers must be created
+	// at application initialization and passed to modules, which can then use them
+	// to claim capabilities they receive and retrieve capabilities which they own
+	// by name, in addition to creating new capabilities & authenticating capabilities
+	// passed by other modules.
+	ScopedKeeper struct {
+		cdc      codec.BinaryCodec
+		storeKey sdk.StoreKey
+		memKey   sdk.StoreKey
+		capMap   map[uint64]*types.Capability
+		module   string
+	}
+```
+
+**File:** x/capability/keeper/keeper.go (L319-356)
+```go
+func (sk ScopedKeeper) ReleaseCapability(ctx sdk.Context, cap *types.Capability) error {
+	if cap == nil {
+		return sdkerrors.Wrap(types.ErrNilCapability, "cannot release nil capability")
+	}
+	name := sk.GetCapabilityName(ctx, cap)
+	if len(name) == 0 {
+		return sdkerrors.Wrap(types.ErrCapabilityNotOwned, sk.module)
 	}
 
-	minSign := data.Params.MinSignedPerWindow
-	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
-	}
+	memStore := ctx.KVStore(sk.memKey)
 
-	downtimeJail := data.Params.DowntimeJailDuration
-	if downtimeJail < 1*time.Minute {
-		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
-	}
+	// Delete the forward mapping between the module and capability tuple and the
+	// capability name in the memKVStore
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
 
-	signedWindow := data.Params.SignedBlocksWindow
-	if signedWindow < 10 {
-		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+
+	// remove owner
+	capOwners := sk.getOwners(ctx, cap)
+	capOwners.Remove(types.NewOwner(sk.module, name))
+
+	prefixStore := prefix.NewStore(ctx.KVStore(sk.storeKey), types.KeyPrefixIndexCapability)
+	indexKey := types.IndexToKey(cap.GetIndex())
+
+	if len(capOwners.Owners) == 0 {
+		// remove capability owner set
+		prefixStore.Delete(indexKey)
+		// since no one owns capability, we can delete capability from map
+		delete(sk.capMap, cap.GetIndex())
+	} else {
+		// update capability owner set
+		prefixStore.Set(indexKey, sk.cdc.MustMarshal(capOwners))
 	}
 
 	return nil
+}
 ```
 
-**File:** x/slashing/genesis.go (L24-38)
+**File:** x/capability/keeper/keeper.go (L361-388)
 ```go
-	for _, info := range data.SigningInfos {
-		address, err := sdk.ConsAddressFromBech32(info.Address)
-		if err != nil {
-			panic(err)
+func (sk ScopedKeeper) GetCapability(ctx sdk.Context, name string) (*types.Capability, bool) {
+	if strings.TrimSpace(name) == "" {
+		return nil, false
+	}
+	memStore := ctx.KVStore(sk.memKey)
+
+	key := types.RevCapabilityKey(sk.module, name)
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
+
+	if len(indexBytes) == 0 {
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+
+		return nil, false
+	}
+
+	cap := sk.capMap[index]
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
+	}
+
+	return cap, true
+}
+```
+
+**File:** baseapp/baseapp.go (L904-915)
+```go
+	defer func() {
+		if r := recover(); r != nil {
+			acltypes.SendAllSignalsForTx(ctx.TxCompletionChannels())
+			recoveryMW := newOutOfGasRecoveryMiddleware(gasWanted, ctx, app.runTxRecoveryMiddleware)
+			recoveryMW = newOCCAbortRecoveryMiddleware(recoveryMW) // TODO: do we have to wrap with occ enabled check?
+			err, result = processRecovery(r, recoveryMW), nil
+			if mode != runTxModeDeliver {
+				ctx.MultiStore().ResetEvents()
+			}
 		}
-		keeper.SetValidatorSigningInfo(ctx, address, info.ValidatorSigningInfo)
-	}
-
-	for _, array := range data.MissedBlocks {
-		address, err := sdk.ConsAddressFromBech32(array.Address)
-		if err != nil {
-			panic(err)
-		}
-		keeper.SetValidatorMissedBlocks(ctx, address, array)
-	}
+		gInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed(), GasEstimate: gasEstimate}
+	}()
 ```
 
-**File:** x/slashing/keeper/infractions.go (L33-36)
+**File:** x/capability/keeper/keeper_test.go (L277-306)
 ```go
-	signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
-	if !found {
-		panic(fmt.Sprintf("Expected signing info for validator %s but not found", consAddr))
-	}
-```
+func (suite KeeperTestSuite) TestRevertCapability() {
+	sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
 
-**File:** x/staking/genesis.go (L47-49)
-```go
-		if !data.Exported {
-			keeper.AfterValidatorCreated(ctx, validator.GetOperator())
-		}
-```
+	ms := suite.ctx.MultiStore()
 
-**File:** x/slashing/spec/04_begin_block.md (L35-36)
-```markdown
-  // signed. We use the 0-value default signing info if not present, except for
-  // start height.
-```
+	msCache := ms.CacheMultiStore()
+	cacheCtx := suite.ctx.WithMultiStore(msCache)
 
-**File:** x/slashing/keeper/hooks.go (L12-25)
-```go
-func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
-	// Update the signing info start height or create a new signing info
-	_, found := k.GetValidatorSigningInfo(ctx, address)
-	if !found {
-		signingInfo := types.NewValidatorSigningInfo(
-			address,
-			ctx.BlockHeight(),
-			0,
-			time.Unix(0, 0),
-			false,
-			0,
-		)
-		k.SetValidatorSigningInfo(ctx, address, signingInfo)
-	}
-```
+	capName := "revert"
+	// Create capability on cached context
+	cap, err := sk.NewCapability(cacheCtx, capName)
+	suite.Require().NoError(err, "could not create capability")
 
-**File:** x/slashing/abci.go (L41-41)
-```go
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+	// Check that capability written in cached context
+	gotCache, ok := sk.GetCapability(cacheCtx, capName)
+	suite.Require().True(ok, "could not retrieve capability from cached context")
+	suite.Require().Equal(cap, gotCache, "did not get correct capability from cached context")
+
+	// Check that capability is NOT written to original context
+	got, ok := sk.GetCapability(suite.ctx, capName)
+	suite.Require().False(ok, "retrieved capability from original context before write")
+	suite.Require().Nil(got, "capability not nil in original store")
+
+	// Write to underlying memKVStore
+	msCache.Write()
+
+	got, ok = sk.GetCapability(suite.ctx, capName)
+	suite.Require().True(ok, "could not retrieve capability from context")
+	suite.Require().Equal(cap, got, "did not get correct capability from context")
+}
 ```

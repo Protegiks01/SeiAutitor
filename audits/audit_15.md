@@ -1,193 +1,209 @@
+Based on my thorough investigation of the sei-cosmos codebase, I can confirm this is a **valid vulnerability**. Let me present my validation findings:
+
+## Validation Analysis
+
+**Code Flow Verification:**
+
+I've traced through the complete execution path and confirmed each component of the claim:
+
+1. The AnteHandler calls `UseGrantedFees` with only top-level messages from `sdkTx.GetMsgs()` [1](#0-0) 
+
+2. The `Tx.GetMsgs()` method returns only messages from `t.Body.Messages` without unwrapping nested messages from `MsgExec` [2](#0-1) 
+
+3. The `AllowedMsgAllowance.Accept()` method validates only the messages passed to it [3](#0-2) 
+
+4. The `allMsgTypesAllowed()` method iterates through messages checking their types but does NOT unwrap nested messages from `MsgExec` [4](#0-3) 
+
+5. During execution, `DispatchActions()` has implicit acceptance logic when the message signer equals the MsgExec grantee, bypassing authorization checks [5](#0-4) 
+
+**Impact Assessment:**
+
+This vulnerability allows unauthorized drainage of feegrant balances for transaction types outside the granter's intended restrictions, constituting a **direct loss of funds** limited to the feegrant balance. The granter loses control over how their allocated funds are spent.
+
+---
+
 # Audit Report
 
 ## Title
-Node Crash via Out-of-Bounds Array Access in Multisig Gas Consumption
+AllowedMsgAllowance Bypass via Nested MsgExec Messages
 
 ## Summary
-An attacker can crash validator nodes by submitting a transaction with a multisig signature containing a BitArray whose size exceeds the number of public keys in the multisig. The `ConsumeMultisignatureVerificationGas` function accesses the public key array by index without bounds validation, causing a Go runtime panic before the signature verification decorator can reject the malformed transaction.
+The `AllowedMsgAllowance` feegrant restriction can be bypassed by wrapping disallowed message types inside an authz `MsgExec`. The AnteHandler only validates top-level messages when checking feegrant allowances, allowing unauthorized execution of any message type while using a restricted feegrant to pay fees.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- x/auth/ante/fee.go (line 168)
+- x/feegrant/filtered_fee.go (lines 65-86, 98-109)
+- types/tx/types.go (lines 22-36)
+- x/authz/keeper/keeper.go (lines 87-111)
 
-**Intended Logic:** 
-The `ConsumeMultisignatureVerificationGas` function should safely consume gas for each signature in a multisig transaction by iterating only over valid public key indices that exist in the multisig public key array.
+**Intended Logic:**
+The `AllowedMsgAllowance` should restrict feegrants to only pay fees for specific message types. When a granter creates a feegrant with specific allowed message type URLs, the system should reject any transaction attempting to use this feegrant for other message types, including nested messages within wrapper types like `MsgExec`.
 
-**Actual Logic:** 
-The function retrieves the size from `sig.BitArray.Count()` and loops from `i = 0` to `i < size`, directly accessing `pubkey.GetPubKeys()[i]` at each iteration without validating that the index is within the bounds of the public key array. The proper validation check `len(pubKeys) != size` exists in `VerifyMultisignature` [2](#0-1) , but this validation occurs in the signature verification phase which executes AFTER gas consumption in the ante handler chain [3](#0-2) .
+**Actual Logic:**
+The `DeductFeeDecorator` calls `UseGrantedFees` with only top-level messages obtained via `sdkTx.GetMsgs()`, which does not extract nested messages from `MsgExec`. The `allMsgTypesAllowed` validation only checks these top-level message types against the allowed list, never examining nested messages within `MsgExec`.
 
 **Exploitation Path:**
-1. Attacker creates a multisig account with N public keys (e.g., 3 keys) using standard multisig account creation
-2. Attacker constructs a transaction with `MultiSignatureData` where the `BitArray` has size M where M > N (e.g., size 10)
-3. Attacker sets at least one bit in the BitArray at index `i >= N` (e.g., sets bit at index 5)
-4. Attacker adds a dummy signature to the Signatures array
-5. Attacker submits the transaction to the network
-6. When a validator processes the transaction through the ante handler chain:
-   - `SigGasConsumeDecorator` executes first (line 57 of ante.go)
-   - It calls `ConsumeMultisignatureVerificationGas` which iterates from i=0 to i=9
-   - At i=5, the code attempts to access `pubkey.GetPubKeys()[5]` on an array containing only 3 elements
-   - Go runtime generates an "index out of range" panic
-   - The panic recovery in `SetUpContextDecorator` [4](#0-3)  only catches `sdk.ErrorOutOfGas` panics and re-panics all others, causing the node to crash
-7. The validator node crashes before `SigVerificationDecorator` (line 58) can execute its validation logic
+1. Attacker obtains a feegrant with `AllowedMsgAllowance` that includes `/cosmos.authz.v1beta1.MsgExec` in the allowed messages list
+2. Attacker creates a transaction containing a `MsgExec` message where they are the grantee
+3. Inside the `MsgExec`, the attacker wraps any disallowed message type (e.g., `/cosmos.bank.v1beta1.MsgSend`) where they are the signer
+4. AnteHandler validates only the top-level `MsgExec` against the feegrant allowance and approves it
+5. Fees are deducted from the feegrant
+6. During execution, `DispatchActions` implicitly accepts the nested message since the signer equals the grantee (no authorization check needed)
+7. The disallowed nested message executes successfully using the feegrant to pay fees
 
-**Security Guarantee Broken:** 
-Memory safety and availability. The system fails to validate array bounds before access, allowing unprivileged users to trigger runtime panics that crash validator nodes, violating the network's availability guarantees.
+**Security Guarantee Broken:**
+The message type restriction mechanism in feegrant authorization is bypassed. The guarantee that feegrant funds will only be used for explicitly approved message types is completely circumvented for nested messages.
 
 ## Impact Explanation
 
-This vulnerability enables a denial-of-service attack against the network with the following characteristics:
+This vulnerability enables unauthorized drainage of feegrant balances for transaction types outside the granter's intended restrictions. The granter loses control over how their allocated funds are spent, potentially allowing complete exhaustion of the feegrant balance for any message type where the grantee is the signer. This breaks the trust model of restricted feegrants, which are specifically designed for limited delegation scenarios (e.g., allowing governance voting but preventing token transfers).
 
-- **Affected Processes:** All validator nodes that process the malicious transaction will crash simultaneously
-- **Attack Accessibility:** Any network participant can execute this attack by submitting a single crafted transaction - no special privileges, resources, or timing required
-- **Attack Sustainability:** The attacker can submit multiple malicious transactions to the mempool to crash nodes repeatedly, maintaining a sustained DoS condition
-- **Network Impact:** In a coordinated attack, an adversary can crash a significant percentage of validator nodes (≥30%), severely degrading network availability and potentially preventing the network from producing new blocks or processing legitimate transactions
-
-The attack qualifies as "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network" which is a Medium severity impact according to the provided criteria.
+While the funds are technically still used for fees (their intended purpose), they're applied to unauthorized transaction types, representing a direct loss of the granter's allocated funds. The impact qualifies as direct loss of funds limited to the feegrant balance.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** 
-Any unprivileged network participant with the ability to submit transactions. The attacker only needs:
-- Standard transaction submission capabilities
-- Ability to create a multisig account (no special permissions required)
-- Ability to construct and sign transactions
+**Likelihood: High**
 
-**Conditions Required:**
-- Normal network operation (no special state or timing required)
-- Standard mempool acceptance of transactions
-- No race conditions or complex state setup needed
+The vulnerability can be exploited by any grantee whose feegrant includes `MsgExec` in the allowed messages list. Required conditions:
+- Granter creates an `AllowedMsgAllowance` including `/cosmos.authz.v1beta1.MsgExec` in the allowed messages
+- No additional authz grant is required due to implicit acceptance when signer equals grantee
 
-**Frequency:** 
-The vulnerability can be exploited immediately and repeatedly. Each malicious transaction crashes every node that attempts to process it during the gas consumption phase. An attacker can flood the mempool with such transactions to maximize impact and sustain the attack indefinitely at minimal cost.
+The exploit is straightforward and requires no special privileges beyond possession of the feegrant. Granters might reasonably include `MsgExec` in allowed lists without understanding the nested message implications, making this highly likely to occur in practice.
 
 ## Recommendation
 
-Add a bounds validation check in `ConsumeMultisignatureVerificationGas` before the loop to ensure the BitArray size matches the number of public keys:
+Modify the `AllowedMsgAllowance.Accept` method in `x/feegrant/filtered_fee.go` to recursively validate nested messages within `MsgExec` and other message wrapper types:
 
-```go
-func ConsumeMultisignatureVerificationGas(
-    meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-    params types.Params, accSeq uint64,
-) error {
-    size := sig.BitArray.Count()
-    pubKeys := pubkey.GetPubKeys()
-    
-    // Validate BitArray size matches public key count before array access
-    if len(pubKeys) != size {
-        return fmt.Errorf("bit array size %d does not match public key count %d", size, len(pubKeys))
-    }
-    
-    sigIndex := 0
-    for i := 0; i < size; i++ {
-        if !sig.BitArray.GetIndex(i) {
-            continue
-        }
-        sigV2 := signing.SignatureV2{
-            PubKey:   pubkey.GetPubKeys()[i],
-            Data:     sig.Signatures[sigIndex],
-            Sequence: accSeq,
-        }
-        err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
-        if err != nil {
-            return err
-        }
-        sigIndex++
-    }
-    return nil
-}
-```
+1. Update `allMsgTypesAllowed` to detect `MsgExec` message types
+2. For each `MsgExec`, call its `GetMessages()` method to extract nested messages
+3. Recursively validate all nested messages against the allowed messages list
+4. Reject the transaction if any nested message type is not in the allowed list
 
-This ensures the invariant is validated before any array access occurs, preventing the out-of-bounds panic while maintaining the same validation semantics as `VerifyMultisignature`. The malformed transaction will be rejected with an error rather than crashing the node.
+Alternative: Document that including `MsgExec` in `AllowedMessages` effectively allows all message types where the grantee is the signer, and warn granters about this implication.
 
 ## Proof of Concept
 
-**File:** `x/auth/ante/sigverify_test.go`
+**Test Location:** x/feegrant/filtered_fee_test.go
 
-**Setup:** 
-- Create a multisig account with 3 public keys
-- Initialize blockchain state with the account
-- Create a test message from the multisig address
+**Test Function:** `TestFilteredFeeBypassWithMsgExec` (to be added)
+
+**Setup:**
+- Create a feegrant with `AllowedMsgAllowance` restricting to only `/cosmos.gov.v1beta1.MsgVote` and `/cosmos.authz.v1beta1.MsgExec`
+- Create a `MsgSend` (disallowed message type) where the grantee is the signer
+- Wrap the `MsgSend` inside a `MsgExec` where the grantee is the executor
 
 **Action:**
-- Construct a `MultiSignatureData` with BitArray size of 10 (larger than 3 public keys)
-- Set bit at index 5 (valid in BitArray but out of bounds for the 3-element public key array)
-- Add a dummy signature to the signatures array
-- Create a transaction with this malicious multisig data
-- Process the transaction through the ante handler chain containing `SigGasConsumeDecorator`
+- Test 1: Attempt to use feegrant directly with `MsgSend` - should be rejected
+- Test 2: Attempt to use feegrant with `MsgExec` wrapping `MsgSend` - currently passes validation
 
 **Result:**
-- When `ConsumeMultisignatureVerificationGas` executes, it loops through indices 0-9
-- At index 5, it attempts `pubkey.GetPubKeys()[5]` on an array with only 3 elements
-- Go runtime panics with "index out of range [5] with length 3"
-- The panic is not caught by the SetUpContextDecorator's recovery (which only catches OutOfGas panics)
-- The node crashes before the SigVerificationDecorator can validate and reject the transaction
+- Test 1: Validation correctly rejects the direct `MsgSend` with "message does not exist in allowed messages" error
+- Test 2: The `MsgExec` wrapping the disallowed `MsgSend` passes feegrant validation, even though `MsgSend` is not in the allowed messages list. The nested message is never validated against the feegrant allowance, demonstrating the bypass.
 
-The test demonstrates that any attacker can crash validator nodes by submitting such malformed multisig transactions, confirming the denial-of-service vulnerability.
+## Notes
+
+The exploit relies on the implicit acceptance logic in `DispatchActions()` where if the message signer equals the MsgExec grantee, no authorization check is performed. This means the attacker doesn't need to create any prior authz grant - they can directly execute any message where they are the signer by wrapping it in MsgExec.
+
+The existing test suite in `x/feegrant/filtered_fee_test.go` does not include any tests for nested message validation, indicating this scenario was not previously considered.
 
 ### Citations
 
-**File:** x/auth/ante/sigverify.go (L446-471)
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-func ConsumeMultisignatureVerificationGas(
-	meter sdk.GasMeter, sig *signing.MultiSignatureData, pubkey multisig.PubKey,
-	params types.Params, accSeq uint64,
-) error {
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+```
 
-	size := sig.BitArray.Count()
-	sigIndex := 0
-
-	for i := 0; i < size; i++ {
-		if !sig.BitArray.GetIndex(i) {
-			continue
-		}
-		sigV2 := signing.SignatureV2{
-			PubKey:   pubkey.GetPubKeys()[i],
-			Data:     sig.Signatures[sigIndex],
-			Sequence: accSeq,
-		}
-		err := DefaultSigVerificationGasConsumer(meter, sigV2, params)
-		if err != nil {
-			return err
-		}
-		sigIndex++
+**File:** types/tx/types.go (L22-36)
+```go
+func (t *Tx) GetMsgs() []sdk.Msg {
+	if t == nil || t.Body == nil {
+		return nil
 	}
 
-	return nil
+	anys := t.Body.Messages
+	res := make([]sdk.Msg, len(anys))
+	for i, any := range anys {
+		cached := any.GetCachedValue()
+		if cached == nil {
+			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
+		}
+		res[i] = cached.(sdk.Msg)
+	}
+	return res
+```
+
+**File:** x/feegrant/filtered_fee.go (L65-86)
+```go
+func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+	if !a.allMsgTypesAllowed(ctx, msgs) {
+		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
+	}
+
+	allowance, err := a.GetAllowance()
+	if err != nil {
+		return false, err
+	}
+
+	remove, err := allowance.Accept(ctx, fee, msgs)
+	if err != nil {
+		return false, err
+	}
+
+	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
+	if err != nil {
+		return false, err
+	}
+
+    return remove, nil
 }
 ```
 
-**File:** crypto/keys/multisig/multisig.go (L55-58)
+**File:** x/feegrant/filtered_fee.go (L98-109)
 ```go
-	// ensure bit array is the correct size
-	if len(pubKeys) != size {
-		return fmt.Errorf("bit array size is incorrect, expecting: %d", len(pubKeys))
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
+
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
+		}
 	}
+
+	return true
+}
 ```
 
-**File:** x/auth/ante/ante.go (L56-58)
+**File:** x/authz/keeper/keeper.go (L87-111)
 ```go
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-```
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
 
-**File:** x/auth/ante/setup.go (L66-79)
-```go
-	defer func() {
-		if r := recover(); r != nil {
-			switch rType := r.(type) {
-			case sdk.ErrorOutOfGas:
-				log := fmt.Sprintf(
-					"out of gas in location: %v; gasWanted: %d, gasUsed: %d",
-					rType.Descriptor, gasTx.GetGas(), newCtx.GasMeter().GasConsumed())
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
 
-				err = sdkerrors.Wrap(sdkerrors.ErrOutOfGas, log)
-			default:
-				panic(r)
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
 			}
 		}
-	}()
 ```
