@@ -1,217 +1,248 @@
-Based on my thorough investigation of the codebase and analysis of all execution paths, I have validated this security claim.
-
 # Audit Report
 
 ## Title
-Chain Halt Due to Orphaned Missed Blocks in Genesis State
+Duplicate Upgrade Name Allows Network Shutdown via Plan Overwrite
 
 ## Summary
-The slashing module's `ValidateGenesis` function fails to validate the consistency between missed blocks and signing info entries. When a genesis file contains missed blocks without corresponding signing info, and validators with those addresses participate in consensus, the chain panics and halts completely due to a specification-implementation mismatch.
+The `ScheduleUpgrade` function in the x/upgrade module permits overwriting a pending upgrade plan using the same upgrade name but a different execution height. When validators prepare to switch binaries at the originally scheduled height, but the plan has been rescheduled to a later height using the same name, all validators executing the new binary at the original height will panic simultaneously with "BINARY UPDATED BEFORE TRIGGER!", causing complete network shutdown.
 
 ## Impact
 High
 
 ## Finding Description
 
-**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) [5](#0-4) 
+**Location:** 
+- `x/upgrade/keeper/keeper.go` lines 188-190 (insufficient validation)
+- `x/upgrade/keeper/keeper.go` lines 195-201 (unconditional overwrite)
+- `x/upgrade/abci.go` lines 92-97 (panic trigger) [1](#0-0) [2](#0-1) [3](#0-2) 
 
 **Intended Logic:**
-According to the specification [6](#0-5) , the system should use a 0-value default signing info if not present. Genesis validation should enforce the invariant that missed blocks entries only exist for validators with corresponding signing info.
+The upgrade system should ensure consistent upgrade coordination across all validators. When governance schedules an upgrade at a specific height, validators should be able to safely prepare and execute the upgrade at that height without risk of plan changes causing chain halts. Each upgrade name should have a single, deterministic execution height.
 
 **Actual Logic:**
-1. ValidateGenesis only validates slashing parameters (downtime fractions, jail duration, signed blocks window) but does NOT validate the relationship between MissedBlocks and SigningInfos [1](#0-0) 
-
-2. InitGenesis imports signing infos and missed blocks independently without any cross-validation [2](#0-1) 
-
-3. When `Exported: true` is set in staking genesis, the `AfterValidatorCreated` hook is skipped [4](#0-3) , preventing automatic signing info creation via the `AfterValidatorBonded` hook [7](#0-6) 
-
-4. When a validator with orphaned missed blocks participates in consensus, HandleValidatorSignatureConcurrent panics instead of using default values [3](#0-2) 
+The `ScheduleUpgrade` function only validates whether an upgrade name has already been completed [1](#0-0) , but does not check if a pending upgrade with the same name exists at a different height. The function then unconditionally overwrites any existing plan [2](#0-1) , as explicitly documented in the code comments [4](#0-3) .
 
 **Exploitation Path:**
-1. Genesis file is created with ValidatorMissedBlockArray entries but no corresponding SigningInfo entries, with `Exported: true` in staking genesis (can occur through manual construction, custom tooling bugs, or merging multiple genesis sources)
-2. Genesis validation passes because ValidateGenesis only checks parameters
-3. Chain operators initialize using InitGenesis, importing the orphaned missed blocks
-4. When the validator participates in consensus, BeginBlocker invokes HandleValidatorSignatureConcurrent [8](#0-7) 
-5. The function panics with "Expected signing info for validator %s but not found"
-6. Entire chain halts due to consensus failure
+
+1. Governance passes proposal scheduling upgrade "v2" at height 1000 via `handleSoftwareUpgradeProposal` [5](#0-4) 
+2. Validators observe the scheduled upgrade and prepare new binaries that include `SetUpgradeHandler("v2", handler)` [6](#0-5)  in their application code
+3. Before height 1000 is reached, governance passes a second proposal scheduling upgrade "v2" at height 1100 (same name, different height)
+4. The second proposal overwrites the first plan without validation because only completion status is checked, not pending plan conflicts
+5. At height 1000, validators execute their planned binary switches (as coordinated for the original upgrade)
+6. BeginBlocker executes with the new binary at height 1000:
+   - `GetUpgradePlan` returns plan with height 1100 (the overwritten plan)
+   - `plan.ShouldExecute(ctx)` returns false [7](#0-6)  because 1100 > 1000
+   - `k.HasHandler("v2")` returns true because the new binary has the handler registered
+   - BeginBlocker detects handler exists for non-ready upgrade and panics [3](#0-2)  with "BINARY UPDATED BEFORE TRIGGER!"
+7. All validators running the upgraded binary panic simultaneously, causing complete consensus failure and network shutdown
 
 **Security Guarantee Broken:**
-The system fails to maintain the critical invariant that missed blocks can only exist for validators with signing info. The implementation contradicts the specification by panicking instead of using default values as documented.
+The network availability guarantee is violated. The upgrade coordination mechanism fails to prevent conflicting upgrade schedules, allowing governance (a trusted actor) to inadvertently trigger total network shutdown through a reasonable operational action (rescheduling an upgrade) that exceeds their intended authority scope.
 
 ## Impact Explanation
 
-This vulnerability causes total network shutdown, matching the acceptance criterion: "Network not being able to confirm new transactions (total network shutdown)."
+This vulnerability causes total network shutdown with severe consequences:
 
-When the panic occurs in BeginBlocker during consensus processing:
-- The entire blockchain network halts immediately across all validators
-- No new blocks can be produced or transactions confirmed
-- The network remains down until all validators coordinate to restart with a corrected genesis file
-- Recovery requires complex coordination and potentially a hard fork
+- **Network Availability**: All validators who switched to the new binary at the originally scheduled height panic simultaneously, halting block production
+- **Transaction Processing**: No new transactions can be confirmed during the shutdown period
+- **Consensus Failure**: Complete halt in consensus requiring manual coordination across all validators to recover
+- **Recovery Complexity**: Recovery requires validators to either manually restart with the old binary, use skip-upgrade flags, or coordinate to wait until the rescheduled height, all requiring off-chain coordination
 
-This is a consensus-breaking failure that impacts the entire network simultaneously, not an application-level error affecting individual transactions.
+This directly matches the HIGH severity impact category: "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
 **Who Can Trigger:**
-Genesis file creators during chain launch or network restart, including participants in multi-party genesis coordination (standard for blockchain launches), those using custom genesis generation tooling, or anyone manually constructing or merging genesis files.
+Any participant who can pass governance proposals (requires majority vote through standard governance mechanisms). Critically, this vulnerability can manifest without malicious intent through legitimate governance operations.
 
-**Required Conditions:**
-1. Genesis file with orphaned missed blocks must be used during chain initialization
-2. The validator addresses in orphaned missed blocks must participate in consensus
-3. `Exported: true` must be set in staking genesis (standard for chain upgrades/restarts)
+**Conditions Required:**
+1. First governance proposal schedules upgrade "X" at height H1
+2. Validators prepare binary switches for height H1 (standard practice and validator best practice)
+3. Second governance proposal schedules upgrade "X" at height H2 where H2 > H1, using the same upgrade name
+4. Validators execute planned binary switches at height H1 based on their original coordination
 
 **Likelihood Assessment:**
-This scenario is realistic because:
-- Multi-party genesis coordination is standard practice where errors can occur
-- The validation gap makes it easy to miss this inconsistency during review
-- Genesis files passing ValidateGenesis gives false confidence of correctness
-- The specification explicitly states missing signing info should be handled gracefully, suggesting this edge case was intended to be supported
-- Once imported, the issue persists as a "time bomb" until triggered
+Moderate to high probability because:
+- Governance may legitimately need to reschedule upgrades due to discovered bugs, timing conflicts, or coordination issues
+- The code explicitly permits plan overwriting [4](#0-3)  without warnings about reusing names
+- No system warnings indicate when an upgrade name is being reused at a different height
+- Validators typically commit to upgrade timing based on governance decisions and may not continuously monitor for last-minute changes
+- The action (rescheduling using the same name) appears reasonable but has catastrophic consequences
 
-The specification-implementation mismatch is critical: even a trusted genesis creator following the documented behavior could inadvertently create this state, causing an unrecoverable security failure (total chain halt) beyond their intended authority of setting initial chain state. This falls under the exception for privileged misconfiguration issues because the impact exceeds the intended authority of the privileged role.
+The likelihood is significant because the triggering condition (governance rescheduling with same name) is a plausible operational scenario, but the impact (total network shutdown) vastly exceeds the expected consequences of such an action.
 
 ## Recommendation
 
-**Primary Fix: Add Validation in ValidateGenesis**
-Add cross-validation in `x/slashing/types/genesis.go` after line 56:
-- Create a map of signing info addresses from `data.SigningInfos`
-- Iterate through `data.MissedBlocks` and verify each address has a corresponding signing info entry
-- Return a descriptive error if orphaned missed blocks are found
+Add validation in `ScheduleUpgrade` to prevent reusing pending upgrade names at different heights:
 
-**Defense-in-Depth: Implement Graceful Handling**
-Align implementation with specification in `x/slashing/keeper/infractions.go` at lines 33-36 by creating default signing info instead of panicking, as documented in the specification. This provides fallback protection if the validation is bypassed.
+```go
+// After the GetDoneHeight check at line 190, add:
+if oldPlan, found := k.GetUpgradePlan(ctx); found {
+    if oldPlan.Name == plan.Name && oldPlan.Height != plan.Height {
+        return sdkerrors.Wrapf(
+            sdkerrors.ErrInvalidRequest, 
+            "upgrade with name %s is already scheduled for height %d, cannot reschedule to height %d with the same name",
+            plan.Name, oldPlan.Height, plan.Height,
+        )
+    }
+}
+```
 
-**Recommended Approach:** Implement both fixes for defense-in-depth:
-- Primary fix prevents the issue at genesis validation time (fail-fast)
-- Defense-in-depth fix aligns implementation with specification and provides runtime protection
+This ensures that to reschedule an upgrade, governance must either:
+1. Use a different upgrade name (e.g., "v2-revised" instead of "v2"), which forces validators to rebuild binaries with the new handler name, or
+2. First cancel the existing upgrade via `CancelSoftwareUpgradeProposal` [8](#0-7) , then schedule the new upgrade
+
+This approach maintains governance flexibility while preventing the catastrophic scenario where validators execute based on stale coordination information.
 
 ## Proof of Concept
 
-The vulnerability is demonstrable through code analysis of the verified execution path:
+**File:** `x/upgrade/abci_test.go`
+
+**Test Function:** `TestDuplicateUpgradeNameCausesNetworkShutdown`
 
 **Setup:**
-1. Create a genesis state with a ValidatorMissedBlockArray entry for a validator address
-2. Do NOT include a corresponding SigningInfo entry for that address  
-3. Set `Exported: true` in the staking genesis to bypass hook-based signing info creation
-4. The malformed genesis passes ValidateGenesis because it only validates parameters [1](#0-0) 
+1. Initialize test suite at block height 10 using `setupTest` [9](#0-8) 
+2. Schedule upgrade "test-upgrade" at height 15 via governance handler [5](#0-4) :
+   ```go
+   err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{
+       Title: "prop", 
+       Plan: types.Plan{Name: "test-upgrade", Height: 15}
+   })
+   require.NoError(t, err)
+   ```
+3. Simulate validators upgrading by registering handler [6](#0-5) :
+   ```go
+   s.keeper.SetUpgradeHandler("test-upgrade", func(ctx sdk.Context, plan types.Plan, vm module.VersionMap) (module.VersionMap, error) {
+       return vm, nil
+   })
+   ```
+4. Schedule second upgrade with same name at height 20, which overwrites the first plan [2](#0-1) :
+   ```go
+   err = s.handler(s.ctx, &types.SoftwareUpgradeProposal{
+       Title: "prop2",
+       Plan: types.Plan{Name: "test-upgrade", Height: 20}
+   })
+   require.NoError(t, err)
+   ```
 
 **Action:**
-5. Import the genesis using InitGenesis, which imports both independently [2](#0-1) 
-6. When BeginBlocker processes votes, it invokes HandleValidatorSignatureConcurrent [5](#0-4) 
+1. Create context at original scheduled height: `newCtx := s.ctx.WithBlockHeight(15)`
+2. Call BeginBlock: `s.module.BeginBlock(newCtx, abci.RequestBeginBlock{Header: newCtx.BlockHeader()})`
 
 **Result:**
-7. The chain panics at [3](#0-2)  with "Expected signing info for validator %s but not found"
-8. This causes total network shutdown
-
-The vulnerability is confirmed by the discrepancy between the specification [6](#0-5)  (which states default values should be used) and the implementation (which panics), combined with the validation gap.
+BeginBlock panics with message "BINARY UPDATED BEFORE TRIGGER! UPGRADE \"test-upgrade\" - in binary but not executed on chain" [10](#0-9) , confirming the network shutdown vulnerability. The panic is triggered because the handler is registered (simulating validators who switched binaries at the original height), but the stored plan indicates execution at height 20 instead of height 15.
 
 ## Notes
 
-This vulnerability represents a critical gap where the system fails to enforce its own documented invariants. The specification explicitly states that missing signing info should be handled gracefully with default values, but the implementation panics instead. This specification-implementation mismatch, combined with incomplete validation, creates a scenario where even trusted parties following documented behavior can inadvertently create genesis files that cause total network shutdown—an impact far beyond the intended authority of setting initial chain state.
+The existing test `TestCanOverwriteScheduleUpgrade` [11](#0-10)  demonstrates that plan overwriting is intentional behavior, but it uses different upgrade names ("bad_test" then "test") and does not test the dangerous scenario where validators have already registered a handler before the plan is overwritten with the same name at a different height.
+
+This vulnerability satisfies platform acceptance criteria because while governance is a privileged role, rescheduling upgrades is within their intended authority, but the consequence (total network shutdown requiring manual recovery) is an unrecoverable security failure that far exceeds the intended scope of the governance action. The issue can occur inadvertently during legitimate operations and matches the HIGH severity impact: "Network not being able to confirm new transactions (total network shutdown)".
 
 ### Citations
 
-**File:** x/slashing/types/genesis.go (L32-58)
+**File:** x/upgrade/keeper/keeper.go (L67-69)
 ```go
-func ValidateGenesis(data GenesisState) error {
-	downtime := data.Params.SlashFractionDowntime
-	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
+func (k Keeper) SetUpgradeHandler(name string, upgradeHandler types.UpgradeHandler) {
+	k.upgradeHandlers[name] = upgradeHandler
+}
+```
+
+**File:** x/upgrade/keeper/keeper.go (L172-174)
+```go
+// ScheduleUpgrade schedules an upgrade based on the specified plan.
+// If there is another Plan already scheduled, it will overwrite it
+// (implicitly cancelling the current plan)
+```
+
+**File:** x/upgrade/keeper/keeper.go (L188-190)
+```go
+	if k.GetDoneHeight(ctx, plan.Name) != 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "upgrade with name %s has already been completed", plan.Name)
+	}
+```
+
+**File:** x/upgrade/keeper/keeper.go (L195-201)
+```go
+	oldPlan, found := k.GetUpgradePlan(ctx)
+	if found {
+		k.ClearIBCState(ctx, oldPlan.Height)
 	}
 
-	dblSign := data.Params.SlashFractionDoubleSign
-	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
-	}
+	bz := k.cdc.MustMarshal(&plan)
+	store.Set(types.PlanKey(), bz)
+```
 
-	minSign := data.Params.MinSignedPerWindow
-	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
+**File:** x/upgrade/abci.go (L92-97)
+```go
+	// if we have a handler for a non-minor upgrade, that means it updated too early and must stop
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
 	}
+```
 
-	downtimeJail := data.Params.DowntimeJailDuration
-	if downtimeJail < 1*time.Minute {
-		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
-	}
+**File:** x/upgrade/handler.go (L29-31)
+```go
+func handleSoftwareUpgradeProposal(ctx sdk.Context, k keeper.Keeper, p *types.SoftwareUpgradeProposal) error {
+	return k.ScheduleUpgrade(ctx, p.Plan)
+}
+```
 
-	signedWindow := data.Params.SignedBlocksWindow
-	if signedWindow < 10 {
-		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
-	}
-
+**File:** x/upgrade/handler.go (L33-35)
+```go
+func handleCancelSoftwareUpgradeProposal(ctx sdk.Context, k keeper.Keeper, _ *types.CancelSoftwareUpgradeProposal) error {
+	k.ClearUpgradePlan(ctx)
 	return nil
 ```
 
-**File:** x/slashing/genesis.go (L24-38)
+**File:** x/upgrade/types/plan.go (L39-44)
 ```go
-	for _, info := range data.SigningInfos {
-		address, err := sdk.ConsAddressFromBech32(info.Address)
-		if err != nil {
-			panic(err)
-		}
-		keeper.SetValidatorSigningInfo(ctx, address, info.ValidatorSigningInfo)
+func (p Plan) ShouldExecute(ctx sdk.Context) bool {
+	if p.Height > 0 {
+		return p.Height <= ctx.BlockHeight()
 	}
+	return false
+}
+```
 
-	for _, array := range data.MissedBlocks {
-		address, err := sdk.ConsAddressFromBech32(array.Address)
-		if err != nil {
-			panic(err)
-		}
-		keeper.SetValidatorMissedBlocks(ctx, address, array)
+**File:** x/upgrade/abci_test.go (L42-64)
+```go
+func setupTest(height int64, skip map[int64]bool) TestSuite {
+	db := dbm.NewMemDB()
+	app := simapp.NewSimApp(log.NewNopLogger(), db, nil, true, skip, simapp.DefaultNodeHome, 0, nil, simapp.MakeTestEncodingConfig(), &simapp.EmptyAppOptions{})
+	genesisState := simapp.NewDefaultGenesisState(app.AppCodec())
+	stateBytes, err := json.MarshalIndent(genesisState, "", "  ")
+	if err != nil {
+		panic(err)
 	}
+	app.InitChain(
+		context.Background(), &abci.RequestInitChain{
+			Validators:    []abci.ValidatorUpdate{},
+			AppStateBytes: stateBytes,
+		},
+	)
+
+	s.keeper = app.UpgradeKeeper
+	s.ctx = app.BaseApp.NewContext(false, tmproto.Header{Height: height, Time: time.Now()})
+
+	s.module = upgrade.NewAppModule(s.keeper)
+	s.querier = s.module.LegacyQuerierHandler(app.LegacyAmino())
+	s.handler = upgrade.NewSoftwareUpgradeProposalHandler(s.keeper)
+	return s
+}
 ```
 
-**File:** x/slashing/keeper/infractions.go (L33-36)
+**File:** x/upgrade/abci_test.go (L90-99)
 ```go
-	signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
-	if !found {
-		panic(fmt.Sprintf("Expected signing info for validator %s but not found", consAddr))
-	}
-```
+func TestCanOverwriteScheduleUpgrade(t *testing.T) {
+	s := setupTest(10, map[int64]bool{})
+	t.Log("Can overwrite plan")
+	err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "bad_test", Height: s.ctx.BlockHeight() + 10}})
+	require.NoError(t, err)
+	err = s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "test", Height: s.ctx.BlockHeight() + 1}})
+	require.NoError(t, err)
 
-**File:** x/staking/genesis.go (L47-49)
-```go
-		if !data.Exported {
-			keeper.AfterValidatorCreated(ctx, validator.GetOperator())
-		}
-```
-
-**File:** x/slashing/abci.go (L38-49)
-```go
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
-			}
-		}(i)
-```
-
-**File:** x/slashing/spec/04_begin_block.md (L35-36)
-```markdown
-  // signed. We use the 0-value default signing info if not present, except for
-  // start height.
-```
-
-**File:** x/slashing/keeper/hooks.go (L12-25)
-```go
-func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
-	// Update the signing info start height or create a new signing info
-	_, found := k.GetValidatorSigningInfo(ctx, address)
-	if !found {
-		signingInfo := types.NewValidatorSigningInfo(
-			address,
-			ctx.BlockHeight(),
-			0,
-			time.Unix(0, 0),
-			false,
-			0,
-		)
-		k.SetValidatorSigningInfo(ctx, address, signingInfo)
-	}
+	VerifyDoUpgrade(t)
+}
 ```

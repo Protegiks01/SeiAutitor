@@ -1,389 +1,488 @@
 # Audit Report
 
 ## Title
-Redelegation Slashing Accounting Mismatch Due to Exchange Rate Changes
+AllowedMsgAllowance Bypass via Nested MsgExec Messages
 
 ## Summary
-The `SlashRedelegation` function contains an accounting vulnerability where it calculates the theoretical slash amount based on the original token balance (`InitialBalance`) but returns this theoretical amount instead of the actual tokens burned. When the destination validator's exchange rate deteriorates between redelegation and slashing, fewer tokens are actually burned than calculated, causing the source validator to be systematically under-slashed.
+The `AllowedMsgAllowance` feegrant restriction can be bypassed by wrapping disallowed message types inside an authz `MsgExec`. The AnteHandler only validates top-level messages when checking feegrant allowances, allowing unauthorized execution of any message type while using a restricted feegrant to pay fees.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** `x/staking/keeper/slash.go`, function `SlashRedelegation` (lines 219-296) and main `Slash` function (lines 93-101) [1](#0-0) 
+**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) [5](#0-4) 
 
-**Intended logic:** When slashing a validator with active redelegations, the protocol should burn exactly `slashFactor * InitialBalance` tokens from each redelegation entry. The `remainingSlashAmount` should be reduced by the actual tokens burned to ensure the total slashed equals `slashFactor * power_at_infraction`.
+**Intended Logic:**
+The `AllowedMsgAllowance` should restrict feegrants to only pay fees for specific message types. When a granter creates a feegrant with specific allowed message type URLs, the system should reject any transaction attempting to use this feegrant for other message types, including nested messages within wrapper types like `MsgExec`.
 
-**Actual logic:** The function performs:
-1. Calculates `slashAmount = slashFactor * entry.InitialBalance` (line 238-240)
-2. Adds this to `totalSlashAmount` (line 240)
-3. Calculates `sharesToUnbond = slashFactor * entry.SharesDst` using shares stored at redelegation time (line 243)
-4. Calls `k.Unbond(sharesToUnbond)` which converts shares to tokens at the destination validator's **current** exchange rate (line 265) [2](#0-1) 
+**Actual Logic:**
+The `DeductFeeDecorator` calls `UseGrantedFees` with only top-level messages obtained via `sdkTx.GetMsgs()`. [4](#0-3)  This method returns messages from `t.Body.Messages` without extracting nested messages from `MsgExec`. The `allMsgTypesAllowed` validation only checks these top-level message types against the allowed list. [3](#0-2)  Nested messages within `MsgExec` are never validated against the feegrant allowance during the ante handler phase.
 
-The `Unbond` function calls `RemoveValidatorTokensAndShares` which uses `TokensFromShares` to convert shares at the current exchange rate: [3](#0-2) [4](#0-3) 
+**Exploitation Path:**
+1. Grantee obtains a feegrant with `AllowedMsgAllowance` that includes `/cosmos.authz.v1beta1.MsgExec` in the allowed messages list
+2. Grantee creates a transaction containing a `MsgExec` message where they are the grantee  
+3. Inside the `MsgExec`, the grantee wraps any disallowed message type (e.g., `/cosmos.bank.v1beta1.MsgSend`) where they are also the signer
+4. AnteHandler validates only the top-level `MsgExec` against the feegrant allowance and approves it [1](#0-0) 
+5. Fees are deducted from the feegrant
+6. During execution, `DispatchActions` implicitly accepts the nested message since the signer equals the grantee [5](#0-4)  (no authorization check is performed when granter equals grantee)
+7. The disallowed nested message executes successfully using the feegrant to pay fees
 
-5. The actual `tokensToBurn` (potentially less than `slashAmount`) is accumulated and burned (lines 279-293)
-6. Returns `totalSlashAmount` instead of the sum of actual `tokensToBurn` values (line 295)
-
-The main `Slash` function then reduces `remainingSlashAmount` by the returned theoretical amount: [5](#0-4) 
-
-**Exploitation path:**
-1. Validator A commits an infraction at height H
-2. User redelegates from A to Validator B using standard redelegation: [6](#0-5) 
-
-3. RedelegationEntry is created with `InitialBalance` (original tokens) and `SharesDst` (shares at B's current rate): [7](#0-6) 
-
-4. Validator B's exchange rate deteriorates (e.g., B gets slashed independently for 50%)
-5. Evidence of A's infraction is submitted and `Slash` is called
-6. `SlashRedelegation` calculates `slashAmount = 50` tokens but only burns 25 tokens (due to B's 0.5:1 rate)
-7. `remainingSlashAmount` reduced by 50, but only 25 actually burned
-8. Validator A is under-slashed by 25 tokens
-
-**Security guarantee broken:** The protocol's slashing invariant `total_tokens_burned = slashFactor * power_at_infraction` is violated. The actual penalty becomes dependent on the destination validator's health rather than solely on infraction severity.
+**Security Guarantee Broken:**
+The message type restriction mechanism in feegrant authorization is completely bypassed. The guarantee that feegrant funds will only be used for explicitly approved message types is circumvented for any nested messages within `MsgExec`.
 
 ## Impact Explanation
 
-This vulnerability systematically undermines the Proof-of-Stake network's economic security model:
+This vulnerability enables unauthorized usage of feegrant balances for transaction types outside the granter's intended restrictions. The granter loses control over how their allocated funds are spent, potentially allowing complete exhaustion of the feegrant balance for any message type where the grantee is the signer. 
 
-1. **Systematic Under-Slashing:** Whenever destination validators have deteriorating exchange rates (common due to slashing, validator operations, or rounding), actual slashing is less than intended. With a 50% exchange rate deterioration, up to 50% of the slashing penalty can be avoided.
+This breaks the trust model of restricted feegrants, which are specifically designed for limited delegation scenarios (e.g., allowing governance voting but preventing token transfers). While the funds are technically still used for fees (their intended purpose), they're applied to unauthorized transaction types, representing a loss of control over the granter's allocated resources.
 
-2. **Economic Security Weakening:** Slashing serves as the primary deterrent against validator misbehavior. Reduced actual penalties weaken this deterrent mechanism, potentially encouraging infractions since the expected cost is lower than designed.
-
-3. **Accounting Invariant Violation:** The protocol's fundamental assumption that slashing removes a deterministic amount based on infraction severity is broken. Instead, the actual penalty varies based on factors unrelated to the infraction.
-
-4. **Potential Gaming:** While the issue occurs naturally, sophisticated actors could deliberately redelegate to validators with declining exchange rates to minimize slashing exposure.
-
-This matches the Medium severity category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+This qualifies as **"A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk"** (Medium severity) from the impact criteria, as it results in unintended authorization bypass behavior within the Cosmos SDK's feegrant system.
 
 ## Likelihood Explanation
 
-**High likelihood:**
+**Likelihood: High**
 
-1. **Common triggers:** Validator infractions occur regularly in PoS networks
-2. **Natural exchange rate fluctuations:** Exchange rates change frequently due to slashing events, validator operations, or precision losses
-3. **Wide redelegation usage:** Redelegation is a core feature widely used by delegators
-4. **Extended vulnerability window:** The unbonding period (typically 21 days) provides ample time for exchange rate changes
+The vulnerability can be exploited by any grantee whose feegrant includes `MsgExec` in the allowed messages list. Required conditions:
+- Granter creates an `AllowedMsgAllowance` including `/cosmos.authz.v1beta1.MsgExec` in the allowed messages
+- No additional authz grant is required due to implicit acceptance when signer equals grantee [5](#0-4) 
 
-**No special requirements:**
-- Any delegator can perform redelegations (no special privileges)
-- The bug causes systematic under-slashing even without intentional exploitation
-- Occurs through normal protocol operations
+The exploit is straightforward and requires no special privileges beyond possession of the feegrant. Granters might reasonably include `MsgExec` in allowed lists without understanding the nested message implications, making this highly likely to occur in practice. The existing test suite [6](#0-5)  does not include any tests for nested message validation, indicating this scenario was not considered during development.
 
 ## Recommendation
 
-Modify `SlashRedelegation` to calculate the target token amount first, then convert to shares at the current exchange rate:
+Modify the `AllowedMsgAllowance.Accept` method to recursively validate nested messages within `MsgExec`:
 
-```go
-// Calculate target tokens to burn based on original stake
-slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
-tokensToBurn := slashAmountDec.TruncateInt()
+1. Update `allMsgTypesAllowed` to detect `MsgExec` message types
+2. For each `MsgExec`, call its `GetMessages()` method to extract nested messages [7](#0-6) 
+3. Recursively validate all nested messages against the allowed messages list
+4. Reject the transaction if any nested message type is not in the allowed list
 
-// Get destination validator
-dstValidator, found := k.GetValidator(ctx, valDstAddr)
-if !found {
-    panic("destination validator not found")
-}
-
-// Convert target token amount to shares at CURRENT exchange rate
-sharesToUnbond, err := dstValidator.SharesFromTokens(tokensToBurn)
-if err != nil {
-    continue
-}
-
-// Cap at available delegation shares
-delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
-if !found {
-    continue
-}
-if sharesToUnbond.GT(delegation.Shares) {
-    sharesToUnbond = delegation.Shares
-    tokensToBurn = dstValidator.TokensFromShares(sharesToUnbond).TruncateInt()
-}
-
-// Unbond and accumulate actual tokens burned
-actualTokens, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
-totalSlashAmount = totalSlashAmount.Add(actualTokens)
-```
-
-Ensure the return value matches actual tokens burned, not theoretical amounts.
+Alternative mitigation: Document that including `MsgExec` in `AllowedMessages` effectively allows all message types where the grantee is the signer, and warn granters about this implication.
 
 ## Proof of Concept
 
+**Test Location:** `x/feegrant/filtered_fee_test.go` (new test to be added)
+
 **Setup:**
-1. Create validators A (source) and B (destination) with 1:1 exchange rates
-2. User delegates 100 tokens to A
-3. User redelegates 100 tokens from A to B, creating `RedelegationEntry` with `InitialBalance=100`, `SharesDst=100`
-4. Validator B gets independently slashed by 50%, reducing exchange rate to 0.5:1
+- Create a feegrant with `AllowedMsgAllowance` restricting to only `/cosmos.gov.v1beta1.MsgVote` and `/cosmos.authz.v1beta1.MsgExec`
+- Create accounts for granter and grantee
+- Fund granter account
+- Grant the allowance from granter to grantee
 
 **Action:**
-1. Validator A is slashed for an infraction with 50% slash factor
-2. `SlashRedelegation` executes:
-   - Calculates: `slashAmount = 0.5 * 100 = 50` tokens (line 238-240)
-   - Calculates: `sharesToUnbond = 0.5 * 100 = 50` shares (line 243)
-   - Unbonds 50 shares: `50 * 0.5 = 25` tokens via `TokensFromShares` (line 265)
-   - Returns `totalSlashAmount = 50` tokens (line 295)
+- Test 1: Create transaction with direct `MsgSend` from grantee using the feegrant - should be rejected
+- Test 2: Create transaction with `MsgExec` (grantee as executor) wrapping `MsgSend` (grantee as signer) using the feegrant
 
 **Result:**
-- `remainingSlashAmount` reduced by 50 tokens
-- Only 25 tokens actually burned
-- Validator A under-slashed by 25 tokens (50% of intended redelegation slash)
-
-**Verification:** Monitor bonded pool balance decrease vs reported slash amounts to confirm actual burned < theoretical slashed.
+- Test 1: Validation correctly rejects with "message does not exist in allowed messages" error
+- Test 2: The `MsgExec` wrapping the disallowed `MsgSend` passes feegrant validation. The nested `MsgSend` is never validated against the feegrant allowance during the ante handler check, demonstrating the bypass. The feegrant balance is depleted for an unauthorized message type.
 
 ## Notes
 
-The vulnerability stems from storing `SharesDst` as a fixed value at redelegation time, then using it for slash calculations when the exchange rate may have changed. The `InitialBalance` correctly captures original tokens, but the actual burning uses share-based calculations with a potentially stale exchange rate relationship, creating systematic accounting mismatch whenever destination validator exchange rates deteriorate.
+The vulnerability relies on two key implementation details:
+
+1. **Top-level message validation only**: The `GetMsgs()` method [4](#0-3)  only returns top-level transaction messages without recursively extracting nested messages from wrapper types like `MsgExec`.
+
+2. **Implicit authorization acceptance**: The `DispatchActions` logic [5](#0-4)  implicitly accepts messages when the signer equals the grantee, meaning no separate authz grant is required for the grantee to execute messages on their own behalf through `MsgExec`.
+
+These two behaviors combine to create the bypass: the feegrant check passes because only `MsgExec` is validated, and the nested messages execute without requiring authorization because the grantee is executing their own messages.
 
 ### Citations
 
-**File:** x/staking/keeper/slash.go (L93-107)
+**File:** x/auth/ante/fee.go (L168-168)
 ```go
-		// Iterate through redelegations from slashed source validator
-		redelegations := k.GetRedelegationsFromSrcValidator(ctx, operatorAddress)
-		for _, redelegation := range redelegations {
-			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
-			if amountSlashed.IsZero() {
-				continue
+			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+```
+
+**File:** x/feegrant/filtered_fee.go (L65-86)
+```go
+func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+	if !a.allMsgTypesAllowed(ctx, msgs) {
+		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
+	}
+
+	allowance, err := a.GetAllowance()
+	if err != nil {
+		return false, err
+	}
+
+	remove, err := allowance.Accept(ctx, fee, msgs)
+	if err != nil {
+		return false, err
+	}
+
+	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
+	if err != nil {
+		return false, err
+	}
+
+    return remove, nil
+}
+```
+
+**File:** x/feegrant/filtered_fee.go (L98-109)
+```go
+func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
+	msgsMap := a.allowedMsgsToMap(ctx)
+
+	for _, msg := range msgs {
+		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		if !msgsMap[sdk.MsgTypeURL(msg)] {
+			return false
+		}
+	}
+
+	return true
+}
+```
+
+**File:** types/tx/types.go (L22-36)
+```go
+func (t *Tx) GetMsgs() []sdk.Msg {
+	if t == nil || t.Body == nil {
+		return nil
+	}
+
+	anys := t.Body.Messages
+	res := make([]sdk.Msg, len(anys))
+	for i, any := range anys {
+		cached := any.GetCachedValue()
+		if cached == nil {
+			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
+		}
+		res[i] = cached.(sdk.Msg)
+	}
+	return res
+```
+
+**File:** x/authz/keeper/keeper.go (L87-111)
+```go
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
 			}
 
-			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
-		}
-	}
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
 
-	// cannot decrease balance below zero
-	tokensToBurn := sdk.MinInt(remainingSlashAmount, validator.Tokens)
-	tokensToBurn = sdk.MaxInt(tokensToBurn, sdk.ZeroInt()) // defensive.
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
+		}
 ```
 
-**File:** x/staking/keeper/slash.go (L219-296)
+**File:** x/feegrant/filtered_fee_test.go (L1-281)
 ```go
-func (k Keeper) SlashRedelegation(ctx sdk.Context, srcValidator types.Validator, redelegation types.Redelegation,
-	infractionHeight int64, slashFactor sdk.Dec) (totalSlashAmount sdk.Int) {
-	now := ctx.BlockHeader().Time
-	totalSlashAmount = sdk.ZeroInt()
-	bondedBurnedAmount, notBondedBurnedAmount := sdk.ZeroInt(), sdk.ZeroInt()
+package feegrant_test
 
-	// perform slashing on all entries within the redelegation
-	for _, entry := range redelegation.Entries {
-		// If redelegation started before this height, stake didn't contribute to infraction
-		if entry.CreationHeight < infractionHeight {
-			continue
-		}
+import (
+	"testing"
+	"time"
 
-		if entry.IsMature(now) {
-			// Redelegation no longer eligible for slashing, skip it
-			continue
-		}
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 
-		// Calculate slash amount proportional to stake contributing to infraction
-		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
-		slashAmount := slashAmountDec.TruncateInt()
-		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+	"github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/simapp"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"github.com/cosmos/cosmos-sdk/x/feegrant"
+)
 
-		// Unbond from target validator
-		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
-		if sharesToUnbond.IsZero() {
-			continue
-		}
+func TestFilteredFeeValidAllow(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{
+		Time: time.Now(),
+	})
 
-		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
-		if err != nil {
-			panic(err)
-		}
+	eth := sdk.NewCoins(sdk.NewInt64Coin("eth", 10))
+	atom := sdk.NewCoins(sdk.NewInt64Coin("atom", 555))
+	smallAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 43))
+	bigAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 1000))
+	leftAtom := bigAtom.Sub(smallAtom)
+	now := ctx.BlockTime()
+	oneHour := now.Add(1 * time.Hour)
+	from := sdk.MustAccAddressFromBech32("cosmos18cgkqduwuh253twzmhedesw3l7v3fm37sppt58")
+	to := sdk.MustAccAddressFromBech32("cosmos1yq8lgssgxlx9smjhes6ryjasmqmd3ts2559g0t")
 
-		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
+	// small fee without expire
+	msgType := "/cosmos.bank.v1beta1.MsgSend"
+	any, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
 
-		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
-		if !found {
-			// If deleted, delegation has zero shares, and we can't unbond any more
-			continue
-		}
+	// all fee without expire
+	any2, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: smallAtom,
+	})
 
-		if sharesToUnbond.GT(delegation.Shares) {
-			sharesToUnbond = delegation.Shares
-		}
+	// wrong fee
+	any3, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
 
-		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
-		if err != nil {
-			panic(fmt.Errorf("error unbonding delegator: %v", err))
-		}
+	// wrong fee
+	any4, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
 
-		dstValidator, found := k.GetValidator(ctx, valDstAddr)
-		if !found {
-			panic("destination validator not found")
-		}
+	// expired
+	any5, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+		Expiration: &now,
+	})
 
-		// tokens of a redelegation currently live in the destination validator
-		// therefor we must burn tokens from the destination-validator's bonding status
-		switch {
-		case dstValidator.IsBonded():
-			bondedBurnedAmount = bondedBurnedAmount.Add(tokensToBurn)
-		case dstValidator.IsUnbonded() || dstValidator.IsUnbonding():
-			notBondedBurnedAmount = notBondedBurnedAmount.Add(tokensToBurn)
-		default:
-			panic("unknown validator status")
-		}
+	// few more than allowed
+	any6, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: atom,
+		Expiration: &now,
+	})
+
+	// with out spend limit
+	any7, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &oneHour,
+	})
+
+	// expired no spend limit
+	any8, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	// msg type not allowed
+	msgType2 := "/cosmos.ibc.applications.transfer.v1.MsgTransfer"
+	any9, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		Expiration: &now,
+	})
+
+	cases := map[string]struct {
+		allowance *feegrant.AllowedMsgAllowance
+		msgs      []sdk.Msg
+		fee       sdk.Coins
+		blockTime time.Time
+		valid     bool
+		accept    bool
+		remove    bool
+		remains   sdk.Coins
+	}{
+		"small fee without expire": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any,
+				AllowedMessages: []string{msgType},
+			},
+			msgs: []sdk.Msg{&banktypes.MsgSend{
+				FromAddress: from.String(),
+				ToAddress:   to.String(),
+				Amount:      bigAtom,
+			}},
+			fee:     smallAtom,
+			accept:  true,
+			remove:  false,
+			remains: leftAtom,
+		},
+		"all fee without expire": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any2,
+				AllowedMessages: []string{msgType},
+			},
+			fee:    smallAtom,
+			accept: true,
+			remove: true,
+		},
+		"wrong fee": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any3,
+				AllowedMessages: []string{msgType},
+			},
+			fee:    eth,
+			accept: false,
+		},
+		"non-expired": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any4,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       smallAtom,
+			blockTime: now,
+			accept:    true,
+			remove:    false,
+			remains:   leftAtom,
+		},
+		"expired": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any5,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       smallAtom,
+			blockTime: oneHour,
+			accept:    false,
+			remove:    true,
+		},
+		"fee more than allowed": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any6,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       bigAtom,
+			blockTime: now,
+			accept:    false,
+		},
+		"with out spend limit": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any7,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       bigAtom,
+			blockTime: now,
+			accept:    true,
+		},
+		"expired no spend limit": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any8,
+				AllowedMessages: []string{msgType},
+			},
+			valid:     true,
+			fee:       bigAtom,
+			blockTime: oneHour,
+			accept:    false,
+		},
+		"msg type not allowed": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       any9,
+				AllowedMessages: []string{msgType2},
+			},
+			msgs: []sdk.Msg{&banktypes.MsgSend{
+				FromAddress: from.String(),
+				ToAddress:   to.String(),
+				Amount:      bigAtom,
+			}},
+			valid:  true,
+			fee:    bigAtom,
+			accept: false,
+		},
 	}
 
-	if err := k.burnBondedTokens(ctx, bondedBurnedAmount); err != nil {
-		panic(err)
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := tc.allowance.ValidateBasic()
+			require.NoError(t, err)
+
+			ctx := app.BaseApp.NewContext(false, tmproto.Header{}).WithBlockTime(tc.blockTime)
+
+			removed, err := tc.allowance.Accept(ctx, tc.fee, tc.msgs)
+			if !tc.accept {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			require.Equal(t, tc.remove, removed)
+			if !removed {
+				allowance, _ := tc.allowance.GetAllowance()
+				assert.Equal(t, tc.remains, allowance.(*feegrant.BasicAllowance).SpendLimit)
+			}
+		})
+	}
+}
+
+func TestFilteredFeeValidAllowance(t *testing.T) {
+	app := simapp.Setup(false)
+
+	smallAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 488))
+	bigAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 1000))
+	leftAtom := sdk.NewCoins(sdk.NewInt64Coin("atom", 512))
+
+	basicAllowance, _ := types.NewAnyWithValue(&feegrant.BasicAllowance{
+		SpendLimit: bigAtom,
+	})
+
+	cases := map[string]struct {
+		allowance *feegrant.AllowedMsgAllowance
+		// all other checks are ignored if valid=false
+		fee       sdk.Coins
+		blockTime time.Time
+		valid     bool
+		accept    bool
+		remove    bool
+		remains   sdk.Coins
+	}{
+		"internal fee is updated": {
+			allowance: &feegrant.AllowedMsgAllowance{
+				Allowance:       basicAllowance,
+				AllowedMessages: []string{"/cosmos.bank.v1beta1.MsgSend"},
+			},
+			fee:     smallAtom,
+			accept:  true,
+			remove:  false,
+			remains: leftAtom,
+		},
 	}
 
-	if err := k.burnNotBondedTokens(ctx, notBondedBurnedAmount); err != nil {
-		panic(err)
-	}
+	for name, stc := range cases {
+		tc := stc // to make scopelint happy
+		t.Run(name, func(t *testing.T) {
+			err := tc.allowance.ValidateBasic()
+			require.NoError(t, err)
 
-	return totalSlashAmount
+			ctx := app.BaseApp.NewContext(false, tmproto.Header{}).WithBlockTime(tc.blockTime)
+
+			// now try to deduct
+			removed, err := tc.allowance.Accept(ctx, tc.fee, []sdk.Msg{
+				&banktypes.MsgSend{
+					FromAddress: "gm",
+					ToAddress:   "gn",
+					Amount:      tc.fee,
+				},
+			})
+			if !tc.accept {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			require.Equal(t, tc.remove, removed)
+			if !removed {
+				var basicAllowanceLeft feegrant.BasicAllowance
+				app.AppCodec().Unmarshal(tc.allowance.Allowance.Value, &basicAllowanceLeft)
+
+				assert.Equal(t, tc.remains, basicAllowanceLeft.SpendLimit)
+			}
+		})
+	}
 }
 ```
 
-**File:** x/staking/keeper/delegation.go (L734-794)
+**File:** x/authz/msgs.go (L197-209)
 ```go
-// Unbond unbonds a particular delegation and perform associated store operations.
-func (k Keeper) Unbond(
-	ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress, shares sdk.Dec,
-) (amount sdk.Int, err error) {
-	// check if a delegation object exists in the store
-	delegation, found := k.GetDelegation(ctx, delAddr, valAddr)
-	if !found {
-		return amount, types.ErrNoDelegatorForAddress
-	}
-
-	// call the before-delegation-modified hook
-	k.BeforeDelegationSharesModified(ctx, delAddr, valAddr)
-
-	// ensure that we have enough shares to remove
-	if delegation.Shares.LT(shares) {
-		return amount, sdkerrors.Wrap(types.ErrNotEnoughDelegationShares, delegation.Shares.String())
-	}
-
-	// get validator
-	validator, found := k.GetValidator(ctx, valAddr)
-	if !found {
-		return amount, types.ErrNoValidatorFound
-	}
-
-	// subtract shares from delegation
-	delegation.Shares = delegation.Shares.Sub(shares)
-
-	delegatorAddress, err := sdk.AccAddressFromBech32(delegation.DelegatorAddress)
-	if err != nil {
-		return amount, err
-	}
-
-	isValidatorOperator := delegatorAddress.Equals(validator.GetOperator())
-
-	// If the delegation is the operator of the validator and undelegating will decrease the validator's
-	// self-delegation below their minimum, we jail the validator.
-	if isValidatorOperator && !validator.Jailed &&
-		validator.TokensFromShares(delegation.Shares).TruncateInt().LT(validator.MinSelfDelegation) {
-		k.jailValidator(ctx, validator)
-		validator = k.mustGetValidator(ctx, validator.GetOperator())
-	}
-
-	// remove the delegation
-	if delegation.Shares.IsZero() {
-		k.RemoveDelegation(ctx, delegation)
-	} else {
-		k.SetDelegation(ctx, delegation)
-		// call the after delegation modification hook
-		k.AfterDelegationModified(ctx, delegatorAddress, delegation.GetValidatorAddr())
-	}
-
-	// remove the shares and coins from the validator
-	// NOTE that the amount is later (in keeper.Delegation) moved between staking module pools
-	validator, amount = k.RemoveValidatorTokensAndShares(ctx, validator, shares)
-
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
-	}
-
-	return amount, nil
-```
-
-**File:** x/staking/keeper/delegation.go (L936-960)
-```go
-	returnAmount, err := k.Unbond(ctx, delAddr, valSrcAddr, sharesAmount)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	if returnAmount.IsZero() {
-		return time.Time{}, types.ErrTinyRedelegationAmount
-	}
-
-	sharesCreated, err := k.Delegate(ctx, delAddr, returnAmount, srcValidator.GetStatus(), dstValidator, false)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	// create the unbonding delegation
-	completionTime, height, completeNow := k.getBeginInfo(ctx, valSrcAddr)
-
-	if completeNow { // no need to create the redelegation object
-		return completionTime, nil
-	}
-
-	red := k.SetRedelegationEntry(
-		ctx, delAddr, valSrcAddr, valDstAddr,
-		height, completionTime, returnAmount, sharesAmount, sharesCreated,
-	)
-```
-
-**File:** x/staking/types/validator.go (L304-306)
-```go
-func (v Validator) TokensFromShares(shares sdk.Dec) sdk.Dec {
-	return (shares.MulInt(v.Tokens)).Quo(v.DelegatorShares)
-}
-```
-
-**File:** x/staking/types/validator.go (L410-430)
-```go
-//	the exchange rate of future shares of this validator can increase.
-func (v Validator) RemoveDelShares(delShares sdk.Dec) (Validator, sdk.Int) {
-	remainingShares := v.DelegatorShares.Sub(delShares)
-
-	var issuedTokens sdk.Int
-	if remainingShares.IsZero() {
-		// last delegation share gets any trimmings
-		issuedTokens = v.Tokens
-		v.Tokens = sdk.ZeroInt()
-	} else {
-		// leave excess tokens in the validator
-		// however fully use all the delegator shares
-		issuedTokens = v.TokensFromShares(delShares).TruncateInt()
-		v.Tokens = v.Tokens.Sub(issuedTokens)
-
-		if v.Tokens.IsNegative() {
-			panic("attempting to remove more tokens than available in validator")
+// GetMessages returns the cache values from the MsgExecAuthorized.Msgs if present.
+func (msg MsgExec) GetMessages() ([]sdk.Msg, error) {
+	msgs := make([]sdk.Msg, len(msg.Msgs))
+	for i, msgAny := range msg.Msgs {
+		msg, ok := msgAny.GetCachedValue().(sdk.Msg)
+		if !ok {
+			return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages contains %T which is not a sdk.MsgRequest", msgAny)
 		}
+		msgs[i] = msg
 	}
 
-	v.DelegatorShares = remainingShares
-```
-
-**File:** proto/cosmos/staking/v1beta1/staking.proto (L231-250)
-```text
-// RedelegationEntry defines a redelegation object with relevant metadata.
-message RedelegationEntry {
-  option (gogoproto.equal)            = true;
-  option (gogoproto.goproto_stringer) = false;
-
-  // creation_height  defines the height which the redelegation took place.
-  int64 creation_height = 1 [(gogoproto.moretags) = "yaml:\"creation_height\""];
-  // completion_time defines the unix time for redelegation completion.
-  google.protobuf.Timestamp completion_time = 2
-      [(gogoproto.nullable) = false, (gogoproto.stdtime) = true, (gogoproto.moretags) = "yaml:\"completion_time\""];
-  // initial_balance defines the initial balance when redelegation started.
-  string initial_balance = 3 [
-    (gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int",
-    (gogoproto.nullable)   = false,
-    (gogoproto.moretags)   = "yaml:\"initial_balance\""
-  ];
-  // shares_dst is the amount of destination-validator shares created by redelegation.
-  string shares_dst = 4
-      [(gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Dec", (gogoproto.nullable) = false];
+	return msgs, nil
 }
 ```

@@ -1,258 +1,211 @@
 # Audit Report
 
 ## Title
-Pre-Gas-Metering CPU Exhaustion via MsgMultiSend with Unbounded Inputs/Outputs
+Network Halt Due to Missing Nil Check in Validator Reward Allocation Loop
 
 ## Summary
-The `MsgMultiSend` message type in the bank module allows unbounded numbers of inputs and outputs that undergo expensive Bech32 address validation in `ValidateBasic()` before any gas metering is established. This enables any user to craft transactions causing disproportionate CPU consumption across all network nodes during `CheckTx` without paying corresponding gas costs.
+The `AllocateTokens` function in the distribution module lacks a nil check when allocating rewards to validators who voted in the previous block. When a validator is removed from state between voting and reward distribution, the code attempts to dereference a nil validator interface, causing a deterministic panic that crashes all nodes simultaneously and halts the network.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:**
-- Primary vulnerability: [1](#0-0) 
-- Entry point: [2](#0-1) 
-- Execution flow: [3](#0-2)  called before [4](#0-3) 
+**Location:** [1](#0-0) 
 
-**Intended logic:**
-The `ValidateBasic()` method should perform lightweight stateless validation. Resource-intensive operations should occur after gas metering is established through the ante handler chain to enforce the "pay-for-what-you-consume" principle as documented in [5](#0-4) .
+**Intended logic:** The reward allocation loop should safely distribute fees to all validators who participated in consensus, handling edge cases where validators may have been removed from state between the voting phase and reward distribution phase.
 
-**Actual logic:**
-In the transaction processing pipeline initiated at [6](#0-5) , `validateBasicTxMsgs()` executes at line 923 BEFORE the ante handler chain at line 947. For `MsgMultiSend`, this triggers `ValidateInputsOutputs()` which performs O(N+M) iterations without any limit on N (inputs) or M (outputs) beyond MaxTxBytes. Each iteration executes:
-- Bech32 address parsing via `AccAddressFromBech32()` at [7](#0-6)  and [8](#0-7) 
-- Coin validation at [9](#0-8) 
-
-Gas metering only begins in the ante handler chain where [10](#0-9)  is positioned after the initial `SetUpContextDecorator`.
+**Actual logic:** The code retrieves validators via `ValidatorByConsAddr` without checking for nil before passing them to `AllocateTokensToValidator`. [2](#0-1)  When the validator is nil, the immediate call to `val.GetCommission()` causes a nil pointer dereference panic. [3](#0-2) 
 
 **Exploitation path:**
-1. Attacker crafts `MsgMultiSend` with maximum inputs/outputs fitting within MaxTxBytes (potentially 10,000-40,000 total given ~50-100 bytes per entry)
-2. Transaction is broadcast to the network
-3. Each node receives it in `CheckTx` which calls `runTx()`
-4. `validateBasicTxMsgs()` iterates through all inputs/outputs, performing expensive Bech32 decoding for each address (10,000-40,000 operations per transaction)
-5. Only after this validation completes does the ante handler chain execute to establish gas metering
-6. CPU resources are consumed (10-200ms per transaction) without any gas charges
-7. Attacker continuously broadcasts such transactions to exhaust node CPU resources
 
-**Security guarantee broken:**
-The fundamental "pay-for-what-you-consume" gas metering principle is violated. Computationally expensive validation operations execute with zero resource accounting, enabling DoS attacks where CPU consumption vastly exceeds any associated costs.
+1. **Block N**: A bonded validator participates in consensus and votes. All delegations are removed via `Undelegate` transactions, causing `DelegatorShares` to reach zero.
+
+2. **Block N EndBlock**: The staking module processes validator state changes via `BlockValidatorUpdates`. [4](#0-3)  The validator transitions from Bonded → Unbonding [5](#0-4) , then Unbonding → Unbonded. Since `DelegatorShares.IsZero()`, `RemoveValidator` deletes the validator including its consensus address mapping. [6](#0-5) [7](#0-6) 
+
+3. **Block N+1 BeginBlock**: Distribution module's `BeginBlocker` calls `AllocateTokens` with votes from block N. [8](#0-7)  `ValidatorByConsAddr` returns nil for the removed validator. The code calls `AllocateTokensToValidator(ctx, nil, reward)` without checking nil, causing immediate panic in BeginBlock.
+
+**Security guarantee broken:** Network liveness and availability. BeginBlock must complete successfully for consensus to proceed. The panic violates the invariant that all state transitions must be handled gracefully without crashing the system.
 
 ## Impact Explanation
 
-This vulnerability affects all validator and full nodes in the network. An attacker broadcasting transactions with thousands of inputs/outputs forces every node to perform extensive validation operations during `CheckTx` before any gas is charged. With typical MaxTxBytes limits allowing 10,000-40,000 inputs/outputs, each transaction requires 10-200ms of CPU time for Bech32 decoding operations. By continuously broadcasting such transactions at 10-100 tx/second, an attacker can consume 100-2000% of a single CPU core, easily exceeding 30% total resource consumption on multi-core systems. This causes:
+This vulnerability causes complete network shutdown when triggered. Since BeginBlock execution is deterministic and consensus-critical, all validators process identical state and crash at the same block height. This results in:
 
-- Significant CPU exhaustion across all network nodes
-- Mempool congestion with malicious transactions
-- Delayed or dropped legitimate user transactions  
-- Degraded network performance and throughput
-- Forced resource upgrades for node operators
+1. **Total network halt** - No new blocks can be produced since all nodes panic
+2. **Loss of transaction finality** - All pending transactions remain unprocessed  
+3. **Requires emergency intervention** - Manual coordination among validators to restart nodes, potentially requiring a coordinated upgrade or hard fork
 
-This directly achieves the Medium severity threshold: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
+The severity qualifies as High impact: "Network not being able to confirm new transactions (total network shutdown)."
 
 ## Likelihood Explanation
 
-**Trigger requirements:**
-- Any network participant can create and broadcast `MsgMultiSend` transactions
-- No privileged access, special permissions, or staking requirements
-- Attack executable at any time during normal network operation
-- Only constraint is MaxTxBytes limit, which still permits thousands of inputs/outputs
+**Who can trigger:** Any network participant with delegations can submit `Undelegate` transactions. No special privileges required.
+
+**Conditions:**
+1. Unbonding period configured to a short duration (validation only requires > 0, allowing values as low as 1 nanosecond) [9](#0-8) 
+2. A validator must have all delegations removed in a single block
+3. The validator must participate in consensus during that block
 
 **Frequency:**
-The attack can be sustained continuously by any malicious actor with minimal cost:
-- Standard network bandwidth for broadcasting transactions
-- Potentially zero transaction fees if rejected before fee deduction
-- No capital lockup or economic risk
-- No sophisticated infrastructure required
+- With short unbonding periods (commonly used in testnets): Moderately likely during normal operations
+- With standard periods: Less likely but still possible when unbonding naturally completes
 
-The attack is highly practical - simply constructing transactions with many inputs/outputs - making this a realistic and immediate threat. The technical barrier is extremely low while the impact is network-wide.
+**Critical Evidence:** The code explicitly acknowledges this scenario can occur in the proposer reward allocation, which includes a nil check and detailed warning, while the voter reward path lacks this same protection. [10](#0-9) 
 
 ## Recommendation
 
-Implement a maximum limit on the combined count of inputs and outputs in `MsgMultiSend.ValidateBasic()` before expensive iteration begins:
+Add a nil check in the vote allocation loop, mirroring the defensive approach used for proposer rewards:
 
 ```go
-func (msg MsgMultiSend) ValidateBasic() error {
-    const MaxInputsOutputs = 100 // Make configurable via governance
+for _, vote := range bondedVotes {
+    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
     
-    if len(msg.Inputs) == 0 {
-        return ErrNoInputs
-    }
-    if len(msg.Outputs) == 0 {
-        return ErrNoOutputs
-    }
-    
-    totalCount := len(msg.Inputs) + len(msg.Outputs)
-    if totalCount > MaxInputsOutputs {
-        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
-            "too many inputs/outputs: %d exceeds maximum %d", 
-            totalCount, MaxInputsOutputs)
+    if validator == nil {
+        logger.Error(fmt.Sprintf(
+            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
+            "This should happen only if the validator unbonded completely within a single block.",
+            vote.Validator.Address.String()))
+        continue
     }
     
-    return ValidateInputsOutputs(msg.Inputs, msg.Outputs)
+    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+    reward := feeMultiplier.MulDecTruncate(powerFraction)
+    
+    k.AllocateTokensToValidator(ctx, validator, reward)
+    remaining = remaining.Sub(reward)
 }
 ```
 
-This bounds computational cost to a reasonable level before gas accounting begins, preventing resource exhaustion while maintaining functionality for legitimate multi-send use cases.
+When a validator is removed, their allocated rewards remain in the pool and get added to the community pool at function end, maintaining consistency with proposer reward behavior.
 
 ## Proof of Concept
 
-**Setup:**
-Add test in `x/bank/types/msgs_test.go`:
+**Test Location:** `x/distribution/keeper/allocation_test.go`
 
-```go
-func TestMsgMultiSendLargeInputsOutputsDoS(t *testing.T) {
-    numInputsOutputs := 10000
-    coins := sdk.NewCoins(sdk.NewInt64Coin("atom", 1))
-    
-    inputs := make([]Input, numInputsOutputs)
-    outputs := make([]Output, numInputsOutputs)
-    
-    for i := 0; i < numInputsOutputs; i++ {
-        addr := sdk.AccAddress([]byte(fmt.Sprintf("addr%d", i)))
-        inputs[i] = NewInput(addr, coins)
-        outputs[i] = NewOutput(addr, coins)
-    }
-    
-    msg := NewMsgMultiSend(inputs, outputs)
-    
-    start := time.Now()
-    err := msg.ValidateBasic()
-    elapsed := time.Since(start)
-    
-    require.NoError(t, err)
-    t.Logf("Validation of %d inputs/outputs took %v", numInputsOutputs*2, elapsed)
-}
-```
+**Setup:**
+1. Initialize test app with 1-nanosecond unbonding period via staking params
+2. Create a validator with minimal delegation (e.g., 100 tokens)  
+3. Fund the fee collector module account with distributable fees
+4. Include the validator in the vote list for block N
 
 **Action:**
-Run the test to measure CPU time consumed during `ValidateBasic()` with 20,000 inputs/outputs.
+1. Submit `Undelegate` messages removing all delegations from the validator
+2. Call `staking.EndBlocker(ctx)` to process validator state changes:
+   - Validator transitions Bonded → Unbonding → Unbonded → Removed
+3. Call `distribution.BeginBlocker(ctx, req)` with `req.LastCommitInfo.Votes` containing the removed validator
 
 **Result:**
-Validation completes successfully but demonstrates excessive CPU consumption (10-200ms depending on hardware). This expensive operation occurs in `validateBasicTxMsgs()` called before the ante handler chain - meaning before ANY gas is charged. An attacker exploits this by flooding the network with such transactions, causing CPU exhaustion across all nodes during `CheckTx` without paying proportional gas costs.
+Panic with nil pointer dereference when `AllocateTokens` attempts to call `val.GetCommission()` on the nil interface at line 113 of allocation.go, causing BeginBlock to fail and halt the network.
 
 ## Notes
 
-The vulnerability is explicitly documented in the codebase's own warning about this DoS vector. The expensive validation occurs not just before transaction size gas is charged, but before the entire ante handler chain establishes ANY gas metering. With no limits on inputs/outputs count, an attacker can maximize CPU consumption per transaction while minimizing cost. This represents a fundamental violation of blockchain resource management principles where operations should be economically bounded by gas costs.
+The vulnerability is confirmed by critical code inconsistency: the proposer reward allocation path includes defensive nil checking with detailed warnings, while the voter reward allocation path lacks this protection despite calling the same underlying function and facing identical risks. This pattern, combined with explicit comments acknowledging the edge case, proves this is an oversight in defensive programming rather than intentional design. The deterministic nature of BeginBlock execution ensures all validators crash simultaneously, making this a network-halting vulnerability.
 
 ### Citations
 
-**File:** x/bank/types/msgs.go (L79-91)
+**File:** x/distribution/keeper/allocation.go (L68-79)
 ```go
-func (msg MsgMultiSend) ValidateBasic() error {
-	// this just makes sure all the inputs and outputs are properly formatted,
-	// not that they actually have the money inside
-	if len(msg.Inputs) == 0 {
-		return ErrNoInputs
-	}
-
-	if len(msg.Outputs) == 0 {
-		return ErrNoOutputs
-	}
-
-	return ValidateInputsOutputs(msg.Inputs, msg.Outputs)
-}
-```
-
-**File:** x/bank/types/msgs.go (L111-111)
-```go
-	_, err := sdk.AccAddressFromBech32(in.Address)
-```
-
-**File:** x/bank/types/msgs.go (L116-122)
-```go
-	if !in.Coins.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, in.Coins.String())
-	}
-
-	if !in.Coins.IsAllPositive() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, in.Coins.String())
+	} else {
+		// previous proposer can be unknown if say, the unbonding period is 1 block, so
+		// e.g. a validator undelegates at block X, it's removed entirely by
+		// block X+1's endblock, then X+2 we need to refer to the previous
+		// proposer for X+1, but we've forgotten about them.
+		logger.Error(fmt.Sprintf(
+			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
+				"This should happen only if the proposer unbonded completely within a single block, "+
+				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
+				"We recommend you investigate immediately.",
+			previousProposer.String()))
 	}
 ```
 
-**File:** x/bank/types/msgs.go (L138-138)
+**File:** x/distribution/keeper/allocation.go (L91-102)
 ```go
-	_, err := sdk.AccAddressFromBech32(out.Address)
+	for _, vote := range bondedVotes {
+		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+
+		// TODO: Consider micro-slashing for missing votes.
+		//
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
+		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+		reward := feeMultiplier.MulDecTruncate(powerFraction)
+
+		k.AllocateTokensToValidator(ctx, validator, reward)
+		remaining = remaining.Sub(reward)
+	}
 ```
 
-**File:** x/bank/types/msgs.go (L165-190)
+**File:** x/distribution/keeper/allocation.go (L111-113)
 ```go
-func ValidateInputsOutputs(inputs []Input, outputs []Output) error {
-	var totalIn, totalOut sdk.Coins
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+```
 
-	for _, in := range inputs {
-		if err := in.ValidateBasic(); err != nil {
-			return err
+**File:** x/staking/keeper/alias_functions.go (L89-95)
+```go
+func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
+	val, found := k.GetValidatorByConsAddr(ctx, addr)
+	if !found {
+		return nil
+	}
+
+	return val
+```
+
+**File:** x/staking/keeper/val_state_change.go (L22-26)
+```go
+	// This fixes a bug when the unbonding period is instant (is the case in
+	// some of the tests). The test expected the validator to be completely
+	// unbonded after the Endblocker (go from Bonded -> Unbonding during
+	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
+	// UnbondAllMatureValidatorQueue).
+```
+
+**File:** x/staking/keeper/val_state_change.go (L190-198)
+```go
+	for _, valAddrBytes := range noLongerBonded {
+		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
+		validator, err = k.bondedToUnbonding(ctx, validator)
+		if err != nil {
+			return
 		}
+		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
+		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
+		updates = append(updates, validator.ABCIValidatorUpdateZero())
+```
 
-		totalIn = totalIn.Add(in.Coins...)
+**File:** x/staking/keeper/validator.go (L176-176)
+```go
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+```
+
+**File:** x/staking/keeper/validator.go (L441-444)
+```go
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
+
+**File:** x/distribution/abci.go (L29-31)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+```
+
+**File:** x/staking/types/params.go (L167-177)
+```go
+func validateUnbondingTime(i interface{}) error {
+	v, ok := i.(time.Duration)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	for _, out := range outputs {
-		if err := out.ValidateBasic(); err != nil {
-			return err
-		}
-
-		totalOut = totalOut.Add(out.Coins...)
-	}
-
-	// make sure inputs and outputs match
-	if !totalIn.IsEqual(totalOut) {
-		return ErrInputOutputMismatch
+	if v <= 0 {
+		return fmt.Errorf("unbonding time must be positive: %d", v)
 	}
 
 	return nil
-}
-```
-
-**File:** baseapp/baseapp.go (L923-925)
-```go
-	if err := validateBasicTxMsgs(msgs); err != nil {
-		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
-	}
-```
-
-**File:** baseapp/baseapp.go (L947-947)
-```go
-		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
-```
-
-**File:** types/handler.go (L65-68)
-```go
-// NOTE: Any application that uses GasMeter to limit transaction processing cost
-// MUST set GasMeter with the FIRST AnteDecorator. Failing to do so will cause
-// transactions to be processed with an infinite gasmeter and open a DOS attack vector.
-// Use `ante.SetUpContextDecorator` or a custom Decorator with similar functionality.
-```
-
-**File:** baseapp/abci.go (L209-231)
-```go
-func (app *BaseApp) CheckTx(ctx context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTxV2, error) {
-	defer telemetry.MeasureSince(time.Now(), "abci", "check_tx")
-
-	var mode runTxMode
-
-	switch {
-	case req.Type == abci.CheckTxType_New:
-		mode = runTxModeCheck
-
-	case req.Type == abci.CheckTxType_Recheck:
-		mode = runTxModeReCheck
-
-	default:
-		panic(fmt.Sprintf("unknown RequestCheckTx type: %s", req.Type))
-	}
-
-	sdkCtx := app.getContextForTx(mode, req.Tx)
-	tx, err := app.txDecoder(req.Tx)
-	if err != nil {
-		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
-		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
-	}
-	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
-```
-
-**File:** x/auth/ante/ante.go (L53-53)
-```go
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
 ```

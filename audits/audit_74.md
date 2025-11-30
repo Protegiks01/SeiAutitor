@@ -1,190 +1,214 @@
 # Audit Report
 
 ## Title
-Stale Liveness Tracking Data Persists After Validator Removal Causing Unfair Jailing on Re-Bonding
+Chain Halt Due to Missing Nil Check When Allocating Rewards to Removed Validators
 
 ## Summary
-The slashing module's `AfterValidatorRemoved` hook fails to clean up `ValidatorSigningInfo` and `ValidatorMissedBlockArray` state when a validator is removed. When a new validator is later created with the same consensus address, it inherits stale liveness tracking data from the previous validator, resulting in premature jailing based on accumulated missed blocks from a prior validator lifecycle.
+The distribution module's `AllocateTokens` function lacks nil validation for validators in the voting loop, while the same protection exists for the proposer. When a validator participates in consensus but is removed before reward distribution (possible with short unbonding periods), the code panics on `val.GetCommission()`, causing a total network shutdown.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-- **location**: `x/slashing/keeper/hooks.go` lines 41-43 [1](#0-0) 
+**Location:** [1](#0-0) 
 
-- **intended logic**: When a validator is completely removed via `RemoveValidator`, all associated slashing state should be cleaned up, including `ValidatorSigningInfo` and `ValidatorMissedBlockArray`. This ensures that if the same consensus address is later used to create a new validator, it starts with fresh liveness tracking (MissedBlocksCounter=0, fresh StartHeight, empty missed blocks array).
+**Intended Logic:** The `AllocateTokens` function should safely distribute rewards to all validators that participated in the previous block, gracefully handling cases where validators may have been removed from state between block production and reward distribution.
 
-- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation [1](#0-0) , but does NOT delete the `ValidatorSigningInfo` (stored at `ValidatorSigningInfoKey(address)`) [2](#0-1)  or the `ValidatorMissedBlockArray` (stored at `ValidatorMissedBlockBitArrayKey(address)`) [3](#0-2) . When `AfterValidatorBonded` is triggered for a validator with the same consensus address, it checks if signing info exists and only creates new info if not found [4](#0-3) . Since the old signing info persists, the new validator inherits the stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
+**Actual Logic:** The function retrieves each validator from `bondedVotes` via `ValidatorByConsAddr` without verifying the returned value is non-nil before usage. [2](#0-1)  When `ValidatorByConsAddr` returns nil (validator was removed), this nil value is passed to `AllocateTokensToValidator`, which immediately panics when calling `val.GetCommission()` on the nil interface. [3](#0-2) 
 
-- **exploitation path**:
-  1. Validator accumulates missed blocks during normal operation
-  2. All delegations are removed, triggering unbonding
-  3. Once unbonding completes and `DelegatorShares.IsZero()`, `RemoveValidator` is called [5](#0-4) 
-  4. `RemoveValidator` deletes the `ValidatorByConsAddrKey` index [6](#0-5) 
-  5. `AfterValidatorRemoved` hook executes, deleting only the pubkey relation [1](#0-0) 
-  6. Later, same consensus address creates new validator, passing the `GetValidatorByConsAddr` check [7](#0-6)  (check passes because the index was deleted)
-  7. New validator bonds, triggering `AfterValidatorBonded` [4](#0-3) 
-  8. Since signing info exists, no new info is created - validator inherits stale `MissedBlocksCounter`
-  9. When liveness is checked, the inherited counter causes premature jailing [8](#0-7) 
+**Exploitation Path:**
+1. Validator V is active at block N and votes
+2. At block N EndBlock, V may transition to Unbonding state
+3. At a subsequent block EndBlock, V completes unbonding with zero delegations and is removed [4](#0-3) 
+4. The removal deletes V from the consensus address index [5](#0-4) 
+5. At next block BeginBlock, `AllocateTokens` is called with votes including V [6](#0-5) 
+6. `ValidatorByConsAddr` returns nil for V
+7. No nil check exists, code calls `AllocateTokensToValidator(ctx, nil, reward)`
+8. Panic occurs at `val.GetCommission()`, all nodes crash simultaneously
 
-- **security guarantee broken**: The protocol invariant that each validator lifecycle should have independent liveness tracking is violated. Validators reusing consensus addresses do not start with a clean slate, inheriting historical downtime data from a previous, removed validator.
+**Security Guarantee Broken:** Chain liveness guarantee. BeginBlock must never panic as it executes identically on all nodes.
 
 ## Impact Explanation
 
-This vulnerability results in validators being jailed prematurely when they reuse consensus keys after full unbonding. The impact includes:
-
-- **Unfair jailing**: Validators are jailed after missing fewer blocks than protocol parameters specify due to inherited counters
-- **Loss of staking rewards**: Jailed validators cannot earn commission or staking rewards during the jail period
-- **Network participation disruption**: Validators are unexpectedly removed from the active set
-- **Protocol inconsistency**: The slashing mechanism behaves unpredictably, violating validator expectations
-
-With default sei-cosmos parameters (`SlashFractionDowntime=0%`), no tokens are directly slashed, but chains may configure non-zero values resulting in actual token loss. This qualifies as **"A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk"** - a Medium severity issue.
+A panic in BeginBlock causes all validator nodes to crash at the same block height deterministically. The entire network halts and cannot confirm new transactions. Recovery requires coordinated manual intervention (hard fork to skip the problematic block or restart from previous state). This matches the "Network not being able to confirm new transactions (total network shutdown)" impact criterion defined as Medium severity.
 
 ## Likelihood Explanation
 
-This vulnerability can be triggered through legitimate validator operations without malicious intent:
+**Triggering Conditions:**
+- Short unbonding period (1-2 blocks) - common in test networks, possible in production if governance reduces the parameter [7](#0-6) 
+- Any validator fully unbonds during the critical timing window
+- Can occur naturally or be deliberately triggered by any validator operator
 
-- **Operational scenario**: Validators performing infrastructure maintenance may fully unbond, then later rebond with the same consensus key for operational simplicity
-- **Prerequisite conditions**: Requires prior missed blocks (normal during network issues) followed by full unbonding and re-creation
-- **No special privileges**: Can occur through standard validator operations accessible to any validator operator
-
-While not the most common operational path, this represents a realistic edge case affecting validators who cycle through the complete lifecycle of bonding → downtime accumulation → full unbonding → re-bonding with the same consensus key.
+**Evidence of Awareness:** The code explicitly handles this exact scenario for the proposer validator [8](#0-7) , proving developers were aware of the timing issue but failed to apply the protection consistently to regular voters.
 
 ## Recommendation
 
-Modify the `AfterValidatorRemoved` hook in the slashing keeper to clean up all validator-related slashing state:
+Add nil check in the `bondedVotes` loop mirroring the proposer protection:
 
 ```go
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-    // Clean up signing info
-    store := ctx.KVStore(k.storeKey)
-    store.Delete(types.ValidatorSigningInfoKey(address))
-    // Clean up missed blocks array  
-    k.ClearValidatorMissedBlockBitArray(ctx, address)
+for _, vote := range bondedVotes {
+    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+    
+    if validator == nil {
+        logger.Error(fmt.Sprintf(
+            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
+            "This can happen if the validator unbonded completely within a short period.",
+            vote.Validator.Address))
+        continue
+    }
+    
+    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+    reward := feeMultiplier.MulDecTruncate(powerFraction)
+    k.AllocateTokensToValidator(ctx, validator, reward)
+    remaining = remaining.Sub(reward)
 }
 ```
-
-This ensures complete state cleanup when a validator is removed, allowing fresh liveness tracking if the consensus address is subsequently reused.
 
 ## Proof of Concept
 
-**File**: `x/slashing/keeper/keeper_test.go` (new test to add)  
-**Function**: `TestValidatorRemovalClearsMissedBlocks`
+**Test Function:** `TestAllocateTokensToRemovedValidator` (to add to `x/distribution/keeper/allocation_test.go`)
 
-**Setup**:
-1. Initialize simapp with slashing parameters (SignedBlocksWindow=1000, MinSignedPerWindow=0.5)
-2. Create validator with consensus pubkey and delegate sufficient tokens
-3. Execute EndBlocker to activate validator in the validator set
+**Setup:**
+1. Initialize test app with very short unbonding period (e.g., 1 second)
+2. Create validator with self-delegation
+3. Fund fee collector with distribution tokens
 
-**Action**:
-1. Simulate 1000 blocks where validator signs correctly (establish baseline)
-2. Simulate 200 blocks where validator does NOT sign, accumulating MissedBlocksCounter=200
-3. Verify signing info shows MissedBlocksCounter=200 via `GetValidatorSigningInfo`
-4. Undelegate all tokens, complete unbonding period, triggering `RemoveValidator`
-5. Verify validator is removed from state via `GetValidator` (returns not found)
-6. Create new validator with the SAME consensus pubkey (should pass `GetValidatorByConsAddr` check since index was deleted)
-7. Execute EndBlocker to bond the new validator
+**Action:**
+1. Undelegate all tokens from validator
+2. Call `BlockValidatorUpdates` to transition to Unbonding [9](#0-8) 
+3. Advance time past unbonding period
+4. Call `UnbondAllMatureValidators` to remove validator
+5. Verify validator removal via `ValidatorByConsAddr` returning nil
+6. Create `VoteInfo` including the removed validator's consensus address
+7. Call `AllocateTokens` with these votes
 
-**Result**:
-Query signing info for the consensus address - it incorrectly shows MissedBlocksCounter=200 (inherited from the removed validator) instead of 0, demonstrating the bug. Subsequently, when the new validator misses 301 additional blocks, it gets jailed at a total of 501 missed blocks, whereas a fresh validator should only be jailed after missing 501 blocks from scratch (demonstrating the unfair premature jailing).
+**Result:**
+Panic at line 113 when calling `val.GetCommission()` on nil interface, demonstrating chain-halting vulnerability. The panic is deterministic and would occur on all nodes simultaneously.
 
 ## Notes
 
-The vulnerability is confirmed through code analysis showing that:
-1. `AfterValidatorRemoved` only calls `deleteAddrPubkeyRelation` [9](#0-8) 
-2. There is a `ClearValidatorMissedBlockBitArray` function available [10](#0-9)  but it's only used during slashing/jailing [11](#0-10) , not during validator removal
-3. No deletion function exists for `ValidatorSigningInfo` and it's not deleted during removal
-
-This confirms the incomplete state cleanup and validates the security claim.
+**Critical Inconsistency:** The code implements proper nil handling for the proposer case with detailed error logging explaining the timing scenario, but completely omits this protection for regular voters, indicating an incomplete fix to a known timing issue. This inconsistency strongly suggests the vulnerability is unintentional rather than by design. The comment at [10](#0-9)  explicitly describes the exact timing scenario that can occur, yet the same protection was not applied to the voters loop.
 
 ### Citations
 
-**File:** x/slashing/keeper/hooks.go (L12-26)
+**File:** x/distribution/keeper/allocation.go (L57-79)
 ```go
-func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
-	// Update the signing info start height or create a new signing info
-	_, found := k.GetValidatorSigningInfo(ctx, address)
-	if !found {
-		signingInfo := types.NewValidatorSigningInfo(
-			address,
-			ctx.BlockHeight(),
-			0,
-			time.Unix(0, 0),
-			false,
-			0,
+	if proposerValidator != nil {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeProposerReward,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, proposerReward.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, proposerValidator.GetOperator().String()),
+			),
 		)
-		k.SetValidatorSigningInfo(ctx, address, signingInfo)
-	}
-}
-```
 
-**File:** x/slashing/keeper/hooks.go (L41-43)
-```go
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-}
-```
-
-**File:** x/slashing/types/keys.go (L38-40)
-```go
-func ValidatorSigningInfoKey(v sdk.ConsAddress) []byte {
-	return append(ValidatorSigningInfoKeyPrefix, address.MustLengthPrefix(v.Bytes())...)
-}
-```
-
-**File:** x/slashing/types/keys.go (L52-54)
-```go
-func ValidatorMissedBlockBitArrayKey(v sdk.ConsAddress) []byte {
-	return append(ValidatorMissedBlockBitArrayKeyPrefix, address.MustLengthPrefix(v.Bytes())...)
-}
-```
-
-**File:** x/staking/keeper/delegation.go (L789-792)
-```go
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
+		k.AllocateTokensToValidator(ctx, proposerValidator, proposerReward)
+		remaining = remaining.Sub(proposerReward)
+	} else {
+		// previous proposer can be unknown if say, the unbonding period is 1 block, so
+		// e.g. a validator undelegates at block X, it's removed entirely by
+		// block X+1's endblock, then X+2 we need to refer to the previous
+		// proposer for X+1, but we've forgotten about them.
+		logger.Error(fmt.Sprintf(
+			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
+				"This should happen only if the proposer unbonded completely within a single block, "+
+				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
+				"We recommend you investigate immediately.",
+			previousProposer.String()))
 	}
 ```
 
-**File:** x/staking/keeper/validator.go (L176-176)
+**File:** x/distribution/keeper/allocation.go (L91-102)
 ```go
+	for _, vote := range bondedVotes {
+		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+
+		// TODO: Consider micro-slashing for missing votes.
+		//
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
+		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+		reward := feeMultiplier.MulDecTruncate(powerFraction)
+
+		k.AllocateTokensToValidator(ctx, validator, reward)
+		remaining = remaining.Sub(reward)
+	}
+```
+
+**File:** x/distribution/keeper/allocation.go (L111-114)
+```go
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+```
+
+**File:** x/staking/keeper/alias_functions.go (L88-96)
+```go
+// ValidatorByConsAddr gets the validator interface for a particular pubkey
+func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
+	val, found := k.GetValidatorByConsAddr(ctx, addr)
+	if !found {
+		return nil
+	}
+
+	return val
+}
+```
+
+**File:** x/staking/keeper/validator.go (L168-177)
+```go
+	valConsAddr, err := validator.GetConsAddr()
+	if err != nil {
+		panic(err)
+	}
+
+	// delete the old validator record
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.GetValidatorKey(address))
 	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+	store.Delete(types.GetValidatorsByPowerIndexKey(validator, k.PowerReduction(ctx)))
 ```
 
-**File:** x/staking/keeper/msg_server.go (L52-54)
+**File:** x/staking/keeper/validator.go (L441-444)
 ```go
-	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
-		return nil, types.ErrValidatorPubKeyExists
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
+
+**File:** x/distribution/abci.go (L29-32)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
 	}
 ```
 
-**File:** x/slashing/keeper/infractions.go (L96-96)
+**File:** x/staking/types/params.go (L167-178)
 ```go
-	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
-```
+func validateUnbondingTime(i interface{}) error {
+	v, ok := i.(time.Duration)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
 
-**File:** x/slashing/keeper/keeper.go (L94-97)
-```go
-func (k Keeper) deleteAddrPubkeyRelation(ctx sdk.Context, addr cryptotypes.Address) {
-	store := ctx.KVStore(k.storeKey)
-	store.Delete(types.AddrPubkeyRelationKey(addr))
+	if v <= 0 {
+		return fmt.Errorf("unbonding time must be positive: %d", v)
+	}
+
+	return nil
 }
 ```
 
-**File:** x/slashing/keeper/signing_info.go (L168-171)
+**File:** x/staking/keeper/val_state_change.go (L27-33)
 ```go
-func (k Keeper) ClearValidatorMissedBlockBitArray(ctx sdk.Context, address sdk.ConsAddress) {
-	store := ctx.KVStore(k.storeKey)
-	store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
-}
-```
+	validatorUpdates, err := k.ApplyAndReturnValidatorSetUpdates(ctx)
+	if err != nil {
+		panic(err)
+	}
 
-**File:** x/slashing/abci.go (L58-60)
-```go
-		if writeInfo.ShouldSlash {
-			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
-			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
+	// unbond all mature validators from the unbonding queue
+	k.UnbondAllMatureValidators(ctx)
 ```

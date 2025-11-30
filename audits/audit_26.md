@@ -1,238 +1,230 @@
-Based on my thorough analysis of the codebase, I can confirm this is a **valid High severity vulnerability**. Here is my validation:
-
 # Audit Report
 
 ## Title
-Genesis State Commission Rate Bypass Causing Network Halt via AllocateTokensToValidator Panic
+Accounting Discrepancy in SlashRedelegation Leading to Validator Under-Slashing
 
 ## Summary
-The `validateGenesisStateValidators` function fails to validate validator commission rates during genesis state loading, allowing validators with commission rates exceeding 100% to be loaded into the chain. This causes a deterministic panic in `AllocateTokensToValidator` during block processing, resulting in total network shutdown requiring a hard fork to recover.
+The `SlashRedelegation` function in `x/staking/keeper/slash.go` contains an accounting bug where it returns a theoretical slash amount calculated from `entry.InitialBalance` but only burns tokens based on capped `delegation.Shares`. When users unbond from the destination validator after redelegating, the redelegation entry remains unchanged while delegation shares decrease, causing the main `Slash` function to reduce `remainingSlashAmount` by more than was actually burned, resulting in systematic validator under-slashing. [1](#0-0) 
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:**
-- Missing validation: [1](#0-0) 
-- Genesis loading without validation: [2](#0-1) 
-- Panic trigger location: [3](#0-2) 
-- Panic mechanism: [4](#0-3) 
+**Location:** `x/staking/keeper/slash.go`, lines 219-296, function `SlashRedelegation`
 
-**Intended logic:** 
-The system enforces that validator commission rates never exceed 100% (1.0) to maintain proper reward accounting. Normal validator creation validates this constraint [5](#0-4)  via `Commission.Validate()` called during message validation [6](#0-5) .
+**Intended logic:** When a validator is slashed for an infraction, the `SlashRedelegation` function should slash all eligible redelegations and return the actual amount of tokens burned. The main `Slash` function uses this returned value to calculate how much additional slashing is needed from the validator's bonded tokens, ensuring the total slashed amount matches the calculated penalty based on validator power at infraction time. [2](#0-1) 
 
-**Actual logic:** 
-The genesis validation function only checks for duplicate validators, jailed+bonded conflicts, and zero delegator shares - it does NOT validate commission rates. When `AllocateTokensToValidator` is called during block processing [7](#0-6) , it calculates `commission = tokens.MulDec(val.GetCommission())` where `GetCommission()` returns `Commission.Rate` [8](#0-7) . If commission rate exceeds 1.0, the commission exceeds the tokens being distributed, causing `tokens.Sub(commission)` to panic with "negative coin amount".
+**Actual logic:** The function calculates a theoretical slash amount from `entry.InitialBalance` at lines 238-240 and accumulates it in `totalSlashAmount`. However, when users have previously unbonded from the destination validator, `delegation.Shares` is less than `entry.SharesDst`. The function caps the unbonding to available shares (lines 261-263), calls `Unbond()` which returns fewer `tokensToBurn` than the theoretical amount, but then returns the uncapped `totalSlashAmount` at line 295. This causes `remainingSlashAmount` in the main `Slash` function to be reduced by more than was actually burned.
 
 **Exploitation path:**
-1. Genesis file contains validator with `Commission.Rate > 1.0` (e.g., 1.5 = 150%)
-2. `ValidateGenesis` passes since commission rates aren't checked in `validateGenesisStateValidators`
-3. `InitGenesis` loads validator via `keeper.SetValidator` [9](#0-8)  without validation
-4. At block height > 1, `BeginBlocker` calls `AllocateTokens` for reward distribution
-5. `AllocateTokensToValidator` calculates commission = tokens × 1.5 (exceeding available tokens)
-6. `shared = tokens.Sub(commission)` attempts to subtract more than available, triggering panic
-7. All nodes crash deterministically at the same block height in consensus code
+1. User delegates X tokens to Validator A
+2. User redelegates X tokens from A to B, creating `RedelegationEntry` with `InitialBalance=X` and `SharesDst=X`
+3. User performs normal unbonding of Y tokens from Validator B, reducing `delegation.Shares` to (X-Y) but leaving `RedelegationEntry` unchanged
+4. Validator A commits an infraction during the redelegation period and is slashed
+5. `SlashRedelegation` calculates `slashAmount = slashFactor * X` from `InitialBalance`
+6. Function attempts to unbond `slashFactor * X` shares but is capped to available `delegation.Shares = (X-Y)`
+7. `Unbond()` returns `tokensToBurn ≈ slashFactor * (X-Y)` tokens (actual burned amount)
+8. Function returns `totalSlashAmount = slashFactor * X` (theoretical amount)
+9. Main `Slash` function subtracts inflated theoretical amount from `remainingSlashAmount`
+10. Validator is under-slashed by approximately `slashFactor * Y` tokens
 
-**Security guarantee broken:**
-Network availability and consensus safety. The panic occurs deterministically in the consensus path during `BeginBlock`, causing all honest nodes to crash at identical block height. The network cannot produce new blocks and remains frozen until manual intervention through a coordinated hard fork with corrected genesis state.
+**Security guarantee broken:** The slashing mechanism's fundamental invariant that validators are penalized by the full calculated slash amount based on their power at infraction time is violated. Validators systematically retain tokens that should have been burned as punishment.
+
+The root cause is structural: `RedelegationEntry` only tracks `InitialBalance` and `SharesDst` without a current balance field like `UnbondingDelegationEntry` has. When users unbond from the destination validator through normal operations, only delegation shares are reduced; redelegation entries remain unchanged. [3](#0-2) [4](#0-3) 
 
 ## Impact Explanation
 
-This vulnerability causes **total network shutdown** affecting all network nodes and the blockchain's ability to process transactions. Every node panics at the same deterministic point in consensus code when attempting to allocate rewards. The network cannot produce new blocks, all transactions halt, and the chain remains frozen until manual intervention through a hard fork with corrected genesis state. This matches the High severity criteria: "Network not being able to confirm new transactions (total network shutdown)" and "Unintended permanent chain split requiring hard fork".
+This vulnerability represents a breakdown in the slashing mechanism, a core security primitive of proof-of-stake networks:
+
+- **Systematic Under-Slashing**: Every slashing event involving redelegations where delegators have reduced their destination delegation through normal unbonding results in validators being under-penalized by the difference between theoretical and actual burned amounts
+- **Economic Security Degradation**: Tokens that should be burned (removed from circulation) as punishment remain with misbehaving validators, reducing the economic deterrent effect that slashing is designed to provide
+- **Protocol Mechanism Failure**: The slashing invariant—that the full calculated penalty is applied—is violated, undermining consensus security assumptions
+- **Cumulative Effect**: This occurs automatically across all affected slashing events without requiring intentional exploitation, potentially accumulating significant under-slashing over time
+
+According to the provided impact categories, this qualifies as **"A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk"** (Medium severity). While no user funds are directly at risk of theft or freezing, the slashing mechanism systematically fails to apply the intended penalties, which is unintended behavior in critical network code. [5](#0-4) 
 
 ## Likelihood Explanation
 
-This requires privileged access to genesis files during chain initialization or upgrades. However, it falls under the platform exception: "even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority."
+**Triggering Conditions:**
+- A redelegation must exist from a validator that is later slashed for an infraction during the redelegation period
+- The delegator must have unbonded some tokens from the destination validator after the redelegation but before the slashing event
+- These are all normal, permissionless user operations
 
-**Realistic scenarios:**
-- **New chain launches**: Genesis preparation scripts with bugs or data corruption
-- **Hard fork upgrades**: Migration scripts that fail to validate validator state
-- **Human error**: Operator typo when manually editing genesis (1.5 instead of 0.15)
-- **Supply chain attacks**: Compromised genesis generation tooling
-- **Testnet environments**: Less rigorous review processes
+**Who Can Trigger:** Any user through standard staking operations—delegating, redelegating, and unbonding—with no special permissions required. The bug triggers automatically when the conditions are met during validator slashing.
 
-Once introduced via genesis, the trigger is automatic during the first reward distribution (block height > 1). The lack of validation creates a dangerous inconsistency where runtime validator creation is protected by [10](#0-9)  but genesis loading bypasses this safeguard.
+**Frequency:** Users commonly redelegate to optimize yields or move away from underperforming validators, and may subsequently unbond for liquidity needs. When combined with validator infractions (which occur periodically in PoS networks), these conditions occur naturally.
+
+**Likelihood Assessment:** Medium - While requiring the specific sequence of operations, all are normal user behaviors in proof-of-stake networks. The issue triggers automatically without intentional exploitation whenever the conditions align.
 
 ## Recommendation
 
-Add commission rate validation to `validateGenesisStateValidators` in `x/staking/genesis.go`. After existing checks in the validator loop (around line 268), add:
+Modify `SlashRedelegation` to track and return the actual amount of tokens burned rather than the theoretical amount:
 
-```go
-if err := val.Commission.Validate(); err != nil {
-    return fmt.Errorf("invalid commission for validator %s: %w", val.OperatorAddress, err)
-}
+**Preferred Solution:** After line 265 where `tokensToBurn` is obtained from `Unbond()`, accumulate the actual burned amount instead of the theoretical `slashAmount` calculated from `InitialBalance` at line 240. Maintain a separate accumulator for actual burned tokens and return that total at line 295.
+
+```
+// After line 240, instead of:
+totalSlashAmount = totalSlashAmount.Add(slashAmount)
+
+// Use:
+// (keep theoretical slashAmount for potential logging/events)
+// After line 265-268 where tokensToBurn is obtained:
+totalActualBurned = totalActualBurned.Add(tokensToBurn)
+
+// At line 295, return:
+return totalActualBurned  // instead of totalSlashAmount
 ```
 
-This ensures genesis validators have the same commission constraints (`MaxRate ≤ 1.0`, `Rate ≤ MaxRate`, `MaxChangeRate ≤ MaxRate`) as validators created through transactions, providing defense-in-depth protection.
+**Alternative Solution:** Track both theoretical and actual amounts with separate accumulators. After obtaining `tokensToBurn` from `Unbond()`, accumulate `min(slashAmount, tokensToBurn)` to ensure the returned value never exceeds actual burned tokens.
+
+The fix ensures that `SlashRedelegation` returns a value that accurately reflects tokens actually removed from circulation, enabling correct accounting in the main `Slash` function's `remainingSlashAmount` calculation.
 
 ## Proof of Concept
 
-While the report mentions a test `TestAllocateTokensToValidatorWithCommissionGreaterThan100Percent`, this test does not exist in the codebase. However, the vulnerability is clearly demonstrated by code analysis:
+**Test Scenario:**
 
-**Setup:**
-1. Create genesis file with validator having `Commission.Rate = sdk.NewDec(2)` (200%)
-2. Load genesis via `InitGenesis` - validation passes since `validateGenesisStateValidators` doesn't check commission rates
-3. Validator is stored via `keeper.SetValidator` without validation
+Setup:
+- Bootstrap 3 validators with 10 consensus power each
+- User delegates 6 tokens to Validator A  
+- User redelegates 6 tokens from A to B (creates `RedelegationEntry` with `InitialBalance=6`, `SharesDst=6`)
+- User unbonds 4 tokens from B via normal `Undelegate` (reduces `delegation.Shares` to 2, but `RedelegationEntry` remains at `InitialBalance=6`, `SharesDst=6`)
 
-**Action:**
-1. Process blocks until height > 1
-2. `BeginBlocker` calls `AllocateTokens` for reward distribution
-3. `AllocateTokensToValidator` is called with the validator
+Action:
+- Slash Validator A at 50% (slashFactor=0.5) for infraction at height during the redelegation period
 
-**Result:**
-- Calculates `commission = tokens.MulDec(2.0)` → commission = 2× tokens
-- Attempts `shared = tokens.Sub(commission)` → tries to subtract more than available
-- Panic: "negative coin amount" from DecCoins.Sub
-- All nodes crash deterministically at same block height
-- Network halts, requiring hard fork to recover
+Expected Behavior:
+- Total intended slash: 50% of validator's power at infraction time
+- Should slash from redelegation based on actual available shares (50% of 2 = 1 token)
+- Should compensate by slashing more from validator's bonded tokens to reach total intended penalty
 
-The existing test [11](#0-10)  demonstrates normal allocation with valid commissions (50%), confirming this is a genesis-specific validation gap.
+Actual Behavior:
+- `SlashRedelegation` calculates theoretical slash: 0.5 * 6 = 3 tokens from `InitialBalance`
+- Function caps unbonding to available shares: min(0.5 * 6, 2) = 2 shares
+- `Unbond()` returns ~1 token burned (50% of 2 shares)
+- Function returns 3 tokens (theoretical) instead of ~1 token (actual)
+- Main `Slash` function subtracts 3 from `remainingSlashAmount`
+- Validator under-slashed by ~2 tokens (3 theoretical - 1 actual)
+
+This demonstrates the accounting discrepancy causes measurable under-slashing, violating the slashing mechanism's security invariant. [6](#0-5) 
 
 ## Notes
 
-This vulnerability is valid under platform acceptance rules despite requiring privileged access because it causes "unrecoverable security failure beyond their intended authority." Even trusted operators do not have authority to permanently halt the entire network - such catastrophic impact from a configuration error exceeds the intended blast radius of any operational role. This represents a critical defense-in-depth failure where genesis loading lacks the same validation protections as runtime operations.
+The comment at lines 214-217 indicates the function intentionally returns "the amount that would have been slashed assuming the unbonding delegation had enough stake to slash," but this creates an accounting mismatch with how the main `Slash` function uses this return value. The specification at `x/staking/spec/02_state_transitions.md` lines 133-138 states "Each amount slashed from redelegations and unbonding delegations is subtracted from the total slash amount," which suggests the actual slashed amount should be used for correct accounting, not the theoretical amount.
 
 ### Citations
 
-**File:** x/staking/genesis.go (L39-40)
+**File:** x/staking/keeper/slash.go (L96-106)
 ```go
-	for _, validator := range data.Validators {
-		keeper.SetValidator(ctx, validator)
+			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
+			if amountSlashed.IsZero() {
+				continue
+			}
+
+			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
+		}
+	}
+
+	// cannot decrease balance below zero
+	tokensToBurn := sdk.MinInt(remainingSlashAmount, validator.Tokens)
 ```
 
-**File:** x/staking/genesis.go (L238-274)
+**File:** x/staking/keeper/slash.go (L214-217)
 ```go
-func validateGenesisStateValidators(validators []types.Validator) error {
-	addrMap := make(map[string]bool, len(validators))
+// return the amount that would have been slashed assuming
+// the unbonding delegation had enough stake to slash
+// (the amount actually slashed may be less if there's
+// insufficient stake remaining)
+```
 
-	for i := 0; i < len(validators); i++ {
-		val := validators[i]
-		consPk, err := val.ConsPubKey()
+**File:** x/staking/keeper/slash.go (L237-268)
+```go
+		// Calculate slash amount proportional to stake contributing to infraction
+		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+		slashAmount := slashAmountDec.TruncateInt()
+		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+
+		// Unbond from target validator
+		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
+		if sharesToUnbond.IsZero() {
+			continue
+		}
+
+		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
 		if err != nil {
-			return err
+			panic(err)
 		}
 
-		strKey := string(consPk.Bytes())
+		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
 
-		if _, ok := addrMap[strKey]; ok {
-			consAddr, err := val.GetConsAddr()
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("duplicate validator in genesis state: moniker %v, address %v", val.Description.Moniker, consAddr)
+		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
+		if !found {
+			// If deleted, delegation has zero shares, and we can't unbond any more
+			continue
 		}
 
-		if val.Jailed && val.IsBonded() {
-			consAddr, err := val.GetConsAddr()
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("validator is bonded and jailed in genesis state: moniker %v, address %v", val.Description.Moniker, consAddr)
+		if sharesToUnbond.GT(delegation.Shares) {
+			sharesToUnbond = delegation.Shares
 		}
 
-		if val.DelegatorShares.IsZero() && !val.IsUnbonding() {
-			return fmt.Errorf("bonded/unbonded genesis validator cannot have zero delegator shares, validator: %v", val)
+		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
+		if err != nil {
+			panic(fmt.Errorf("error unbonding delegator: %v", err))
 		}
+```
 
-		addrMap[strKey] = true
-	}
+**File:** proto/cosmos/staking/v1beta1/staking.proto (L211-229)
+```text
+// UnbondingDelegationEntry defines an unbonding object with relevant metadata.
+message UnbondingDelegationEntry {
+  option (gogoproto.equal)            = true;
+  option (gogoproto.goproto_stringer) = false;
 
-	return nil
+  // creation_height is the height which the unbonding took place.
+  int64 creation_height = 1 [(gogoproto.moretags) = "yaml:\"creation_height\""];
+  // completion_time is the unix time for unbonding completion.
+  google.protobuf.Timestamp completion_time = 2
+      [(gogoproto.nullable) = false, (gogoproto.stdtime) = true, (gogoproto.moretags) = "yaml:\"completion_time\""];
+  // initial_balance defines the tokens initially scheduled to receive at completion.
+  string initial_balance = 3 [
+    (gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int",
+    (gogoproto.nullable)   = false,
+    (gogoproto.moretags)   = "yaml:\"initial_balance\""
+  ];
+  // balance defines the tokens to receive at completion.
+  string balance = 4 [(gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int", (gogoproto.nullable) = false];
 }
 ```
 
-**File:** x/distribution/keeper/allocation.go (L111-114)
-```go
-func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
-	// split tokens between validator and delegators according to commission
-	commission := tokens.MulDec(val.GetCommission())
-	shared := tokens.Sub(commission)
-```
+**File:** proto/cosmos/staking/v1beta1/staking.proto (L232-250)
+```text
+message RedelegationEntry {
+  option (gogoproto.equal)            = true;
+  option (gogoproto.goproto_stringer) = false;
 
-**File:** types/dec_coin.go (L303-310)
-```go
-func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
-	diff, hasNeg := coins.SafeSub(coinsB)
-	if hasNeg {
-		panic("negative coin amount")
-	}
-
-	return diff
+  // creation_height  defines the height which the redelegation took place.
+  int64 creation_height = 1 [(gogoproto.moretags) = "yaml:\"creation_height\""];
+  // completion_time defines the unix time for redelegation completion.
+  google.protobuf.Timestamp completion_time = 2
+      [(gogoproto.nullable) = false, (gogoproto.stdtime) = true, (gogoproto.moretags) = "yaml:\"completion_time\""];
+  // initial_balance defines the initial balance when redelegation started.
+  string initial_balance = 3 [
+    (gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int",
+    (gogoproto.nullable)   = false,
+    (gogoproto.moretags)   = "yaml:\"initial_balance\""
+  ];
+  // shares_dst is the amount of destination-validator shares created by redelegation.
+  string shares_dst = 4
+      [(gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Dec", (gogoproto.nullable) = false];
 }
 ```
 
-**File:** x/staking/types/commission.go (L57-59)
-```go
-	case cr.MaxRate.GT(sdk.OneDec()):
-		// max rate cannot be greater than 1
-		return ErrCommissionHuge
-```
-
-**File:** x/staking/types/msg.go (L128-130)
-```go
-	if err := msg.Commission.Validate(); err != nil {
-		return err
-	}
-```
-
-**File:** x/distribution/abci.go (L29-31)
-```go
-	if ctx.BlockHeight() > 1 {
-		previousProposer := k.GetPreviousProposerConsAddr(ctx)
-		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
-```
-
-**File:** x/staking/types/validator.go (L286-289)
-```go
-func (v Validator) SetInitialCommission(commission Commission) (Validator, error) {
-	if err := commission.Validate(); err != nil {
-		return v, err
-	}
-```
-
-**File:** x/staking/types/validator.go (L511-511)
-```go
-func (v Validator) GetCommission() sdk.Dec        { return v.Commission.Rate }
-```
-
-**File:** x/staking/keeper/validator.go (L57-61)
-```go
-func (k Keeper) SetValidator(ctx sdk.Context, validator types.Validator) {
-	store := ctx.KVStore(k.storeKey)
-	bz := types.MustMarshalValidator(k.cdc, &validator)
-	store.Set(types.GetValidatorKey(validator.GetOperator()), bz)
-}
-```
-
-**File:** x/distribution/keeper/allocation_test.go (L18-45)
-```go
-func TestAllocateTokensToValidatorWithCommission(t *testing.T) {
-	app := simapp.Setup(false)
-	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
-
-	addrs := simapp.AddTestAddrs(app, ctx, 3, sdk.NewInt(1234))
-	valAddrs := simapp.ConvertAddrsToValAddrs(addrs)
-	tstaking := teststaking.NewHelper(t, ctx, app.StakingKeeper)
-
-	// create validator with 50% commission
-	tstaking.Commission = stakingtypes.NewCommissionRates(sdk.NewDecWithPrec(5, 1), sdk.NewDecWithPrec(5, 1), sdk.NewDec(0))
-	tstaking.CreateValidator(sdk.ValAddress(addrs[0]), valConsPk1, sdk.NewInt(100), true)
-	val := app.StakingKeeper.Validator(ctx, valAddrs[0])
-
-	// allocate tokens
-	tokens := sdk.DecCoins{
-		{Denom: sdk.DefaultBondDenom, Amount: sdk.NewDec(10)},
-	}
-	app.DistrKeeper.AllocateTokensToValidator(ctx, val, tokens)
-
-	// check commission
-	expected := sdk.DecCoins{
-		{Denom: sdk.DefaultBondDenom, Amount: sdk.NewDec(5)},
-	}
-	require.Equal(t, expected, app.DistrKeeper.GetValidatorAccumulatedCommission(ctx, val.GetOperator()).Commission)
-
-	// check current rewards
-	require.Equal(t, expected, app.DistrKeeper.GetValidatorCurrentRewards(ctx, val.GetOperator()).Rewards)
-}
+**File:** x/staking/spec/02_state_transitions.md (L133-138)
+```markdown
+- Every unbonding delegation and pseudo-unbonding redelegation such that the infraction occured before the unbonding or
+  redelegation began from the validator are slashed by the `slashFactor` percentage of the initialBalance.
+- Each amount slashed from redelegations and unbonding delegations is subtracted from the
+  total slash amount.
+- The `remaingSlashAmount` is then slashed from the validator's tokens in the `BondedPool` or
+  `NonBondedPool` depending on the validator's status. This reduces the total supply of tokens.
 ```

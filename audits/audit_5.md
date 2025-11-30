@@ -1,266 +1,210 @@
 # Audit Report
 
 ## Title
-Unvalidated Empty AccessOps Array Causes Chain Halt via Governance Proposals
+Front-Running Module Account Creation Causes Network-Wide Panic During Chain Upgrades
 
 ## Summary
-The `ValidateAccessOps` function performs array access without bounds checking, causing a panic when an empty `AccessOps` array is provided. This vulnerability can be triggered through governance proposals that bypass content validation in `ValidateBasic`, leading to simultaneous crashes of all validator nodes and complete network shutdown during proposal execution in `EndBlock`.
+An attacker can pre-create a `BaseAccount` at a future module's deterministic address before a chain upgrade, causing all validators to panic simultaneously when the new module's `InitGenesis` attempts to retrieve its module account, resulting in total network shutdown.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-- **location**: 
-  - Primary vulnerability: [1](#0-0) 
-  - Insufficient proposal validation: [2](#0-1) 
-  - Proposal execution handler: [3](#0-2) 
-  - EndBlock execution without panic recovery: [4](#0-3) 
+**Location:** 
+- Panic location: [1](#0-0) 
+- Account creation: [2](#0-1) 
+- Blocked address check: [3](#0-2) 
+- Module address derivation: [4](#0-3) 
+- Blocked addresses initialization: [5](#0-4) 
 
-- **intended logic**: The `ValidateAccessOps` function should validate that AccessOps arrays are non-empty before accessing elements and verify they terminate with a COMMIT operation. Governance proposal validation should comprehensively validate all proposal contents before allowing the voting process to begin.
+**Intended logic:** 
+Module accounts should only exist as `ModuleAccountI` types at their deterministic addresses. The `blockedAddrs` mechanism should prevent users from creating accounts at module addresses. When a chain upgrade adds a new module, `GetModuleAccount` should safely create the module account during `InitGenesis`.
 
-- **actual logic**: The function directly accesses `accessOps[len(accessOps)-1]` at line 33 without checking if the slice is empty. When `len(accessOps)` equals 0, the expression `len(accessOps)-1` evaluates to -1, causing an index out-of-bounds panic. The `ValidateBasic()` method only validates title and description through `govtypes.ValidateAbstract(p)` [5](#0-4) , completely bypassing validation of the `MessageDependencyMapping` contents.
+**Actual logic:** 
+The `blockedAddrs` map is populated only from modules existing in `maccPerms` at app initialization. [5](#0-4)  Future modules added via upgrade are not in this map. When coins are sent to a future module address, the `BlockedAddr` check passes [6](#0-5)  because the address isn't blocked yet. This creates a `BaseAccount` at the module address [2](#0-1)  using the default `ProtoBaseAccount` prototype [7](#0-6) . During upgrade, when `GetModuleAccountAndPermissions` retrieves this account and finds it's not a `ModuleAccountI`, it executes an unconditional panic. [1](#0-0) 
 
-- **exploitation path**:
-  1. A governance proposal containing `MessageDependencyMapping` with an empty `AccessOps` array is created (valid per protobuf schema [6](#0-5) )
-  2. The proposal passes `ValidateBasic` validation which only checks title/description fields
-  3. The proposal proceeds through the voting period and receives sufficient votes to pass
-  4. During `EndBlock` execution [7](#0-6) , the approved proposal handler is invoked
-  5. `HandleMsgUpdateResourceDependencyMappingProposal` calls `k.SetResourceDependencyMapping`
-  6. This invokes `types.ValidateMessageDependencyMapping` at [8](#0-7) , which calls `ValidateAccessOps`
-  7. The panic occurs when accessing the non-existent array element at index -1
-  8. Since `EndBlock` has no panic recovery mechanism (confirmed by absence of defer/recover), the node process crashes
-  9. All validator nodes execute the same `EndBlock` deterministically at the same block height, causing simultaneous crashes
-  10. The chain halts completely with no blocks being produced
+**Exploitation path:**
+1. Attacker observes governance proposal announcing new module "newmodule" at upgrade height H
+2. Attacker calculates deterministic address using [4](#0-3) 
+3. Before upgrade, attacker submits `MsgSend` with 1 token to calculated address
+4. `BlockedAddr` check passes because address not in `blockedAddrs` yet [3](#0-2) 
+5. `SendCoins` creates `BaseAccount` at module address [2](#0-1) 
+6. At upgrade height, `RunMigrations` calls `InitGenesis` for new modules not in fromVM [8](#0-7) 
+7. Module's `InitGenesis` calls `GetModuleAccount` [9](#0-8) 
+8. `GetModuleAccountAndPermissions` finds `BaseAccount`, type assertion fails, panic occurs [1](#0-0) 
+9. All validators panic at same height during consensus execution
+10. Network completely halts
 
-- **security guarantee broken**: Network availability and liveness. The blockchain must gracefully handle invalid inputs by returning validation errors, not crashing all nodes through unrecovered panics that terminate the consensus process.
+**Security guarantee broken:** 
+Network availability and upgrade safety. The deterministic module address derivation combined with static `blockedAddrs` creates a race condition where attackers can claim future module addresses before they're protected.
 
 ## Impact Explanation
 
-When the malformed governance proposal executes during `EndBlock`, all validator nodes crash simultaneously because they deterministically process the same proposal at the same block height. This results in:
+This vulnerability causes complete network shutdown affecting all validators simultaneously. When all validators panic at the same block height during upgrade execution:
 
-- **Complete network shutdown**: No validator nodes remain operational to produce new blocks
-- **Transaction processing halt**: No transactions can be confirmed or executed  
-- **Consensus failure**: The network cannot reach consensus on new blocks
-- **Recovery complexity**: Requires coordinated manual intervention across all validators, potentially requiring emergency patches and coordinated network restart
+- No new transactions can be confirmed after the upgrade height
+- The upgrade plan is consumed but module initialization failed, leaving state inconsistent
+- Chain cannot progress without manual intervention
+- Recovery requires coordinated hard fork with state export/import or emergency patch
+- Existing upgrade cannot be rolled back cleanly
 
-The uncontrolled panic propagates through the application layer without being caught by any recovery mechanism, terminating the node process entirely. This represents a complete denial-of-service affecting the entire network.
+This matches the specified impact criterion: "Network not being able to confirm new transactions (total network shutdown)" with Medium severity.
 
 ## Likelihood Explanation
 
-**Who can trigger**: Any participant capable of submitting governance proposals and obtaining sufficient voting support from the community.
+**Trigger Conditions:**
+- **Who:** Any network participant with minimal funds (transaction fees + 1 token)
+- **When:** Between upgrade proposal passing and upgrade execution (typically days/weeks window)
+- **Requirements:** Knowledge of new module name (publicly available in governance proposal)
 
-**Conditions required**:
-- Governance proposal with empty `AccessOps` is submitted (requires minimum deposit)
-- Proposal receives sufficient votes to pass (requires governance participation)
-- Proposal executes after voting period ends
+**Frequency:**
+- Can occur with every chain upgrade introducing new modules
+- Multiple chain upgrades per year in active Cosmos chains
+- High likelihood given low cost, public information, and large time window
 
-**Likelihood factors**:
-1. While governance approval is required, this is fundamentally a **validation bug** not a governance attack scenario
-2. Proposals created with buggy tooling, automated scripts, or human error could inadvertently contain empty arrays (valid per protobuf schema)
-3. The validation failure is subtle - validators reviewing proposals may not notice the empty array in the JSON structure
-4. No validation occurs at submission or voting time; the crash only manifests during execution
-5. Once executed, the impact is immediate and deterministic across all nodes
-6. The protobuf schema allows empty repeated fields, making this a valid input structure
+**Detection Difficulty:**
+- Attack transaction appears as normal coin transfer
+- Indistinguishable from legitimate transfers
+- Only becomes apparent when all validators crash during upgrade
 
-This represents a critical validation gap where well-intentioned governance participants could accidentally halt the network through programming errors in proposal creation tooling or manual mistakes during proposal preparation.
+The combination of public information, minimal cost, large attack window, and inability to detect makes exploitation highly likely.
 
 ## Recommendation
 
-**Immediate fix**: Add bounds checking in `ValidateAccessOps`:
+**Primary Fix:**
+Add graceful handling in `GetModuleAccountAndPermissions` to convert pre-existing `BaseAccount` to `ModuleAccount`:
 
 ```go
-func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
-    if len(accessOps) == 0 {
-        return ErrNoCommitAccessOp
+if acc != nil {
+    macc, ok := acc.(types.ModuleAccountI)
+    if !ok {
+        // Handle case where BaseAccount was created before module
+        if baseAcc, isBase := acc.(*types.BaseAccount); isBase && 
+           baseAcc.GetPubKey() == nil && baseAcc.GetSequence() == 0 {
+            // Convert to module account preserving account number
+            newMacc := types.NewModuleAccount(baseAcc, moduleName, perms...)
+            ak.SetModuleAccount(ctx, newMacc)
+            return newMacc, perms
+        }
+        panic("account is not a module account")
     }
-    lastAccessOp := accessOps[len(accessOps)-1]
-    if lastAccessOp != *CommitAccessOp() {
-        return ErrNoCommitAccessOp
-    }
-    // ... rest of validation
+    return macc, perms
 }
 ```
 
-**Additional improvements**:
-
-1. Enhance `MsgUpdateResourceDependencyMappingProposal.ValidateBasic()` to validate mapping contents before governance voting begins
-2. Fix `ValidateGenesis` in module.go [9](#0-8)  to call the comprehensive `types.ValidateGenesis(data)` [10](#0-9)  instead of only `data.Params.Validate()`
-3. Consider adding panic recovery in EndBlock execution as a defense-in-depth measure
+**Alternative Prevention:**
+Implement proactive blocking of future module addresses by maintaining a registry of planned module names from pending upgrade proposals and adding their addresses to `blockedAddrs` dynamically.
 
 ## Proof of Concept
 
-**Test location**: `x/accesscontrol/types/message_dependency_mapping_test.go`
+**Setup:**
+1. Create test app with initial `maccPerms` excluding "testmodule"
+2. Calculate deterministic module address: `types.NewModuleAddress("testmodule")`
+3. Fund attacker account with tokens
 
-**Setup**: Import required packages and define test function
+**Action:**
+1. Before module exists in `maccPerms`, call `BankKeeper.SendCoins(ctx, attackerAddr, moduleAddr, coins)`
+2. Verify `BaseAccount` created: `acc := AccountKeeper.GetAccount(ctx, moduleAddr); _, ok := acc.(types.ModuleAccountI)` returns false
+3. Update app's `maccPerms` to include "testmodule" with permissions
+4. Reinitialize `AccountKeeper` with new `maccPerms`
+5. Call `AccountKeeper.GetModuleAccount(ctx, "testmodule")`
 
-**Action**: Call `ValidateAccessOps` with empty slice:
-```go
-func TestValidateAccessOps_EmptyArray_Panic(t *testing.T) {
-    emptyAccessOps := []acltypes.AccessOperation{}
-    
-    defer func() {
-        if r := recover(); r == nil {
-            t.Errorf("Expected panic but got none")
-        }
-    }()
-    
-    types.ValidateAccessOps(emptyAccessOps)
-}
-```
-
-**Result**: The function panics with "runtime error: index out of range [-1]" instead of returning a proper validation error. The panic occurs because Go interprets `accessOps[len(accessOps)-1]` as `accessOps[-1]` when the slice length is 0, resulting in an invalid memory access that terminates the process.
+**Result:**
+- Function panics with message "account is not a module account" at [10](#0-9) 
+- Demonstrates validators would crash during upgrade when `InitGenesis` is called
+- Confirms network shutdown scenario
 
 ## Notes
 
-This vulnerability represents a critical validation gap in the access control governance proposal flow. While governance approval is required, the issue stems from insufficient input validation that allows accidentally malformed proposals to crash the entire network. 
-
-The key distinction is that this is not about malicious governance actors - it's about a programming error (missing bounds check) that transforms routine validation mistakes into catastrophic network failures. Governance participants' intended authority includes approving or rejecting proposals, but does not extend to accidentally halting the entire network through tooling errors. The absence of panic recovery in the `EndBlock` execution path [11](#0-10)  means this panic propagates to the node process level, causing immediate termination across all validators simultaneously.
+The vulnerability stems from a fundamental design assumption that module addresses are "reserved" through the `blockedAddrs` mechanism, but this mechanism is static and only protects addresses of modules that exist at initialization time. The deterministic address derivation allows attackers to precompute future module addresses, and the account creation logic permits account creation at any non-blocked address. Combined with the unconditional panic and the upgrade flow that calls `InitGenesis` for new modules, this creates a critical vulnerability in the upgrade process.
 
 ### Citations
 
-**File:** x/accesscontrol/types/message_dependency_mapping.go (L32-36)
+**File:** x/auth/keeper/keeper.go (L187-193)
 ```go
-func ValidateAccessOps(accessOps []acltypes.AccessOperation) error {
-	lastAccessOp := accessOps[len(accessOps)-1]
-	if lastAccessOp != *CommitAccessOp() {
-		return ErrNoCommitAccessOp
+	acc := ak.GetAccount(ctx, addr)
+	if acc != nil {
+		macc, ok := acc.(types.ModuleAccountI)
+		if !ok {
+			panic("account is not a module account")
+		}
+		return macc, perms
+```
+
+**File:** x/bank/keeper/send.go (L166-170)
+```go
+	accExists := k.ak.HasAccount(ctx, toAddr)
+	if !accExists {
+		defer telemetry.IncrCounter(1, "new", "account")
+		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
 	}
 ```
 
-**File:** x/accesscontrol/types/gov.go (L42-45)
+**File:** x/bank/keeper/send.go (L348-355)
 ```go
-func (p *MsgUpdateResourceDependencyMappingProposal) ValidateBasic() error {
-	err := govtypes.ValidateAbstract(p)
-	return err
-}
-```
-
-**File:** x/accesscontrol/handler.go (L12-20)
-```go
-func HandleMsgUpdateResourceDependencyMappingProposal(ctx sdk.Context, k *keeper.Keeper, p *types.MsgUpdateResourceDependencyMappingProposal) error {
-	for _, resourceDepMapping := range p.MessageDependencyMapping {
-		err := k.SetResourceDependencyMapping(ctx, resourceDepMapping)
-		if err != nil {
-			return err
+func (k BaseSendKeeper) BlockedAddr(addr sdk.AccAddress) bool {
+	if len(addr) == len(CoinbaseAddressPrefix)+8 {
+		if bytes.Equal(CoinbaseAddressPrefix, addr[:len(CoinbaseAddressPrefix)]) {
+			return true
 		}
 	}
-	return nil
+	return k.blockedAddrs[addr.String()]
 }
 ```
 
-**File:** x/gov/abci.go (L67-74)
+**File:** x/auth/types/account.go (L162-165)
 ```go
-		if passes {
-			handler := keeper.Router().GetRoute(proposal.ProposalRoute())
-			cacheCtx, writeCache := ctx.CacheContext()
-
-			// The proposal handler may execute state mutating logic depending
-			// on the proposal content. If the handler fails, no state mutation
-			// is written and the error message is logged.
-			err := handler(cacheCtx, proposal.GetContent())
-```
-
-**File:** x/gov/types/content.go (L37-54)
-```go
-func ValidateAbstract(c Content) error {
-	title := c.GetTitle()
-	if len(strings.TrimSpace(title)) == 0 {
-		return sdkerrors.Wrap(ErrInvalidProposalContent, "proposal title cannot be blank")
-	}
-	if len(title) > MaxTitleLength {
-		return sdkerrors.Wrapf(ErrInvalidProposalContent, "proposal title is longer than max length of %d", MaxTitleLength)
-	}
-
-	description := c.GetDescription()
-	if len(description) == 0 {
-		return sdkerrors.Wrap(ErrInvalidProposalContent, "proposal description cannot be blank")
-	}
-	if len(description) > MaxDescriptionLength {
-		return sdkerrors.Wrapf(ErrInvalidProposalContent, "proposal description is longer than max length of %d", MaxDescriptionLength)
-	}
-
-	return nil
-```
-
-**File:** proto/cosmos/accesscontrol/accesscontrol.proto (L38-44)
-```text
-message MessageDependencyMapping {
-    string message_key = 1;
-    repeated AccessOperation access_ops = 2 [
-        (gogoproto.nullable) = false
-    ];
-    bool dynamic_enabled = 3;
+// NewModuleAddress creates an AccAddress from the hash of the module's name
+func NewModuleAddress(name string) sdk.AccAddress {
+	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
 }
 ```
 
-**File:** baseapp/abci.go (L178-201)
+**File:** simapp/app.go (L261-263)
 ```go
-func (app *BaseApp) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) (res abci.ResponseEndBlock) {
-	// Clear DeliverTx Events
-	ctx.MultiStore().ResetEvents()
+	app.AccountKeeper = authkeeper.NewAccountKeeper(
+		appCodec, keys[authtypes.StoreKey], app.GetSubspace(authtypes.ModuleName), authtypes.ProtoBaseAccount, maccPerms,
+	)
+```
 
-	defer telemetry.MeasureSince(time.Now(), "abci", "end_block")
-
-	if app.endBlocker != nil {
-		res = app.endBlocker(ctx, req)
-		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+**File:** simapp/app.go (L607-614)
+```go
+func (app *SimApp) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range maccPerms {
+		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
 	}
 
-	if cp := app.GetConsensusParams(ctx); cp != nil {
-		res.ConsensusParamUpdates = legacytm.ABCIToLegacyConsensusParams(cp)
-	}
-
-	// call the streaming service hooks with the EndBlock messages
-	for _, streamingListener := range app.abciListeners {
-		if err := streamingListener.ListenEndBlock(app.deliverState.ctx, req, res); err != nil {
-			app.logger.Error("EndBlock listening hook failed", "height", req.Height, "err", err)
-		}
-	}
-
-	return res
+	return modAccAddrs
 }
 ```
 
-**File:** x/accesscontrol/keeper/keeper.go (L91-98)
+**File:** x/bank/keeper/msg_server.go (L47-47)
 ```go
-func (k Keeper) SetResourceDependencyMapping(
-	ctx sdk.Context,
-	dependencyMapping acltypes.MessageDependencyMapping,
-) error {
-	err := types.ValidateMessageDependencyMapping(dependencyMapping)
-	if err != nil {
-		return err
-	}
+	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
 ```
 
-**File:** x/accesscontrol/module.go (L62-69)
+**File:** types/module/module.go (L575-589)
 ```go
-func (AppModuleBasic) ValidateGenesis(cdc codec.JSONCodec, config client.TxEncodingConfig, bz json.RawMessage) error {
-	var data types.GenesisState
-	if err := cdc.UnmarshalJSON(bz, &data); err != nil {
-		return fmt.Errorf("failed to unmarshal %s genesis state: %w", types.ModuleName, err)
-	}
+		} else {
+			cfgtor, ok := cfg.(configurator)
+			if !ok {
+				// Currently, the only implementator of Configurator (the interface)
+				// is configurator (the struct).
+				return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", configurator{}, cfg)
+			}
 
-	return data.Params.Validate()
-}
+			moduleValUpdates := module.InitGenesis(ctx, cfgtor.cdc, module.DefaultGenesis(cfgtor.cdc))
+			ctx.Logger().Info(fmt.Sprintf("adding a new module: %s", moduleName))
+			// The module manager assumes only one module will update the
+			// validator set, and that it will not be by a new module.
+			if len(moduleValUpdates) > 0 {
+				return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "validator InitGenesis updates already set by a previous module")
+			}
 ```
 
-**File:** x/accesscontrol/types/genesis.go (L29-43)
+**File:** x/mint/genesis.go (L13-13)
 ```go
-func ValidateGenesis(data GenesisState) error {
-	for _, mapping := range data.MessageDependencyMapping {
-		err := ValidateMessageDependencyMapping(mapping)
-		if err != nil {
-			return err
-		}
-	}
-	for _, mapping := range data.WasmDependencyMappings {
-		err := ValidateWasmDependencyMapping(mapping)
-		if err != nil {
-			return err
-		}
-	}
-	return data.Params.Validate()
-}
+	ak.GetModuleAccount(ctx, types.ModuleName)
 ```

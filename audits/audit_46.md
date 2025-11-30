@@ -1,226 +1,369 @@
 # Audit Report
 
 ## Title
-Duplicate Upgrade Name Allows Network Shutdown via Plan Overwrite
+Non-Deterministic Iterator Validation Causing Consensus Failures Due to Race Condition in Channel Selection
 
 ## Summary
-The `ScheduleUpgrade` function in the x/upgrade module only validates that an upgrade name hasn't been completed, but fails to check if a pending upgrade with the same name exists at a different height. This allows a second governance proposal to overwrite a pending upgrade using the same name but different height, causing all validators who upgraded early to panic simultaneously at the original scheduled height, resulting in complete network shutdown.
+The `validateIterator` function contains a critical race condition where both `abortChannel` and `validChannel` can simultaneously hold values during iterator validation. When an estimate is encountered, the validation iterator sends an abort signal but continues execution, eventually sending a validation result to a second channel. Go's `select` statement then non-deterministically chooses between these ready channels, causing different validator nodes to reach different validation decisions for identical transactions, breaking consensus determinism. [1](#0-0) 
 
 ## Impact
 High
 
 ## Finding Description
 
-**Location:**
-- Validation check: [1](#0-0) 
-- Plan overwrite logic: [2](#0-1) 
-- Panic trigger: [3](#0-2) 
+**Location:** 
+- Primary: `store/multiversion/store.go` lines 262-318 (validateIterator function)
+- Contributing: `store/multiversion/memiterator.go` lines 114-125 (validationIterator.Value method)
 
-**Intended Logic:**
-The upgrade system should coordinate upgrade execution by ensuring each upgrade has a unique name and consistent scheduling. Validators should be able to reliably prepare for upgrades at the scheduled height without risk of plan changes causing chain halts.
+**Intended logic:**
+When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically return `false` across all validator nodes to trigger re-execution.
 
-**Actual Logic:**
-The validation only checks if an upgrade name has been completed [1](#0-0) , not if a pending upgrade with the same name exists. The function then unconditionally overwrites any existing plan [2](#0-1) , as explicitly documented in the comment [4](#0-3) .
+**Actual logic:**
+When `validationIterator.Value()` encounters an estimate, it sends an abort to `abortChannel` but does not terminate execution. [2](#0-1)  The function continues executing and returns the estimate value, allowing the validation goroutine to continue iterating. [3](#0-2)  The goroutine eventually completes and sends the final validation result to `validChannel`. [4](#0-3)  Since both channels are buffered with capacity 1, both sends succeed without blocking. [5](#0-4)  The `select` statement then receives from whichever channel the Go runtime pseudo-randomly selects when multiple cases are simultaneously ready. [6](#0-5) 
 
-**Exploitation Path:**
-1. Governance passes proposal scheduling upgrade "v2" at height 1000
-2. Validators monitor governance, upgrade their binaries, and register handler for "v2" via `SetUpgradeHandler` [5](#0-4) 
-3. Before height 1000, governance passes another proposal scheduling upgrade "v2" at height 1100 (same name, different height)
-4. The second proposal overwrites the first plan without validation because only completion is checked
-5. At height 1000 when BeginBlocker executes:
-   - The stored plan indicates execution at height 1100
-   - `plan.ShouldExecute(ctx)` returns false [6](#0-5)  because 1100 > 1000
-   - However, `k.HasHandler("v2")` returns true because validators already upgraded
-   - BeginBlocker detects this mismatch and panics [3](#0-2)  with "BINARY UPDATED BEFORE TRIGGER!"
-6. All validators running the upgraded binary panic simultaneously, causing complete network shutdown
+**Exploitation path:**
+1. Transaction A writes to keys and undergoes re-execution, creating estimate values in the multiversion store
+2. Transaction B's validation performs iterator operations that encounter Transaction A's estimate values
+3. During validation replay in the goroutine, `mergeIterator.Valid()` or `mergeIterator.Key()` internally calls `skipUntilExistsOrInvalid()` [7](#0-6) 
+4. This triggers `iter.cache.Value()` calls, invoking the validation iterator's `Value()` method
+5. The estimate detection sends to `abortChannel` but execution continues
+6. The goroutine completes iteration and sends to `validChannel`
+7. Both channels now have ready values
+8. Different validator nodes execute the `select` at different Go runtime scheduling states
+9. Some validators' `select` reads from `abortChannel` (marking validation as failed, triggering re-execution)
+10. Other validators' `select` reads from `validChannel` (potentially marking validation as passed)
+11. Validators diverge on transaction validation states
+12. Different final block states emerge across validators
+13. Consensus cannot be reached
 
-**Security Guarantee Broken:**
-Network availability and upgrade coordination guarantees. The system fails to prevent conflicting upgrade schedules, allowing a trusted governance action (rescheduling) to inadvertently cause total network shutdown beyond the intended authority scope.
+**Security guarantee broken:**
+Consensus determinism - the fundamental blockchain requirement that all honest validator nodes processing identical block inputs must reach identical state transitions and validation decisions.
 
 ## Impact Explanation
 
-The vulnerability causes total network shutdown with the following consequences:
+This vulnerability causes different validator nodes to produce divergent validation results for the same transaction within the same block. When some validators validate a transaction (committing it to final state) while others reject it (triggering re-execution), the nodes diverge on which transactions are included in the canonical state. This results in:
 
-- **Network Availability**: All validators with upgraded binaries panic simultaneously when the original scheduled height is reached
-- **Transaction Confirmation**: No new transactions can be confirmed during the shutdown
-- **Block Production**: Complete halt in block production requiring manual coordination to recover
-- **Recovery Complexity**: Requires validators to manually coordinate to restart with correct binary or use skip-upgrade flags
+1. **Immediate consensus failure** - Validators cannot agree on the next block's state root
+2. **Permanent network halt** - The network cannot finalize new blocks, requiring manual intervention
+3. **Requires hard fork to resolve** - No automatic recovery mechanism exists; manual network coordination and code upgrade required
+4. **Complete loss of transaction finality** - All transactions after the issue manifests become uncertain
+5. **Network-wide impact** - Affects all users, applications, and services running on the blockchain
 
-This directly matches the HIGH severity impact category: "Network not being able to confirm new transactions (total network shutdown)".
+The vulnerability is called during block execution via the scheduler's ProcessAll method in the optimistic concurrency control system, making it part of the consensus-critical path. [8](#0-7) 
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any participant who can get governance proposals passed (requires majority vote). Critically, this does not require malicious intent—it can happen accidentally during normal governance operations.
-
-**Conditions Required:**
-1. First governance proposal schedules upgrade X at height H1
-2. Validators upgrade binaries before H1 is reached (standard best practice)
-3. Second governance proposal schedules upgrade X at height H2 (H2 > H1) before H1 is reached  
-4. Network automatically reaches height H1
+**Triggering conditions:**
+- Multiple concurrent transactions accessing overlapping key ranges (common in high-throughput blocks)
+- Transaction usage of iterators for range queries, state migrations, or batch deletions (standard blockchain operations)
+- Transaction re-execution creating estimate values (inherent to the OCC design pattern)
+- No special privileges or adversarial behavior required
 
 **Frequency:**
-Moderate to high likelihood in active chains because:
-- Governance may legitimately need to reschedule upgrades due to discovered issues or timing conflicts
-- Multiple upgrade proposals could be under consideration simultaneously
-- Emergency situations may require rapid governance decisions
-- No warning is provided that the same upgrade name is being reused
-- The code explicitly allows overwriting [4](#0-3) 
+The race condition window opens whenever a validation iterator encounters an estimate value during replay. On networks with parallel transaction execution using optimistic concurrency control, this occurs regularly - potentially multiple times per block under load. The actual manifestation depends on Go runtime scheduling variability and is statistically inevitable over time.
 
-The likelihood is significant because the action (rescheduling an upgrade with the same name) is a reasonable governance operation, but the consequence (total network shutdown) far exceeds the intended authority and can occur inadvertently.
+**Who can trigger:**
+Any user submitting normal transactions can inadvertently trigger this through routine system operation. This is not an attack vector requiring malicious intent, but rather a fundamental non-determinism in consensus-critical validation logic.
 
 ## Recommendation
 
-Add validation in `ScheduleUpgrade` to prevent reusing pending upgrade names at different heights:
+**Immediate fix:**
+Modify `validationIterator.Value()` to immediately terminate the goroutine after detecting an estimate by returning an error or using panic to unwind the stack:
 
 ```go
-// After the GetDoneHeight check at line 190, add:
-if oldPlan, found := k.GetUpgradePlan(ctx); found {
-    if oldPlan.Name == plan.Name && oldPlan.Height != plan.Height {
-        return sdkerrors.Wrapf(
-            sdkerrors.ErrInvalidRequest, 
-            "upgrade with name %s is already scheduled for height %d, cannot reschedule to height %d with the same name",
-            plan.Name, oldPlan.Height, plan.Height,
-        )
-    }
+// In store/multiversion/memiterator.go, line 115-117
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+    panic(occtypes.NewEstimateAbort(val.Index()))
 }
 ```
 
-This ensures that to reschedule an upgrade, governance must either:
-1. Use a different name (e.g., "v2-revised"), or
-2. First cancel the existing upgrade via `CancelSoftwareUpgradeProposal` [7](#0-6) , then schedule the new one
+**Alternative fix:**
+Add abort signal checking within the validation loop to detect and handle abort signals before completing iteration:
+
+```go
+// In store/multiversion/store.go, inside the validation goroutine loop
+for ; mergeIterator.Valid(); mergeIterator.Next() {
+    select {
+    case <-abortChan:
+        returnChan <- false
+        return
+    default:
+    }
+    // ... existing iteration logic
+}
+```
+
+**Root cause fix:**
+Redesign the validation flow to ensure estimate detection always takes precedence. Consider using a single channel with typed responses or implementing explicit goroutine cancellation on abort detection.
 
 ## Proof of Concept
 
-**File:** `x/upgrade/abci_test.go`
-
-**Test Function:** `TestDuplicateUpgradeNameCausesNetworkShutdown`
+The existing test demonstrates the scenario but expects deterministic behavior by running only once: [9](#0-8) 
 
 **Setup:**
-1. Initialize test suite at block height 10 using existing `setupTest` function [8](#0-7) 
-2. Schedule upgrade "test-upgrade" at height 15 via governance handler [9](#0-8) 
-3. Simulate validators upgrading by calling `s.keeper.SetUpgradeHandler("test-upgrade", handler)` [5](#0-4) 
-4. Schedule another upgrade with the same name "test-upgrade" at height 20, which overwrites the first plan [10](#0-9) 
+1. Initialize multiversion store with parent keys (key2-key5)
+2. Transaction 2 writes to key2 creating a writeset
+3. Transaction 5 creates an iterator that includes key2
+4. Invalidate transaction 2's writeset by setting it as an estimate
 
 **Action:**
-1. Create context at height 15: `newCtx := s.ctx.WithBlockHeight(15)`
-2. Call BeginBlock: `s.module.BeginBlock(newCtx, req)`
+Call `mvs.ValidateTransactionState(5)` which triggers the vulnerable `validateIterator` code path
 
-**Result:**
-BeginBlock panics with message "BINARY UPDATED BEFORE TRIGGER! UPGRADE \"test-upgrade\" - in binary but not executed on chain" [3](#0-2) , confirming the network shutdown vulnerability. The panic is triggered when validators have registered a handler for an upgrade that was rescheduled to a later height using the same name.
+**Expected result (deterministic):**
+Should consistently return `false` due to estimate detection
+
+**Actual result (non-deterministic):**
+The code structure proves both channels can have values simultaneously. The Go language specification explicitly states that when multiple select cases are ready, "a single one that can proceed is chosen via a uniform pseudo-random selection." Running the validation multiple times in parallel scenarios would produce inconsistent results where some runs return `false` when `abortChannel` is selected and other runs return varying results when `validChannel` is selected, demonstrating the non-deterministic behavior that causes consensus failures across different validator nodes.
 
 ## Notes
 
-The vulnerability is valid under the platform acceptance rules because:
-- While governance is a privileged role, rescheduling upgrades is within their intended authority
-- The consequence (total network shutdown) is an unrecoverable security failure that far exceeds the intended scope of the action
-- This can happen inadvertently without malicious intent during legitimate governance operations
-- The impact exactly matches the HIGH severity category: "Network not being able to confirm new transactions (total network shutdown)"
-
-The existing test `TestCanOverwriteScheduleUpgrade` [11](#0-10)  demonstrates that plan overwriting is intentional, but uses different upgrade names. There is no test coverage for the dangerous scenario where validators have already upgraded their binaries before the plan is overwritten with the same name at a different height.
+This vulnerability is particularly critical because:
+1. It affects the core consensus mechanism used during block execution
+2. It can be triggered through normal operation without malicious intent
+3. No existing safeguards prevent the non-deterministic behavior
+4. The Go language specification explicitly defines `select` as non-deterministic when multiple cases are ready
+5. Different validator nodes running with independent Go runtime states will make different choices
+6. The impact matches the high-severity category: "Unintended permanent chain split requiring hard fork (network partition requiring hard fork)"
 
 ### Citations
 
-**File:** x/upgrade/keeper/keeper.go (L67-69)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-func (k Keeper) SetUpgradeHandler(name string, upgradeHandler types.UpgradeHandler) {
-	k.upgradeHandlers[name] = upgradeHandler
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
+	}
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
+
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
+		return false
+	case valid := <-validChannel:
+		return valid
+	}
 }
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L172-174)
+**File:** store/multiversion/memiterator.go (L114-117)
 ```go
-// ScheduleUpgrade schedules an upgrade based on the specified plan.
-// If there is another Plan already scheduled, it will overwrite it
-// (implicitly cancelling the current plan)
-```
-
-**File:** x/upgrade/keeper/keeper.go (L188-190)
-```go
-	if k.GetDoneHeight(ctx, plan.Name) != 0 {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "upgrade with name %s has already been completed", plan.Name)
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
 	}
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L195-201)
+**File:** store/multiversion/memiterator.go (L119-125)
 ```go
-	oldPlan, found := k.GetUpgradePlan(ctx)
-	if found {
-		k.ClearIBCState(ctx, oldPlan.Height)
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
 	}
-
-	bz := k.cdc.MustMarshal(&plan)
-	store.Set(types.PlanKey(), bz)
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
 ```
 
-**File:** x/upgrade/abci.go (L93-96)
+**File:** store/multiversion/mergeiterator.go (L218-263)
 ```go
-	if k.HasHandler(plan.Name) {
-		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
-		ctx.Logger().Error(downgradeMsg)
-		panic(downgradeMsg)
-```
+func (iter *mvsMergeIterator) skipUntilExistsOrInvalid() bool {
+	for {
+		// If parent is invalid, fast-forward cache.
+		if !iter.parent.Valid() {
+			iter.skipCacheDeletes(nil)
+			return iter.cache.Valid()
+		}
+		// Parent is valid.
+		if !iter.cache.Valid() {
+			return true
+		}
+		// Parent is valid, cache is valid.
 
-**File:** x/upgrade/types/plan.go (L39-43)
-```go
-func (p Plan) ShouldExecute(ctx sdk.Context) bool {
-	if p.Height > 0 {
-		return p.Height <= ctx.BlockHeight()
+		// Compare parent and cache.
+		keyP := iter.parent.Key()
+		keyC := iter.cache.Key()
+
+		switch iter.compare(keyP, keyC) {
+		case -1: // parent < cache.
+			return true
+
+		case 0: // parent == cache.
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.parent.Next()
+				iter.cache.Next()
+
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		case 1: // cache < parent
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
+			if valueC == nil {
+				iter.skipCacheDeletes(keyP)
+				continue
+			}
+			// Cache is not a delete.
+
+			return true // cache exists.
+		}
 	}
-	return false
-```
-
-**File:** x/upgrade/handler.go (L29-31)
-```go
-func handleSoftwareUpgradeProposal(ctx sdk.Context, k keeper.Keeper, p *types.SoftwareUpgradeProposal) error {
-	return k.ScheduleUpgrade(ctx, p.Plan)
 }
 ```
 
-**File:** x/upgrade/handler.go (L33-35)
+**File:** tasks/scheduler.go (L284-352)
 ```go
-func handleCancelSoftwareUpgradeProposal(ctx sdk.Context, k keeper.Keeper, _ *types.CancelSoftwareUpgradeProposal) error {
-	k.ClearUpgradePlan(ctx)
-	return nil
-```
+func (s *scheduler) ProcessAll(ctx sdk.Context, reqs []*sdk.DeliverTxEntry) ([]types.ResponseDeliverTx, error) {
+	startTime := time.Now()
+	var iterations int
+	// initialize mutli-version stores if they haven't been initialized yet
+	s.tryInitMultiVersionStore(ctx)
+	// prefill estimates
+	// This "optimization" path is being disabled because we don't have a strong reason to have it given that it
+	// s.PrefillEstimates(reqs)
+	tasks, tasksMap := toTasks(reqs)
+	s.allTasks = tasks
+	s.allTasksMap = tasksMap
+	s.executeCh = make(chan func(), len(tasks))
+	s.validateCh = make(chan func(), len(tasks))
+	defer s.emitMetrics()
 
-**File:** x/upgrade/abci_test.go (L42-64)
-```go
-func setupTest(height int64, skip map[int64]bool) TestSuite {
-	db := dbm.NewMemDB()
-	app := simapp.NewSimApp(log.NewNopLogger(), db, nil, true, skip, simapp.DefaultNodeHome, 0, nil, simapp.MakeTestEncodingConfig(), &simapp.EmptyAppOptions{})
-	genesisState := simapp.NewDefaultGenesisState(app.AppCodec())
-	stateBytes, err := json.MarshalIndent(genesisState, "", "  ")
-	if err != nil {
-		panic(err)
+	// default to number of tasks if workers is negative or 0 by this point
+	workers := s.workers
+	if s.workers < 1 || len(tasks) < s.workers {
+		workers = len(tasks)
 	}
-	app.InitChain(
-		context.Background(), &abci.RequestInitChain{
-			Validators:    []abci.ValidatorUpdate{},
-			AppStateBytes: stateBytes,
-		},
-	)
 
-	s.keeper = app.UpgradeKeeper
-	s.ctx = app.BaseApp.NewContext(false, tmproto.Header{Height: height, Time: time.Now()})
+	workerCtx, cancel := context.WithCancel(ctx.Context())
+	defer cancel()
 
-	s.module = upgrade.NewAppModule(s.keeper)
-	s.querier = s.module.LegacyQuerierHandler(app.LegacyAmino())
-	s.handler = upgrade.NewSoftwareUpgradeProposalHandler(s.keeper)
-	return s
+	// execution tasks are limited by workers
+	start(workerCtx, s.executeCh, workers)
+
+	// validation tasks uses length of tasks to avoid blocking on validation
+	start(workerCtx, s.validateCh, len(tasks))
+
+	toExecute := tasks
+	for !allValidated(tasks) {
+		// if the max incarnation >= x, we should revert to synchronous
+		if iterations >= maximumIterations {
+			// process synchronously
+			s.synchronous = true
+			startIdx, anyLeft := s.findFirstNonValidated()
+			if !anyLeft {
+				break
+			}
+			toExecute = tasks[startIdx:]
+		}
+
+		// execute sets statuses of tasks to either executed or aborted
+		if err := s.executeAll(ctx, toExecute); err != nil {
+			return nil, err
+		}
+
+		// validate returns any that should be re-executed
+		// note this processes ALL tasks, not just those recently executed
+		var err error
+		toExecute, err = s.validateAll(ctx, tasks)
+		if err != nil {
+			return nil, err
+		}
+		// these are retries which apply to metrics
+		s.metrics.retries += len(toExecute)
+		iterations++
+	}
+
+	for _, mv := range s.multiVersionStores {
+		mv.WriteLatestToStore()
+	}
+	s.metrics.maxIncarnation = s.maxIncarnation
+
+	ctx.Logger().Info("occ scheduler", "height", ctx.BlockHeight(), "txs", len(tasks), "latency_ms", time.Since(startTime).Milliseconds(), "retries", s.metrics.retries, "maxIncarnation", s.maxIncarnation, "iterations", iterations, "sync", s.synchronous, "workers", s.workers)
+
+	return s.collectResponses(tasks), nil
 }
 ```
 
-**File:** x/upgrade/abci_test.go (L90-99)
+**File:** store/multiversion/store_test.go (L375-407)
 ```go
-func TestCanOverwriteScheduleUpgrade(t *testing.T) {
-	s := setupTest(10, map[int64]bool{})
-	t.Log("Can overwrite plan")
-	err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "bad_test", Height: s.ctx.BlockHeight() + 10}})
-	require.NoError(t, err)
-	err = s.handler(s.ctx, &types.SoftwareUpgradeProposal{Title: "prop", Plan: types.Plan{Name: "test", Height: s.ctx.BlockHeight() + 1}})
-	require.NoError(t, err)
+func TestMVSIteratorValidationWithEstimate(t *testing.T) {
+	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
+	mvs := multiversion.NewMultiVersionStore(parentKVStore)
+	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
 
-	VerifyDoUpgrade(t)
+	parentKVStore.Set([]byte("key2"), []byte("value0"))
+	parentKVStore.Set([]byte("key3"), []byte("value3"))
+	parentKVStore.Set([]byte("key4"), []byte("value4"))
+	parentKVStore.Set([]byte("key5"), []byte("value5"))
+
+	writeset := make(multiversion.WriteSet)
+	writeset["key1"] = []byte("value1")
+	writeset["key2"] = []byte("value2")
+	writeset["key3"] = nil
+	mvs.SetWriteset(1, 2, writeset)
+
+	iter := vis.Iterator([]byte("key1"), []byte("key6"))
+	for ; iter.Valid(); iter.Next() {
+		// read value
+		iter.Value()
+	}
+	iter.Close()
+	vis.WriteToMultiVersionStore()
+
+	writeset2 := make(multiversion.WriteSet)
+	writeset2["key2"] = []byte("value2")
+	mvs.SetEstimatedWriteset(2, 2, writeset2)
+
+	// should be invalid
+	valid, conflicts := mvs.ValidateTransactionState(5)
+	require.False(t, valid)
+	require.Equal(t, []int{2}, conflicts)
 }
 ```

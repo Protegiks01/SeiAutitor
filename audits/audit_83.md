@@ -1,243 +1,242 @@
 # Audit Report
 
 ## Title
-Stale Liveness Tracking State Persists After Validator Removal Causing Unfair Slashing on Consensus Key Reuse
+Genesis Transaction Validation Bypass Enables Chain Startup Denial-of-Service
 
 ## Summary
-When a validator is removed from the validator set after all delegations are unbonded, the slashing module's `AfterValidatorRemoved` hook fails to delete `ValidatorSigningInfo` and `ValidatorMissedBlockArray`. If the same consensus address later creates a new validator, the stale liveness tracking data persists, causing the new validator to inherit the previous validator's `MissedBlocksCounter` and face premature downtime slashing.
+A validation gap exists in the genesis transaction collection process where `CollectTxs` does not call `ValidateBasic()` on transaction messages, while `DeliverGenTxs` does and panics on validation failure. This allows invalid genesis transactions to be included in genesis.json, causing complete network startup failure.
 
 ## Impact
 Medium
 
 ## Finding Description
-- **location**: `x/slashing/keeper/hooks.go:40-43` (AfterValidatorRemoved function)
 
-- **intended logic**: When a validator is completely removed from the validator set (all delegations unbonded), all associated slashing state should be cleaned up. If the same consensus address later creates a new validator, it should start with fresh liveness tracking: `MissedBlocksCounter=0`, fresh `StartHeight`, and an empty missed blocks array.
+**Location:**
+- Validation gap: [1](#0-0) 
+- Panic on failure: [2](#0-1) 
+- ValidateBasic implementation: [3](#0-2) 
+- Empty validation checks: [4](#0-3) 
 
-- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation but does NOT delete the `ValidatorSigningInfo` or `ValidatorMissedBlockArray`. [1](#0-0)  These persist in storage keyed by consensus address. When a new validator with the same consensus address bonds, `AfterValidatorBonded` checks if signing info exists and only creates new info if not found. [2](#0-1)  Since the old signing info persists, the new validator inherits the stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
+**Intended Logic:**
+Genesis transactions should be thoroughly validated during the `collect-gentxs` phase to ensure only valid transactions are included in genesis.json. Pre-validated transactions should then execute successfully during chain initialization without errors.
 
-- **exploitation path**: 
-  1. Validator accumulates missed blocks during operation (e.g., 200 out of 1000-block window, below slashing threshold of 501)
-  2. Validator's operator unbonds all delegations, causing `DelegatorShares` to reach zero [3](#0-2) 
-  3. `RemoveValidator` is called, deleting the `ValidatorByConsAddrKey` index [4](#0-3)  but leaving signing info intact
-  4. Later, the same consensus key creates a new validator (passes the `GetValidatorByConsAddr` check [5](#0-4)  since the index was deleted [6](#0-5) )
-  5. New validator bonds, triggering `AfterValidatorBonded` which finds existing signing info and reuses it
-  6. New validator inherits `MissedBlocksCounter=200` from previous lifecycle
-  7. If new validator misses 301 additional blocks, it reaches 501 total and gets slashed/jailed [7](#0-6) , whereas a fresh validator would need to miss 501 blocks from the start
+**Actual Logic:**
+The `CollectTxs` function extracts messages and validates account balances and delegation amounts [5](#0-4)  but does NOT call `ValidateBasic()` on the messages themselves. However, during chain startup, the transaction delivery pipeline calls `validateBasicTxMsgs` [6](#0-5)  which invokes `ValidateBasic()` on each message [7](#0-6) .
 
-- **security guarantee broken**: The protocol invariant that each validator lifecycle has independent liveness tracking is violated. Validators cannot rely on getting a clean slate when creating a new validator with an existing consensus key after full unbonding and removal.
+**Exploitation Path:**
+1. Genesis participant creates a gentx JSON with empty `CommissionRates{}` or `Description{}`
+2. Places file in gentxs directory before `collect-gentxs` execution
+3. `CollectTxs` validates balances but skips `ValidateBasic()` call
+4. Invalid gentx is included in genesis.json
+5. During chain startup, `InitGenesis` is invoked [8](#0-7) 
+6. `DeliverGenTxs` processes gentxs and calls `deliverTx`
+7. Delivery pipeline calls `ValidateBasic()` which returns error for empty commission/description
+8. Code unconditionally panics: `if !res.IsOK() { panic(res.Log) }` [9](#0-8) 
+9. All nodes using same genesis.json experience identical panic
+10. Network cannot start
+
+**Security Guarantee Broken:**
+The system fails defense-in-depth validation. Validation boundaries are inconsistent - some checks occur during collection (balances), while critical message validity checks only occur during delivery, allowing invalid data to bypass initial validation and cause catastrophic failure at genesis initialization.
 
 ## Impact Explanation
-Validators who reuse consensus keys after complete unbonding and removal inherit stale missed block counters from their previous lifecycle. This causes them to be slashed and jailed after missing significantly fewer blocks than the configured `SignedBlocksWindow - MinSignedPerWindow` threshold. With default parameters (window=1000, min=500), a validator with inherited `MissedBlocksCounter=200` would be slashed after missing only 301 new blocks instead of 501, a 40% reduction in the downtime tolerance. 
 
-This results in:
-- Unfair economic penalties through slashing (loss of validator stake based on `SlashFractionDowntime` parameter)
-- Validators being incorrectly jailed and removed from the active set, losing block rewards and commission
-- Undermined fairness of the slashing mechanism, as validators with reused keys are treated differently than fresh validators
-- Potential operational disruption and discouragement of validator participation
+This vulnerability causes **complete network failure at genesis**:
 
-This qualifies as **Medium severity** under the impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+- **Irrecoverable without manual intervention**: Chain cannot self-recover; requires identifying the malicious gentx, removing it, and regenerating genesis.json
+- **Affects all nodes simultaneously**: All nodes using the same genesis.json fail to start
+- **Network never reaches operational state**: No blocks produced, no transactions processed
+- **Pre-consensus DoS**: Prevents chain from initializing consensus mechanisms
+
+This matches the explicit impact criteria: "Network not being able to confirm new transactions (total network shutdown)" - classified as **Medium** severity.
 
 ## Likelihood Explanation
-This vulnerability can be triggered through normal validator operations without any malicious intent:
-- Validators performing infrastructure maintenance or upgrades who fully unbond temporarily
-- Validators who reuse existing consensus keys for operational simplicity (common practice to avoid key management complexity)
-- Any validator operator who accumulates some missed blocks (normal during network issues or node problems) before complete unbonding
 
-While complete unbonding followed by recreation with the same consensus key is not a frequent operation, it is a legitimate use case. The conditions required are all standard validator lifecycle operations accessible to any validator operator, making this a realistic edge case that affects the protocol's fairness guarantees.
+**Who Can Trigger:**
+- Genesis participants who submit gentx files
+- Could occur accidentally through human error (misconfigured gentx)
+
+**Required Conditions:**
+- Access to submit gentx file during genesis ceremony (standard for genesis participants)
+- Empty commission or description fields in gentx
+- Timing: before `collect-gentxs` execution
+
+**Frequency:**
+Exploitable only during genesis (one-time window), but impact is catastrophic. Attack requires minimal sophistication - simply creating a JSON file with empty fields. An honest participant could trigger this accidentally.
+
+**Key Point:** Although genesis participants are somewhat privileged, this qualifies under the exception clause: "even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." A single participant's error should not prevent the entire network from starting.
 
 ## Recommendation
-Modify the `AfterValidatorRemoved` hook in `x/slashing/keeper/hooks.go` to properly clean up all validator-related slashing state:
+
+Add `ValidateBasic()` validation in `CollectTxs` after line 136 where messages are extracted:
 
 ```go
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-    // Clean up signing info
-    store := ctx.KVStore(k.storeKey)
-    store.Delete(types.ValidatorSigningInfoKey(address))
-    // Clean up missed blocks array
-    k.ClearValidatorMissedBlockBitArray(ctx, address)
+msgs := genTx.GetMsgs()
+for _, msg := range msgs {
+    if err := msg.ValidateBasic(); err != nil {
+        return appGenTxs, persistentPeers, fmt.Errorf("gentx %s failed ValidateBasic: %w", fo.Name(), err)
+    }
 }
 ```
 
-This ensures that when a validator is removed, all liveness tracking data is cleared, allowing a fresh start if the consensus address is later reused. This pattern follows the proper cleanup demonstrated by the distribution module's `AfterValidatorRemoved` hook. [8](#0-7) 
+This ensures validation parity between collection-time and delivery-time, rejecting invalid gentxs during collection rather than causing panic during genesis.
 
 ## Proof of Concept
 
-**Test Location**: `x/slashing/keeper/keeper_test.go` (new test to add)  
-**Function**: `TestValidatorRemovalClearsMissedBlocks`
+**Setup:**
+The existing test suite demonstrates that empty `CommissionRates{}` can be constructed [10](#0-9) 
 
-**Setup**:
-1. Initialize test chain with slashing parameters (`SignedBlocksWindow=1000`, `MinSignedPerWindow=500`)
-2. Create and bond validator A with a specific consensus pubkey
-3. Simulate 200 blocks where validator does NOT sign (accumulate `MissedBlocksCounter=200`)
-4. Verify signing info exists with `MissedBlocksCounter=200` using `GetValidatorSigningInfo` [9](#0-8) 
+**Test Case:**
+Add test to `TestDeliverGenTxs` in `x/genutil/gentx_test.go`:
 
-**Action**:
-1. Unbond all delegations from validator A
-2. Complete unbonding period and verify validator is removed from state
-3. Verify `GetValidatorByConsAddr` returns not found (index deleted)
-4. Create new validator B with the SAME consensus pubkey as validator A
-5. Bond the new validator
+```go
+{
+    "invalid gentx with empty commission causes panic",
+    func() {
+        _ = suite.setAccountBalance(addr1, 50)
+        
+        amount := sdk.NewInt64Coin(sdk.DefaultBondDenom, 10)
+        emptyComm := stakingtypes.CommissionRates{} // Invalid - empty commission
+        desc := stakingtypes.NewDescription("validator", "", "", "", "")
+        minSelfDel := sdk.OneInt()
+        
+        invalidMsg, err := stakingtypes.NewMsgCreateValidator(
+            sdk.ValAddress(pk1.Address()), pk1, amount, desc, emptyComm, minSelfDel,
+        )
+        suite.Require().NoError(err)
+        
+        tx, err := helpers.GenTx(
+            suite.encodingConfig.TxConfig,
+            []sdk.Msg{invalidMsg},
+            sdk.Coins{sdk.NewInt64Coin(sdk.DefaultBondDenom, 10)},
+            helpers.DefaultGenTxGas,
+            suite.ctx.ChainID(),
+            []uint64{0},
+            []uint64{0},
+            priv1,
+        )
+        suite.Require().NoError(err)
+        
+        genTxs = make([]json.RawMessage, 1)
+        genTx, err := suite.encodingConfig.TxConfig.TxJSONEncoder()(tx)
+        suite.Require().NoError(err)
+        genTxs[0] = genTx
+    },
+    false, // expPass = false, expecting panic
+},
+```
 
-**Result**:
-Query signing info for the consensus address - it incorrectly shows `MissedBlocksCounter=200` (inherited from removed validator A) instead of `MissedBlocksCounter=0` for a fresh validator. This proves the bug exists and demonstrates that the new validator starts with stale liveness tracking state, leading to premature slashing if it misses additional blocks.
+**Expected Result:**
+Test panics when `DeliverGenTxs` is called, confirming invalid gentx bypasses collection validation but causes panic during genesis delivery.
+
+**Verification:**
+Run: `go test -v ./x/genutil/... -run TestDeliverGenTxs`
 
 ## Notes
 
-The slashing module specification [10](#0-9)  only mentions that `AfterValidatorRemoved` "removes a validator's consensus key" but does NOT mention cleaning up signing info or missed block data, indicating incomplete design. The only cleanup function `ClearValidatorMissedBlockBitArray` [11](#0-10)  exists but is only called during slashing operations [12](#0-11) , NOT during validator removal. No function exists to delete `ValidatorSigningInfo` when a validator is removed.
+This represents a critical validation gap in the genesis process. While genesis participants have a special role, defense-in-depth principles require consistent validation at all boundaries. The fact that `CollectTxs` performs *some* validations (balances, funds) but not *all* validations (`ValidateBasic()`) creates an exploitable inconsistency that can prevent the entire network from starting.
+
+The vulnerability qualifies under the privilege exception because a single genesis participant's error (intentional or accidental) causes an unrecoverable network-wide failure that exceeds their intended authority scope. The impact matches the Medium severity criterion: "Network not being able to confirm new transactions (total network shutdown)."
 
 ### Citations
 
-**File:** x/slashing/keeper/hooks.go (L12-26)
+**File:** x/genutil/collect.go (L136-177)
 ```go
-func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
-	// Update the signing info start height or create a new signing info
-	_, found := k.GetValidatorSigningInfo(ctx, address)
-	if !found {
-		signingInfo := types.NewValidatorSigningInfo(
-			address,
-			ctx.BlockHeight(),
-			0,
-			time.Unix(0, 0),
-			false,
-			0,
-		)
-		k.SetValidatorSigningInfo(ctx, address, signingInfo)
-	}
-}
-```
+		msgs := genTx.GetMsgs()
 
-**File:** x/slashing/keeper/hooks.go (L40-43)
-```go
-// AfterValidatorRemoved deletes the address-pubkey relation when a validator is removed,
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-}
-```
+		// TODO abstract out staking message validation back to staking
+		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
 
-**File:** x/staking/keeper/delegation.go (L789-792)
-```go
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
-	}
-```
+		// validate delegator and validator addresses and funds against the accounts in the state
+		delAddr := msg.DelegatorAddress
+		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
+		if err != nil {
+			return appGenTxs, persistentPeers, err
+		}
 
-**File:** x/staking/keeper/validator.go (L36-45)
-```go
-func (k Keeper) GetValidatorByConsAddr(ctx sdk.Context, consAddr sdk.ConsAddress) (validator types.Validator, found bool) {
-	store := ctx.KVStore(k.storeKey)
-
-	opAddr := store.Get(types.GetValidatorByConsAddrKey(consAddr))
-	if opAddr == nil {
-		return validator, false
-	}
-
-	return k.GetValidator(ctx, opAddr)
-}
-```
-
-**File:** x/staking/keeper/validator.go (L176-176)
-```go
-	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
-```
-
-**File:** x/staking/keeper/msg_server.go (L52-54)
-```go
-	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
-		return nil, types.ErrValidatorPubKeyExists
-	}
-```
-
-**File:** x/slashing/keeper/infractions.go (L96-96)
-```go
-	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
-```
-
-**File:** x/distribution/keeper/hooks.go (L25-76)
-```go
-// AfterValidatorRemoved performs clean up after a validator is removed
-func (h Hooks) AfterValidatorRemoved(ctx sdk.Context, _ sdk.ConsAddress, valAddr sdk.ValAddress) {
-	// fetch outstanding
-	outstanding := h.k.GetValidatorOutstandingRewardsCoins(ctx, valAddr)
-
-	// force-withdraw commission
-	commission := h.k.GetValidatorAccumulatedCommission(ctx, valAddr).Commission
-	if !commission.IsZero() {
-		// subtract from outstanding
-		outstanding = outstanding.Sub(commission)
-
-		// split into integral & remainder
-		coins, remainder := commission.TruncateDecimal()
-
-		// remainder to community pool
-		feePool := h.k.GetFeePool(ctx)
-		feePool.CommunityPool = feePool.CommunityPool.Add(remainder...)
-		h.k.SetFeePool(ctx, feePool)
-
-		// add to validator account
-		if !coins.IsZero() {
-			accAddr := sdk.AccAddress(valAddr)
-			withdrawAddr := h.k.GetDelegatorWithdrawAddr(ctx, accAddr)
-
-			if err := h.k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, withdrawAddr, coins); err != nil {
-				panic(err)
+		delBal, delOk := balancesMap[delAddr]
+		if !delOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
 			}
+
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
+		}
+
+		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
+		if !valOk {
+			_, file, no, ok := runtime.Caller(1)
+			if ok {
+				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
+			}
+			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
+		}
+
+		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
+			return appGenTxs, persistentPeers, fmt.Errorf(
+				"insufficient fund for delegation %v: %v < %v",
+				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
+			)
+		}
+
+		// exclude itself from persistent peers
+		if msg.Description.Moniker != moniker {
+			addressesIPs = append(addressesIPs, nodeAddrIP)
+		}
+```
+
+**File:** x/genutil/gentx.go (L113-116)
+```go
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
+		}
+```
+
+**File:** baseapp/baseapp.go (L787-801)
+```go
+// validateBasicTxMsgs executes basic validator calls for messages.
+func validateBasicTxMsgs(msgs []sdk.Msg) error {
+	if len(msgs) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
+	}
+
+	for _, msg := range msgs {
+		err := msg.ValidateBasic()
+		if err != nil {
+			return err
 		}
 	}
 
-	// Add outstanding to community pool
-	// The validator is removed only after it has no more delegations.
-	// This operation sends only the remaining dust to the community pool.
-	feePool := h.k.GetFeePool(ctx)
-	feePool.CommunityPool = feePool.CommunityPool.Add(outstanding...)
-	h.k.SetFeePool(ctx, feePool)
-
-	// delete outstanding
-	h.k.DeleteValidatorOutstandingRewards(ctx, valAddr)
-
-	// remove commission record
-	h.k.DeleteValidatorAccumulatedCommission(ctx, valAddr)
-
-	// clear slashes
-	h.k.DeleteValidatorSlashEvents(ctx, valAddr)
-
-	// clear historical rewards
-	h.k.DeleteValidatorHistoricalRewards(ctx, valAddr)
-
-	// clear current rewards
-	h.k.DeleteValidatorCurrentRewards(ctx, valAddr)
+	return nil
 }
 ```
 
-**File:** x/slashing/keeper/signing_info.go (L34-38)
+**File:** baseapp/baseapp.go (L923-923)
 ```go
-func (k Keeper) SetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress, info types.ValidatorSigningInfo) {
-	store := ctx.KVStore(k.storeKey)
-	bz := k.cdc.MustMarshal(&info)
-	store.Set(types.ValidatorSigningInfoKey(address), bz)
-}
+	if err := validateBasicTxMsgs(msgs); err != nil {
 ```
 
-**File:** x/slashing/keeper/signing_info.go (L168-171)
+**File:** x/staking/types/msg.go (L120-126)
 ```go
-func (k Keeper) ClearValidatorMissedBlockBitArray(ctx sdk.Context, address sdk.ConsAddress) {
-	store := ctx.KVStore(k.storeKey)
-	store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
-}
+	if msg.Description == (Description{}) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "empty description")
+	}
+
+	if msg.Commission == (CommissionRates{}) {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "empty commission")
+	}
 ```
 
-**File:** x/slashing/spec/05_hooks.md (L15-17)
-```markdown
-+ `AfterValidatorBonded` creates a `ValidatorSigningInfo` instance as described in the following section.
-+ `AfterValidatorCreated` stores a validator's consensus key.
-+ `AfterValidatorRemoved` removes a validator's consensus key.
+**File:** x/genutil/genesis.go (L17-18)
+```go
+	if len(genesisState.GenTxs) > 0 {
+		validators, err = DeliverGenTxs(ctx, genesisState.GenTxs, stakingKeeper, deliverTx, txEncodingConfig)
 ```
 
-**File:** x/slashing/abci.go (L58-60)
+**File:** x/genutil/gentx_test.go (L30-32)
 ```go
-		if writeInfo.ShouldSlash {
-			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
-			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
+	desc  = stakingtypes.NewDescription("testname", "", "", "", "")
+	comm  = stakingtypes.CommissionRates{}
+)
 ```

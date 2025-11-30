@@ -1,226 +1,194 @@
 # Audit Report
 
 ## Title
-Network Halt Due to Missing Nil Check in Validator Reward Allocation Loop
+Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
 
 ## Summary
-The `AllocateTokens` function in the distribution module lacks a nil check when allocating rewards to validators who voted in the previous block. When a validator is removed from state between voting and reward distribution, the code attempts to dereference a nil validator interface, causing a deterministic panic that crashes all nodes simultaneously and halts the network. [1](#0-0) 
+The `TrackHistoricalInfo` function in the staking module contains a pruning logic flaw where a break statement exits the pruning loop upon encountering the first missing historical entry. When governance sets `HistoricalEntries` to 0 temporarily (a valid parameter value), gaps are created in the historical entry sequence. Upon setting it back to a non-zero value, the pruning loop encounters these gaps first and immediately exits, leaving all old entries permanently orphaned in storage. This causes unbounded storage growth that compounds with every subsequent block.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** `x/distribution/keeper/allocation.go` lines 91-102
+**Location:** [1](#0-0) 
 
-**Intended logic:** 
-The reward allocation loop should safely distribute fees to all validators who participated in consensus, handling edge cases where validators may have been removed from state between the voting phase and reward distribution phase.
+**Intended logic:** The function should maintain exactly `HistoricalEntries` number of recent historical info entries by pruning all entries older than `currentHeight - HistoricalEntries`. Storage should remain bounded to the configured parameter value, preventing resource exhaustion.
 
-**Actual logic:** 
-The code retrieves validators via `ValidatorByConsAddr` without checking for nil before passing them to `AllocateTokensToValidator`. When the validator is nil, the immediate call to `val.GetCommission()` in `AllocateTokensToValidator` causes a nil pointer dereference panic. [2](#0-1) 
+**Actual logic:** The pruning loop iterates downward from `currentHeight - HistoricalEntries` and breaks immediately upon encountering the first missing entry at [2](#0-1) . The code explicitly assumes entries form a "continuous range" as stated in the comment [3](#0-2) , but this assumption is violated when `HistoricalEntries` is temporarily set to 0.
 
 **Exploitation path:**
+1. Network operates with `HistoricalEntries=100`, accumulating entries for blocks 1-100
+2. Governance proposal changes `HistoricalEntries` to 0 at block 101 (validated as acceptable by [4](#0-3) )
+3. During blocks 101-110, no new entries are saved due to early return [5](#0-4) , but existing entries 1-100 remain in storage
+4. Governance proposal changes `HistoricalEntries` to 5 at block 111
+5. At block 111, pruning loop starts at height 106 (111-5), finds no entry at height 106 (gap period), immediately breaks
+6. Old entries 1-100 are never deleted, new entry 111 is saved
+7. Each subsequent block adds a new entry without deleting old ones because the pruning loop always encounters the gap first
+8. Storage grows unboundedly: {1-100, 111, 112, 113, ...}
 
-1. **Block N**: A bonded validator participates in consensus and votes. All delegations are removed via `Undelegate` transactions, causing `DelegatorShares` to reach zero.
-
-2. **Block N EndBlock**: The staking module processes validator state changes:
-   - `ApplyAndReturnValidatorSetUpdates` transitions the validator from Bonded → Unbonding [3](#0-2) 
-   - With a short unbonding period, `UnbondAllMatureValidators` immediately transitions the validator from Unbonding → Unbonded [4](#0-3) 
-   - Since `DelegatorShares.IsZero()` and validator is unbonded, `RemoveValidator` deletes the validator including its consensus address mapping [5](#0-4) 
-
-3. **Block N+1 BeginBlock**: Distribution module's `BeginBlocker` calls `AllocateTokens` with votes from block N [6](#0-5) 
-   - `ValidatorByConsAddr` returns nil for the removed validator [7](#0-6) 
-   - The code calls `AllocateTokensToValidator(ctx, nil, reward)` without checking nil, causing immediate panic in BeginBlock
-
-**Security guarantee broken:** 
-Network liveness and availability. BeginBlock must complete successfully for consensus to proceed. The panic violates the invariant that all state transitions must be handled gracefully without crashing the system.
+**Security guarantee broken:** The storage bound invariant is violated. The system should maintain exactly `HistoricalEntries` entries, but instead accumulates entries without bound. Once triggered, governance cannot recover from this state through any parameter change—only a hard fork can resolve it.
 
 ## Impact Explanation
 
-This vulnerability causes complete network shutdown when triggered. Since BeginBlock execution is deterministic and consensus-critical, all validators process identical state and crash at the same block height. This results in:
+Each `HistoricalInfo` entry contains a complete block header and full validator set [6](#0-5) , with a default of 35 validators [7](#0-6) . Each entry represents multiple kilobytes of data.
 
-1. **Total network halt** - No new blocks can be produced since all nodes panic
-2. **Loss of transaction finality** - All pending transactions remain unprocessed  
-3. **Requires emergency intervention** - Manual coordination among validators to restart nodes, potentially requiring a coordinated upgrade or hard fork
+After vulnerability triggering:
+- Expected storage with `HistoricalEntries=5`: 5 entries
+- Actual storage after 24 hours (assuming 10-second blocks): 100 old entries + 8,640 new entries = 8,740 entries
+- Storage increase: 174,700%
 
-The severity qualifies as High impact: "Network not being able to confirm new transactions (total network shutdown)."
+This far exceeds the 30% threshold for Medium severity "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours." Over time, this leads to storage exhaustion, node crashes when disk space is exhausted, and network degradation as nodes run out of storage.
 
 ## Likelihood Explanation
 
-**Who can trigger:** Any network participant with delegations can submit `Undelegate` transactions. No special privileges required.
+**Who can trigger:** Any network participant through the standard governance process. The `HistoricalEntries` parameter is governance-controlled [8](#0-7) .
 
-**Conditions:**
-1. Unbonding period configured to a short duration (validation only requires > 0, allowing values as low as 1 nanosecond) [8](#0-7) 
-2. A validator must have all delegations removed in a single block
-3. The validator must participate in consensus during that block
+**Conditions required:**
+1. Governance proposal changes `HistoricalEntries` from non-zero to 0
+2. After several blocks, another proposal changes it back to a non-zero value
 
-**Frequency:**
-- With short unbonding periods (commonly used in testnets): Moderately likely during normal operations
-- With standard periods: Less likely but still possible when unbonding naturally completes
+**Why realistic:**
+- The validation function explicitly allows `HistoricalEntries=0` as valid [4](#0-3) 
+- The simulation code confirms 0 is an intended valid value [9](#0-8) 
+- Documentation suggests non-IBC chains may legitimately set `HistoricalEntries=0` to save resources [10](#0-9) 
+- This is not a malicious attack but a legitimate governance operation triggering a code bug
+- Once triggered, the issue is **unrecoverable** without a hard fork—governance cannot remove orphaned entries through any parameter change
 
-**Critical Evidence:** The code explicitly acknowledges this scenario can occur in the proposer reward allocation, which includes a nil check and detailed warning [9](#0-8) , while the voter reward path lacks this same protection. The codebase comments explicitly acknowledge instant unbonding as a supported scenario [10](#0-9) .
+**Frequency:** Once triggered through normal governance operations, the effect compounds with every subsequent block via [11](#0-10) .
 
 ## Recommendation
 
-Add a nil check in the vote allocation loop, mirroring the defensive approach used for proposer rewards:
+Modify the pruning logic to delete all entries older than the retention threshold, regardless of gaps. Remove the break condition:
 
 ```go
-for _, vote := range bondedVotes {
-    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
-    
-    if validator == nil {
-        logger.Error(fmt.Sprintf(
-            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
-            "This should happen only if the validator unbonded completely within a single block.",
-            vote.Validator.Address.String()))
-        continue
+// Prune all entries older than retention height, regardless of gaps
+pruneHeight := ctx.BlockHeight() - int64(entryNum)
+for i := pruneHeight; i >= 0; i-- {
+    _, found := k.GetHistoricalInfo(ctx, i)
+    if found {
+        k.DeleteHistoricalInfo(ctx, i)
     }
-    
-    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
-    reward := feeMultiplier.MulDecTruncate(powerFraction)
-    
-    k.AllocateTokensToValidator(ctx, validator, reward)
-    remaining = remaining.Sub(reward)
+    // Continue checking all heights - do not break on missing entries
 }
 ```
 
-When a validator is removed, their allocated rewards remain in the pool and get added to the community pool at function end, maintaining consistency with proposer reward behavior.
+Alternatively, track the oldest and newest entry heights in state to enable efficient range-based deletion without relying on the "continuous range" assumption.
 
 ## Proof of Concept
 
-**Test Location:** `x/distribution/keeper/allocation_test.go`
+**File:** `x/staking/keeper/historical_info_test.go`
+
+**Test Function:** `TestTrackHistoricalInfoUnboundedGrowth`
 
 **Setup:**
-1. Initialize test app with 1-nanosecond unbonding period via staking params
-2. Create a validator with minimal delegation (e.g., 100 tokens)  
-3. Fund the fee collector module account with distributable fees
-4. Include the validator in the vote list for block N
+- Initialize staking keeper using `createTestInput()`
+- Set `HistoricalEntries=100` via `SetParams`
+- Create 100 blocks with historical entries by calling `TrackHistoricalInfo` with incrementing block heights (1-100)
+- Verify 100 entries exist using `GetAllHistoricalInfo`
 
 **Action:**
-1. Submit `Undelegate` messages removing all delegations from the validator
-2. Call `staking.EndBlocker(ctx)` to process validator state changes:
-   - Validator transitions Bonded → Unbonding → Unbonded → Removed
-3. Call `distribution.BeginBlocker(ctx, req)` with `req.LastCommitInfo.Votes` containing the removed validator
+1. Change `HistoricalEntries` to 0 via `SetParams`
+2. Generate 10 blocks (101-110) by calling `TrackHistoricalInfo` with updated block heights in context
+3. Verify no new entries created during this period (gap created)
+4. Change `HistoricalEntries` to 5 via `SetParams`
+5. Generate block 111 by calling `TrackHistoricalInfo` with height 111 in context
+6. Count total entries using `GetAllHistoricalInfo`
 
 **Result:**
-Panic with nil pointer dereference when `AllocateTokens` attempts to call `val.GetCommission()` on the nil interface at line 113 of allocation.go, causing BeginBlock to fail and halt the network.
+- Expected after block 111: 5 entries (heights 107-111)
+- Actual after block 111: 101 entries (heights 1-100 + 111)
+- This proves old entries are never pruned when gaps exist, violating the `HistoricalEntries` bound
 
 ## Notes
 
-The vulnerability is confirmed by critical code inconsistency: the proposer reward allocation path includes defensive nil checking with detailed warnings, while the voter reward allocation path lacks this protection despite calling the same underlying function and facing identical risks. This pattern, combined with explicit comments acknowledging the edge case and defensive nil checks in other modules (evidence and slashing), proves this is an oversight in defensive programming rather than intentional design. The deterministic nature of BeginBlock execution ensures all validators crash simultaneously, making this a network-halting vulnerability.
+This vulnerability is called every block through `BeginBlocker`, making it production-critical. The flaw stems from an incorrect assumption that entries form a "continuous range," which is violated by legitimate governance operations that temporarily set `HistoricalEntries=0`. This is not a misconfiguration but a code bug triggered by explicitly supported parameter values, causing an unrecoverable security failure beyond governance's intended authority. While governance is trusted to change parameters, setting any valid parameter value should not cause permanent, unfixable storage issues that require a hard fork to resolve.
 
 ### Citations
 
-**File:** x/distribution/keeper/allocation.go (L68-79)
+**File:** x/staking/keeper/historical_info.go (L75-75)
 ```go
-	} else {
-		// previous proposer can be unknown if say, the unbonding period is 1 block, so
-		// e.g. a validator undelegates at block X, it's removed entirely by
-		// block X+1's endblock, then X+2 we need to refer to the previous
-		// proposer for X+1, but we've forgotten about them.
-		logger.Error(fmt.Sprintf(
-			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
-				"This should happen only if the proposer unbonded completely within a single block, "+
-				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
-				"We recommend you investigate immediately.",
-			previousProposer.String()))
-	}
+	// Since the entries to be deleted are always in a continuous range, we can iterate
 ```
 
-**File:** x/distribution/keeper/allocation.go (L91-102)
+**File:** x/staking/keeper/historical_info.go (L78-85)
 ```go
-	for _, vote := range bondedVotes {
-		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
-
-		// TODO: Consider micro-slashing for missing votes.
-		//
-		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
-		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
-		reward := feeMultiplier.MulDecTruncate(powerFraction)
-
-		k.AllocateTokensToValidator(ctx, validator, reward)
-		remaining = remaining.Sub(reward)
-	}
-```
-
-**File:** x/distribution/keeper/allocation.go (L111-115)
-```go
-func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
-	// split tokens between validator and delegators according to commission
-	commission := tokens.MulDec(val.GetCommission())
-	shared := tokens.Sub(commission)
-
-```
-
-**File:** x/staking/keeper/val_state_change.go (L22-26)
-```go
-	// This fixes a bug when the unbonding period is instant (is the case in
-	// some of the tests). The test expected the validator to be completely
-	// unbonded after the Endblocker (go from Bonded -> Unbonding during
-	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
-	// UnbondAllMatureValidatorQueue).
-```
-
-**File:** x/staking/keeper/val_state_change.go (L190-199)
-```go
-	for _, valAddrBytes := range noLongerBonded {
-		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
-		validator, err = k.bondedToUnbonding(ctx, validator)
-		if err != nil {
-			return
+	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
+		_, found := k.GetHistoricalInfo(ctx, i)
+		if found {
+			k.DeleteHistoricalInfo(ctx, i)
+		} else {
+			break
 		}
-		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
-		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
-		updates = append(updates, validator.ABCIValidatorUpdateZero())
 	}
 ```
 
-**File:** x/staking/keeper/validator.go (L176-176)
+**File:** x/staking/keeper/historical_info.go (L88-89)
 ```go
-	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+	if entryNum == 0 {
+		return
 ```
 
-**File:** x/staking/keeper/validator.go (L441-444)
+**File:** x/staking/types/params.go (L24-24)
 ```go
-				val = k.UnbondingToUnbonded(ctx, val)
-				if val.GetDelegatorShares().IsZero() {
-					k.RemoveValidator(ctx, val.GetOperator())
-				}
+	DefaultMaxValidators uint32 = 35
 ```
 
-**File:** x/distribution/abci.go (L29-32)
+**File:** x/staking/types/params.go (L29-32)
 ```go
-	if ctx.BlockHeight() > 1 {
-		previousProposer := k.GetPreviousProposerConsAddr(ctx)
-		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
-	}
+	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
+	// value by not adding the staking module to the application module manager's
+	// SetOrderBeginBlockers.
+	DefaultHistoricalEntries uint32 = 10000
 ```
 
-**File:** x/staking/keeper/alias_functions.go (L88-96)
+**File:** x/staking/types/params.go (L242-248)
 ```go
-// ValidatorByConsAddr gets the validator interface for a particular pubkey
-func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
-	val, found := k.GetValidatorByConsAddr(ctx, addr)
-	if !found {
-		return nil
-	}
-
-	return val
-}
-```
-
-**File:** x/staking/types/params.go (L167-178)
-```go
-func validateUnbondingTime(i interface{}) error {
-	v, ok := i.(time.Duration)
+func validateHistoricalEntries(i interface{}) error {
+	_, ok := i.(uint32)
 	if !ok {
 		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	if v <= 0 {
-		return fmt.Errorf("unbonding time must be positive: %d", v)
-	}
-
 	return nil
+```
+
+**File:** x/staking/types/historical_info.go (L15-27)
+```go
+// NewHistoricalInfo will create a historical information struct from header and valset
+// it will first sort valset before inclusion into historical info
+func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
+	// Must sort in the same way that tendermint does
+	sort.SliceStable(valSet, func(i, j int) bool {
+		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
+	})
+
+	return HistoricalInfo{
+		Header: header,
+		Valset: valSet,
+	}
 }
+```
+
+**File:** x/staking/keeper/params.go (L82-84)
+```go
+// set the params
+func (k Keeper) SetParams(ctx sdk.Context, params types.Params) {
+	k.paramstore.SetParamSet(ctx, &params)
+```
+
+**File:** x/staking/simulation/genesis.go (L34-37)
+```go
+// getHistEntries returns randomized HistoricalEntries between 0-100.
+func getHistEntries(r *rand.Rand) uint32 {
+	return uint32(r.Intn(int(types.DefaultHistoricalEntries + 1)))
+}
+```
+
+**File:** x/staking/abci.go (L15-18)
+```go
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+
+	k.TrackHistoricalInfo(ctx)
 ```

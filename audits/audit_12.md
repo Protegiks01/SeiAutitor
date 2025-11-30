@@ -1,210 +1,358 @@
 # Audit Report
 
 ## Title
-Front-Running Module Account Creation Causes Network-Wide Panic During Chain Upgrades
+Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
 
 ## Summary
-An attacker can pre-create a `BaseAccount` at a future module's deterministic address before a chain upgrade, causing all validators to panic simultaneously when the new module's `InitGenesis` attempts to retrieve its module account. This results in total network shutdown.
+A critical validation gap in the distribution module allows governance to set parameters where `baseProposerReward + bonusProposerReward + communityTax > 1.0` through individual parameter updates, causing `voteMultiplier` to become negative and triggering a network-halting panic during block processing.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:**
-- Panic: [1](#0-0) 
-- Account creation: [2](#0-1) 
-- Blocked address check: [3](#0-2) 
-- Module address derivation: [4](#0-3) 
-- Blocked addresses initialization: [5](#0-4) 
+**Location:** [1](#0-0) [2](#0-1) 
 
-**Intended logic:** 
-Module accounts should only exist as `ModuleAccountI` types at their deterministic addresses. The `blockedAddrs` mechanism should prevent users from creating accounts at module addresses. When a chain upgrade adds a new module, `GetModuleAccount` should safely create the module account during `InitGenesis`.
+**Intended Logic:**
+Distribution parameters must satisfy the invariant `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. This invariant is explicitly enforced in `ValidateBasic()`: [3](#0-2) 
 
-**Actual logic:** 
-The `blockedAddrs` map is populated only from modules existing in `maccPerms` at app initialization [5](#0-4) . Future modules added via upgrade are not in this map. When coins are sent to a future module address, the `BlockedAddr` check passes [6](#0-5)  because the address isn't blocked yet. This creates a `BaseAccount` at the module address [2](#0-1)  using the default `ProtoBaseAccount` prototype [7](#0-6) . During upgrade, when `GetModuleAccountAndPermissions` retrieves this account and finds it's not a `ModuleAccountI`, it executes an unconditional panic [1](#0-0) .
+**Actual Logic:**
+When parameters are updated through governance proposals, the system calls `Subspace.Update()`: [4](#0-3) [5](#0-4) 
 
-**Exploitation path:**
-1. Attacker observes governance proposal announcing new module "newmodule" at upgrade height H
-2. Attacker calculates deterministic address: `crypto.AddressHash([]byte("newmodule"))` [4](#0-3) 
-3. Before upgrade, attacker submits `MsgSend` with 1 token to calculated address
-4. `BlockedAddr` check passes because address not in `blockedAddrs` yet [3](#0-2) 
-5. `SendCoins` creates `BaseAccount` at module address [2](#0-1) 
-6. At upgrade height, `RunMigrations` calls `InitGenesis` for new modules not in fromVM [8](#0-7) 
-7. Module's `InitGenesis` calls `GetModuleAccount` [9](#0-8) 
-8. `GetModuleAccountAndPermissions` finds `BaseAccount`, type assertion fails, panic occurs [1](#0-0) 
-9. All validators panic at same height during consensus execution
-10. Network completely halts
+This only validates individual parameters using functions that check each parameter is between 0 and 1.0: [6](#0-5) 
 
-**Security guarantee broken:** 
-Network availability and upgrade safety. The deterministic module address derivation combined with static `blockedAddrs` creates a race condition where attackers can claim future module addresses before they're protected.
+The `ValidateBasic()` function that checks the combined constraint is only called during genesis validation: [7](#0-6) 
+
+**Exploitation Path:**
+1. Three governance proposals pass independently (each appears valid: 0 ≤ value ≤ 1.0):
+   - `baseProposerReward = 0.5`
+   - `bonusProposerReward = 0.5`
+   - `communityTax = 0.1`
+   - Combined sum: 1.1 > 1.0 (violates invariant)
+
+2. During BeginBlock, `AllocateTokens` is called automatically: [8](#0-7) 
+
+3. With 100% validator participation, `proposerMultiplier = 0.5 + (0.5 * 1.0) = 1.0`, resulting in `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1` (negative)
+
+4. This produces negative `DecCoins` for rewards via `MulDecTruncate(-0.1)`
+
+5. `AllocateTokensToValidator` is called with negative tokens
+
+6. When computing `shared = tokens.Sub(commission)`, the `Sub` method panics: [9](#0-8) 
+
+**Security Guarantee Broken:**
+The system fails to enforce the critical invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates, allowing inadvertent configuration that causes catastrophic network failure.
 
 ## Impact Explanation
 
-This vulnerability causes complete network shutdown affecting all validators simultaneously. When all validators panic at the same block height during upgrade execution:
+**Consequences:**
+- **Total network shutdown**: All validator nodes panic simultaneously when processing BeginBlock after the misconfigured parameters take effect
+- **Cannot process transactions**: Network consensus completely breaks down as all nodes crash
+- **Unrecoverable without hard fork**: Emergency governance cannot fix parameters because the network is halted and no blocks can be processed
+- **Requires coordinated manual intervention**: Validators must coordinate off-chain to reset parameters and restart the network with corrected state
 
-- No new transactions can be confirmed after the upgrade height
-- The upgrade plan is consumed but module initialization failed, leaving state inconsistent
-- Chain cannot progress without manual intervention
-- Recovery requires coordinated hard fork with state export/import or emergency patch
-- Existing upgrade cannot be rolled back cleanly
+**Precedent in Codebase:**
+The developers explicitly recognized and fixed a similar issue for ConsensusParams: [10](#0-9) 
 
-This matches the specified impact criterion: "Network not being able to confirm new transactions (total network shutdown)."
+The comment acknowledges that parameter validation gaps "will cause a chain halt since validation is done during ApplyBlock". This confirms the severity of such validation gaps and demonstrates that distribution parameters lack the same protection.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- **Who:** Any network participant with minimal funds (transaction fees + 1 token)
-- **When:** Between upgrade proposal passing and upgrade execution (typically days/weeks window)
-- **Requirements:** Knowledge of new module name (publicly available in governance proposal)
+**Who Can Trigger:**
+Any token holder can submit governance proposals. This requires three separate proposals to pass through normal democratic voting.
 
-**Frequency:**
-- Can occur with every chain upgrade introducing new modules
-- Multiple chain upgrades per year in active Cosmos chains
-- High likelihood given low cost, public information, and large time window
+**Realistic Scenario (Non-Malicious):**
+- Month 1: Proposal to increase proposer rewards (`baseProposerReward = 0.5`)
+- Month 2: Proposal to add voting bonuses (`bonusProposerReward = 0.5`)
+- Month 3: Proposal to fund community pool (`communityTax = 0.1`)
+- Each proposal reviewed individually, all appear valid (0 ≤ value ≤ 1.0)
+- No reviewer checks combined constraint across all parameters
+- Network halts inadvertently on next block
 
-**Detection Difficulty:**
-- Attack transaction appears as normal coin transfer
-- Indistinguishable from legitimate transfers
-- Only becomes apparent when all validators crash during upgrade
+**Likelihood:** Moderate - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint without malicious intent.
 
-The combination of public information, minimal cost, large attack window, and inability to detect makes exploitation highly likely.
+**Platform Rule Exception:**
+While this requires governance approval (privileged role), the platform acceptance rule explicitly allows this because "even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority." This is a validation bug in the code that allows governance to accidentally exceed its intended authority through seemingly valid individual parameter changes.
 
 ## Recommendation
 
-**Primary Fix:**
-Add graceful handling in `GetModuleAccountAndPermissions` to convert pre-existing `BaseAccount` to `ModuleAccount`:
+1. **Immediate Fix**: Add cross-parameter validation to governance parameter updates. Modify `handleParameterChangeProposal()` to call `Params.ValidateBasic()` on the complete parameter set after applying changes to distribution parameters, similar to the ConsensusParams validation pattern shown in: [11](#0-10) 
 
-```go
-if acc != nil {
-    macc, ok := acc.(types.ModuleAccountI)
-    if !ok {
-        // Handle case where BaseAccount was created before module
-        if baseAcc, isBase := acc.(*types.BaseAccount); isBase && 
-           baseAcc.GetPubKey() == nil && baseAcc.GetSequence() == 0 {
-            // Convert to module account preserving account number
-            newMacc := types.NewModuleAccount(baseAcc, moduleName, perms...)
-            ak.SetModuleAccount(ctx, newMacc)
-            return newMacc, perms
-        }
-        panic("account is not a module account")
-    }
-    return macc, perms
-}
-```
+2. **Alternative Approach**: Enhance individual validator functions to query current values of other parameters and validate the combined sum will not exceed 1.0 after the update.
 
-**Alternative Prevention:**
-Implement proactive blocking of future module addresses by maintaining a registry of planned module names from pending upgrade proposals and adding their addresses to `blockedAddrs` dynamically.
+3. **Defensive Programming**: Add a safety check in `AllocateTokens` to detect negative `voteMultiplier` and handle gracefully (log error, clamp to zero) rather than allowing panic to propagate.
+
+4. **Follow Existing Pattern**: Apply the same validation pattern used for ConsensusParams to distribution parameters to prevent inadvertent chain halts from parameter misconfiguration.
 
 ## Proof of Concept
 
+**Test File:** `x/distribution/keeper/allocation_test.go`
+
 **Setup:**
-1. Create test app with initial `maccPerms` excluding "testmodule"
-2. Calculate deterministic module address: `types.NewModuleAddress("testmodule")`
-3. Fund attacker account with tokens
+- Initialize test application using `simapp.Setup(false)` following existing test pattern: [12](#0-11) 
+
+- Create two validators with equal voting power
+- Set misconfigured parameters simulating post-governance state:
+  - `CommunityTax: sdk.NewDecWithPrec(1, 1)` (0.1)
+  - `BaseProposerReward: sdk.NewDecWithPrec(5, 1)` (0.5)
+  - `BonusProposerReward: sdk.NewDecWithPrec(5, 1)` (0.5)
+  - Combined sum: 1.1 > 1.0
+
+- Fund fee collector with tokens: [13](#0-12) 
 
 **Action:**
-1. Before module exists in `maccPerms`, call `BankKeeper.SendCoins(ctx, attackerAddr, moduleAddr, coins)`
-2. Verify `BaseAccount` created: `acc := AccountKeeper.GetAccount(ctx, moduleAddr); _, ok := acc.(types.ModuleAccountI)` returns false
-3. Update app's `maccPerms` to include "testmodule" with permissions
-4. Reinitialize `AccountKeeper` with new `maccPerms`
-5. Call `AccountKeeper.GetModuleAccount(ctx, "testmodule")`
+- Create vote info with both validators at 100% participation (`SignedLastBlock: true`): [14](#0-13) 
+
+- Call `app.DistrKeeper.AllocateTokens(ctx, totalPower, totalPower, proposerConsAddr, votes)`
+- This maximizes `proposerMultiplier = 1.0`, resulting in `voteMultiplier = -0.1`
 
 **Result:**
-- Function panics with message "account is not a module account" at [10](#0-9) 
-- Demonstrates validators would crash during upgrade when `InitGenesis` is called
-- Confirms network shutdown scenario
+- Panic with message "negative coin amount" when `AllocateTokensToValidator` attempts `tokens.Sub(commission)` on negative amounts
+- This panic would halt all nodes processing blocks with these parameters, requiring coordinated off-chain intervention to recover
 
 ## Notes
 
-The vulnerability stems from a fundamental design assumption that module addresses are "reserved" through the `blockedAddrs` mechanism, but this mechanism is static and only protects addresses of modules that exist at initialization time. The deterministic address derivation allows attackers to precompute future module addresses, and the account creation logic permits account creation at any non-blocked address. Combined with the unconditional panic and the upgrade flow that calls `InitGenesis` for new modules, this creates a critical vulnerability in the upgrade process.
+This vulnerability represents a validation gap in the code rather than a governance system issue. The codebase precedent of fixing similar issues for ConsensusParams confirms this is a recognized vulnerability pattern. The privilege exception applies because governance can inadvertently trigger an unrecoverable network halt beyond its intended authority through seemingly valid individual parameter changes that each pass validation independently but collectively violate critical system invariants.
 
 ### Citations
 
-**File:** x/auth/keeper/keeper.go (L187-193)
+**File:** x/distribution/keeper/allocation.go (L82-84)
 ```go
-	acc := ak.GetAccount(ctx, addr)
-	if acc != nil {
-		macc, ok := acc.(types.ModuleAccountI)
+	communityTax := k.GetCommunityTax(ctx)
+	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
+	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
+```
+
+**File:** x/distribution/keeper/allocation.go (L111-114)
+```go
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+```
+
+**File:** x/distribution/types/params.go (L67-71)
+```go
+	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
+		)
+	}
+```
+
+**File:** x/distribution/types/params.go (L76-131)
+```go
+func validateCommunityTax(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("community tax must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("community tax must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("community tax too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBaseProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("base proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("base proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("base proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBonusProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("bonus proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("bonus proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+```
+
+**File:** x/params/proposal_handler.go (L26-43)
+```go
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
 		if !ok {
-			panic("account is not a module account")
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
 		}
-		return macc, perms
-```
 
-**File:** x/bank/keeper/send.go (L166-170)
-```go
-	accExists := k.ak.HasAccount(ctx, toAddr)
-	if !accExists {
-		defer telemetry.IncrCounter(1, "new", "account")
-		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
-	}
-```
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
 
-**File:** x/bank/keeper/send.go (L348-355)
-```go
-func (k BaseSendKeeper) BlockedAddr(addr sdk.AccAddress) bool {
-	if len(addr) == len(CoinbaseAddressPrefix)+8 {
-		if bytes.Equal(CoinbaseAddressPrefix, addr[:len(CoinbaseAddressPrefix)]) {
-			return true
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
 		}
 	}
-	return k.blockedAddrs[addr.String()]
+
+	return nil
 }
 ```
 
-**File:** x/auth/types/account.go (L162-165)
+**File:** x/params/types/subspace.go (L196-219)
 ```go
-// NewModuleAddress creates an AccAddress from the hash of the module's name
-func NewModuleAddress(name string) sdk.AccAddress {
-	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
+	}
+
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+		return err
+	}
+
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
+	return nil
 }
 ```
 
-**File:** simapp/app.go (L261-263)
+**File:** x/distribution/types/genesis.go (L45-46)
 ```go
-	app.AccountKeeper = authkeeper.NewAccountKeeper(
-		appCodec, keys[authtypes.StoreKey], app.GetSubspace(authtypes.ModuleName), authtypes.ProtoBaseAccount, maccPerms,
+func ValidateGenesis(gs *GenesisState) error {
+	if err := gs.Params.ValidateBasic(); err != nil {
+```
+
+**File:** x/distribution/abci.go (L29-31)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+```
+
+**File:** types/dec_coin.go (L302-309)
+```go
+// Sub subtracts a set of DecCoins from another (adds the inverse).
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
+	}
+
+	return diff
+```
+
+**File:** x/params/types/proposal/proposal.go (L101-109)
+```go
+		// We need to verify ConsensusParams since they are only validated once the proposal passes.
+		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
+		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
+		// Therefore, we validate when we get a param-change msg for ConsensusParams
+		if pc.Subspace == "baseapp" {
+			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
+				return err
+			}
+		}
+```
+
+**File:** x/params/types/proposal/proposal.go (L115-134)
+```go
+func verifyConsensusParamsUsingDefault(changes []ParamChange) error {
+	// Start with a default (valid) set of parameters, and update based on proposal then check
+	defaultCP := types.DefaultConsensusParams()
+	for _, change := range changes {
+		// Note: BlockParams seems to be the only support ConsensusParams available for modifying with proposal
+		switch change.Key {
+		case "BlockParams":
+			blockParams := types.DefaultBlockParams()
+			err := json.Unmarshal([]byte(change.Value), &blockParams)
+			if err != nil {
+				return err
+			}
+			defaultCP.Block = blockParams
+		}
+	}
+	if err := defaultCP.ValidateConsensusParams(); err != nil {
+		return err
+	}
+	return nil
+}
+```
+
+**File:** x/distribution/keeper/allocation_test.go (L47-63)
+```go
+func TestAllocateTokensToManyValidators(t *testing.T) {
+	app := simapp.Setup(false)
+	ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+	params := app.StakingKeeper.GetParams(ctx)
+	params.MinCommissionRate = sdk.NewDec(0)
+	app.StakingKeeper.SetParams(ctx, params)
+
+	testDistrParms := disttypes.Params{
+		CommunityTax:        sdk.NewDecWithPrec(2, 2), // 2%
+		BaseProposerReward:  sdk.NewDecWithPrec(1, 2), // 1%
+		BonusProposerReward: sdk.NewDecWithPrec(4, 2), // 4%
+		WithdrawAddrEnabled: true,
+	}
+	app.DistrKeeper.SetParams(
+		ctx,
+		testDistrParms,
 	)
 ```
 
-**File:** simapp/app.go (L607-614)
+**File:** x/distribution/keeper/allocation_test.go (L96-101)
 ```go
-func (app *SimApp) ModuleAccountAddrs() map[string]bool {
-	modAccAddrs := make(map[string]bool)
-	for acc := range maccPerms {
-		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+	fees := sdk.NewCoins(sdk.NewCoin(sdk.DefaultBondDenom, sdk.NewInt(100)))
+	feeCollector := app.AccountKeeper.GetModuleAccount(ctx, types.FeeCollectorName)
+	require.NotNil(t, feeCollector)
+
+	// fund fee collector
+	require.NoError(t, simapp.FundModuleAccount(app.BankKeeper, ctx, feeCollector.GetName(), fees))
+```
+
+**File:** x/distribution/keeper/allocation_test.go (L105-114)
+```go
+	votes := []abci.VoteInfo{
+		{
+			Validator:       abciValA,
+			SignedLastBlock: true,
+		},
+		{
+			Validator:       abciValB,
+			SignedLastBlock: true,
+		},
 	}
-
-	return modAccAddrs
-}
-```
-
-**File:** x/bank/keeper/msg_server.go (L47-47)
-```go
-	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
-```
-
-**File:** types/module/module.go (L575-589)
-```go
-		} else {
-			cfgtor, ok := cfg.(configurator)
-			if !ok {
-				// Currently, the only implementator of Configurator (the interface)
-				// is configurator (the struct).
-				return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "expected %T, got %T", configurator{}, cfg)
-			}
-
-			moduleValUpdates := module.InitGenesis(ctx, cfgtor.cdc, module.DefaultGenesis(cfgtor.cdc))
-			ctx.Logger().Info(fmt.Sprintf("adding a new module: %s", moduleName))
-			// The module manager assumes only one module will update the
-			// validator set, and that it will not be by a new module.
-			if len(moduleValUpdates) > 0 {
-				return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "validator InitGenesis updates already set by a previous module")
-			}
-```
-
-**File:** x/mint/genesis.go (L13-13)
-```go
-	ak.GetModuleAccount(ctx, types.ModuleName)
 ```

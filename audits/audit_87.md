@@ -1,318 +1,278 @@
 # Audit Report
 
 ## Title
-Missing Duplicate Validator Validation in Genesis Transaction Collection Causes Total Network Shutdown
+MsgExec Self-Execution Bypasses ValidateBasic Enabling Governance Vote Weight Manipulation
 
 ## Summary
-The `CollectTxs` function fails to validate for duplicate validator operator addresses or consensus public keys when collecting genesis transactions. This allows duplicate validators to be included in genesis.json, causing all network nodes to panic during chain initialization and preventing the blockchain from starting.
+The authz module's `MsgExec` does not validate inner messages during stateless validation. When combined with the self-execution feature (where granter equals grantee), this allows any voter to submit `MsgVoteWeighted` with invalid total weights that bypass validation, enabling vote weight amplification during governance tallying.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- `x/genutil/collect.go` (lines 101-183)
-- `x/genutil/gentx.go` (lines 113-116)
-- `x/staking/keeper/msg_server.go` (lines 42-54)
-- `baseapp/abci.go` (line 73)
+**Location:**
+- [1](#0-0) 
+- [2](#0-1) 
+- [3](#0-2) 
+- [4](#0-3) 
 
-**Intended Logic:**
-During genesis ceremony, the `collect-gentxs` command should comprehensively validate all genesis transactions to ensure they can be successfully applied during chain initialization. This includes verifying that no two validators share the same operator address or consensus public key, as validators must be uniquely identifiable. Invalid genesis transactions should be rejected during collection with proper error messages before being committed to genesis.json.
+**Intended logic:** All transaction messages should undergo stateless validation via `ValidateBasic()` during `CheckTx`. For `MsgVoteWeighted`, this includes verifying the total weight equals exactly 1.0 [5](#0-4) . The ante handler system is designed to call `ValidateBasic()` on all messages [6](#0-5) .
 
-**Actual Logic:**
-The `CollectTxs` function only validates account balances and sufficient delegation funds. [1](#0-0)  After extracting each `MsgCreateValidator` message, the function never maintains tracking maps for validator addresses or consensus public keys to detect duplicates across multiple gentx files. The function simply appends all gentxs to the result set without duplicate checking.
+**Actual logic:** `MsgExec.ValidateBasic()` only validates the grantee address and non-empty messages array - it does NOT call `ValidateBasic()` on inner messages [1](#0-0) . During execution, when granter equals grantee (self-execution), `DispatchActions()` bypasses authorization checks with the comment "If granter != grantee then check authorization.Accept, otherwise we implicitly accept" [2](#0-1) . The `VoteWeighted` handler calls `AddVote()` directly, which only validates individual option weights (0 < weight <= 1) via `ValidWeightedVoteOption()` [7](#0-6) , but does NOT validate that the total weight sum equals 1.0.
 
-Similarly, the `ValidateGenesis` function only checks that transactions decode correctly and contain `MsgCreateValidator` messages, but performs no duplicate validation. [2](#0-1)  The TODO comment at line 113 indicates incomplete validation.
+**Exploitation path:**
+1. Attacker constructs `MsgVoteWeighted` with invalid weights (e.g., YES: 0.8, NO: 0.7, total: 1.5)
+2. Wraps it in `MsgExec` where Grantee = Voter = attacker's own address
+3. Transaction passes `CheckTx` because `MsgExec.ValidateBasic()` doesn't validate inner messages
+4. During `DeliverTx`, `DispatchActions()` extracts granter from inner message's signer (voter address), compares with grantee (same address), and implicitly accepts without authorization checks
+5. `VoteWeighted` handler executes [4](#0-3) , calling `AddVote()` without invoking `ValidateBasic()`
+6. Invalid vote is stored with total weight > 1.0
+7. During tally, voting power is multiplied by each option's weight [8](#0-7)  and [9](#0-8) 
 
-**Exploitation Path:**
-1. During genesis ceremony, multiple validators generate gentx files independently
-2. A malicious genesis participant or configuration error causes a gentx to use the same validator operator address OR consensus public key as another validator
-3. Genesis coordinator runs `collect-gentxs` which calls `CollectTxs`
-4. `CollectTxs` validates both gentxs successfully (only checking account balances)
-5. Both duplicate gentxs are included in the final genesis.json file
-6. All validators download genesis.json and attempt to start their nodes
-7. During `InitChain` ABCI call, the chain initialization proceeds via `app.initChainer` [3](#0-2) 
-8. The genutil module's `InitGenesis` function invokes `DeliverGenTxs` to process genesis transactions
-9. First gentx successfully creates the validator
-10. Second gentx (duplicate) attempts to create the validator, but the staking handler detects the duplicate and returns `ErrValidatorOwnerExists` or `ErrValidatorPubKeyExists` [4](#0-3) 
-11. In `DeliverGenTxs`, the error result causes an immediate panic [5](#0-4) 
-12. The panic propagates through the InitChain call stack with no recovery mechanism
-13. All nodes crash during initialization - complete network shutdown
-
-**Security Guarantee Broken:**
-The network availability guarantee is violated. A single malicious or misconfigured genesis participant can prevent the entire network from ever becoming operational, constituting a denial-of-service vulnerability at the genesis level that exceeds their intended authority.
+**Security guarantee broken:** The validation invariant that all messages must pass `ValidateBasic()` before execution is violated. This breaks the governance integrity assumption that each voter's weight distribution must sum to exactly 1.0.
 
 ## Impact Explanation
 
-**Affected Systems:**
-All network nodes fail to complete chain initialization. The blockchain cannot start:
-- No blocks can be produced
-- No transactions can be processed
-- No consensus rounds can occur  
-- The network remains completely non-operational
+An attacker can manipulate their effective voting power by submitting votes with total weight > 1.0. For example, with total weight = 1.5, a voter with 10% of staking power effectively casts 15% of the vote weight. The tally code directly multiplies voting power by option weights without validation [8](#0-7) , allowing vote weight amplification.
 
-**Severity Justification:**
-This represents a total network shutdown where:
-- The chain is prevented from ever becoming operational
-- 100% of network nodes fail simultaneously during InitChain
-- Failure occurs before any normal consensus or transaction processing begins
-- No self-recovery mechanism exists
-- Manual remediation is required: identifying the problematic gentx, removing it from genesis.json, regenerating the genesis file, redistributing to all validators, and coordinating a restart
-
-This matches the specified Medium severity impact: "Network not being able to confirm new transactions (total network shutdown)".
+This can swing close proposal outcomes, enabling minority stakeholders to pass or reject proposals against the majority's will. While this doesn't directly steal funds, it corrupts the governance process which controls critical protocol operations including parameter changes, community pool spending, and protocol upgrades. This qualifies as Medium severity under "A bug in the network code that results in unintended behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**Who can trigger it:**
-Any participant in the genesis ceremony who submits a gentx. While this is a privileged role, the vulnerability qualifies under the exception rule because even a trusted role can inadvertently trigger an unrecoverable security failure that exceeds their intended authority.
+**Who can trigger:** Any user with voting power (staked tokens or delegations).
 
-**Realistic Scenarios:**
-1. **Accidental triggers:**
-   - Key generation software bugs producing duplicate keys
-   - Configuration file copy-paste errors
-   - Manual setup mistakes in multi-validator environments
-   - Backup/restore operations using outdated configurations
+**Conditions required:**
+- An active governance proposal in voting period
+- Single transaction submission containing `MsgExec` with invalid inner `MsgVoteWeighted`
 
-2. **Malicious triggers:**
-   - Disgruntled genesis participant intentionally submitting duplicate validator
-   - Contentious fork scenario where participant wants to sabotage launch
-   - Compromised genesis participant's system
-
-3. **High-probability contexts:**
-   - Public/permissionless chain launches with many genesis validators
-   - Testnets where validator vetting is less rigorous
-   - Chains with decentralized genesis ceremony processes
-
-**Likelihood Assessment:**
-Once genesis.json contains duplicate validators, the attack succeeds with 100% reliability - every single node will fail to start. The impact (total network shutdown) vastly exceeds the intended authority of a genesis participant, who should only be able to control their own validator submission, not prevent the entire network from launching.
+**Frequency:** Can be exploited during any proposal's voting period. No special setup, timing requirements, or authorization grants needed. The attacker simply submits `MsgExec` with grantee set to their own address, containing `MsgVoteWeighted` with voter also set to their address, causing the granter == grantee condition to skip authorization.
 
 ## Recommendation
 
-Implement duplicate validator validation in the `CollectTxs` function:
+Add validation of inner messages in `MsgExec.ValidateBasic()`:
 
-1. **Before the gentx processing loop**, initialize tracking maps:
-   ```go
-   seenValidatorAddrs := make(map[string]bool)
-   seenConsensusPubKeys := make(map[string]bool)
-   ```
+```go
+func (msg MsgExec) ValidateBasic() error {
+    _, err := sdk.AccAddressFromBech32(msg.Grantee)
+    if err != nil {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+    }
 
-2. **During the loop** (after extracting `MsgCreateValidator`):
-   - Check if `msg.ValidatorAddress` already exists in `seenValidatorAddrs`
-   - Extract the consensus public key from `msg.Pubkey` and check if it exists in `seenConsensusPubKeys`
-   - Return a descriptive error if either duplicate is detected
-   - Add both to their respective maps after validation passes
+    if len(msg.Msgs) == 0 {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+    }
 
-3. **Error message format:**
-   ```go
-   return appGenTxs, persistentPeers, fmt.Errorf(
-       "duplicate validator detected in gentx %s: validator address %s already exists",
-       fo.Name(), msg.ValidatorAddress)
-   ```
+    // Validate inner messages
+    msgs, err := msg.GetMessages()
+    if err != nil {
+        return err
+    }
+    
+    for _, innerMsg := range msgs {
+        if err := innerMsg.ValidateBasic(); err != nil {
+            return sdkerrors.Wrapf(err, "invalid inner message")
+        }
+    }
 
-This ensures duplicate validators are caught during the collection phase (where they fail gracefully with an error message) rather than during chain initialization (where they cause a panic and total network failure).
+    return nil
+}
+```
 
-Additionally, consider enhancing the `ValidateGenesis` function to perform similar checks as a secondary validation layer.
+This ensures all messages undergo stateless validation regardless of how they are submitted.
 
 ## Proof of Concept
 
-The vulnerability can be reproduced with the following test structure in `x/genutil/gentx_test.go`:
+**Test scenario:**
+1. **Setup:** Create a governance proposal in voting period and a voter account with voting power
+2. **Action:** Submit `MsgExec` with Grantee = voter address, containing `MsgVoteWeighted` with Voter = same address and invalid weights (total > 1.0, e.g., YES: 0.8, NO: 0.7)
+3. **Result:** Transaction succeeds, invalid vote is stored with total weight 1.5, and during tally the voter's power is multiplied by 1.5x
 
-**Setup:**
-1. Create test application context with simapp
-2. Fund two different accounts (addr1, addr2) with sufficient token balances
-3. Create two `MsgCreateValidator` messages:
-   - First: uses addr1 as delegator, valAddr1 as operator, pubkey1 as consensus key
-   - Second: uses addr2 as delegator, valAddr1 as operator (duplicate), pubkey2 as consensus key
-4. Encode both messages as properly signed genesis transactions
-5. Create a genesis state containing both gentxs
-
-**Action:**
-```go
-validators, err := genutil.DeliverGenTxs(
-    ctx, 
-    genesisState.GenTxs, 
-    app.StakingKeeper, 
-    app.BaseApp.DeliverTx,
-    encodingConfig.TxConfig,
-)
-```
-
-**Expected Result:**
-The function panics when processing the second gentx because:
-1. First gentx successfully creates validator with valAddr1
-2. Second gentx attempts to create validator with same valAddr1
-3. `CreateValidator` handler returns `ErrValidatorOwnerExists`
-4. `DeliverGenTxs` executes `panic(res.Log)`
-
-The test should use `require.Panics()` to verify the panic occurs, confirming that duplicate validators in genesis transactions cause total initialization failure. The existing test suite already confirms this panic behavior. [6](#0-5) 
-
-**Alternative PoC** (testing duplicate consensus pubkey):
-Repeat the above but use the same consensus pubkey in both `MsgCreateValidator` messages while keeping different operator addresses. This triggers `ErrValidatorPubKeyExists` with the same panic result.
+The vulnerability is reproducible by:
+- Creating `MsgVoteWeighted` with options [YES: 0.8, NO: 0.7] (total: 1.5)
+- Verifying it fails `ValidateBasic()` when submitted directly
+- Wrapping it in `MsgExec` where grantee = voter address
+- Observing that `MsgExec.ValidateBasic()` passes
+- Confirming the vote is stored with total weight 1.5
+- Verifying during tally the voter's power is multiplied by inflated weights
 
 ## Notes
 
-The vulnerability exists due to validation being improperly split across two phases:
-
-1. **Collection phase** (`CollectTxs`) - Only validates account balances and account existence, missing validator uniqueness checks
-2. **Delivery phase** (`DeliverGenTxs`) - Validates validator uniqueness through the staking handler, but uses panic for failure handling
-
-This architectural gap allows malicious gentxs to pass initial validation but trigger unrecoverable panics during deployment. The proper solution is to move validator uniqueness validation to the collection phase where errors can be returned gracefully, preventing problematic genesis files from being created in the first place.
-
-The TODO comment at line 138 of collect.go ("TODO abstract out staking message validation back to staking") suggests the developers recognized that staking validation is incomplete in the current implementation. [7](#0-6)
+This vulnerability exists because `MsgExec.ValidateBasic()` does not validate inner messages [1](#0-0) , and the self-execution code path bypasses authorization when granter == grantee [2](#0-1) . The governance module's `AddVote()` only validates individual option validity [3](#0-2) , not total weight constraints, allowing invalid votes to be stored and tallied with amplified weight.
 
 ### Citations
 
-**File:** x/genutil/collect.go (L101-183)
+**File:** x/authz/msgs.go (L221-232)
 ```go
-	for _, fo := range fos {
-		if fo.IsDir() {
-			continue
-		}
-		if !strings.HasSuffix(fo.Name(), ".json") {
-			continue
-		}
-
-		// get the genTx
-		jsonRawTx, err := ioutil.ReadFile(filepath.Join(genTxsDir, fo.Name()))
-		if err != nil {
-			return appGenTxs, persistentPeers, err
-		}
-
-		var genTx sdk.Tx
-		if genTx, err = txJSONDecoder(jsonRawTx); err != nil {
-			return appGenTxs, persistentPeers, err
-		}
-
-		appGenTxs = append(appGenTxs, genTx)
-
-		// the memo flag is used to store
-		// the ip and node-id, for example this may be:
-		// "528fd3df22b31f4969b05652bfe8f0fe921321d5@192.168.2.37:26656"
-
-		memoTx, ok := genTx.(sdk.TxWithMemo)
-		if !ok {
-			return appGenTxs, persistentPeers, fmt.Errorf("expected TxWithMemo, got %T", genTx)
-		}
-		nodeAddrIP := memoTx.GetMemo()
-		if len(nodeAddrIP) == 0 {
-			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
-		}
-
-		// genesis transactions must be single-message
-		msgs := genTx.GetMsgs()
-
-		// TODO abstract out staking message validation back to staking
-		msg := msgs[0].(*stakingtypes.MsgCreateValidator)
-
-		// validate delegator and validator addresses and funds against the accounts in the state
-		delAddr := msg.DelegatorAddress
-		valAddr, err := sdk.ValAddressFromBech32(msg.ValidatorAddress)
-		if err != nil {
-			return appGenTxs, persistentPeers, err
-		}
-
-		delBal, delOk := balancesMap[delAddr]
-		if !delOk {
-			_, file, no, ok := runtime.Caller(1)
-			if ok {
-				fmt.Printf("CollectTxs-1, called from %s#%d\n", file, no)
-			}
-
-			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", delAddr, balancesMap)
-		}
-
-		_, valOk := balancesMap[sdk.AccAddress(valAddr).String()]
-		if !valOk {
-			_, file, no, ok := runtime.Caller(1)
-			if ok {
-				fmt.Printf("CollectTxs-2, called from %s#%d - %s\n", file, no, sdk.AccAddress(msg.ValidatorAddress).String())
-			}
-			return appGenTxs, persistentPeers, fmt.Errorf("account %s balance not in genesis state: %+v", valAddr, balancesMap)
-		}
-
-		if delBal.GetCoins().AmountOf(msg.Value.Denom).LT(msg.Value.Amount) {
-			return appGenTxs, persistentPeers, fmt.Errorf(
-				"insufficient fund for delegation %v: %v < %v",
-				delBal.GetAddress().String(), delBal.GetCoins().AmountOf(msg.Value.Denom), msg.Value.Amount,
-			)
-		}
-
-		// exclude itself from persistent peers
-		if msg.Description.Moniker != moniker {
-			addressesIPs = append(addressesIPs, nodeAddrIP)
-		}
+func (msg MsgExec) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
 	}
 
-	sort.Strings(addressesIPs)
-	persistentPeers = strings.Join(addressesIPs, ",")
-
-	return appGenTxs, persistentPeers, nil
-```
-
-**File:** x/genutil/types/genesis_state.go (L98-120)
-```go
-// ValidateGenesis validates GenTx transactions
-func ValidateGenesis(genesisState *GenesisState, txJSONDecoder sdk.TxDecoder) error {
-	for i, genTx := range genesisState.GenTxs {
-		var tx sdk.Tx
-		tx, err := txJSONDecoder(genTx)
-		if err != nil {
-			return err
-		}
-
-		msgs := tx.GetMsgs()
-		if len(msgs) != 1 {
-			return errors.New(
-				"must provide genesis Tx with exactly 1 CreateValidator message")
-		}
-
-		// TODO: abstract back to staking
-		if _, ok := msgs[0].(*stakingtypes.MsgCreateValidator); !ok {
-			return fmt.Errorf(
-				"genesis transaction %v does not contain a MsgCreateValidator", i)
-		}
+	if len(msg.Msgs) == 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
 	}
+
 	return nil
 }
 ```
 
-**File:** baseapp/abci.go (L73-73)
+**File:** x/authz/keeper/keeper.go (L87-111)
 ```go
-	resp := app.initChainer(app.deliverState.ctx, *req)
-```
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
 
-**File:** x/staking/keeper/msg_server.go (L42-54)
-```go
-	// check to see if the pubkey or sender has been registered before
-	if _, found := k.GetValidator(ctx, valAddr); found {
-		return nil, types.ErrValidatorOwnerExists
-	}
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
 
-	pk, ok := msg.Pubkey.GetCachedValue().(cryptotypes.PubKey)
-	if !ok {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "Expecting cryptotypes.PubKey, got %T", pk)
-	}
-
-	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
-		return nil, types.ErrValidatorPubKeyExists
-	}
-```
-
-**File:** x/genutil/gentx.go (L113-116)
-```go
-		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
-		if !res.IsOK() {
-			panic(res.Log)
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
 		}
 ```
 
-**File:** x/genutil/gentx_test.go (L272-277)
+**File:** x/gov/keeper/vote.go (L21-25)
 ```go
-				suite.Require().Panics(func() {
-					genutil.DeliverGenTxs(
-						ctx, genTxs, suite.app.StakingKeeper, suite.app.BaseApp.DeliverTx,
-						suite.encodingConfig.TxConfig,
-					)
-				})
+	for _, option := range options {
+		if !types.ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
+		}
+	}
+```
+
+**File:** x/gov/keeper/msg_server.go (L93-121)
+```go
+func (k msgServer) VoteWeighted(goCtx context.Context, msg *types.MsgVoteWeighted) (*types.MsgVoteWeightedResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	accAddr, accErr := sdk.AccAddressFromBech32(msg.Voter)
+	if accErr != nil {
+		return nil, accErr
+	}
+	err := k.Keeper.AddVote(ctx, msg.ProposalId, accAddr, msg.Options)
+	if err != nil {
+		return nil, err
+	}
+
+	defer telemetry.IncrCounterWithLabels(
+		[]string{types.ModuleName, "vote"},
+		1,
+		[]metrics.Label{
+			telemetry.NewLabel("proposal_id", strconv.Itoa(int(msg.ProposalId))),
+		},
+	)
+
+	ctx.EventManager().EmitEvent(
+		sdk.NewEvent(
+			sdk.EventTypeMessage,
+			sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+			sdk.NewAttribute(sdk.AttributeKeySender, msg.Voter),
+		),
+	)
+
+	return &types.MsgVoteWeightedResponse{}, nil
+}
+```
+
+**File:** x/gov/types/msgs.go (L243-274)
+```go
+func (msg MsgVoteWeighted) ValidateBasic() error {
+	if msg.Voter == "" {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, msg.Voter)
+	}
+
+	if len(msg.Options) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, WeightedVoteOptions(msg.Options).String())
+	}
+
+	totalWeight := sdk.NewDec(0)
+	usedOptions := make(map[VoteOption]bool)
+	for _, option := range msg.Options {
+		if !ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(ErrInvalidVote, option.String())
+		}
+		totalWeight = totalWeight.Add(option.Weight)
+		if usedOptions[option.Option] {
+			return sdkerrors.Wrap(ErrInvalidVote, "Duplicated vote option")
+		}
+		usedOptions[option.Option] = true
+	}
+
+	if totalWeight.GT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight overflow 1.00")
+	}
+
+	if totalWeight.LT(sdk.NewDec(1)) {
+		return sdkerrors.Wrap(ErrInvalidVote, "Total weight lower than 1.00")
+	}
+
+	return nil
+}
+```
+
+**File:** x/auth/ante/basic.go (L18-39)
+```go
+// ValidateBasicDecorator will call tx.ValidateBasic and return any non-nil error.
+// If ValidateBasic passes, decorator calls next AnteHandler in chain. Note,
+// ValidateBasicDecorator decorator will not get executed on ReCheckTx since it
+// is not dependent on application state.
+type ValidateBasicDecorator struct{}
+
+func NewValidateBasicDecorator() ValidateBasicDecorator {
+	return ValidateBasicDecorator{}
+}
+
+func (vbd ValidateBasicDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+	// no need to validate basic on recheck tx, call next antehandler
+	if ctx.IsReCheckTx() {
+		return next(ctx, tx, simulate)
+	}
+
+	if err := tx.ValidateBasic(); err != nil {
+		return ctx, err
+	}
+
+	return next(ctx, tx, simulate)
+}
+```
+
+**File:** x/gov/types/vote.go (L80-85)
+```go
+func ValidWeightedVoteOption(option WeightedVoteOption) bool {
+	if !option.Weight.IsPositive() || option.Weight.GT(sdk.NewDec(1)) {
+		return false
+	}
+	return ValidVoteOption(option.Option)
+}
+```
+
+**File:** x/gov/keeper/tally.go (L59-62)
+```go
+				for _, option := range vote.Options {
+					subPower := votingPower.Mul(option.Weight)
+					results[option.Option] = results[option.Option].Add(subPower)
+				}
+```
+
+**File:** x/gov/keeper/tally.go (L82-85)
+```go
+		for _, option := range val.Vote {
+			subPower := votingPower.Mul(option.Weight)
+			results[option.Option] = results[option.Option].Add(subPower)
+		}
 ```

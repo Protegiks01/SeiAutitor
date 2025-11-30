@@ -1,216 +1,169 @@
-Based on my investigation, I will now validate this security claim.
-
-## Investigation Summary
-
-I have traced through the complete execution flow and verified each component of the claim:
-
-**1. Code Path Verification:**
-
-The panic occurs in `HandleValidatorSignatureConcurrent` when it cannot find a validator's pubkey: [1](#0-0) 
-
-The pubkey is deleted immediately when a validator is removed: [2](#0-1) 
-
-This hook is called during validator removal: [3](#0-2) 
-
-**2. Timing Analysis:**
-
-ValidatorUpdateDelay is set to 1 block: [4](#0-3) 
-
-This means when a validator set update is returned at the end of block N, the validator stops signing at block N+2, but still signs block N+1.
-
-The critical sequence in `BlockValidatorUpdates`: [5](#0-4) 
-
-When unbonding completes and delegator shares are zero, the validator is immediately removed: [6](#0-5) 
-
-**3. Trigger Conditions:**
-
-The code explicitly supports instant unbonding scenarios: [7](#0-6) 
-
-The validation only requires positive unbonding time: [8](#0-7) 
-
-**4. Evidence of Correct Pattern:**
-
-The evidence keeper demonstrates the correct architectural approach - graceful handling instead of panicking: [9](#0-8) 
-
-## Validation Decision
-
-This is a **VALID** vulnerability with **Medium** severity.
-
 # Audit Report
 
 ## Title
-Chain Halt Due to Race Condition Between Validator Removal and Signature Processing
+Off-by-One Error in Double-Sign Slashing Causes Incorrect Slashing of Unbonding Delegations
 
 ## Summary
-When a validator completes unbonding with zero delegator shares, the `AfterValidatorRemoved` hook immediately deletes its pubkey mapping. However, due to ValidatorUpdateDelay (1 block), the next block's BeginBlocker must still process this validator's signature from the previous block. When `GetPubkey` fails, the system panics, causing a complete chain halt.
+The evidence handler contains an off-by-one error when calculating the infraction height parameter for slashing unbonding delegations. When processing double-sign evidence, it passes `distributionHeight` (infractionHeight - 1) instead of the actual infraction height, causing unbonding delegations initiated at the exact block where the validator set was finalized to be incorrectly slashed, even though their stake did not contribute to the validator's voting power during the infraction.
 
 ## Impact
 Medium
 
 ## Finding Description
-- **location:** `x/slashing/keeper/infractions.go` line 28-30 (panic point), `x/slashing/keeper/hooks.go` line 42 (premature deletion), `x/staking/keeper/validator.go` line 180 (removal trigger)
 
-- **intended logic:** Validator metadata should remain accessible for processing signatures from blocks where the validator was still in the active set. Cleanup should occur only after all signature processing is complete.
+**Location:**
+- Primary: [1](#0-0) 
+- Secondary: [2](#0-1) 
 
-- **actual logic:** The `AfterValidatorRemoved` hook deletes the pubkey mapping immediately during `RemoveValidator`. However, ValidatorUpdateDelay causes a 1-block lag where the removed validator's signature from the previous block must still be processed in the next block's BeginBlocker. When `HandleValidatorSignatureConcurrent` calls `GetPubkey`, it receives an error and panics.
+**Intended Logic:**
+According to the staking specification [3](#0-2) , only unbonding delegations where "the infraction occurred before the unbonding began" should be slashed. The system should follow the "follow the usei" principle [4](#0-3) , meaning only stake that actively contributed to a validator's voting power at the time of an infraction should be slashed.
 
-- **exploitation path:**
-  1. Block N EndBlocker: A validator with zero delegations completes its unbonding period (requires unbonding time ≤ block time)
-  2. `ApplyAndReturnValidatorSetUpdates` returns a zero-power update for the validator
-  3. `UnbondAllMatureValidators` calls `RemoveValidator` since delegator shares are zero
-  4. `AfterValidatorRemoved` hook deletes the pubkey mapping
-  5. Block N+1 BeginBlocker: Processes `LastCommitInfo.Votes` from block N
-  6. Block N was signed by the old validator set (including the removed validator)
-  7. `HandleValidatorSignatureConcurrent` is called for the removed validator
-  8. `GetPubkey` returns error "address not found"
-  9. System panics with "Validator consensus-address %s not found"
-  10. Chain halts completely, requiring manual intervention
+When a delegator unbonds at block H-1:
+1. During DeliverTx, the `Undelegate` function sets CreationHeight = ctx.BlockHeight() = H-1 [5](#0-4) 
+2. Validator tokens are immediately reduced [6](#0-5) 
+3. At EndBlock(H-1), the validator set for block H is calculated with the reduced power
+4. At block H, the validator signs with reduced power (unbonded stake is NOT part of voting power)
 
-- **security guarantee broken:** The blockchain's liveness guarantee is violated. The system cannot recover automatically and requires coordinated manual intervention or an emergency patch.
+**Actual Logic:**
+The evidence handler calculates `distributionHeight = infractionHeight - ValidatorUpdateDelay` where ValidatorUpdateDelay = 1 [7](#0-6) , and passes `distributionHeight` as the infraction height parameter to the Slash function. For a double-sign at block H, this becomes H-1.
+
+The slashing check uses `entry.CreationHeight < infractionHeight` to determine which delegations to skip. For an unbonding with CreationHeight = H-1 and infractionHeight parameter = H-1, the check evaluates to `H-1 < H-1` → false, so the entry is NOT skipped and IS slashed incorrectly.
+
+**Exploitation Path:**
+1. Delegator submits unbonding transaction at block H-1 (normal operation)
+2. Transaction processed with CreationHeight = H-1, validator's power reduced immediately
+3. EndBlock(H-1) calculates validator set for block H with reduced power
+4. Validator double-signs at block H (with reduced power that doesn't include unbonded stake)
+5. Evidence handler calculates distributionHeight = H-1 and passes it as infraction height
+6. Slash function incorrectly slashes the unbonding because `H-1 < H-1` evaluates to false
+7. Delegator loses SlashFractionDoubleSign (typically 5%) of their unbonding amount
+
+**Security Guarantee Broken:**
+This violates the documented invariant that only stake contributing to an infraction should be penalized. The unbonded stake was removed from the validator's power before the validator set for block H was finalized, so it did not contribute to the validator's voting power when the double-sign occurred at block H.
 
 ## Impact Explanation
-This vulnerability causes complete network shutdown matching the "Network not being able to confirm new transactions (total network shutdown)" impact category. All validators are unable to progress past the block where the panic occurs. The chain cannot self-recover and requires external coordination, emergency patch deployment, or potentially a hard fork to resume operations.
+Delegators who unbond from a validator at the exact block height where the validator set is finalized (distributionHeight) suffer direct loss of funds when that validator subsequently double-signs at the next block. The typical SlashFractionDoubleSign is 5%, representing a permanent loss of the delegators' unbonding funds. This directly violates the core security principle that penalties should only apply to stake that actively contributed to the misbehavior.
+
+This qualifies as a "Direct loss of funds" impact, albeit conditional on specific timing and validator misbehavior.
 
 ## Likelihood Explanation
-**Production environments:** Very low likelihood due to standard 3-week unbonding periods creating a sufficient timing buffer.
+This issue occurs when:
+1. A delegator unbonds from a validator at block height H-1 (routine operation)
+2. The same validator commits a double-sign infraction at block height H (rare but significant event)
 
-**Test environments:** High likelihood as instant unbonding is commonly used.
-
-**Triggering conditions:**
-- Requires unbonding time ≤ block time for the race condition to occur
-- The code explicitly supports this configuration through validation accepting any positive duration
-- Can be triggered through normal validator operations (delegator unbonding)
-- No special privileges or malicious intent required
-
-**Configuration validity:** The code explicitly acknowledges and supports instant unbonding scenarios, making this a legitimate code defect rather than a misconfiguration issue.
+While double-sign events are relatively rare, unbonding is a routine operation in any active Proof-of-Stake network. When a double-sign does occur, any delegators who happened to unbond at the specific height (distributionHeight) will be incorrectly slashed. This occurs in normal network operation without requiring any special conditions or privileged access. The likelihood is low due to the narrow timing window, but the impact when it occurs is direct loss of funds.
 
 ## Recommendation
-Implement graceful handling of missing pubkeys in `HandleValidatorSignatureConcurrent`, consistent with the evidence keeper's approach:
+Modify the evidence handler to pass `distributionHeight + 1` instead of `distributionHeight` to the Slash function:
 
 ```go
-consAddr = sdk.ConsAddress(addr)
-if _, err := k.GetPubkey(ctx, addr); err != nil {
-    logger.Info("Validator pubkey not found, likely recently removed", "address", consAddr)
-    return
-}
+k.slashingKeeper.Slash(
+    ctx,
+    consAddr,
+    k.slashingKeeper.SlashFractionDoubleSign(ctx),
+    evidence.GetValidatorPower(), 
+    distributionHeight + 1,  // Changed from distributionHeight
+)
 ```
 
-Alternatively, delay pubkey deletion in the `AfterValidatorRemoved` hook for ValidatorUpdateDelay + 1 blocks to ensure signature processing completes before cleanup.
+This ensures the infraction height parameter correctly represents the actual block where the infraction occurred (H), not where the validator set was determined (H-1). The slashing check will then correctly evaluate to `H-1 < H` → true, skipping unbonding delegations whose stake was removed before the validator set for the infraction block was finalized.
 
 ## Proof of Concept
+
 **Setup:**
-1. Create test app with unbonding period of 1 nanosecond
-2. Create validator with self-delegation
-3. Call EndBlocker to bond the validator
-4. Undelegate all tokens
+1. Initialize a validator with delegated stake at block 100
+2. Execute EndBlock(100) to finalize validator set for block 101
 
 **Action:**
-1. Call EndBlocker - triggers `UnbondAllMatureValidators` which removes validator and deletes pubkey
-2. Advance to next block
-3. Call BeginBlocker with `LastCommitInfo` containing the removed validator's vote
+1. At block 101 during DeliverTx: Delegator submits unbonding transaction, `Undelegate` sets CreationHeight = 101, validator's tokens reduced
+2. At EndBlock(101): Validator set for block 102 calculated with reduced power
+3. At block 102: Validator double-signs
+4. Evidence processing: `distributionHeight = 102 - 1 = 101`, `SlashUnbondingDelegation` called with `infractionHeight = 101`
+5. Slashing check: `101 < 101` → false, unbonding IS slashed
 
 **Result:**
-Panic occurs with message "Validator consensus-address %s not found" when BeginBlocker attempts to call `GetPubkey` for the removed validator, demonstrating the chain halt vulnerability.
+- Expected: Slash amount = 0 (stake didn't contribute to infraction)
+- Actual: Slash amount = 5% of unbonding amount
+- Demonstrates stake that did not contribute to validator's power at infraction is incorrectly slashed
+
+**Note:** The existing test [8](#0-7)  tests the case where CreationHeight = 0 and infractionHeight = 1 (clearly before), but does not test the boundary case where CreationHeight equals distributionHeight, which is where the off-by-one error manifests.
 
 ## Notes
-While this primarily affects test environments, it represents a legitimate code defect because:
-1. The code explicitly supports short unbonding periods through permissive validation
-2. The evidence keeper demonstrates graceful handling as the correct architectural pattern
-3. The failure mode (panic causing chain halt) is catastrophic and requires manual intervention
-4. Chains might theoretically choose shorter unbonding periods for operational reasons
-5. This creates an architectural inconsistency that should be resolved for defensive programming and system robustness
+This is a valid vulnerability that causes direct loss of funds for delegators under specific conditions. The technical analysis is sound, and the issue violates documented security invariants. While the likelihood is reduced by the requirement for a double-sign event to occur at the specific next block, the impact when it occurs is real and measurable. The vulnerability can be triggered through normal network operations without requiring privileged access or special conditions beyond standard validator misbehavior (which the protocol explicitly handles and penalizes).
 
 ### Citations
 
-**File:** x/slashing/keeper/infractions.go (L28-30)
+**File:** x/evidence/keeper/infraction.go (L101-112)
 ```go
-	if _, err := k.GetPubkey(ctx, addr); err != nil {
-		panic(fmt.Sprintf("Validator consensus-address %s not found", consAddr))
+	distributionHeight := infractionHeight - sdk.ValidatorUpdateDelay
+
+	// Slash validator. The `power` is the int64 power of the validator as provided
+	// to/by Tendermint. This value is validator.Tokens as sent to Tendermint via
+	// ABCI, and now received as evidence. The fraction is passed in to separately
+	// to slash unbonding and rebonding delegations.
+	k.slashingKeeper.Slash(
+		ctx,
+		consAddr,
+		k.slashingKeeper.SlashFractionDoubleSign(ctx),
+		evidence.GetValidatorPower(), distributionHeight,
+	)
+```
+
+**File:** x/staking/keeper/slash.go (L174-177)
+```go
+		// If unbonding started before this height, stake didn't contribute to infraction
+		if entry.CreationHeight < infractionHeight {
+			continue
+		}
+```
+
+**File:** x/staking/spec/02_state_transitions.md (L133-134)
+```markdown
+- Every unbonding delegation and pseudo-unbonding redelegation such that the infraction occured before the unbonding or
+  redelegation began from the validator are slashed by the `slashFactor` percentage of the initialBalance.
+```
+
+**File:** x/evidence/spec/06_begin_block.md (L40-44)
+```markdown
+If valid `Equivocation` evidence is included in a block, the validator's stake is
+reduced (slashed) by `SlashFractionDoubleSign` as defined by the `x/slashing` module
+of what their stake was when the infraction occurred, rather than when the evidence was discovered.
+We want to "follow the usei", i.e., the stake that contributed to the infraction
+should be slashed, even if it has since been redelegated or started unbonding.
+```
+
+**File:** x/staking/keeper/delegation.go (L848-850)
+```go
+	if validator.IsBonded() {
+		k.bondedTokensToNotBonded(ctx, returnAmount)
 	}
 ```
 
-**File:** x/slashing/keeper/hooks.go (L41-43)
+**File:** x/staking/keeper/delegation.go (L853-853)
 ```go
-func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
-	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
-}
+	ubd := k.SetUnbondingDelegationEntry(ctx, delAddr, valAddr, ctx.BlockHeight(), completionTime, returnAmount)
 ```
 
-**File:** x/staking/keeper/validator.go (L180-180)
+**File:** types/staking.go (L26-26)
 ```go
-	k.AfterValidatorRemoved(ctx, valConsAddr, validator.GetOperator())
-```
-
-**File:** x/staking/keeper/validator.go (L441-444)
-```go
-				val = k.UnbondingToUnbonded(ctx, val)
-				if val.GetDelegatorShares().IsZero() {
-					k.RemoveValidator(ctx, val.GetOperator())
-				}
-```
-
-**File:** types/staking.go (L17-26)
-```go
-	// Delay, in blocks, between when validator updates are returned to the
-	// consensus-engine and when they are applied. For example, if
-	// ValidatorUpdateDelay is set to X, and if a validator set update is
-	// returned with new validators at the end of block 10, then the new
-	// validators are expected to sign blocks beginning at block 11+X.
-	//
-	// This value is constant as this should not change without a hard fork.
-	// For Tendermint this should be set to 1 block, for more details see:
-	// https://tendermint.com/docs/spec/abci/apps.html#endblock
 	ValidatorUpdateDelay int64 = 1
 ```
 
-**File:** x/staking/keeper/val_state_change.go (L17-33)
+**File:** x/staking/keeper/slash_test.go (L75-89)
 ```go
-func (k Keeper) BlockValidatorUpdates(ctx sdk.Context) []abci.ValidatorUpdate {
-	// Calculate validator set changes.
-	//
-	// NOTE: ApplyAndReturnValidatorSetUpdates has to come before
-	// UnbondAllMatureValidatorQueue.
-	// This fixes a bug when the unbonding period is instant (is the case in
-	// some of the tests). The test expected the validator to be completely
-	// unbonded after the Endblocker (go from Bonded -> Unbonding during
-	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
-	// UnbondAllMatureValidatorQueue).
-	validatorUpdates, err := k.ApplyAndReturnValidatorSetUpdates(ctx)
-	if err != nil {
-		panic(err)
-	}
+func TestSlashUnbondingDelegation(t *testing.T) {
+	app, ctx, addrDels, addrVals := bootstrapSlashTest(t, 10)
 
-	// unbond all mature validators from the unbonding queue
-	k.UnbondAllMatureValidators(ctx)
-```
+	fraction := sdk.NewDecWithPrec(5, 1)
 
-**File:** x/staking/types/params.go (L167-177)
-```go
-func validateUnbondingTime(i interface{}) error {
-	v, ok := i.(time.Duration)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
+	// set an unbonding delegation with expiration timestamp (beyond which the
+	// unbonding delegation shouldn't be slashed)
+	ubd := types.NewUnbondingDelegation(addrDels[0], addrVals[0], 0,
+		time.Unix(5, 0), sdk.NewInt(10))
 
-	if v <= 0 {
-		return fmt.Errorf("unbonding time must be positive: %d", v)
-	}
+	app.StakingKeeper.SetUnbondingDelegation(ctx, ubd)
 
-	return nil
-```
-
-**File:** x/evidence/keeper/infraction.go (L29-40)
-```go
-	if _, err := k.slashingKeeper.GetPubkey(ctx, consAddr.Bytes()); err != nil {
-		// Ignore evidence that cannot be handled.
-		//
-		// NOTE: We used to panic with:
-		// `panic(fmt.Sprintf("Validator consensus-address %v not found", consAddr))`,
-		// but this couples the expectations of the app to both Tendermint and
-		// the simulator.  Both are expected to provide the full range of
-		// allowable but none of the disallowed evidence types.  Instead of
-		// getting this coordination right, it is easier to relax the
-		// constraints and ignore evidence that cannot be handled.
-		return
-	}
+	// unbonding started prior to the infraction height, stakw didn't contribute
+	slashAmount := app.StakingKeeper.SlashUnbondingDelegation(ctx, ubd, 1, fraction)
+	require.True(t, slashAmount.Equal(sdk.NewInt(0)))
 ```

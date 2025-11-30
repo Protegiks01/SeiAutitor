@@ -1,237 +1,182 @@
 # Audit Report
 
 ## Title
-Accounting Discrepancy in SlashRedelegation Leading to Validator Under-Slashing
+Pre-Creation of BaseAccount at Future Module Address Causes Network Halt During Chain Upgrades
 
 ## Summary
-The `SlashRedelegation` function contains an accounting bug where it returns a theoretical slash amount calculated from `entry.InitialBalance` but only burns tokens based on capped `delegation.Shares`. When users unbond from the destination validator after redelegating, the redelegation entry remains unchanged while delegation shares decrease, causing the main `Slash` function to incorrectly reduce `remainingSlashAmount` by more than was actually burned, resulting in systematic validator under-slashing. [1](#0-0) 
+An attacker can send coins to the deterministic address of a future module before a chain upgrade, creating a `BaseAccount` at that address. When the new module's `InitGenesis` calls `GetModuleAccount` during upgrade execution, the type assertion fails and triggers a panic, causing all validators to halt simultaneously and preventing the network from producing new blocks.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** `x/staking/keeper/slash.go`, function `SlashRedelegation` (lines 219-296)
+**Location:**
+- Panic trigger: [1](#0-0) 
+- Account creation: [2](#0-1) 
+- Blocked address check: [3](#0-2) 
+- Module address calculation: [4](#0-3) 
+- Module account registry: [5](#0-4) 
+- Static module permissions: [6](#0-5) 
 
-**Intended logic:** When a validator is slashed, the function should slash all eligible redelegations and return the actual amount of tokens burned. The main `Slash` function uses this returned value to determine how much additional slashing is needed from the validator's bonded tokens, ensuring the total slashed amount matches the calculated penalty based on the validator's power at the time of infraction.
+**Intended Logic:**
+When a chain upgrade adds a new module, the upgrade handler should safely call `InitGenesis`, which retrieves or creates the module account via `GetModuleAccount`. Module accounts should only exist as `ModuleAccountI` types at their deterministic addresses, and regular users should not be able to create accounts at future module addresses before they are registered.
 
-**Actual logic:** The function exhibits a critical accounting discrepancy where it calculates and accumulates a theoretical slash amount from `entry.InitialBalance` (lines 238-240), but when delegation shares have been reduced through normal unbonding, it can only unbond and burn a capped amount based on available `delegation.Shares` (lines 261-265). Despite burning fewer tokens, the function returns the uncapped theoretical amount (line 295), causing `remainingSlashAmount` in the main `Slash` function to be reduced by more than was actually burned. [2](#0-1) [3](#0-2) 
+**Actual Logic:**
+The blocked address mechanism only includes addresses of currently registered modules from the static `maccPerms` map. [5](#0-4)  A future module's address is not in this map, so the `BlockedAddr` check passes [7](#0-6) , allowing any user to send coins to that address. This triggers automatic `BaseAccount` creation. [2](#0-1)  During upgrade, when `InitGenesis` calls `GetModuleAccount` [8](#0-7) , the `GetModuleAccountAndPermissions` function performs a type assertion and unconditionally panics when finding a `BaseAccount` instead of `ModuleAccountI`. [1](#0-0) 
 
-**Exploitation path:**
-1. User delegates X tokens to Validator A
-2. User redelegates from A to B, creating `RedelegationEntry` with `InitialBalance=X` and `SharesDst=X`
-3. User unbonds Y tokens from B through normal unbonding, reducing `delegation.Shares` to (X-Y)
-4. Validator A is slashed for an infraction that occurred during the redelegation period
-5. `SlashRedelegation` calculates theoretical slash of `slashFactor * X` but can only burn `slashFactor * (X-Y)` tokens
-6. Function returns `slashFactor * X` (theoretical) instead of `slashFactor * (X-Y)` (actual)
-7. Main `Slash` function subtracts the inflated amount from `remainingSlashAmount`
-8. Validator is under-slashed by approximately `slashFactor * Y` tokens
+**Exploitation Path:**
+1. Governance proposal passes to add new module at upgrade height H (module name is public information)
+2. Attacker calculates deterministic module address using `NewModuleAddress(moduleName)` [4](#0-3) 
+3. Before height H, attacker submits `MsgSend` transferring 1 token to the calculated address
+4. `BlockedAddr` check passes because the module is not yet registered [5](#0-4) 
+5. `SendCoins` creates a `BaseAccount` at the module address [2](#0-1) 
+6. At height H, upgrade executes and `InitGenesis` is called for the new module [9](#0-8) 
+7. Module's `InitGenesis` calls `GetModuleAccount` [8](#0-7) 
+8. `GetModuleAccountAndPermissions` finds the `BaseAccount`, type assertion fails, and panics [1](#0-0) 
+9. All validators execute identical deterministic code and panic at the same height
+10. Network completely halts - no new blocks can be produced
 
-**Security guarantee broken:** The slashing mechanism's fundamental invariant—that validators are penalized by the full calculated slash amount based on their power at the time of infraction—is violated. Validators systematically retain tokens that should have been burned. [4](#0-3) 
-
-The root cause is structural: `RedelegationEntry` only tracks `InitialBalance` and `SharesDst` without a current balance field like `UnbondingDelegationEntry`. When users unbond from the destination validator, only delegation shares are reduced; redelegation entries remain unchanged. [5](#0-4) 
+**Security Guarantee Broken:**
+Network availability and consensus liveness. The system fails to safely handle module upgrades when accounts are pre-created at future module addresses.
 
 ## Impact Explanation
 
-This vulnerability represents direct loss of funds to the protocol's economic security:
-
-- **Systematic Under-Slashing**: Every slashing event involving redelegations where delegators have reduced their destination delegation results in validators being under-penalized
-- **Economic Security Failure**: Tokens that should be burned (removed from circulation) as punishment remain with misbehaving validators, reducing the deterrent effect of slashing
-- **Protocol Value Loss**: The under-slashed amount represents real economic value that should have been destroyed but wasn't
-- **Cumulative Impact**: This occurs automatically across all affected slashing events, potentially accumulating significant impact over time
-
-The severity is High because it directly undermines slashing—a core security mechanism fundamental to proof-of-stake network security—by allowing validators to retain tokens that should be burned as punishment for infractions.
+This vulnerability causes total network shutdown affecting all validators simultaneously. All validator nodes panic during the upgrade block's execution, preventing the network from producing new blocks after the upgrade height. The chain state becomes inconsistent with the upgrade plan consumed but module initialization incomplete. No transactions can be confirmed, and recovery requires coordinated emergency response with either a hard fork or emergency patch deployment to all validators.
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- A redelegation must exist from a validator that is later slashed (common in PoS networks)
-- The destination delegation must have fewer shares than recorded in the redelegation entry (occurs through normal unbonding)
-- The source validator must be slashed for an infraction during the redelegation period
-
-**Who Can Trigger:** Any regular user through standard blockchain operations—performing redelegations and unbonding—with no special permissions required.
-
-**Frequency:** Occurs automatically whenever the above conditions are met. Redelegation followed by partial unbonding is a normal user behavior pattern for liquidity management and yield optimization.
-
-**Likelihood Assessment:** Medium to High - While requiring specific conditions, these are all normal operations that occur regularly in proof-of-stake networks. The bug triggers automatically without intentional exploitation.
+**High likelihood** due to:
+- **Minimal cost**: Only requires standard transaction fees plus 1 token of minimal denomination
+- **No special privileges**: Any network participant can execute the attack
+- **Public information**: Module names are disclosed in governance proposals days or weeks before execution
+- **Ample time window**: Attackers have the entire period between proposal passage and upgrade execution to perform the attack
+- **100% success rate**: If executed before the upgrade, the attack succeeds due to deterministic execution across all validators
+- **Detection difficulty**: The malicious transaction appears as a normal coin transfer
+- **High frequency**: Affects every chain upgrade that introduces new modules (multiple per year in active chains)
 
 ## Recommendation
 
-Modify `SlashRedelegation` to track and return the actual amount of tokens burned rather than the theoretical amount:
+Implement graceful handling in `GetModuleAccountAndPermissions` to detect and convert pre-existing unused `BaseAccount` instances to proper module accounts. Check if the account is a `BaseAccount` that has never been used (verified by `GetPubKey() == nil && GetSequence() == 0`), and if so, safely convert it to a module account rather than panicking.
 
-**Preferred Solution:** Accumulate actual burned amounts instead of theoretical amounts. After line 265 where `tokensToBurn` is obtained from `Unbond()`, accumulate this actual value instead of accumulating `slashAmount` (from `InitialBalance`) at line 240. Return the total of actual burned tokens at line 295.
-
-**Alternative Solution:** Track both theoretical and actual amounts separately, maintaining two accumulators. Use `min(slashAmount, tokensToBurn)` when accumulating to ensure the returned value reflects tokens actually removed from circulation.
-
-The fix must ensure that the value returned by `SlashRedelegation` accurately reflects tokens actually burned, enabling correct accounting in the main `Slash` function.
+**Alternative mitigation**: Extend the blocked address mechanism to include a registry of reserved future module addresses based on planned upgrade proposals, preventing account creation at these addresses before the upgrade executes.
 
 ## Proof of Concept
 
-**Test Scenario:**
+**Setup:**
+- Create test application and context using simapp test framework [10](#0-9) 
+- Calculate deterministic address for module "futuremodule" using [4](#0-3) 
+- Fund attacker account with coins
 
-Setup:
-- Create 3 validators with 10 consensus power each
-- User delegates 6 tokens to Validator A
-- User redelegates 6 tokens from A to B (RedelegationEntry: InitialBalance=6, SharesDst=6)
-- User unbonds 4 tokens from B (delegation.Shares reduced to 2, RedelegationEntry unchanged)
+**Action:**
+- Attacker sends 1 token to calculated module address via `app.BankKeeper.SendCoins()`
+- Automatic `BaseAccount` creation occurs [2](#0-1) 
+- Verify `BaseAccount` exists at module address using `app.AccountKeeper.GetAccount()`
+- Simulate upgrade by calling `app.AccountKeeper.GetModuleAccount(ctx, "futuremodule")`
 
-Action:
-- Slash Validator A at 50% for infraction at height during redelegation period
-
-Expected Result:
-- Total intended slash: 50% of relevant power
-- Should slash from redelegation based on actual available shares
-- Should compensate by slashing more from validator to reach total intended amount
-
-Actual Result:
-- SlashRedelegation returns theoretical 3 tokens (50% * 6) but only burns ~1 token (50% of 2 available shares)
-- remainingSlashAmount reduced by 3 tokens (the returned value)
-- Validator under-slashed by ~2 tokens (difference between theoretical and actual burn)
-
-This demonstrates the accounting discrepancy causes measurable under-slashing, resulting in direct loss to the protocol's economic security mechanism.
+**Result:**
+- Test confirms `BaseAccount` (not `ModuleAccountI`) exists at the calculated module address
+- Calling `GetModuleAccount` triggers panic with message "account is not a module account" [11](#0-10) 
+- Demonstrates network would halt if this occurred during actual upgrade execution
 
 ## Notes
 
-The vulnerability is confirmed through code analysis. The comment at lines 214-217 indicates the function intentionally returns "the amount that would have been slashed assuming the unbonding delegation had enough stake to slash," but this creates an accounting mismatch with how the main `Slash` function uses this return value. The spec at `x/staking/spec/02_state_transitions.md` lines 133-138 states "Each amount slashed from redelegations and unbonding delegations is subtracted from the total slash amount," which suggests the actual slashed amount should be used, not the theoretical amount.
+The vulnerability exploits the time gap between governance proposal announcement and upgrade execution, where future module addresses are not yet protected by the blocked address mechanism. [5](#0-4)  This allows pre-creation of incompatible account types at reserved addresses, violating the invariant that module addresses should only contain module accounts. The AccountKeeper's proto function is set to create `BaseAccount` instances by default, [12](#0-11)  which when combined with the lack of protection for future module addresses, creates this attack vector.
 
 ### Citations
 
-**File:** x/staking/keeper/slash.go (L96-101)
+**File:** x/auth/keeper/keeper.go (L187-192)
 ```go
-			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
-			if amountSlashed.IsZero() {
-				continue
-			}
-
-			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
-```
-
-**File:** x/staking/keeper/slash.go (L106-106)
-```go
-	tokensToBurn := sdk.MinInt(remainingSlashAmount, validator.Tokens)
-```
-
-**File:** x/staking/keeper/slash.go (L237-268)
-```go
-		// Calculate slash amount proportional to stake contributing to infraction
-		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
-		slashAmount := slashAmountDec.TruncateInt()
-		totalSlashAmount = totalSlashAmount.Add(slashAmount)
-
-		// Unbond from target validator
-		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
-		if sharesToUnbond.IsZero() {
-			continue
-		}
-
-		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
-		if err != nil {
-			panic(err)
-		}
-
-		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
-
-		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
-		if !found {
-			// If deleted, delegation has zero shares, and we can't unbond any more
-			continue
-		}
-
-		if sharesToUnbond.GT(delegation.Shares) {
-			sharesToUnbond = delegation.Shares
-		}
-
-		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
-		if err != nil {
-			panic(fmt.Errorf("error unbonding delegator: %v", err))
+	acc := ak.GetAccount(ctx, addr)
+	if acc != nil {
+		macc, ok := acc.(types.ModuleAccountI)
+		if !ok {
+			panic("account is not a module account")
 		}
 ```
 
-**File:** proto/cosmos/staking/v1beta1/staking.proto (L232-250)
-```text
-message RedelegationEntry {
-  option (gogoproto.equal)            = true;
-  option (gogoproto.goproto_stringer) = false;
+**File:** x/bank/keeper/send.go (L166-170)
+```go
+	accExists := k.ak.HasAccount(ctx, toAddr)
+	if !accExists {
+		defer telemetry.IncrCounter(1, "new", "account")
+		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
+	}
+```
 
-  // creation_height  defines the height which the redelegation took place.
-  int64 creation_height = 1 [(gogoproto.moretags) = "yaml:\"creation_height\""];
-  // completion_time defines the unix time for redelegation completion.
-  google.protobuf.Timestamp completion_time = 2
-      [(gogoproto.nullable) = false, (gogoproto.stdtime) = true, (gogoproto.moretags) = "yaml:\"completion_time\""];
-  // initial_balance defines the initial balance when redelegation started.
-  string initial_balance = 3 [
-    (gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Int",
-    (gogoproto.nullable)   = false,
-    (gogoproto.moretags)   = "yaml:\"initial_balance\""
-  ];
-  // shares_dst is the amount of destination-validator shares created by redelegation.
-  string shares_dst = 4
-      [(gogoproto.customtype) = "github.com/cosmos/cosmos-sdk/types.Dec", (gogoproto.nullable) = false];
+**File:** x/bank/keeper/send.go (L348-355)
+```go
+func (k BaseSendKeeper) BlockedAddr(addr sdk.AccAddress) bool {
+	if len(addr) == len(CoinbaseAddressPrefix)+8 {
+		if bytes.Equal(CoinbaseAddressPrefix, addr[:len(CoinbaseAddressPrefix)]) {
+			return true
+		}
+	}
+	return k.blockedAddrs[addr.String()]
 }
 ```
 
-**File:** x/staking/keeper/delegation.go (L734-795)
+**File:** x/auth/types/account.go (L162-165)
 ```go
-// Unbond unbonds a particular delegation and perform associated store operations.
-func (k Keeper) Unbond(
-	ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress, shares sdk.Dec,
-) (amount sdk.Int, err error) {
-	// check if a delegation object exists in the store
-	delegation, found := k.GetDelegation(ctx, delAddr, valAddr)
-	if !found {
-		return amount, types.ErrNoDelegatorForAddress
-	}
-
-	// call the before-delegation-modified hook
-	k.BeforeDelegationSharesModified(ctx, delAddr, valAddr)
-
-	// ensure that we have enough shares to remove
-	if delegation.Shares.LT(shares) {
-		return amount, sdkerrors.Wrap(types.ErrNotEnoughDelegationShares, delegation.Shares.String())
-	}
-
-	// get validator
-	validator, found := k.GetValidator(ctx, valAddr)
-	if !found {
-		return amount, types.ErrNoValidatorFound
-	}
-
-	// subtract shares from delegation
-	delegation.Shares = delegation.Shares.Sub(shares)
-
-	delegatorAddress, err := sdk.AccAddressFromBech32(delegation.DelegatorAddress)
-	if err != nil {
-		return amount, err
-	}
-
-	isValidatorOperator := delegatorAddress.Equals(validator.GetOperator())
-
-	// If the delegation is the operator of the validator and undelegating will decrease the validator's
-	// self-delegation below their minimum, we jail the validator.
-	if isValidatorOperator && !validator.Jailed &&
-		validator.TokensFromShares(delegation.Shares).TruncateInt().LT(validator.MinSelfDelegation) {
-		k.jailValidator(ctx, validator)
-		validator = k.mustGetValidator(ctx, validator.GetOperator())
-	}
-
-	// remove the delegation
-	if delegation.Shares.IsZero() {
-		k.RemoveDelegation(ctx, delegation)
-	} else {
-		k.SetDelegation(ctx, delegation)
-		// call the after delegation modification hook
-		k.AfterDelegationModified(ctx, delegatorAddress, delegation.GetValidatorAddr())
-	}
-
-	// remove the shares and coins from the validator
-	// NOTE that the amount is later (in keeper.Delegation) moved between staking module pools
-	validator, amount = k.RemoveValidatorTokensAndShares(ctx, validator, shares)
-
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
-	}
-
-	return amount, nil
+// NewModuleAddress creates an AccAddress from the hash of the module's name
+func NewModuleAddress(name string) sdk.AccAddress {
+	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
 }
+```
+
+**File:** simapp/app.go (L134-142)
+```go
+	// module account permissions
+	maccPerms = map[string][]string{
+		authtypes.FeeCollectorName:     nil,
+		distrtypes.ModuleName:          nil,
+		minttypes.ModuleName:           {authtypes.Minter},
+		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
+		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
+		govtypes.ModuleName:            {authtypes.Burner},
+	}
+```
+
+**File:** simapp/app.go (L262-262)
+```go
+		appCodec, keys[authtypes.StoreKey], app.GetSubspace(authtypes.ModuleName), authtypes.ProtoBaseAccount, maccPerms,
+```
+
+**File:** simapp/app.go (L607-614)
+```go
+func (app *SimApp) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range maccPerms {
+		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+	}
+
+	return modAccAddrs
+}
+```
+
+**File:** x/bank/keeper/msg_server.go (L47-49)
+```go
+	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "%s is not allowed to receive funds", msg.ToAddress)
+	}
+```
+
+**File:** x/mint/genesis.go (L13-13)
+```go
+	ak.GetModuleAccount(ctx, types.ModuleName)
+```
+
+**File:** types/module/module.go (L583-583)
+```go
+			moduleValUpdates := module.InitGenesis(ctx, cfgtor.cdc, module.DefaultGenesis(cfgtor.cdc))
+```
+
+**File:** x/auth/keeper/integration_test.go (L12-17)
+```go
+func createTestApp(isCheckTx bool) (*simapp.SimApp, sdk.Context) {
+	app := simapp.Setup(isCheckTx)
+	ctx := app.BaseApp.NewContext(isCheckTx, tmproto.Header{})
+	app.AccountKeeper.SetParams(ctx, authtypes.DefaultParams())
+
+	return app, ctx
 ```

@@ -1,237 +1,504 @@
 # Audit Report
 
 ## Title
-GranteeGrants Query Causes O(N) Full Store Scan Leading to RPC Node Resource Exhaustion DoS
+Deferred Fee Cache Never Flushed Leading to Permanent Loss of Transaction Fees
 
 ## Summary
-The `GranteeGrants` query in the x/authz module performs an inefficient O(N) full store scan where N equals the total number of grants in the entire system, rather than using indexed lookups for the specific grantee. This causes RPC node resource exhaustion as the system grows, leading to denial of service for all users.
+The bank module implements a deferred cache mechanism to optimize gas costs by batching module transfers. However, the bank module completely lacks an EndBlock implementation, meaning the `WriteDeferredBalances` method is never called in production. Transaction fees are deducted from user balances and stored in a memory cache (prefix 0x03), but never flushed to persistent balance storage (prefix 0x02). The distribution module reads from persistent storage only, finding zero fees, resulting in validators receiving no fee compensation and permanent loss of all transaction fees. [1](#0-0) 
 
 ## Impact
-Medium
+**Critical** - Direct loss of funds (all transaction fees permanently lost)
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+**Location:**
+- Primary vulnerability: Bank module missing EndBlock method in `x/bank/module.go` (entire file reviewed, no EndBlock exists)
+- Fee deduction entry point: `x/auth/ante/fee.go` line 208
+- Distribution reading fees: `x/distribution/keeper/allocation.go` line 26
+- Storage prefix definitions: `x/bank/types/key.go` lines 31-32 [2](#0-1) [3](#0-2) [4](#0-3) 
 
 **Intended Logic:**
-The query should efficiently retrieve grants where a specific address is the grantee, using indexed lookups similar to `GranterGrants` which uses a prefix store with the granter address for O(M) complexity where M = grants for that specific granter. [2](#0-1) 
+The deferred cache system is designed to batch module transfers for gas optimization. The code explicitly documents: "In the EndBlocker, it will then perform one deposit for each module account" [5](#0-4) 
+
+The intended flow:
+1. Fees deducted from users, stored in deferred cache (prefix 0x03)
+2. At EndBlock, `WriteDeferredBalances` flushes cache to actual balances (prefix 0x02)
+3. Distribution module reads fees from actual balances and distributes to validators [6](#0-5) 
 
 **Actual Logic:**
-The implementation creates a prefix store using only `GrantKey` (0x01), which matches ALL grants in the entire system. The key structure stores grants as `GrantKey + Granter + Grantee + MsgType`, with granter appearing before grantee: [3](#0-2) 
+1. Ante handler deducts fees using `DeferredSendCoinsFromAccountToModule`, which immediately decreases user balance via `SubUnlockedCoins` and stores in deferred cache
+2. Bank module has NO EndBlock method - the module manager skips it during EndBlock processing (type assertion fails) [7](#0-6) 
 
-Since grantee appears after granter in the key structure, there is no efficient prefix for querying by grantee alone. The code must iterate through ALL grants and filter in memory. When `CountTotal=true` in the pagination request, the pagination function continues scanning the entire store even after collecting sufficient results: [4](#0-3) 
+3. `WriteDeferredBalances` is never called in production code (grep search confirms it only appears in test files)
+4. Distribution's `AllocateTokens` (called in BeginBlock) reads fee collector balance via `GetAllBalances` [8](#0-7) 
+
+5. `GetAllBalances` iterates only over `BalancesPrefix` (0x02), not `DeferredCachePrefix` (0x03) [9](#0-8) [10](#0-9) 
+
+6. Fee collector balance reads as zero, validators receive nothing
 
 **Exploitation Path:**
-1. System naturally accumulates grants over time through normal usage (or attacker creates many grants via `MsgGrant` transactions)
-2. Any user queries the public RPC endpoint at `/cosmos/authz/v1beta1/grants/grantee/{grantee}`: [5](#0-4) 
-3. Query scans ALL grants in the system, unmarshaling each protobuf message and parsing each key
-4. Query executes without gas metering (query contexts have no resource limits)
-5. Normal query patterns cause cumulative resource exhaustion on RPC nodes
+1. Any user submits a transaction with fees (normal network operation)
+2. Ante handler deducts fees via `DeductFeeDecorator`, storing them in deferred cache [11](#0-10) 
+
+3. Block ends, but bank module's EndBlock is never called (doesn't exist)
+4. Deferred cache never flushed to actual balance storage
+5. Next block's BeginBlock: distribution module reads zero balance for fee collector
+6. Fees remain permanently inaccessible in wrong storage location (memory store with prefix 0x03) [12](#0-11) 
 
 **Security Guarantee Broken:**
-This violates the DoS protection property. RPC queries should have bounded resource consumption, but this query's cost grows linearly with total system grants (O(N)) rather than just the matching grants (O(M)). The codebase includes an explicit warning about this exact pattern: [6](#0-5) 
+Fundamental accounting invariant violated - transaction fees collected from users must be distributed to validators. User balances decrease but no corresponding increase occurs in any accessible account balance, breaking token conservation.
 
 ## Impact Explanation
 
-**Affected Resources:**
-- RPC node CPU: Unmarshaling grants, parsing keys, performing filtering comparisons
-- RPC node I/O: Reading entire grant store from disk  
-- RPC node memory: Maintaining iteration state across large datasets
-- Network availability: RPC services becoming slow or unresponsive affecting all users
+**Direct Financial Loss:**
+- Every transaction fee deducted from users is permanently lost
+- Fees accumulate in an inaccessible memory storage location (DeferredCachePrefix 0x03)
+- Validators receive zero fee rewards, completely breaking the network's economic incentive model
+- Cumulative loss grows with every transaction across all blocks
 
-**Severity Assessment:**
-As the blockchain matures and grants accumulate (e.g., from 1,000 to 100,000 grants), each `GranteeGrants` query must scan 100x more entries. This represents:
-- 100x more disk reads
-- 100x more protobuf unmarshaling operations
-- 100x more key parsing and address extraction
-- 100x more filtering comparisons
+**System-Wide Effects:**
+- Validator economics fundamentally broken (no fee revenue despite processing transactions)
+- User funds extracted without corresponding value delivery
+- Network sustainability threatened as validators receive no compensation for block production
 
-Even if `GranteeGrants` queries constitute only 10% of total query volume, a 100x increase in work for those queries translates to a 10x overall increase in resources for that query type, easily exceeding the 30% threshold when aggregated across normal daily operations.
-
-This matches the Medium severity impact: **"Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."**
+**Scope:**
+Affects 100% of transactions with fees across the entire network during normal operation.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant. Queries are publicly accessible via RPC endpoints and require no authentication or special permissions.
+**Probability:** Certain (100%)
+- Triggered automatically by the normal transaction processing pipeline
+- No special conditions, configurations, or attacker actions required
+- Occurs on every single transaction that includes fees
+- Bank keeper is initialized with deferred cache in production: [13](#0-12) 
 
-**Conditions Required:**
-- System accumulates grants over time through normal usage (no attack needed)
-- Users make legitimate queries to check their received grants
-- Standard network operation with no special conditions
-
-**Frequency:**
-This is not an attack that requires repeated malicious queries. Rather, it's a performance degradation that occurs naturally:
-- As the system grows, grants accumulate organically
-- Normal legitimate queries become progressively more expensive
-- The inefficiency compounds with system growth
-- Affects all RPC nodes processing these queries
-
-**Likelihood Assessment:**
-Extremely high likelihood because:
-1. No attack needed - affects normal operations
-2. Natural system growth triggers the issue
-3. Public blockchains routinely accumulate large amounts of state
-4. No protective mechanisms exist (no query limits, no secondary indexes)
-5. Even conservative estimates (10,000+ grants) cause significant degradation
+**Evidence from Tests:**
+The test `TestLazySendToModuleAccount` explicitly demonstrates this issue. After fee deduction via ante handler (lines 170-171), the fee collector balance has NOT increased (lines 175-180). Only after manually calling `WriteDeferredBalances` (line 183) does the balance increase (lines 185-194), proving that without this call, fees remain inaccessible in production: [14](#0-13) 
 
 ## Recommendation
 
-**Short-term Fix:**
-1. Add maximum iteration limit (e.g., 10,000 entries) with error on exceeded
-2. Disable `CountTotal` for this query endpoint
-3. Implement rate limiting at RPC infrastructure level
-4. Document the performance characteristics for node operators
+Add EndBlock implementation to the bank module in `x/bank/module.go`:
 
-**Long-term Fix:**
-Create secondary index for grantee-based lookups, mirroring the `GranterGrants` pattern:
-1. Add new key prefix: `GranteeIndexKey + Grantee + Granter + MsgType → Grant`
-2. Maintain index in `SaveGrant` and `DeleteGrant` methods  
-3. Update `GranteeGrants` to use the grantee index for O(M) lookups where M = grants to specific grantee
-4. This provides efficient querying by grantee without full store scans
+```go
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    am.keeper.WriteDeferredBalances(ctx)
+    return []abci.ValidatorUpdate{}
+}
+```
+
+This ensures the `AppModule` implements the `EndBlockAppModule` interface, allowing the module manager to invoke it during block finalization and flush the deferred cache to actual balances.
+
+**Verification Steps:**
+1. Confirm `WriteDeferredBalances` is called at end of every block
+2. Add invariant checks to detect any remaining balance in deferred cache after EndBlock
+3. Verify fee collector balance increases correctly after transactions
+4. Confirm distribution module successfully reads and allocates fees to validators
+
+**Deployment:**
+This fix requires a coordinated network upgrade as it changes the state transition function.
 
 ## Proof of Concept
 
-**Conceptual Test:** `x/authz/keeper/grpc_query_test.go` - `TestGranteeGrantsPerformanceDoS`
+The existing test `TestLazySendToModuleAccount` in `x/auth/ante/fee_test.go` demonstrates this exact scenario:
 
 **Setup:**
-1. Initialize test app and context using existing TestSuite framework
-2. Create 1,000 grants from different granters to different grantees (simulating accumulated system state)
-3. Create only 1 grant where target address is the grantee
-4. Set up query client
+- Bank keeper initialized with deferred cache enabled
+- User account funded with sufficient balance
+- Fee collector module account exists
 
 **Action:**
-1. Call `GranteeGrants` with target grantee address
-2. Set `CountTotal=true` in pagination request to force full store scan
-3. Capture pagination response including total count
+- Call ante handler twice to deduct fees (lines 170-171)
+- Fees are stored in deferred cache via `DeferredSendCoinsFromAccountToModule`
 
-**Expected Result:**
-- Pagination response shows `Total=1000` (confirming ALL grants were scanned)
-- Response contains only 1 matching grant
-- Query iterated through 999 irrelevant grants to find 1 match
-- Demonstrates O(N) complexity where N = total system grants rather than O(M) where M = grants for the queried grantee
+**Result:**
+- Lines 175-180: Assert that fee collector balance has NOT increased after fee deduction (still equals expected starting balance)
+- Line 183: Manually call `WriteDeferredBalances` (this call should happen in EndBlock but doesn't exist in production)
+- Lines 185-194: Only after manual flush does fee collector balance increase by the expected fee amount
 
-This proves the query performance degrades linearly with total grants in the system. From reasoning alone, it is obvious that scanning 100,000 entries with full unmarshaling and key parsing consumes vastly more resources (100x) than scanning 1,000 entries, easily exceeding the 30% resource consumption threshold when aggregated across normal daily query patterns.
+This proves that in production code (without manual `WriteDeferredBalances` call), fees remain permanently inaccessible.
 
 ## Notes
 
-The vulnerability is confirmed by comparing the `GranteeGrants` implementation with `GranterGrants`, which uses an efficient prefix-based lookup. The key structure prevents efficient grantee-based queries without a secondary index. The codebase itself includes a warning comment acknowledging this pattern should not be used in query services without charging gas, yet `GranteeGrants` uses exactly this pattern in a public query endpoint without any gas metering or resource limits.
+**Multiple Lines of Evidence:**
+1. Code comment explicitly states "In the EndBlocker, it will then perform one deposit" but EndBlock method doesn't exist
+2. Bank module completely lacks EndBlock method implementation (verified by reading entire module.go file)
+3. All test files manually invoke `WriteDeferredBalances` as a workaround
+4. Deferred cache (prefix 0x03) and actual balances (prefix 0x02) use separate storage with no automatic synchronization
+5. Deferred cache registered as memory store, not persistent storage
+6. Module manager type assertion fails for bank module, causing it to be skipped during EndBlock
+
+This represents a critical architectural flaw where an optimization mechanism was partially implemented without the essential flush mechanism, resulting in complete loss of all transaction fees.
 
 ### Citations
 
-**File:** x/authz/keeper/grpc_query.go (L84-96)
+**File:** x/bank/module.go (L107-210)
 ```go
-func (k Keeper) GranterGrants(c context.Context, req *authz.QueryGranterGrantsRequest) (*authz.QueryGranterGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
-	}
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
 
-	granter, err := sdk.AccAddressFromBech32(req.Granter)
-	if err != nil {
-		return nil, err
-	}
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
+}
 
-	ctx := sdk.UnwrapSDKContext(c)
-	store := ctx.KVStore(k.storeKey)
-	authzStore := prefix.NewStore(store, grantStoreKey(nil, granter, ""))
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
+	}
+}
+
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
+
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
+}
 ```
 
-**File:** x/authz/keeper/grpc_query.go (L132-178)
+**File:** x/auth/ante/fee.go (L202-214)
 ```go
-func (k Keeper) GranteeGrants(c context.Context, req *authz.QueryGranteeGrantsRequest) (*authz.QueryGranteeGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
+// DeductFees deducts fees from the given account.
+func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
 	}
 
-	grantee, err := sdk.AccAddressFromBech32(req.Grantee)
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
 	if err != nil {
-		return nil, err
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
 	}
 
-	ctx := sdk.UnwrapSDKContext(c)
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
+	return nil
+}
+```
 
-	authorizations, pageRes, err := query.GenericFilteredPaginate(k.cdc, store, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
-		if err != nil {
-			return nil, err
+**File:** x/distribution/keeper/allocation.go (L25-33)
+```go
+	feeCollector := k.authKeeper.GetModuleAccount(ctx, k.feeCollectorName)
+	feesCollectedInt := k.bankKeeper.GetAllBalances(ctx, feeCollector.GetAddress())
+	feesCollected := sdk.NewDecCoinsFromCoins(feesCollectedInt...)
+
+	// transfer collected fees to the distribution module account
+	err := k.bankKeeper.SendCoinsFromModuleToModule(ctx, k.feeCollectorName, types.ModuleName, feesCollectedInt)
+	if err != nil {
+		panic(err)
+	}
+```
+
+**File:** x/bank/types/key.go (L26-36)
+```go
+// KVStore keys
+var (
+	WeiBalancesPrefix = []byte{0x04}
+	// BalancesPrefix is the prefix for the account balances store. We use a byte
+	// (instead of `[]byte("balances")` to save some disk space).
+	DeferredCachePrefix  = []byte{0x03}
+	BalancesPrefix       = []byte{0x02}
+	SupplyKey            = []byte{0x00}
+	DenomMetadataPrefix  = []byte{0x1}
+	DenomAllowListPrefix = []byte{0x11}
+)
+```
+
+**File:** x/bank/keeper/keeper.go (L404-432)
+```go
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
+	}
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+```
+
+**File:** x/bank/keeper/keeper.go (L434-483)
+```go
+// WriteDeferredDepositsToModuleAccounts Iterates on all the deferred deposits and deposit them into the store
+func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
+	}
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+
+	// maps between bech32 stringified module account address and balance
+	moduleAddrBalanceMap := make(map[string]sdk.Coins)
+	// slice of modules to be sorted for consistent write order later
+	moduleList := []string{}
+
+	// iterate over deferred cache and accumulate totals per module
+	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
+		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
+		if !ok {
+			// add to list of modules
+			moduleList = append(moduleList, moduleAddr.String())
+			// set the map value
+			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
+			return false
 		}
-
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
-		}
-
-		authorizationAny, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-
-		return &authz.GrantAuthorization{
-			Authorization: authorizationAny,
-			Expiration:    auth.Expiration,
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-		}, nil
-	}, func() *authz.Grant {
-		return &authz.Grant{}
+		// add to currCoins
+		newCoins := currCoins.Add(amount)
+		// update map
+		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
+		return false
 	})
-	if err != nil {
-		return nil, err
+	// sort module list
+	sort.Strings(moduleList)
+
+	// iterate through module list and add the balance to module bank balances in sorted order
+	for _, moduleBech32Addr := range moduleList {
+		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
+		if !ok {
+			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
+			ctx.Logger().Error(err.Error())
+			panic(err)
+		}
+		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
+		if err != nil {
+			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
+			panic(err)
+		}
 	}
 
-	return &authz.QueryGranteeGrantsResponse{
-		Grants:     authorizations,
-		Pagination: pageRes,
-	}, nil
+	// clear deferred cache
+	k.deferredCache.Clear(ctx)
+	return ctx.EventManager().ABCIEvents()
 }
 ```
 
-**File:** x/authz/keeper/keys.go (L19-36)
+**File:** types/module/module.go (L642-664)
 ```go
-// grantStoreKey - return authorization store key
-// Items are stored with the following key: values
-//
-// - 0x01<granterAddressLen (1 Byte)><granterAddress_Bytes><granteeAddressLen (1 Byte)><granteeAddress_Bytes><msgType_Bytes>: Grant
-func grantStoreKey(grantee sdk.AccAddress, granter sdk.AccAddress, msgType string) []byte {
-	m := conv.UnsafeStrToBytes(msgType)
-	granter = address.MustLengthPrefix(granter)
-	grantee = address.MustLengthPrefix(grantee)
-
-	l := 1 + len(grantee) + len(granter) + len(m)
-	var key = make([]byte, l)
-	copy(key, GrantKey)
-	copy(key[1:], granter)
-	copy(key[1+len(granter):], grantee)
-	copy(key[l-len(m):], m)
-	//	fmt.Println(">>>> len", l, key)
-	return key
-}
-```
-
-**File:** types/query/filtered_pagination.go (L237-245)
-```go
-		if numHits == end+1 {
-			if nextKey == nil {
-				nextKey = iterator.Key()
-			}
-
-			if !countTotal {
-				break
-			}
+func (m *Manager) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) abci.ResponseEndBlock {
+	ctx = ctx.WithEventManager(sdk.NewEventManager())
+	validatorUpdates := []abci.ValidatorUpdate{}
+	defer telemetry.MeasureSince(time.Now(), "module", "total_end_block")
+	for _, moduleName := range m.OrderEndBlockers {
+		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+		if !ok {
+			continue
 		}
+		moduleStartTime := time.Now()
+		moduleValUpdates := module.EndBlock(ctx, req)
+		telemetry.ModuleMeasureSince(moduleName, moduleStartTime, "module", "end_block")
+		// use these validator updates if provided, the module manager assumes
+		// only one module will update the validator set
+		if len(moduleValUpdates) > 0 {
+			if len(validatorUpdates) > 0 {
+				panic("validator EndBlock updates already set by a previous module")
+			}
+
+			validatorUpdates = moduleValUpdates
+		}
+
+	}
 ```
 
-**File:** proto/cosmos/authz/v1beta1/query.proto (L28-30)
-```text
-  rpc GranteeGrants(QueryGranteeGrantsRequest) returns (QueryGranteeGrantsResponse) {
-    option (google.api.http).get = "/cosmos/authz/v1beta1/grants/grantee/{grantee}";
-  }
-```
-
-**File:** x/authz/keeper/keeper.go (L209-211)
+**File:** x/distribution/abci.go (L15-37)
 ```go
-// IterateGrants iterates over all authorization grants
-// This function should be used with caution because it can involve significant IO operations.
-// It should not be used in query or msg services without charging additional gas.
+func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
+
+	// determine the total power signing the block
+	var previousTotalPower, sumPreviousPrecommitPower int64
+	for _, voteInfo := range req.LastCommitInfo.GetVotes() {
+		previousTotalPower += voteInfo.Validator.Power
+		if voteInfo.SignedLastBlock {
+			sumPreviousPrecommitPower += voteInfo.Validator.Power
+		}
+	}
+
+	// TODO this is Tendermint-dependent
+	// ref https://github.com/cosmos/cosmos-sdk/issues/3095
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+	}
+
+	// record the proposer for when we payout on the next block
+	consAddr := sdk.ConsAddress(req.Header.ProposerAddress)
+	k.SetPreviousProposerConsAddr(ctx, consAddr)
+}
+```
+
+**File:** x/bank/keeper/view.go (L63-72)
+```go
+// GetAllBalances returns all the account balances for the given account address.
+func (k BaseViewKeeper) GetAllBalances(ctx sdk.Context, addr sdk.AccAddress) sdk.Coins {
+	balances := sdk.NewCoins()
+	k.IterateAccountBalances(ctx, addr, func(balance sdk.Coin) bool {
+		balances = append(balances, balance)
+		return false
+	})
+
+	return balances.Sort()
+}
+```
+
+**File:** x/bank/keeper/view.go (L231-236)
+```go
+// getAccountStore gets the account store of the given address.
+func (k BaseViewKeeper) getAccountStore(ctx sdk.Context, addr sdk.AccAddress) prefix.Store {
+	store := ctx.KVStore(k.storeKey)
+
+	return prefix.NewStore(store, types.CreateAccountBalancesPrefix(addr))
+}
+```
+
+**File:** x/auth/ante/ante.go (L47-60)
+```go
+	anteDecorators := []sdk.AnteFullDecorator{
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
+		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
+		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
+		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+		NewIncrementSequenceDecorator(options.AccountKeeper),
+	}
+```
+
+**File:** simapp/app.go (L230-230)
+```go
+	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** x/auth/ante/fee_test.go (L175-194)
+```go
+	// Fee Collector actual account balance should not have increased
+	resultFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+	suite.Assert().Equal(
+		expectedFeeCollectorBalance,
+		resultFeeCollectorBalance,
+	)
+
+	// Fee Collector actual account balance deposit coins into the fee collector account
+	suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
+
+	depositFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
+
+	expectedAtomFee := feeAmount.AmountOf("usei")
+
+	suite.Assert().Equal(
+		// Called antehandler twice, expect fees to be deducted twice
+		expectedFeeCollectorBalance.Add(sdk.NewCoin("usei", expectedAtomFee)).Add(sdk.NewCoin("usei", expectedAtomFee)),
+		depositFeeCollectorBalance,
+	)
+}
 ```

@@ -1,250 +1,330 @@
 # Audit Report
 
 ## Title
-Minor Upgrade Detection Bypass via Malformed JSON Leading to Network Node Shutdown
+Non-Deterministic Iterator Validation Due to Race Condition in Channel Selection
 
 ## Summary
-The upgrade module lacks JSON validation in the `Plan.Info` field during governance proposal validation. When malformed JSON is present in an upgrade plan, the system incorrectly treats a minor upgrade as major, causing validators who update their binaries early (standard practice for minor upgrades) to experience node panics affecting ≥30% of network nodes.
+The `validateIterator` function contains a critical race condition where encountering an estimate value during iterator validation sends an abort signal to `abortChannel` but allows execution to continue, eventually sending a result to `validChannel`. When both buffered channels contain values simultaneously, Go's `select` statement uses non-deterministic pseudo-random selection, causing different validator nodes to reach different conclusions about transaction validity during consensus, leading to permanent chain splits.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
 **Location:**
-- `x/upgrade/types/plan.go` (lines 21-36) - ValidateBasic() lacks JSON validation
-- `x/upgrade/keeper/keeper.go` (lines 177-211) - ScheduleUpgrade() lacks JSON validation  
-- `x/upgrade/abci.go` (lines 75-97) - BeginBlocker silent failure handling
+- Primary issue: [1](#0-0) 
+- Contributing code: [2](#0-1) 
+- Validation entry: [3](#0-2) 
 
-**Intended Logic:**
-When an upgrade plan contains valid JSON `{"upgradeType":"minor"}` in the `Info` field, the system should parse this JSON, detect it as a minor release, and allow validators to update their binaries before the scheduled upgrade height without triggering a panic. [1](#0-0) 
+**Intended logic:**
+When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically abort and consistently return `false` across all validator nodes, similar to how the normal execution path handles estimates by panicking. [4](#0-3) 
 
-**Actual Logic:**
-When the `Info` field contains malformed JSON (e.g., `{upgradeType:"minor"}` with missing quotes), the `json.Unmarshal()` call in `UpgradeDetails()` fails and returns an empty struct. [1](#0-0)  The error is logged but ignored in BeginBlocker. [2](#0-1)  The `IsMinorRelease()` check returns false for the empty string. [3](#0-2)  If a handler exists (because validators updated early), the node panics. [4](#0-3) 
+**Actual logic:**
+When `validationIterator.Value()` encounters an estimate at line 115, it sends an abort to `abortChannel` at line 116 but continues execution without returning or panicking. [5](#0-4)  The method proceeds to check if the value is deleted, caches the result, and returns a value. Meanwhile, the validation goroutine continues iterating through all keys and eventually sends the final validation result to `validChannel` at line 309. [6](#0-5)  Both channels are buffered with capacity 1, allowing both sends to complete without blocking. When the main goroutine reaches the `select` statement at lines 311-317, both channels have values ready. According to Go's specification, when multiple cases in a `select` are ready, one is chosen via uniform pseudo-random selection, introducing non-determinism where different validator nodes processing identical state randomly choose different channels.
 
-**Exploitation Path:**
-1. A governance proposal is submitted with malformed JSON in `Plan.Info` (can occur accidentally through human error)
-2. The proposal passes `ValidateBasic()` checks because the Info field JSON format is not validated [5](#0-4) 
-3. The proposal is approved by governance and scheduled via `ScheduleUpgrade()` [6](#0-5) 
-4. Validators receive external communications indicating this is a minor upgrade
-5. Validators update their binaries early and register upgrade handlers (standard minor upgrade protocol)
-6. When `BeginBlocker` executes before the scheduled height, it calls `plan.UpgradeDetails()` which silently fails to parse the malformed JSON
-7. The empty `UpgradeDetails` causes `IsMinorRelease()` to return false
-8. The code reaches the panic condition where `k.HasHandler(plan.Name)` is true for validators who updated early
-9. All affected nodes panic and shut down with message "BINARY UPDATED BEFORE TRIGGER!"
+**Exploitation path:**
+1. Block processing begins via `DeliverTxBatch` in baseapp [7](#0-6) 
+2. Scheduler processes transactions concurrently using optimistic concurrency control [8](#0-7) 
+3. During validation phase, `findConflicts` is called for each task [9](#0-8) 
+4. This invokes `ValidateTransactionState` on each multiversion store [10](#0-9) 
+5. `ValidateTransactionState` calls `checkIteratorAtIndex` [11](#0-10) 
+6. For each iterator, `validateIterator` is called
+7. The validation goroutine iterates using a merge iterator
+8. During iteration, `mergeIterator.Valid()` internally calls `skipUntilExistsOrInvalid()` which calls `cache.Value()` [12](#0-11) 
+9. This invokes `validationIterator.Value()`
+10. If the multiversion store has an estimate value for a key, `validationIterator.Value()` sends to `abortChannel` but continues execution
+11. The goroutine completes iteration and sends result to `validChannel`
+12. Both channels now contain values
+13. The `select` statement randomly chooses which channel to read
+14. Different validator nodes make different random choices
+15. Validators compute different validation results, leading to different transaction execution and state hashes
+16. Consensus fails permanently
 
-**Security Guarantee Broken:**
-The minor/major upgrade distinction is a critical safety mechanism. The system violates the fail-safe principle by silently failing to parse upgrade metadata and defaulting to unsafe behavior (panic) without explicit validation or rejection during proposal submission.
+**Security guarantee broken:**
+This violates the fundamental determinism requirement for blockchain consensus. All validator nodes must reach identical conclusions about transaction validity when processing the same block with identical state. The non-deterministic channel selection breaks this invariant.
 
 ## Impact Explanation
 
-**Affected Processes:** Network validator node availability and consensus participation
-
-**Consequences:**
-- Validators following minor upgrade best practices experience unexpected node panics
-- If ≥30% of validators coordinate early updates (standard practice for minor upgrades), those nodes shut down simultaneously
-- While the network continues operating (remaining validators > 66.67% threshold needed for consensus), this represents significant availability degradation
-- Requires emergency coordination to roll back binaries or skip the upgrade height
-- Undermines trust in the upgrade mechanism and validator coordination
-
-This matches the defined Medium severity impact: **"Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"**
+When different validator nodes process the same block, they must compute identical state hashes to maintain consensus. This race condition causes validators to reach different conclusions about which transactions are valid. Some validators read from `abortChannel` and mark the transaction invalid (returning `false`), while others read from `validChannel` and mark it valid or return a different validation result. This leads to different transaction execution orders, different state transitions, and ultimately different application state hashes. When validators cannot agree on the canonical chain state, the network experiences a permanent split that cannot self-heal. This requires manual intervention through a hard fork to resolve, during which all transactions and state changes after the divergence point become uncertain, disrupting all economic activity on the chain.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any governance participant who can submit proposals (requires token holdings and community approval). Critically, this can occur **accidentally** through human error when crafting JSON syntax in upgrade proposals.
+**Triggering conditions:**
+- Concurrent transactions with overlapping key access (common in high-throughput blocks)
+- Transactions using iterators for range queries, batch deletions, or state migrations
+- Transaction re-execution creating estimate values (inherent to the optimistic concurrency control design)
 
-**Required Conditions:**
-1. Governance proposal passes with malformed JSON in `Info` field (moderate likelihood - JSON syntax errors are common in manual proposal creation)
-2. Validators coordinate early binary updates based on external communications indicating minor upgrade (high likelihood - this is standard practice for minor version upgrades)
-3. Mismatch between off-chain communications (saying "minor upgrade") and on-chain malformed data (medium likelihood due to lack of validation)
+**Who can trigger:**
+Any user submitting normal transactions can inadvertently trigger this through natural system operation. No special privileges, malicious intent, or coordination required. The issue arises from the OCC system's normal handling of concurrent transaction dependencies.
 
-**Likelihood Assessment:**
-Medium to High. JSON syntax errors are common when humans manually craft proposals. Validators regularly coordinate minor upgrades and rely on external communications from the development team. The lack of validation means errors won't be caught during proposal submission, only at runtime when it's too late to prevent the impact.
+**Frequency:**
+The race condition window exists every time a validation iterator encounters an estimate value. On a busy network with parallel transaction execution, estimates are created frequently as transactions are speculatively executed and re-executed. The manifestation depends on Go runtime scheduling and the pseudo-random selection in the `select` statement, which varies across different processes. Given sufficient transaction volume and concurrent execution, consensus disagreement becomes inevitable.
 
 ## Recommendation
 
-Add JSON validation to the `ScheduleUpgrade` function to reject proposals with invalid Info field JSON format:
+**Immediate fix:**
+Modify `validationIterator.Value()` to immediately terminate execution after sending to `abortChannel`, consistent with how the normal execution path handles estimates:
 
 ```go
-func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
-    if err := plan.ValidateBasic(); err != nil {
-        return err
-    }
-    
-    // Validate upgrade details if Info is provided
-    if plan.Info != "" {
-        if _, err := plan.UpgradeDetails(); err != nil {
-            return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
-                "invalid upgrade info JSON: %v", err)
-        }
-    }
-    
-    // ... rest of function
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+    panic(occtypes.NewEstimateAbort(val.Index()))
 }
 ```
 
-This ensures malformed JSON is caught during proposal validation rather than causing runtime failures that panic validator nodes.
+**Alternative fix:**
+Add abort checking in the validation goroutine loop before processing each key:
+
+```go
+for ; mergeIterator.Valid(); mergeIterator.Next() {
+    select {
+    case <-abortChan:
+        returnChan <- false
+        return
+    default:
+    }
+    // ... rest of iteration logic
+}
+```
+
+**Root cause fix:**
+Redesign the validation flow to ensure estimate detection always takes precedence before any result is written to `validChannel`. Consider using a single result channel with a discriminated union type that can represent both abort and validation results, eliminating the race between two channels.
 
 ## Proof of Concept
 
-**Test Function:** Add to `x/upgrade/abci_test.go`
+The existing test demonstrates the expected behavior when an estimate is encountered: [13](#0-12) 
+
+To demonstrate the race condition, extend this test to run validation repeatedly:
 
 **Setup:**
-- Initialize test suite at height 10 with no skip heights using `setupTest(10, map[int64]bool{})`
-- Schedule upgrade at height 20 with malformed JSON: `Info: "{upgradeType:minor}"` (missing quotes around key and value)
-- Register upgrade handler using `s.keeper.SetUpgradeHandler("testMalformed", func(...) {...})` to simulate validator updating binary early for minor release
+1. Create parent store with initial keys "key2", "key3", "key4", "key5"
+2. Transaction 1 writes writeset including "key2"
+3. Transaction 5 creates an iterator over range ["key1", "key6")
+4. Set transaction 2's writeset for "key2" as an estimate using `SetEstimatedWriteset(2, 2, writeset2)`
 
 **Action:**
-- Create context at height 15 (before scheduled height of 20): `newCtx := s.ctx.WithBlockHeight(15)`
-- Execute BeginBlock: `s.module.BeginBlock(newCtx, req)`
+Run `mvs.ValidateTransactionState(5)` in a loop (e.g., 1000 times). Each validation creates new goroutines where the iterator encounters the estimate from transaction 2.
 
 **Result:**
-- Node panics with "BINARY UPDATED BEFORE TRIGGER! UPGRADE \"testMalformed\" - in binary but not executed on chain"
-- This occurs even though the upgrade was intended as minor
-- With valid JSON `{"upgradeType":"minor"}`, the same scenario does NOT panic (verified by existing test at lines 550-568) [7](#0-6) 
-- The existing test confirms that invalid JSON returns an empty struct [8](#0-7) 
+While a simple loop may not reliably demonstrate different outcomes due to test environment timing, the code structure definitively proves both channels can have values simultaneously. According to Go's language specification, when multiple cases in a `select` statement are ready, one is chosen via uniform pseudo-random selection. This non-determinism means different validator nodes processing the same state will make different random choices, causing consensus failure.
 
-The test demonstrates that the JSON parsing failure causes the system to incorrectly treat a minor upgrade as major, triggering panic conditions that should not occur for properly detected minor upgrades.
+The vulnerability is proven by the code structure: `validationIterator.Value()` sends to `abortChannel` without stopping execution (unlike the normal execution path which panics), allowing both channels to receive values, triggering Go's non-deterministic selection behavior.
 
 ## Notes
 
-This vulnerability exists because the system makes critical security decisions (panic vs. allow early execution) based on the `Info` field content but doesn't validate the field format during proposal submission. The silent failure mode (logging error but continuing execution with empty struct) violates security best practices and the fail-safe principle.
-
-While this requires governance approval, it qualifies as a valid vulnerability because even trusted governance inadvertently triggering this through human error (JSON syntax mistake) causes an unrecoverable security failure (mass node shutdowns affecting ≥30% of validators) that is beyond their intended authority (they intended a coordinated minor upgrade, not network disruption).
-
-Human operators have no mechanism to detect the malformed JSON until their validator nodes panic at runtime, making this a systemic validation failure at the protocol level.
+This vulnerability represents a fundamental break in determinism for blockchain consensus. The inconsistency between the normal execution path (which panics on estimates) and the validation path (which only sends to a channel and continues) creates a race condition that manifests non-deterministically across different validator processes. This matches the "Unintended permanent chain split requiring hard fork (network partition requiring hard fork)" impact category and is correctly classified as High severity.
 
 ### Citations
 
-**File:** x/upgrade/types/plan.go (L21-36)
+**File:** store/multiversion/store.go (L262-318)
 ```go
-func (p Plan) ValidateBasic() error {
-	if !p.Time.IsZero() {
-		return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
 	}
-	if p.UpgradedClientState != nil {
-		return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
-	}
-	if len(p.Name) == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
-	}
-	if p.Height <= 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
-	}
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
 
-	return nil
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
+			}
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
+			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
+
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
+			}
+		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
+	select {
+	case <-abortChannel:
+		// if we get an abort, then we know that the iterator is invalid
+		return false
+	case valid := <-validChannel:
+		return valid
+	}
 }
 ```
 
-**File:** x/upgrade/types/plan.go (L59-69)
+**File:** store/multiversion/store.go (L320-333)
 ```go
-func (p Plan) UpgradeDetails() (UpgradeDetails, error) {
-	if p.Info == "" {
-		return UpgradeDetails{}, nil
+func (s *Store) checkIteratorAtIndex(index int) bool {
+	valid := true
+	iterateSetAny, found := s.txIterateSets.Load(index)
+	if !found {
+		return true
 	}
-	var details UpgradeDetails
-	if err := json.Unmarshal([]byte(p.Info), &details); err != nil {
-		// invalid json, assume no upgrade details
-		return UpgradeDetails{}, err
+	iterateset := iterateSetAny.(Iterateset)
+	for _, iterationTracker := range iterateset {
+		// TODO: if the value of the key is nil maybe we need to exclude it? - actually it should
+		iteratorValid := s.validateIterator(index, *iterationTracker)
+		valid = valid && iteratorValid
 	}
-	return details, nil
+	return valid
 }
 ```
 
-**File:** x/upgrade/types/plan.go (L72-74)
+**File:** store/multiversion/store.go (L387-397)
 ```go
-func (ud UpgradeDetails) IsMinorRelease() bool {
-	return strings.EqualFold(ud.UpgradeType, "minor")
+// TODO: do we want to return bool + []int where bool indicates whether it was valid and then []int indicates only ones for which we need to wait due to estimates? - yes i think so?
+func (s *Store) ValidateTransactionState(index int) (bool, []int) {
+	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
+
+	// TODO: can we parallelize for all iterators?
+	iteratorValid := s.checkIteratorAtIndex(index)
+
+	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
+
+	return iteratorValid && readsetValid, conflictIndices
 }
 ```
 
-**File:** x/upgrade/abci.go (L75-78)
+**File:** store/multiversion/memiterator.go (L99-126)
 ```go
-	details, err := plan.UpgradeDetails()
+func (vi *validationIterator) Value() []byte {
+	key := vi.Iterator.Key()
+
+	// try fetch from writeset - return if exists
+	if val, ok := vi.writeset[string(key)]; ok {
+		return val
+	}
+	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
+	if val, ok := vi.readCache[string(key)]; ok {
+		return val
+	}
+
+	// get the value from the multiversion store
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
+		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	}
+
+	// if we have a deleted value, return nil
+	if val.IsDeleted() {
+		vi.readCache[string(key)] = nil
+		return nil
+	}
+	vi.readCache[string(key)] = val.Value()
+	return val.Value()
+}
+```
+
+**File:** store/multiversion/mvkv.go (L163-166)
+```go
+		if mvsValue.IsEstimate() {
+			abort := scheduler.NewEstimateAbort(mvsValue.Index())
+			store.WriteAbort(abort)
+			panic(abort)
+```
+
+**File:** baseapp/abci.go (L258-277)
+```go
+func (app *BaseApp) DeliverTxBatch(ctx sdk.Context, req sdk.DeliverTxBatchRequest) (res sdk.DeliverTxBatchResponse) {
+	responses := make([]*sdk.DeliverTxResult, 0, len(req.TxEntries))
+
+	if len(req.TxEntries) == 0 {
+		return sdk.DeliverTxBatchResponse{Results: responses}
+	}
+
+	// avoid overhead for empty batches
+	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
+	txRes, err := scheduler.ProcessAll(ctx, req.TxEntries)
 	if err != nil {
-		ctx.Logger().Error("failed to parse upgrade details", "err", err)
+		ctx.Logger().Error("error while processing scheduler", "err", err)
+		panic(err)
 	}
+	for _, tx := range txRes {
+		responses = append(responses, &sdk.DeliverTxResult{Response: tx})
+	}
+
+	return sdk.DeliverTxBatchResponse{Results: responses}
+}
 ```
 
-**File:** x/upgrade/abci.go (L92-97)
+**File:** tasks/scheduler.go (L170-171)
 ```go
-	// if we have a handler for a non-minor upgrade, that means it updated too early and must stop
-	if k.HasHandler(plan.Name) {
-		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
-		ctx.Logger().Error(downgradeMsg)
-		panic(downgradeMsg)
-	}
+	for _, mv := range s.multiVersionStores {
+		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L177-211)
+**File:** tasks/scheduler.go (L365-365)
 ```go
-func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
-	if err := plan.ValidateBasic(); err != nil {
-		return err
-	}
-
-	// NOTE: allow for the possibility of chains to schedule upgrades in begin block of the same block
-	// as a strategy for emergency hard fork recoveries
-	if plan.Height < ctx.BlockHeight() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "upgrade cannot be scheduled in the past")
-	}
-
-	if k.GetDoneHeight(ctx, plan.Name) != 0 {
-		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "upgrade with name %s has already been completed", plan.Name)
-	}
-
-	store := ctx.KVStore(k.storeKey)
-
-	// clear any old IBC state stored by previous plan
-	oldPlan, found := k.GetUpgradePlan(ctx)
-	if found {
-		k.ClearIBCState(ctx, oldPlan.Height)
-	}
-
-	bz := k.cdc.MustMarshal(&plan)
-	store.Set(types.PlanKey(), bz)
-
-	telemetry.SetGaugeWithLabels(
-		[]string{"cosmos", "upgrade", "plan", "height"},
-		float32(plan.Height),
-		[]metrics.Label{
-			{Name: "name", Value: plan.Name},
-			{Name: "info", Value: plan.Info},
-		},
-	)
-	return nil
+		if valid, conflicts := s.findConflicts(task); !valid {
 ```
 
-**File:** x/upgrade/abci_test.go (L550-568)
+**File:** store/multiversion/mergeiterator.go (L239-241)
 ```go
-		{
-			"test not panic: minor upgrade should apply",
-			func() (sdk.Context, abci.RequestBeginBlock) {
-				s.keeper.SetUpgradeHandler("test4", func(_ sdk.Context, _ types.Plan, vm module.VersionMap) (module.VersionMap, error) {
-					return vm, nil
-				})
-
-				err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{
-					Title: "Upgrade test",
-					Plan:  types.Plan{Name: "test4", Height: s.ctx.BlockHeight() + 10, Info: minorUpgradeInfo},
-				})
-				require.NoError(t, err)
-
-				newCtx := s.ctx.WithBlockHeight(12)
-				req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
-				return newCtx, req
-			},
-			false,
-		},
+		case 0: // parent == cache.
+			// Skip over if cache item is a delete.
+			valueC := iter.cache.Value()
 ```
 
-**File:** x/upgrade/types/plan_test.go (L175-180)
+**File:** store/multiversion/store_test.go (L375-407)
 ```go
-			name: "invalid json in Info",
-			plan: types.Plan{
-				Info: `{upgradeType:"minor"}`,
-			},
-			want: types.UpgradeDetails{},
-		},
+func TestMVSIteratorValidationWithEstimate(t *testing.T) {
+	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
+	mvs := multiversion.NewMultiVersionStore(parentKVStore)
+	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
+
+	parentKVStore.Set([]byte("key2"), []byte("value0"))
+	parentKVStore.Set([]byte("key3"), []byte("value3"))
+	parentKVStore.Set([]byte("key4"), []byte("value4"))
+	parentKVStore.Set([]byte("key5"), []byte("value5"))
+
+	writeset := make(multiversion.WriteSet)
+	writeset["key1"] = []byte("value1")
+	writeset["key2"] = []byte("value2")
+	writeset["key3"] = nil
+	mvs.SetWriteset(1, 2, writeset)
+
+	iter := vis.Iterator([]byte("key1"), []byte("key6"))
+	for ; iter.Valid(); iter.Next() {
+		// read value
+		iter.Value()
+	}
+	iter.Close()
+	vis.WriteToMultiVersionStore()
+
+	writeset2 := make(multiversion.WriteSet)
+	writeset2["key2"] = []byte("value2")
+	mvs.SetEstimatedWriteset(2, 2, writeset2)
+
+	// should be invalid
+	valid, conflicts := mvs.ValidateTransactionState(5)
+	require.False(t, valid)
+	require.Equal(t, []int{2}, conflicts)
+}
 ```

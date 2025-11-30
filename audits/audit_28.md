@@ -1,207 +1,291 @@
 # Audit Report
 
 ## Title
-Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
+Incorrect Slash Accounting for Redelegations When Destination Validator Has Been Slashed
 
 ## Summary
-The `TrackHistoricalInfo` function contains a critical flaw in its pruning mechanism where a `break` statement causes the pruning loop to exit immediately upon encountering the first missing historical entry. This violates the storage bound invariant when gaps exist in the historical entry sequence, leading to unbounded storage growth that cannot be recovered without a code fix. [1](#0-0) 
+The `SlashRedelegation` function returns a theoretical slash amount based on `InitialBalance` while actually burning fewer tokens when the destination validator's exchange rate has decreased due to prior slashing. This creates an accounting mismatch that causes the total tokens burned to be less than the protocol-specified `slashFactor * power`, violating the core slashing invariant.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-- **location**: `x/staking/keeper/historical_info.go`, lines 78-85 in the `TrackHistoricalInfo` function
+**Location:** The vulnerability exists in the `SlashRedelegation` function [1](#0-0)  and its interaction with the main `Slash` function [2](#0-1) .
 
-- **intended logic**: The function should maintain exactly `HistoricalEntries` number of recent historical info entries by pruning all entries older than `currentHeight - HistoricalEntries`. Storage should be bounded to prevent resource exhaustion.
+**Intended Logic:** According to the protocol specification [3](#0-2) , when a validator is slashed, the total amount must equal `slashFactor * power` at the infraction height. Each actual amount slashed from redelegations and unbonding delegations should be subtracted from the total, with the remaining amount slashed from the validator's bonded tokens.
 
-- **actual logic**: The pruning loop iterates downward from `currentHeight - HistoricalEntries` and breaks immediately upon encountering the first missing entry. [1](#0-0)  The code comment explicitly states an incorrect assumption: "the entries to be deleted are always in a continuous range" [2](#0-1) , but this assumption is violated when `HistoricalEntries` is temporarily set to 0.
+**Actual Logic:** The `SlashRedelegation` function calculates a theoretical slash amount as `slashFactor * entry.InitialBalance` and accumulates this in `totalSlashAmount` (lines 238-240 of slash.go). However, the actual tokens burned are obtained by calling `Unbond()` (line 265) which converts shares to tokens using the destination validator's current exchange rate via `TokensFromShares()` [4](#0-3) . 
 
-- **exploitation path**:
-  1. Network operates with `HistoricalEntries=100`, accumulating entries for blocks 1-100
-  2. Governance proposal changes `HistoricalEntries` to 0 at block 101
-  3. At block 101, the pruning loop starts at height 101, finds no entry (not created yet), breaks immediately - entries 1-100 remain
-  4. Lines 87-90 prevent new entry creation when `entryNum==0` [3](#0-2) 
-  5. During blocks 101-110, no new entries are created (gap period)
-  6. Governance proposal changes `HistoricalEntries` to 5 at block 111
-  7. At block 111, pruning loop starts at height 106 (111-5), finds no entry at height 106 (gap period), immediately breaks
-  8. Old entries 1-100 are never deleted, new entry 111 is saved
-  9. Each subsequent block adds a new entry without deleting old ones
-  10. Storage grows unboundedly: {1-100, 111, 112, 113, ...}
+When a destination validator has been slashed, its exchange rate decreases because slashing reduces `Tokens` without reducing `DelegatorShares` [5](#0-4) . This causes the actual `tokensToBurn` to be less than the theoretical `slashAmount`. However, the function returns `totalSlashAmount` (theoretical) not the actual burned amount. The main `Slash` function then subtracts this theoretical amount from `remainingSlashAmount`, resulting in total actual tokens burned being less than the protocol-specified amount.
 
-- **security guarantee broken**: The storage bound invariant is violated. The system should maintain exactly `HistoricalEntries` entries, but instead accumulates entries without bound.
+**Exploitation Path:**
+1. Validator A commits a slashable infraction at height H1
+2. After H1, tokens are redelegated from A to B (creating redelegation entry with `InitialBalance` and `SharesDst`)
+3. Validator B is slashed for its own independent infraction, reducing its exchange rate (e.g., from 1.0 to 0.5)
+4. Validator A is slashed for the H1 infraction:
+   - `SlashRedelegation` calculates theoretical = `slashFactor * InitialBalance`
+   - Actual burn via `Unbond` = `slashFactor * SharesDst * currentExchangeRate`
+   - Since B was slashed: currentExchangeRate < 1.0, so actual burn < theoretical
+   - Function returns theoretical amount
+   - Main `Slash` subtracts theoretical from `remainingSlashAmount`
+   - Validator A's bonded tokens are slashed by the remaining amount
+   - Total actual burn < `slashFactor * power` (protocol violation)
+
+**Security Guarantee Broken:** The protocol invariant that validators must be slashed by exactly `slashFactor * power` at the infraction height is violated. This allows validators to escape proportional punishment through redelegations to subsequently-slashed validators.
 
 ## Impact Explanation
 
-Each `HistoricalInfo` entry contains a complete block header and full validator set [4](#0-3) . With the default 35 validators [5](#0-4) , each entry represents substantial data (multiple kilobytes).
+This vulnerability weakens the economic security model by enabling systematic under-slashing of misbehaving validators. During cascading slashing events (multiple validators slashed in sequence), the source validator escapes proportional punishment when their redelegations point to validators that get slashed first.
 
-After the vulnerability is triggered:
-- Expected storage with `HistoricalEntries=5`: 5 entries
-- Actual storage: 100 old entries + 8,640+ new entries per day (assuming 10-second blocks)
-- Within 24 hours: increases from 100 to 8,740+ entries = 174,700% increase
-
-This far exceeds the 30% threshold for Medium severity resource consumption impact, meeting the criterion: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."
-
-Over time, this leads to storage exhaustion, node crashes when disk space is exhausted, and potential network degradation if sufficient nodes run out of storage.
+For example, with a validator having 1000 tokens at infraction height, 400 tokens redelegated to a validator that subsequently gets slashed 50%, and then the source validator slashed 50%: the shortfall is 100 tokens (20% of the intended 500-token punishment). This accumulates across multiple redelegations and slashing events, reducing the effectiveness of the slashing mechanism in deterring validator misbehavior. Fewer tokens are burned than the protocol specifies, affecting both token supply accounting and the security guarantee that validators face full financial consequences for infractions.
 
 ## Likelihood Explanation
 
-**Who can trigger**: Any network participant through the standard governance process. The `HistoricalEntries` parameter is governance-controlled. [6](#0-5) 
+**Who Can Trigger:** Any network participant through normal operations—no special privileges required. Slashing is triggered automatically by the protocol [6](#0-5)  when validators commit infractions (double-signing, downtime, etc.).
 
-**Conditions required**:
-1. A governance proposal changes `HistoricalEntries` from non-zero to 0
-2. After several blocks, another proposal changes it back to a non-zero value
+**Conditions Required:**
+1. A validator commits a slashable infraction
+2. After the infraction, delegators redelegate from that validator to another (routine operation)
+3. The destination validator gets slashed for its own independent infraction
+4. The source validator's infraction is detected and slashed
 
-**Why realistic**:
-- The validation function explicitly allows `HistoricalEntries=0` as valid (only checks type, not value) [7](#0-6) 
-- The simulation code confirms 0 is an intended valid value: "returns randomized HistoricalEntries between 0-100" [8](#0-7) 
-- Non-IBC chains may legitimately set `HistoricalEntries=0` to save resources [9](#0-8) 
-- This is not a malicious attack but a legitimate governance operation that triggers a code bug
-- Once triggered, the issue is **unrecoverable** without a code fix—governance cannot remove the orphaned entries through any parameter change
-
-**Frequency**: Once triggered through normal governance operations, the effect compounds with every subsequent block as `TrackHistoricalInfo` is called in every `BeginBlocker`. [10](#0-9) 
+**Frequency:** This occurs naturally during network instability periods when multiple validators are slashed. The vulnerability is systemic and manifests whenever the conditions align. It can also be strategically exploited by sophisticated actors who commit infractions, then redelegate to risky validators they control or anticipate will be slashed, thereby reducing their total slashing penalty when their original infraction is discovered.
 
 ## Recommendation
 
-Modify the pruning logic to delete all entries older than the retention threshold, regardless of gaps. Remove the break condition and iterate through all possible heights:
+Modify `SlashRedelegation` to return the actual burned amount rather than the theoretical amount:
 
-```go
-// Prune all entries older than retention height, regardless of gaps
-pruneHeight := ctx.BlockHeight() - int64(entryNum)
-for i := pruneHeight; i >= 0; i-- {
-    _, found := k.GetHistoricalInfo(ctx, i)
-    if found {
-        k.DeleteHistoricalInfo(ctx, i)
-    }
-    // Continue checking all heights - do not break on missing entries
-}
-```
+1. Track the cumulative actual `tokensToBurn` from all redelegation entries instead of the theoretical `slashAmount`
+2. Accumulate `tokensToBurn` (obtained from `Unbond`) to `totalSlashAmount` instead of accumulating the theoretical `slashAmount`
+3. Return the sum of actual `tokensToBurn` values
 
-Alternatively, track the oldest and newest entry heights in state to enable efficient range-based deletion without relying on the "continuous range" assumption.
+Alternatively, implement a two-phase approach:
+1. Record both theoretical and actual amounts during redelegation slashing
+2. Track the shortfall between theoretical and actual burns
+3. Adjust the validator's bonded token slash to compensate for any shortfall
+
+This ensures the slashing invariant is maintained: total actual tokens burned = `slashFactor * power` at infraction height.
 
 ## Proof of Concept
 
-**File**: `x/staking/keeper/historical_info_test.go`
+**Test File:** `x/staking/keeper/slash_test.go`
+**Function:** `TestSlashRedelegationWithSlashedDestination` (to be added)
 
-**Test Function**: `TestTrackHistoricalInfoUnboundedGrowth`
+**Setup:**
+1. Bootstrap test environment with validators A and B, each with 1000 tokens (power=10)
+2. Create delegator with sufficient funds
+3. Create redelegation from validator A to B of 400 tokens at height 11
+4. Mark validator A's infraction at height 10
 
-**Setup**:
-- Initialize staking keeper using `createTestInput()`
-- Set `HistoricalEntries=100`
-- Create 100 blocks with historical entries using `TrackHistoricalInfo`
-- Verify 100 entries exist in storage
+**Action:**
+1. Slash validator B by 50% at height 12 (reduces B's exchange rate from 1.0 to 0.5)
+2. Record bonded pool balance before slashing A
+3. Slash validator A by 50% at height 13 for infraction at height 10
+4. Record bonded pool balance after slashing A
 
-**Action**:
-1. Change `HistoricalEntries` to 0 via `SetParams`
-2. Generate 10 blocks (101-110) by calling `TrackHistoricalInfo` with updated block heights
-3. Verify no new entries created during this period (gap created)
-4. Change `HistoricalEntries` to 5 via `SetParams`
-5. Generate block 111 by calling `TrackHistoricalInfo`
-6. Count total entries using `GetAllHistoricalInfo`
+**Result:**
+- Theoretical slash for redelegation: 50% × 400 = 200 tokens
+- Actual burn from redelegation: 50% × 400 shares × 0.5 exchange rate = 100 tokens
+- Total intended slash: 50% × 1000 = 500 tokens
+- Redelegation theoretical amount subtracted from remaining: 200 tokens
+- Remaining slash from A's bonded tokens: 500 - 200 = 300 tokens
+- Total actual tokens burned: 100 + 300 = 400 tokens
+- **Expected: 500 tokens, Actual: 400 tokens, Shortfall: 100 tokens (20% under-slash)**
 
-**Result**:
-- Expected after block 111: 5 entries (107-111)
-- Actual after block 111: 101 entries (1-100 + 111)
-- This proves old entries are never pruned when a gap exists, violating the `HistoricalEntries` bound
+The bonded pool balance decrease confirms only 400 tokens are burned instead of the protocol-specified 500 tokens, demonstrating a violation of the slashing invariant.
 
 ## Notes
 
-This vulnerability is called every block through `BeginBlocker`, making it a production-critical issue. The flaw stems from an incorrect assumption that entries form a "continuous range," which is violated by legitimate governance operations that temporarily set `HistoricalEntries=0`. This is not a misconfiguration but a code bug triggered by supported parameter values, causing an unrecoverable security failure beyond governance's intended authority. The issue qualifies for the governance exception because setting `HistoricalEntries=0` is explicitly documented and tested as valid, yet triggering this legitimate operation causes permanent, unrecoverable storage corruption that cannot be fixed through any subsequent governance action.
+The function comment [7](#0-6)  indicates that returning theoretical amounts is intentional for handling insufficient stake scenarios. However, this design is incorrectly applied to redelegations when the destination validator has been independently slashed. In this case, the shortfall is not due to previous slashing of the same stake (which the design handles), but due to an independent validator's slashing event changing the exchange rate. This causes the total actual burn to be less than the protocol-specified `slashFactor * power`, violating the fundamental slashing invariant and distinguishing this vulnerability from the intended behavior described in the comment.
 
 ### Citations
 
-**File:** x/staking/keeper/historical_info.go (L71-77)
+**File:** x/staking/keeper/slash.go (L93-102)
 ```go
-	// Prune store to ensure we only have parameter-defined historical entries.
-	// In most cases, this will involve removing a single historical entry.
-	// In the rare scenario when the historical entries gets reduced to a lower value k'
-	// from the original value k. k - k' entries must be deleted from the store.
-	// Since the entries to be deleted are always in a continuous range, we can iterate
-	// over the historical entries starting from the most recent version to be pruned
-	// and then return at the first empty entry.
+		// Iterate through redelegations from slashed source validator
+		redelegations := k.GetRedelegationsFromSrcValidator(ctx, operatorAddress)
+		for _, redelegation := range redelegations {
+			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
+			if amountSlashed.IsZero() {
+				continue
+			}
+
+			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
+		}
 ```
 
-**File:** x/staking/keeper/historical_info.go (L78-85)
+**File:** x/staking/keeper/slash.go (L214-217)
 ```go
-	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
-		_, found := k.GetHistoricalInfo(ctx, i)
-		if found {
-			k.DeleteHistoricalInfo(ctx, i)
-		} else {
-			break
+// return the amount that would have been slashed assuming
+// the unbonding delegation had enough stake to slash
+// (the amount actually slashed may be less if there's
+// insufficient stake remaining)
+```
+
+**File:** x/staking/keeper/slash.go (L219-296)
+```go
+func (k Keeper) SlashRedelegation(ctx sdk.Context, srcValidator types.Validator, redelegation types.Redelegation,
+	infractionHeight int64, slashFactor sdk.Dec) (totalSlashAmount sdk.Int) {
+	now := ctx.BlockHeader().Time
+	totalSlashAmount = sdk.ZeroInt()
+	bondedBurnedAmount, notBondedBurnedAmount := sdk.ZeroInt(), sdk.ZeroInt()
+
+	// perform slashing on all entries within the redelegation
+	for _, entry := range redelegation.Entries {
+		// If redelegation started before this height, stake didn't contribute to infraction
+		if entry.CreationHeight < infractionHeight {
+			continue
+		}
+
+		if entry.IsMature(now) {
+			// Redelegation no longer eligible for slashing, skip it
+			continue
+		}
+
+		// Calculate slash amount proportional to stake contributing to infraction
+		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
+		slashAmount := slashAmountDec.TruncateInt()
+		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+
+		// Unbond from target validator
+		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
+		if sharesToUnbond.IsZero() {
+			continue
+		}
+
+		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
+		if err != nil {
+			panic(err)
+		}
+
+		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
+
+		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
+		if !found {
+			// If deleted, delegation has zero shares, and we can't unbond any more
+			continue
+		}
+
+		if sharesToUnbond.GT(delegation.Shares) {
+			sharesToUnbond = delegation.Shares
+		}
+
+		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
+		if err != nil {
+			panic(fmt.Errorf("error unbonding delegator: %v", err))
+		}
+
+		dstValidator, found := k.GetValidator(ctx, valDstAddr)
+		if !found {
+			panic("destination validator not found")
+		}
+
+		// tokens of a redelegation currently live in the destination validator
+		// therefor we must burn tokens from the destination-validator's bonding status
+		switch {
+		case dstValidator.IsBonded():
+			bondedBurnedAmount = bondedBurnedAmount.Add(tokensToBurn)
+		case dstValidator.IsUnbonded() || dstValidator.IsUnbonding():
+			notBondedBurnedAmount = notBondedBurnedAmount.Add(tokensToBurn)
+		default:
+			panic("unknown validator status")
 		}
 	}
-```
 
-**File:** x/staking/keeper/historical_info.go (L87-90)
-```go
-	// if there is no need to persist historicalInfo, return
-	if entryNum == 0 {
-		return
+	if err := k.burnBondedTokens(ctx, bondedBurnedAmount); err != nil {
+		panic(err)
 	}
-```
 
-**File:** x/staking/types/historical_info.go (L15-27)
-```go
-// NewHistoricalInfo will create a historical information struct from header and valset
-// it will first sort valset before inclusion into historical info
-func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
-	// Must sort in the same way that tendermint does
-	sort.SliceStable(valSet, func(i, j int) bool {
-		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
-	})
-
-	return HistoricalInfo{
-		Header: header,
-		Valset: valSet,
+	if err := k.burnNotBondedTokens(ctx, notBondedBurnedAmount); err != nil {
+		panic(err)
 	}
+
+	return totalSlashAmount
 }
 ```
 
-**File:** x/staking/types/params.go (L24-24)
-```go
-	DefaultMaxValidators uint32 = 35
+**File:** x/staking/spec/02_state_transitions.md (L131-138)
+```markdown
+- The total `slashAmount` is calculated as the `slashFactor` (a chain parameter) \* `TokensFromConsensusPower`,
+  the total number of tokens bonded to the validator at the time of the infraction.
+- Every unbonding delegation and pseudo-unbonding redelegation such that the infraction occured before the unbonding or
+  redelegation began from the validator are slashed by the `slashFactor` percentage of the initialBalance.
+- Each amount slashed from redelegations and unbonding delegations is subtracted from the
+  total slash amount.
+- The `remaingSlashAmount` is then slashed from the validator's tokens in the `BondedPool` or
+  `NonBondedPool` depending on the validator's status. This reduces the total supply of tokens.
 ```
 
-**File:** x/staking/types/params.go (L29-32)
+**File:** x/staking/types/validator.go (L304-306)
 ```go
-	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
-	// value by not adding the staking module to the application module manager's
-	// SetOrderBeginBlockers.
-	DefaultHistoricalEntries uint32 = 10000
+func (v Validator) TokensFromShares(shares sdk.Dec) sdk.Dec {
+	return (shares.MulInt(v.Tokens)).Quo(v.DelegatorShares)
+}
 ```
 
-**File:** x/staking/types/params.go (L242-249)
+**File:** x/staking/types/validator.go (L393-405)
 ```go
-func validateHistoricalEntries(i interface{}) error {
-	_, ok := i.(uint32)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
+func (v Validator) RemoveTokens(tokens sdk.Int) Validator {
+	if tokens.IsNegative() {
+		panic(fmt.Sprintf("should not happen: trying to remove negative tokens %v", tokens))
 	}
 
-	return nil
+	if v.Tokens.LT(tokens) {
+		panic(fmt.Sprintf("should not happen: only have %v tokens, trying to remove %v", v.Tokens, tokens))
+	}
+
+	v.Tokens = v.Tokens.Sub(tokens)
+
+	return v
 }
 ```
 
-**File:** x/staking/keeper/params.go (L82-84)
+**File:** x/slashing/abci.go (L22-66)
 ```go
-// set the params
-func (k Keeper) SetParams(ctx sdk.Context, params types.Params) {
-	k.paramstore.SetParamSet(ctx, &params)
-```
-
-**File:** x/staking/simulation/genesis.go (L34-37)
-```go
-// getHistEntries returns randomized HistoricalEntries between 0-100.
-func getHistEntries(r *rand.Rand) uint32 {
-	return uint32(r.Intn(int(types.DefaultHistoricalEntries + 1)))
-}
-```
-
-**File:** x/staking/abci.go (L15-18)
-```go
-func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+// BeginBlocker check for infraction evidence or downtime of validators
+// on every begin block
+func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
 	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
 
-	k.TrackHistoricalInfo(ctx)
+	var wg sync.WaitGroup
+	// Iterate over all the validators which *should* have signed this block
+	// store whether or not they have actually signed it and slash/unbond any
+	// which have missed too many blocks in a row (downtime slashing)
+
+	// this allows us to preserve the original ordering for writing purposes
+	slashingWriteInfo := make([]*SlashingWriteInfo, len(req.LastCommitInfo.GetVotes()))
+
+	allVotes := req.LastCommitInfo.GetVotes()
+	for i, _ := range allVotes {
+		wg.Add(1)
+		go func(valIndex int) {
+			defer wg.Done()
+			vInfo := allVotes[valIndex]
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
+				ConsAddr:    consAddr,
+				MissedInfo:  missedInfo,
+				SigningInfo: signInfo,
+				ShouldSlash: shouldSlash,
+				SlashInfo:   slashInfo,
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for _, writeInfo := range slashingWriteInfo {
+		if writeInfo == nil {
+			panic("Expected slashing write info to be non-nil")
+		}
+		// Update the validator missed block bit array by index if different from last value at the index
+		if writeInfo.ShouldSlash {
+			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
+			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
+		} else {
+			k.SetValidatorMissedBlocks(ctx, writeInfo.ConsAddr, writeInfo.MissedInfo)
+		}
+		k.SetValidatorSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SigningInfo)
+	}
+}
 ```

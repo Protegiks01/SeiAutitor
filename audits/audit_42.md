@@ -1,253 +1,236 @@
 # Audit Report
 
 ## Title
-Missing Input Validation in ValidatorSigningInfo Enables Network Halt via Negative IndexOffset
+Minor Upgrade Detection Bypass via Malformed JSON Leading to Network Shutdown
 
 ## Summary
-The slashing module lacks validation for the `IndexOffset` field in `ValidatorSigningInfo`, allowing negative values to be persisted through genesis initialization. When BeginBlocker processes validators with negative `IndexOffset` values, a runtime panic occurs in bit shift operations, causing all validator nodes to crash simultaneously and total network shutdown.
+The upgrade module fails to validate JSON syntax in the `Plan.Info` field during governance proposal submission. When malformed JSON is present, the `UpgradeDetails()` parsing silently fails at runtime, causing the upgrade to be incorrectly treated as a major release. Validators who update their binaries early (following the documented minor upgrade protocol) will experience node panics with the "BINARY UPDATED BEFORE TRIGGER!" message, potentially causing network-wide shutdown if ≥30% of validators are affected.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location**: 
-- Primary vulnerability: `x/slashing/keeper/signing_info.go` lines 34-38 (`SetValidatorSigningInfo`)
-- Missing genesis validation: `x/slashing/types/genesis.go` lines 32-58 (`ValidateGenesis`)
-- Panic trigger: `x/slashing/keeper/signing_info.go` lines 78-86 (`GetBooleanFromBitGroups`)
+**Location:**
+- `x/upgrade/types/plan.go` (ValidateBasic function, lines 21-36)
+- `x/upgrade/types/plan.go` (UpgradeDetails function, lines 59-69)
+- `x/upgrade/keeper/keeper.go` (ScheduleUpgrade function, lines 177-180)
+- `x/upgrade/abci.go` (BeginBlocker function, lines 75-78 and 92-97)
 
-**Intended logic**: The system should validate that `IndexOffset` is non-negative and within the valid range [0, SignedBlocksWindow) before persisting `ValidatorSigningInfo`. The protobuf definition defines `index_offset` as `int64`, which allows negative values. [1](#0-0) 
+**Intended logic:** When an upgrade plan specifies `{"upgradeType":"minor"}` in the `Info` field, the system should parse this JSON successfully, classify the upgrade as minor, and allow validators to safely update their binaries before the scheduled upgrade height without triggering a panic. The minor/major upgrade distinction is a documented security feature where minor upgrades allow early binary updates with "No panic" while major upgrades require "Exact height only" execution and "Panic if handler present too early." [1](#0-0) 
 
-**Actual logic**: 
-- `SetValidatorSigningInfo` directly marshals and stores any provided value without validation checks. [2](#0-1) 
+**Actual logic:** The `Plan.ValidateBasic()` function only validates the plan name, height, and deprecated fields, but does not validate JSON syntax in the `Info` field. When `BeginBlocker` executes, it calls `plan.UpgradeDetails()` which attempts JSON parsing. If JSON is malformed (e.g., `{upgradeType:minor}` with missing quotes), `json.Unmarshal` fails and returns an empty `UpgradeDetails{}` struct with an error. [2](#0-1) 
 
-- `ValidateGenesis` only validates the `Params` field while completely skipping validation of the `SigningInfos` array. [3](#0-2) 
+The error is only logged and ignored in `BeginBlocker`: [3](#0-2) 
 
-**Exploitation path**:
-1. Genesis state contains a `ValidatorSigningInfo` with negative `IndexOffset` (e.g., -5) due to manual error, tooling bug, or state corruption
-2. `InitGenesis` iterates through signing infos and calls `SetValidatorSigningInfo` which stores the value without validation [4](#0-3) 
+The empty struct has `UpgradeType = ""`, causing `IsMinorRelease()` to return false. The code then falls through to major upgrade logic, and if a handler exists (validators updated early for what they believed was a minor release), the node panics: [4](#0-3) 
 
-3. First block's `BeginBlocker` executes, processing all validators in parallel [5](#0-4) 
+**Exploitation path:**
+1. A governance proposal is submitted with malformed JSON in the `Info` field (e.g., `{upgradeType:minor}` instead of `{"upgradeType":"minor"}`) - this can occur through accidental human error
+2. The proposal passes `ValidateBasic()` because JSON syntax is not checked
+3. The governance proposal is approved through standard democratic voting process
+4. The upgrade plan is scheduled via `ScheduleUpgrade()`, which also doesn't validate JSON syntax: [5](#0-4) 
 
-4. `HandleValidatorSignatureConcurrent` reads the IndexOffset directly [6](#0-5) 
+5. Validators, believing the upgrade is minor based on proposal description or external communications, update their binaries before the scheduled height (following standard minor upgrade protocol)
+6. When `BeginBlocker` executes before the scheduled height, JSON parsing fails silently
+7. The upgrade is incorrectly classified as major release due to empty `UpgradeDetails`
+8. Each validator node with the updated handler panics with "BINARY UPDATED BEFORE TRIGGER!"
+9. If ≥30% of validators are affected, the network experiences severe degradation or completely halts consensus
 
-5. Calls `GetBooleanFromBitGroups(missedInfo.MissedBlocks, index)` with negative index [7](#0-6) 
-
-6. In `GetBooleanFromBitGroups`, line 81 computes `indexShift := index % UINT_64_NUM_BITS` which yields -5 (Go preserves sign in modulo), then line 86 attempts `indexMask := uint64(1) << indexShift`, causing runtime panic with "negative shift amount" [8](#0-7) 
-
-7. All nodes crash simultaneously due to deterministic genesis state processing
-
-**Security guarantee broken**: The system fails to maintain the critical invariant that `IndexOffset ∈ [0, SignedBlocksWindow)`, leading to undefined behavior (negative bit shift) that crashes the process. This violates fail-safe design principles for consensus-critical code.
+**Security guarantee broken:** The minor/major upgrade type detection mechanism is a documented security feature that allows safe early binary updates for minor releases. The silent failure of JSON parsing violates the documented upgrade protocol where minor releases should allow "early execution" with "No panic" behavior, creating a vector for network-wide availability failures beyond governance's intended authority.
 
 ## Impact Explanation
 
-**Affected components**: All validator nodes, network consensus, transaction processing capability
+The impact directly affects network availability and validator node operation:
 
-**Consequences**:
-- **Total network halt**: All nodes panic simultaneously when processing the first block after genesis initialization
-- **Permanent service disruption**: Nodes cannot recover without external intervention to fix genesis state
-- **Hard fork requirement**: Resolution requires coordinating all validators to restart with corrected genesis data
-- **Zero transaction throughput**: No blocks can be produced until the issue is resolved
+- **Validator Panics**: All validators who updated their binaries early following documented minor upgrade best practices will experience node crashes with the "BINARY UPDATED BEFORE TRIGGER!" panic message
+- **Network Degradation**: If 30-33% of validators are affected, the network continues operating but with degraded consensus quality below the Byzantine fault tolerance threshold
+- **Network Halt**: If >33% of validators are affected, the network cannot reach the required 2/3+ consensus threshold and completely halts, unable to confirm new transactions
+- **Recovery Complexity**: Affected validators must roll back their binaries or coordinate to skip the upgrade height through emergency off-chain coordination
+- **Economic Impact**: Network downtime affects all users, dApps, and economic activity on the chain
 
-This completely breaks the blockchain's core purpose of maintaining continuous operation. The deterministic nature of genesis processing ensures all nodes fail identically, making network self-recovery impossible.
+This directly matches the Medium severity impact categories:
+- "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network" (for 30-33% affected)
+- "Network not being able to confirm new transactions (total network shutdown)" (for >33% affected)
 
 ## Likelihood Explanation
 
-**Triggering conditions**:
-- Occurs during genesis initialization or chain restart with exported state
-- Any single `ValidatorSigningInfo` with negative `IndexOffset` triggers the vulnerability
-- Deterministic impact affecting all nodes without timing dependencies
+**Triggering parties**: Any participant who can submit and pass governance proposals (requires governance token holdings and community support through a public democratic process). Importantly, this can occur through inadvertent human error when crafting proposals, not requiring malicious intent.
 
-**Probability**: While genesis files are controlled by privileged operators, this vulnerability can be triggered accidentally through:
-- Manual JSON editing errors during chain upgrades
-- Bugs in genesis export/import tooling
-- State corruption from other vulnerabilities
-- Integer underflow in migration or state export code
-- Copy-paste errors in configuration
+**Required conditions:**
+1. Governance proposal containing malformed JSON must be submitted and approved through standard voting
+2. Validators must interpret the upgrade as minor based on proposal description or official communications
+3. Validators must update their binaries before scheduled height (standard practice for minor upgrades per documented protocol)
+4. BeginBlock must execute with updated handlers present
 
-The lack of defensive validation creates a fragile system where subtle errors in privileged operations cause catastrophic, unrecoverable failures beyond the intended scope of administrative control. This qualifies under the privilege exception clause because even a trusted role inadvertently triggering it causes an unrecoverable security failure (network-wide halt requiring hard fork) that far exceeds normal administrative authority.
+**Likelihood assessment**: Moderate to high likelihood because:
+- JSON syntax errors (missing quotes, trailing commas) are extremely common in human-crafted text
+- Validators rely on external communications and proposal descriptions to determine upgrade types
+- The malformed JSON is only detected at runtime, not during proposal validation, providing no early warning to catch the error
+- Validators typically update in coordinated batches before minor releases to ensure smooth transitions, making it likely that multiple validators (potentially >30%) would be simultaneously affected
+- The silent failure mode provides no feedback loop to prevent the issue
 
 ## Recommendation
 
-Implement comprehensive validation at multiple layers:
+Add JSON validation to the upgrade plan validation flow to reject malformed JSON early and fail fast rather than silently at runtime. Enhance `Plan.ValidateBasic()` to include JSON validation:
 
-**1. Add validation in `SetValidatorSigningInfo`**:
-Check that `IndexOffset >= 0` before storing. Consider also validating that `IndexOffset < SignedBlocksWindow` to ensure the invariant is maintained.
+```go
+func (p Plan) ValidateBasic() error {
+    // ... existing validations ...
+    
+    // Validate JSON syntax in Info field if present
+    if p.Info != "" {
+        if _, err := p.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, 
+                fmt.Sprintf("invalid JSON in Info field: %v", err))
+        }
+    }
+    
+    return nil
+}
+```
 
-**2. Add validation in `ValidateGenesis`**:
-Iterate through `data.SigningInfos` and validate each `ValidatorSigningInfo.IndexOffset` is non-negative and `MissedBlocksCounter` is non-negative.
+Alternatively, add validation in `ScheduleUpgrade()`:
 
-**3. Add defensive check in `GetBooleanFromBitGroups`**:
-Return false early if `index < 0` to prevent negative shift operations, similar to the protection in `CompactBitArray.GetIndex`. [9](#0-8) 
+```go
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+    if err := plan.ValidateBasic(); err != nil {
+        return err
+    }
+    
+    // Validate upgrade details if Info is provided
+    if plan.Info != "" {
+        if _, err := plan.UpgradeDetails(); err != nil {
+            return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, 
+                "invalid upgrade info JSON: %v", err)
+        }
+    }
+    
+    // ... rest of function
+}
+```
+
+This ensures malformed JSON is rejected during proposal validation before it can cause runtime failures.
 
 ## Proof of Concept
 
-**Test file**: `x/slashing/genesis_test.go` (new test to add)
+**File**: `x/upgrade/abci_test.go`
 
-**Setup**:
-- Initialize test app with simapp.Setup
-- Create validator signing info with negative IndexOffset (-5)
-- Store it using SetValidatorSigningInfo (which accepts it without validation)
-- Configure validator in missed blocks tracking
+**Setup:**
+- Initialize test suite at height 10 with no skip heights using `setupTest(10, map[int64]bool{})`
+- Schedule upgrade at height 20 with malformed JSON: `{upgradeType:minor}` (missing quotes around key and value)
 
-**Action**:
-- Call BeginBlocker with RequestBeginBlock containing the validator
-- The BeginBlocker processes the validator's signing info
-- HandleValidatorSignatureConcurrent reads the negative IndexOffset
-- GetBooleanFromBitGroups is called with negative index
-- The modulo operation preserves the negative sign: -5 % 64 = -5
-- The bit shift operation attempts: uint64(1) << -5
+**Action:**
+1. Submit governance proposal with malformed JSON upgrade info using `s.handler()`
+2. Verify proposal is accepted despite malformed JSON (demonstrates validation bypass)
+3. Register upgrade handler using `s.keeper.SetUpgradeHandler()` to simulate validator updating binary early for what they believe is a minor release
+4. Execute BeginBlock at height 15 (before scheduled height of 20) using `s.module.BeginBlock()`
 
-**Result**: 
-Runtime panic with error message "negative shift amount", demonstrating the network shutdown scenario. The test would use `require.Panics()` to verify the panic occurs.
+**Expected Result:**
+- Node panics with "BINARY UPDATED BEFORE TRIGGER!" message
+- This demonstrates that malformed JSON bypasses minor release detection and incorrectly triggers major upgrade panic logic
+
+**Test Function:**
+```go
+func TestMalformedJSONBypassesMinorUpgradeDetection(t *testing.T) {
+    s := setupTest(10, map[int64]bool{})
+    malformedMinorUpgradeInfo := `{upgradeType:minor}` // Missing quotes
+    
+    err := s.handler(s.ctx, &types.SoftwareUpgradeProposal{
+        Title: "Minor Upgrade Test",
+        Plan: types.Plan{Name: "test_minor", Height: 20, Info: malformedMinorUpgradeInfo},
+    })
+    require.NoError(t, err) // Proposal accepted despite malformed JSON
+    
+    s.keeper.SetUpgradeHandler("test_minor", func(_ sdk.Context, _ types.Plan, vm module.VersionMap) (module.VersionMap, error) {
+        return vm, nil
+    })
+    
+    newCtx := s.ctx.WithBlockHeight(15)
+    req := abci.RequestBeginBlock{Header: newCtx.BlockHeader()}
+    
+    // PANICS due to malformed JSON bypassing minor release detection
+    require.Panics(t, func() {
+        s.module.BeginBlock(newCtx, req)
+    })
+}
+```
+
+**Comparison:** The same scenario with valid JSON `{"upgradeType":"minor"}` would NOT panic, proving the issue is specifically the malformed JSON handling causing incorrect upgrade type classification.
 
 ## Notes
 
-This vulnerability meets the exception clause for privileged operations because:
-1. **Unrecoverable failure**: Total network halt with no self-recovery mechanism
-2. **Beyond intended authority**: Chain operators cannot fix this without coordinating all validators for a hard fork, far exceeding normal administrative control
-3. **Catastrophic scope**: Affects entire network simultaneously, not just the misconfigured component
-4. **Fail-unsafe design**: Lacks defensive validation for a critical invariant in consensus-critical code
+This vulnerability is valid despite requiring governance because:
 
-The impact classification is **Medium** as it matches: "Network not being able to confirm new transactions (total network shutdown)" from the provided impact list.
+1. **Inadvertent Error**: The malformed JSON is an inadvertent human formatting error, not a malicious action
+2. **Beyond Intended Authority**: Governance intended a minor upgrade (the malformed JSON attempts to specify `upgradeType:minor`), but the system's silent failure causes it to behave as a major upgrade, resulting in validator panics beyond governance's intended authority
+3. **Documented Protocol Violation**: The minor/major upgrade distinction is explicitly documented behavior that validators rely on for safe operations
+4. **Severe Impact**: Matches Medium severity impact categories (≥30% node shutdown, potential network halt)
+5. **Silent Failure**: The error is only logged at runtime, not caught during validation, providing no early warning
+6. **System Resilience**: Even trusted governance can make formatting mistakes; the system should validate basic input syntax to prevent catastrophic runtime failures
+7. **Straightforward Fix**: Adding JSON validation during proposal validation is a simple, effective mitigation
+
+The fix requires adding JSON syntax validation during the proposal validation phase to reject malformed upgrade plans before they can be scheduled and cause network-wide disruption.
 
 ### Citations
 
-**File:** proto/cosmos/slashing/v1beta1/slashing.proto (L40-40)
-```text
-  int64 index_offset = 3 [(gogoproto.moretags) = "yaml:\"index_offset\""];
-```
-
-**File:** x/slashing/keeper/signing_info.go (L34-38)
+**File:** x/upgrade/types/plan.go (L21-36)
 ```go
-func (k Keeper) SetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress, info types.ValidatorSigningInfo) {
-	store := ctx.KVStore(k.storeKey)
-	bz := k.cdc.MustMarshal(&info)
-	store.Set(types.ValidatorSigningInfoKey(address), bz)
-}
-```
-
-**File:** x/slashing/keeper/signing_info.go (L78-86)
-```go
-func (k Keeper) GetBooleanFromBitGroups(bitGroupArray []uint64, index int64) bool {
-	// convert the index into indexKey + indexShift
-	indexKey := index / UINT_64_NUM_BITS
-	indexShift := index % UINT_64_NUM_BITS
-	if indexKey >= int64(len(bitGroupArray)) {
-		return false
+func (p Plan) ValidateBasic() error {
+	if !p.Time.IsZero() {
+		return sdkerrors.ErrInvalidRequest.Wrap("time-based upgrades have been deprecated in the SDK")
 	}
-	// shift 1 by the indexShift value to generate bit mask (to index into the bitGroup)
-	indexMask := uint64(1) << indexShift
-```
-
-**File:** x/slashing/types/genesis.go (L32-58)
-```go
-func ValidateGenesis(data GenesisState) error {
-	downtime := data.Params.SlashFractionDowntime
-	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
+	if p.UpgradedClientState != nil {
+		return sdkerrors.ErrInvalidRequest.Wrap("upgrade logic for IBC has been moved to the IBC module")
 	}
-
-	dblSign := data.Params.SlashFractionDoubleSign
-	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
+	if len(p.Name) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "name cannot be empty")
 	}
-
-	minSign := data.Params.MinSignedPerWindow
-	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
-		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
-	}
-
-	downtimeJail := data.Params.DowntimeJailDuration
-	if downtimeJail < 1*time.Minute {
-		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
-	}
-
-	signedWindow := data.Params.SignedBlocksWindow
-	if signedWindow < 10 {
-		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
+	if p.Height <= 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "height must be greater than 0")
 	}
 
 	return nil
-```
-
-**File:** x/slashing/genesis.go (L24-29)
-```go
-	for _, info := range data.SigningInfos {
-		address, err := sdk.ConsAddressFromBech32(info.Address)
-		if err != nil {
-			panic(err)
-		}
-		keeper.SetValidatorSigningInfo(ctx, address, info.ValidatorSigningInfo)
-```
-
-**File:** x/slashing/abci.go (L24-66)
-```go
-func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
-
-	var wg sync.WaitGroup
-	// Iterate over all the validators which *should* have signed this block
-	// store whether or not they have actually signed it and slash/unbond any
-	// which have missed too many blocks in a row (downtime slashing)
-
-	// this allows us to preserve the original ordering for writing purposes
-	slashingWriteInfo := make([]*SlashingWriteInfo, len(req.LastCommitInfo.GetVotes()))
-
-	allVotes := req.LastCommitInfo.GetVotes()
-	for i, _ := range allVotes {
-		wg.Add(1)
-		go func(valIndex int) {
-			defer wg.Done()
-			vInfo := allVotes[valIndex]
-			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
-			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
-				ConsAddr:    consAddr,
-				MissedInfo:  missedInfo,
-				SigningInfo: signInfo,
-				ShouldSlash: shouldSlash,
-				SlashInfo:   slashInfo,
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	for _, writeInfo := range slashingWriteInfo {
-		if writeInfo == nil {
-			panic("Expected slashing write info to be non-nil")
-		}
-		// Update the validator missed block bit array by index if different from last value at the index
-		if writeInfo.ShouldSlash {
-			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
-			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
-		} else {
-			k.SetValidatorMissedBlocks(ctx, writeInfo.ConsAddr, writeInfo.MissedInfo)
-		}
-		k.SetValidatorSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SigningInfo)
-	}
 }
 ```
 
-**File:** x/slashing/keeper/infractions.go (L40-40)
+**File:** x/upgrade/types/plan.go (L59-69)
 ```go
-	index := signInfo.IndexOffset
-```
-
-**File:** x/slashing/keeper/infractions.go (L55-55)
-```go
-	previous := k.GetBooleanFromBitGroups(missedInfo.MissedBlocks, index)
-```
-
-**File:** crypto/types/compact_bit_array.go (L54-63)
-```go
-func (bA *CompactBitArray) GetIndex(i int) bool {
-	if bA == nil {
-		return false
+func (p Plan) UpgradeDetails() (UpgradeDetails, error) {
+	if p.Info == "" {
+		return UpgradeDetails{}, nil
 	}
-	if i < 0 || i >= bA.Count() {
-		return false
+	var details UpgradeDetails
+	if err := json.Unmarshal([]byte(p.Info), &details); err != nil {
+		// invalid json, assume no upgrade details
+		return UpgradeDetails{}, err
 	}
-
-	return bA.Elems[i>>3]&(1<<uint8(7-(i%8))) > 0
+	return details, nil
 }
+```
+
+**File:** x/upgrade/abci.go (L75-78)
+```go
+	details, err := plan.UpgradeDetails()
+	if err != nil {
+		ctx.Logger().Error("failed to parse upgrade details", "err", err)
+	}
+```
+
+**File:** x/upgrade/abci.go (L92-97)
+```go
+	// if we have a handler for a non-minor upgrade, that means it updated too early and must stop
+	if k.HasHandler(plan.Name) {
+		downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain", plan.Name)
+		ctx.Logger().Error(downgradeMsg)
+		panic(downgradeMsg)
+	}
+```
+
+**File:** x/upgrade/keeper/keeper.go (L177-180)
+```go
+func (k Keeper) ScheduleUpgrade(ctx sdk.Context, plan types.Plan) error {
+	if err := plan.ValidateBasic(); err != nil {
+		return err
+	}
 ```

@@ -1,241 +1,249 @@
 # Audit Report
 
 ## Title
-Unbounded Deposit Iteration in EndBlocker Enables Block Production DoS Attack
+Stale Liveness Tracking State Persists After Validator Removal Causing Unfair Slashing on Consensus Key Reuse
 
 ## Summary
-The governance module's `IterateDeposits` function processes all deposits for a proposal during EndBlocker execution without any limit on the number of depositors. Since EndBlocker runs with an infinite gas meter, an attacker can create thousands of minimal deposits from unique addresses, causing significant block processing delays (500%+ of normal block time) when the proposal finalizes, affecting all validators network-wide.
+The slashing module's `AfterValidatorRemoved` hook fails to delete `ValidatorSigningInfo` and `ValidatorMissedBlockArray` when a validator is removed from the validator set. This causes validators who reuse the same consensus key after full unbonding to inherit stale `MissedBlocksCounter` values, resulting in premature downtime slashing that violates the protocol's fairness guarantees.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** 
-- `x/gov/keeper/deposit.go` (lines 88-104, 54-68, 164-179)
-- `x/gov/abci.go` (lines 20-22, 58-62)
-- `types/context.go` (line 272)
-- `store/types/gas.go` (lines 252-258)
-- `x/gov/types/msgs.go` (lines 153-165)
+- **location**: `x/slashing/keeper/hooks.go:40-43` (AfterValidatorRemoved function)
 
-**Intended Logic:** The `IterateDeposits` function should iterate through deposits to refund or delete them when a proposal ends. The system expects reasonable deposit counts and relies on gas metering to prevent abuse.
+- **intended logic**: When a validator is completely removed after all delegations are unbonded, all associated slashing state should be cleaned up to ensure that any future validator using the same consensus address starts with fresh liveness tracking (`MissedBlocksCounter=0`, fresh `StartHeight`, empty missed blocks array).
 
-**Actual Logic:** The function iterates through ALL deposits without any limit on depositor count [1](#0-0) . The EndBlocker context is created with an infinite gas meter [2](#0-1)  which never enforces limits [3](#0-2) . Each unique depositor creates a separate entry [4](#0-3) , and `MsgDeposit` validation has no minimum deposit requirement per transaction [5](#0-4) .
+- **actual logic**: The `AfterValidatorRemoved` hook only deletes the address-pubkey relation. [1](#0-0)  It does NOT delete `ValidatorSigningInfo` or `ValidatorMissedBlockArray`, which remain in storage keyed by consensus address. When a new validator bonds with the same consensus address, `AfterValidatorBonded` checks if signing info exists and only creates new info if not found. [2](#0-1)  Since the old signing info persists, the new validator inherits the stale `MissedBlocksCounter`, `IndexOffset`, and `StartHeight`.
 
-**Exploitation Path:**
-1. Attacker generates thousands of unique addresses (5,000-100,000)
-2. Each address submits `MsgDeposit` with minimal amount (1 token) - passes validation since no per-transaction minimum exists
-3. `AddDeposit` creates separate deposit entry for each unique depositor
-4. Deposits accumulate across multiple blocks during deposit/voting period (default 2 days)
-5. When proposal ends, EndBlocker calls `DeleteDeposits` [6](#0-5)  or `RefundDeposits` [7](#0-6) 
-6. These functions iterate through ALL accumulated deposits [8](#0-7) [9](#0-8)  performing expensive operations: KVStore reads, protobuf unmarshaling, bank module transfers (multiple state operations), and state deletions
-7. Since EndBlocker has infinite gas meter, no limit stops this iteration, causing substantial block processing delay
+- **exploitation path**:
+  1. Validator accumulates missed blocks during operation (e.g., 200 out of 1000-block window, below the slashing threshold of 501)
+  2. Validator operator unbonds all delegations, causing `DelegatorShares` to reach zero [3](#0-2) 
+  3. `RemoveValidator` is called, deleting the `ValidatorByConsAddrKey` index [4](#0-3)  but leaving signing info intact
+  4. Later, the same consensus key creates a new validator (passes the `GetValidatorByConsAddr` check [5](#0-4)  since the index was deleted [6](#0-5) )
+  5. New validator bonds, triggering `AfterValidatorBonded` which finds existing signing info and reuses it
+  6. New validator inherits `MissedBlocksCounter=200` from previous lifecycle
+  7. If new validator misses 301 additional blocks, it reaches 501 total and gets slashed/jailed [7](#0-6) , whereas a fresh validator would need to miss 501 blocks from the start
 
-**Security Guarantee Broken:** The blockchain's liveness property and predictable block production are compromised. All validators must complete EndBlocker processing before finalizing a block, so unbounded iteration directly impacts network-wide block times.
+- **security guarantee broken**: The protocol invariant that each validator lifecycle has independent liveness tracking is violated. Validators cannot rely on getting a clean slate when creating a new validator with an existing consensus key after full unbonding and removal.
 
 ## Impact Explanation
 
-With 5,000-10,000 deposits, an attacker can delay individual blocks by 500% or more of normal block time. For a chain with 1-second blocks, this means 5-10+ second delays. Each deposit iteration involves:
-- KVStore read operations (I/O-bound)
-- Protobuf unmarshaling (CPU-bound)
-- Bank module operations with multiple state reads/writes for balance updates
-- State deletion operations
+Validators who reuse consensus keys after complete unbonding and removal inherit stale missed block counters from their previous lifecycle. With default parameters (window=1000, min=500), a validator with inherited `MissedBlocksCounter=200` would be slashed after missing only 301 new blocks instead of 501, representing a 40% reduction in downtime tolerance.
 
-Conservative performance estimate: ~1ms per deposit iteration due to combined I/O and state operations. With 5,000 deposits: 5 seconds delay = 500% of 1-second block time. With 10,000 deposits: 10 seconds = 1000% delay.
+This results in:
+- Unfair economic penalties through slashing (loss of validator stake based on `SlashFractionDowntime` parameter)
+- Validators being incorrectly jailed and removed from the active set, losing block rewards and commission
+- Undermined fairness of the slashing mechanism, as validators with reused keys are treated differently than fresh validators
+- Potential operational disruption and discouragement of validator participation
 
-This cumulative burden impacts:
-- Transaction finality and user experience across the network
-- Validator synchronization
-- Dependent systems that may timeout
-- Overall network stability during the attack period
+This qualifies as Medium severity under: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk." While funds are lost through slashing, the slashing mechanism itself operates as designed—the bug lies in the state management that causes the mechanism to be applied unfairly.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any unprivileged network participant with tokens for gas fees can execute this attack.
+This vulnerability can be triggered through normal validator operations:
+- Validators performing infrastructure maintenance or upgrades who fully unbond temporarily
+- Validators who reuse existing consensus keys for operational simplicity
+- Any validator operator who accumulates missed blocks (normal during network issues) before complete unbonding
 
-**Conditions Required:**
-- An active proposal in deposit or voting period
-- Sufficient tokens for N minimal deposits plus transaction fees
-- No special permissions required
-
-**Cost vs Impact:** The attack is economically favorable because deposits are refunded when proposals pass or expire normally [9](#0-8) . The attacker's main cost is transaction fees plus temporary capital lockup, while the network disruption is significant. This can be repeated on any governance proposal.
-
-**Feasibility:** High - The block gas limit only constrains transactions per block during submission, but doesn't protect against accumulated state over time. An attacker can spread deposits across many blocks during the deposit period, then all get processed in a single EndBlocker iteration with infinite gas.
+While complete unbonding followed by recreation with the same consensus key is not frequent, it is a legitimate use case. The conditions required are all standard validator lifecycle operations accessible to any validator operator, making this a realistic edge case that affects the protocol's fairness guarantees.
 
 ## Recommendation
 
-Implement one or more of the following mitigations:
+Modify the `AfterValidatorRemoved` hook in `x/slashing/keeper/hooks.go` to properly clean up all validator-related slashing state:
 
-1. **Add Maximum Depositors Limit:** Enforce a maximum number of unique depositors per proposal (e.g., 1,000-5,000) in the `AddDeposit` function. Reject new unique depositors once the limit is reached, though existing depositors can continue adding to their deposits.
+```go
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+    k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
+    // Clean up signing info
+    store := ctx.KVStore(k.storeKey)
+    store.Delete(types.ValidatorSigningInfoKey(address))
+    // Clean up missed blocks array
+    k.ClearValidatorMissedBlockBitArray(ctx, address)
+}
+```
 
-2. **Implement Minimum Deposit Per Transaction:** Add validation in `MsgDeposit.ValidateBasic()` to enforce a meaningful minimum deposit amount per transaction (e.g., 100 tokens) to increase attack cost.
+This ensures that when a validator is removed, all liveness tracking data is cleared, allowing a fresh start if the consensus address is later reused. This pattern follows the comprehensive cleanup demonstrated by the distribution module's `AfterValidatorRemoved` hook. [8](#0-7) 
 
-3. **Batch Processing with State Tracking:** Modify `RefundDeposits` and `DeleteDeposits` to process deposits in batches across multiple blocks if the count exceeds a threshold, maintaining state about progress between blocks.
-
-4. **Gas Metering for EndBlocker Operations:** Replace the infinite gas meter with a bounded meter during EndBlocker deposit iterations, with graceful handling if gas is exhausted (e.g., continuing in the next block).
-
-The most straightforward fix is option 1 (maximum depositors limit) combined with option 2 (minimum deposit per transaction), as these prevent the attack vector while maintaining protocol functionality.
+Note that the required cleanup functions already exist: [9](#0-8)  for setting signing info (implying deletion is possible via store.Delete), and [10](#0-9)  for clearing the missed blocks array (though currently only called during slashing [11](#0-10) ).
 
 ## Proof of Concept
 
-**Setup:** Create a governance proposal and generate thousands of unique addresses (e.g., 5,000 for testing, scalable to 10,000+).
+**Test Location**: `x/slashing/keeper/keeper_test.go` (new test to add)  
+**Function**: `TestValidatorRemovalClearsMissedBlocks`
 
-**Action:** Each unique address submits a `MsgDeposit` with minimal amount (1 token). Spread these across multiple blocks during the deposit period. After all deposits are made, advance time to expire the proposal, triggering the EndBlocker.
+**Setup**:
+1. Initialize test chain with slashing parameters (`SignedBlocksWindow=1000`, `MinSignedPerWindow=500`)
+2. Create and bond validator A with a specific consensus pubkey
+3. Simulate 200 blocks where validator does NOT sign (accumulate `MissedBlocksCounter=200`)
+4. Verify signing info exists with `MissedBlocksCounter=200`
 
-**Result:** The EndBlocker execution time increases dramatically proportional to the number of unique depositors. With 5,000 deposits, the delay is measurable at ~5 seconds (500% of 1-second normal block time); with 10,000 deposits, delays reach 10 seconds (1000%). Measure:
-- Baseline time to create deposits
-- EndBlocker execution time when calling `DeleteDeposits` or `RefundDeposits`
-- Ratio demonstrating the DoS impact (should exceed 5x normal block time)
+**Action**:
+1. Unbond all delegations from validator A
+2. Complete unbonding period and verify validator is removed from state
+3. Verify `GetValidatorByConsAddr` returns not found (index deleted)
+4. Create new validator B with the SAME consensus pubkey as validator A
+5. Bond the new validator
 
-The vulnerability is confirmed by code analysis showing: no depositor count limits, infinite gas meter in EndBlocker context, and unbounded iteration through all accumulated deposits. The impact magnitude is derivable from first principles: ~1ms per iteration × 5,000 iterations = 5 seconds = 500% delay.
+**Result**:
+Query signing info for the consensus address - it incorrectly shows `MissedBlocksCounter=200` (inherited from removed validator A) instead of `MissedBlocksCounter=0` for a fresh validator. This demonstrates that the new validator starts with stale liveness tracking state, leading to premature slashing if it misses additional blocks.
 
 ## Notes
 
-The vulnerability is validated based on comprehensive code analysis. While the report provides a conceptual PoC rather than an executable Go test, the technical claims are definitively verified:
-- Unbounded iteration is evident in the code [1](#0-0) 
-- Infinite gas meter usage in EndBlocker is confirmed [10](#0-9) [3](#0-2) 
-- No limits exist on depositor count or per-transaction minimums
-- The computational cost of 5K-10K iterations with bank operations would clearly cause significant delays
-
-This meets the accepted impact category for Medium severity: "Temporary freezing of network transactions by delaying one block by 500% or more of the average block time."
+The slashing module specification [12](#0-11)  only mentions that `AfterValidatorRemoved` "removes a validator's consensus key" but does NOT mention cleaning up signing info or missed block data, indicating incomplete design specification. In contrast, the distribution module performs comprehensive cleanup of all validator-related state in its `AfterValidatorRemoved` implementation, demonstrating the expected pattern for proper state management.
 
 ### Citations
 
-**File:** x/gov/keeper/deposit.go (L54-68)
+**File:** x/slashing/keeper/hooks.go (L12-26)
 ```go
-func (keeper Keeper) DeleteDeposits(ctx sdk.Context, proposalID uint64) {
-	store := ctx.KVStore(keeper.storeKey)
-
-	keeper.IterateDeposits(ctx, proposalID, func(deposit types.Deposit) bool {
-		err := keeper.bankKeeper.BurnCoins(ctx, types.ModuleName, deposit.Amount)
-		if err != nil {
-			panic(err)
-		}
-
-		depositor := sdk.MustAccAddressFromBech32(deposit.Depositor)
-
-		store.Delete(types.DepositKey(proposalID, depositor))
-		return false
-	})
-}
-```
-
-**File:** x/gov/keeper/deposit.go (L88-104)
-```go
-// IterateDeposits iterates over the all the proposals deposits and performs a callback function
-func (keeper Keeper) IterateDeposits(ctx sdk.Context, proposalID uint64, cb func(deposit types.Deposit) (stop bool)) {
-	store := ctx.KVStore(keeper.storeKey)
-	iterator := sdk.KVStorePrefixIterator(store, types.DepositsKey(proposalID))
-
-	defer iterator.Close()
-
-	for ; iterator.Valid(); iterator.Next() {
-		var deposit types.Deposit
-
-		keeper.cdc.MustUnmarshal(iterator.Value(), &deposit)
-
-		if cb(deposit) {
-			break
-		}
+func (k Keeper) AfterValidatorBonded(ctx sdk.Context, address sdk.ConsAddress, _ sdk.ValAddress) {
+	// Update the signing info start height or create a new signing info
+	_, found := k.GetValidatorSigningInfo(ctx, address)
+	if !found {
+		signingInfo := types.NewValidatorSigningInfo(
+			address,
+			ctx.BlockHeight(),
+			0,
+			time.Unix(0, 0),
+			false,
+			0,
+		)
+		k.SetValidatorSigningInfo(ctx, address, signingInfo)
 	}
 }
 ```
 
-**File:** x/gov/keeper/deposit.go (L139-146)
+**File:** x/slashing/keeper/hooks.go (L40-43)
 ```go
-	// Add or update deposit object
-	deposit, found := keeper.GetDeposit(ctx, proposalID, depositorAddr)
-
-	if found {
-		deposit.Amount = deposit.Amount.Add(depositAmount...)
-	} else {
-		deposit = types.NewDeposit(proposalID, depositorAddr, depositAmount)
-	}
-```
-
-**File:** x/gov/keeper/deposit.go (L164-179)
-```go
-// RefundDeposits refunds and deletes all the deposits on a specific proposal
-func (keeper Keeper) RefundDeposits(ctx sdk.Context, proposalID uint64) {
-	store := ctx.KVStore(keeper.storeKey)
-
-	keeper.IterateDeposits(ctx, proposalID, func(deposit types.Deposit) bool {
-		depositor := sdk.MustAccAddressFromBech32(deposit.Depositor)
-
-		err := keeper.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, depositor, deposit.Amount)
-		if err != nil {
-			panic(err)
-		}
-
-		store.Delete(types.DepositKey(proposalID, depositor))
-		return false
-	})
+// AfterValidatorRemoved deletes the address-pubkey relation when a validator is removed,
+func (k Keeper) AfterValidatorRemoved(ctx sdk.Context, address sdk.ConsAddress) {
+	k.deleteAddrPubkeyRelation(ctx, crypto.Address(address))
 }
 ```
 
-**File:** types/context.go (L262-280)
+**File:** x/staking/keeper/delegation.go (L789-792)
 ```go
-func NewContext(ms MultiStore, header tmproto.Header, isCheckTx bool, logger log.Logger) Context {
-	// https://github.com/gogo/protobuf/issues/519
-	header.Time = header.Time.UTC()
-	return Context{
-		ctx:             context.Background(),
-		ms:              ms,
-		header:          header,
-		chainID:         header.ChainID,
-		checkTx:         isCheckTx,
-		logger:          logger,
-		gasMeter:        NewInfiniteGasMeter(1, 1),
-		minGasPrice:     DecCoins{},
-		eventManager:    NewEventManager(),
-		evmEventManager: NewEVMEventManager(),
-
-		txBlockingChannels:   make(acltypes.MessageAccessOpsChannelMapping),
-		txCompletionChannels: make(acltypes.MessageAccessOpsChannelMapping),
-		txMsgAccessOps:       make(map[int][]acltypes.AccessOperation),
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
 	}
 ```
 
-**File:** store/types/gas.go (L252-258)
+**File:** x/staking/keeper/validator.go (L36-45)
 ```go
-func (g *infiniteGasMeter) IsPastLimit() bool {
-	return false
-}
+func (k Keeper) GetValidatorByConsAddr(ctx sdk.Context, consAddr sdk.ConsAddress) (validator types.Validator, found bool) {
+	store := ctx.KVStore(k.storeKey)
 
-func (g *infiniteGasMeter) IsOutOfGas() bool {
-	return false
+	opAddr := store.Get(types.GetValidatorByConsAddrKey(consAddr))
+	if opAddr == nil {
+		return validator, false
+	}
+
+	return k.GetValidator(ctx, opAddr)
 }
 ```
 
-**File:** x/gov/types/msgs.go (L153-165)
+**File:** x/staking/keeper/validator.go (L176-176)
 ```go
-func (msg MsgDeposit) ValidateBasic() error {
-	if msg.Depositor == "" {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, msg.Depositor)
-	}
-	if !msg.Amount.IsValid() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
-	}
-	if msg.Amount.IsAnyNegative() {
-		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
-	}
-
-	return nil
-}
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
 ```
 
-**File:** x/gov/abci.go (L20-22)
+**File:** x/staking/keeper/msg_server.go (L52-54)
 ```go
-	keeper.IterateInactiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-		keeper.DeleteProposal(ctx, proposal.ProposalId)
-		keeper.DeleteDeposits(ctx, proposal.ProposalId)
+	if _, found := k.GetValidatorByConsAddr(ctx, sdk.GetConsAddress(pk)); found {
+		return nil, types.ErrValidatorPubKeyExists
+	}
 ```
 
-**File:** x/gov/abci.go (L58-62)
+**File:** x/slashing/keeper/infractions.go (L96-96)
 ```go
-			if burnDeposits {
-				keeper.DeleteDeposits(ctx, proposal.ProposalId)
-			} else {
-				keeper.RefundDeposits(ctx, proposal.ProposalId)
+	if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+```
+
+**File:** x/distribution/keeper/hooks.go (L25-76)
+```go
+// AfterValidatorRemoved performs clean up after a validator is removed
+func (h Hooks) AfterValidatorRemoved(ctx sdk.Context, _ sdk.ConsAddress, valAddr sdk.ValAddress) {
+	// fetch outstanding
+	outstanding := h.k.GetValidatorOutstandingRewardsCoins(ctx, valAddr)
+
+	// force-withdraw commission
+	commission := h.k.GetValidatorAccumulatedCommission(ctx, valAddr).Commission
+	if !commission.IsZero() {
+		// subtract from outstanding
+		outstanding = outstanding.Sub(commission)
+
+		// split into integral & remainder
+		coins, remainder := commission.TruncateDecimal()
+
+		// remainder to community pool
+		feePool := h.k.GetFeePool(ctx)
+		feePool.CommunityPool = feePool.CommunityPool.Add(remainder...)
+		h.k.SetFeePool(ctx, feePool)
+
+		// add to validator account
+		if !coins.IsZero() {
+			accAddr := sdk.AccAddress(valAddr)
+			withdrawAddr := h.k.GetDelegatorWithdrawAddr(ctx, accAddr)
+
+			if err := h.k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, withdrawAddr, coins); err != nil {
+				panic(err)
 			}
+		}
+	}
+
+	// Add outstanding to community pool
+	// The validator is removed only after it has no more delegations.
+	// This operation sends only the remaining dust to the community pool.
+	feePool := h.k.GetFeePool(ctx)
+	feePool.CommunityPool = feePool.CommunityPool.Add(outstanding...)
+	h.k.SetFeePool(ctx, feePool)
+
+	// delete outstanding
+	h.k.DeleteValidatorOutstandingRewards(ctx, valAddr)
+
+	// remove commission record
+	h.k.DeleteValidatorAccumulatedCommission(ctx, valAddr)
+
+	// clear slashes
+	h.k.DeleteValidatorSlashEvents(ctx, valAddr)
+
+	// clear historical rewards
+	h.k.DeleteValidatorHistoricalRewards(ctx, valAddr)
+
+	// clear current rewards
+	h.k.DeleteValidatorCurrentRewards(ctx, valAddr)
+}
+```
+
+**File:** x/slashing/keeper/signing_info.go (L34-38)
+```go
+func (k Keeper) SetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress, info types.ValidatorSigningInfo) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&info)
+	store.Set(types.ValidatorSigningInfoKey(address), bz)
+}
+```
+
+**File:** x/slashing/keeper/signing_info.go (L168-171)
+```go
+func (k Keeper) ClearValidatorMissedBlockBitArray(ctx sdk.Context, address sdk.ConsAddress) {
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.ValidatorMissedBlockBitArrayKey(address))
+}
+```
+
+**File:** x/slashing/abci.go (L58-60)
+```go
+		if writeInfo.ShouldSlash {
+			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
+			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
+```
+
+**File:** x/slashing/spec/05_hooks.md (L15-17)
+```markdown
++ `AfterValidatorBonded` creates a `ValidatorSigningInfo` instance as described in the following section.
++ `AfterValidatorCreated` stores a validator's consensus key.
++ `AfterValidatorRemoved` removes a validator's consensus key.
 ```

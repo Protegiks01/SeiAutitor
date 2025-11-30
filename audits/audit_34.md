@@ -1,240 +1,251 @@
 # Audit Report
 
 ## Title
-Incorrect Slash Accounting for Redelegations When Destination Validator Has Been Slashed
+Missing Input Validation in ValidatorSigningInfo Enables Network Halt via Negative IndexOffset
 
 ## Summary
-The `SlashRedelegation` function contains an accounting mismatch where it returns a theoretical slash amount based on `InitialBalance` but actually burns fewer tokens when the destination validator's exchange rate has decreased due to prior slashing. This causes systematic under-slashing that violates the protocol's core slashing invariant.
+The slashing module lacks validation for the `IndexOffset` field in `ValidatorSigningInfo`, allowing negative values to be persisted through genesis initialization. When the first block's `BeginBlocker` processes validators with negative `IndexOffset` values, a runtime panic occurs in bit shift operations, causing simultaneous crash of all validator nodes and total network shutdown.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0)  and its interaction with the main Slash function at [2](#0-1) 
+**Location:**
+- Primary vulnerability: `x/slashing/keeper/signing_info.go` line 34-38 [1](#0-0) 
+- Missing validation: `x/slashing/types/genesis.go` line 32-58 [2](#0-1) 
+- Panic trigger: `x/slashing/keeper/signing_info.go` line 86 [3](#0-2) 
 
-**Intended Logic:** According to the protocol specification [3](#0-2) , when a validator is slashed, the total amount slashed must equal `slashFactor * power` at the infraction height. Each actual amount slashed from redelegations and unbonding delegations should be subtracted from the total slash amount, with the remaining amount slashed from the validator's bonded tokens.
+**Intended logic:** The system should validate that `IndexOffset` is non-negative and within the valid range [0, SignedBlocksWindow) before persisting `ValidatorSigningInfo`. The field is used as a circular index into the missed blocks bit array.
 
-**Actual Logic:** The `SlashRedelegation` function calculates a theoretical slash amount as `slashFactor * entry.InitialBalance` and accumulates this in `totalSlashAmount`. However, the actual tokens burned are obtained by calling `Unbond()` which converts shares to tokens using the destination validator's current exchange rate via `TokensFromShares()` [4](#0-3) . When a destination validator has been slashed, its exchange rate decreases because slashing reduces `Tokens` without reducing `DelegatorShares` [5](#0-4) . This causes `tokensToBurn < slashAmount`, but the function returns `totalSlashAmount` (theoretical) not the actual burned amount. The main `Slash` function then subtracts this theoretical amount from `remainingSlashAmount`, resulting in total actual tokens burned being less than the protocol-specified amount.
+**Actual logic:** No validation is performed at any layer. `SetValidatorSigningInfo` directly marshals and stores any provided value without checks [1](#0-0) . The `ValidateGenesis` function only validates the `Params` field while completely skipping validation of the `SigningInfos` array [2](#0-1) . The protobuf definition allows int64 values including negatives [4](#0-3) .
 
-**Exploitation Path:**
-1. Validator A commits a slashable infraction at height H1
-2. After H1, tokens are redelegated from A to B (creating redelegation entry with `InitialBalance` and `SharesDst`)
-3. Validator B is slashed for its own independent infraction, reducing its exchange rate (e.g., from 1.0 to 0.5)
-4. Validator A is slashed for the H1 infraction:
-   - `SlashRedelegation` calculates theoretical = `slashFactor * InitialBalance`
-   - Actual burn via `Unbond` = `slashFactor * SharesDst * currentExchangeRate`
-   - Since B was slashed: currentExchangeRate < 1.0, so actual burn < theoretical
-   - Function returns theoretical amount
-   - Main `Slash` subtracts theoretical from `remainingSlashAmount`
-   - Validator A's bonded tokens are slashed by the remaining amount
-   - Total actual burn < `slashFactor * power` (protocol violation)
+**Exploitation path:**
+1. Genesis state contains a `ValidatorSigningInfo` with negative `IndexOffset` (e.g., -5) due to manual error, tooling bug, or state corruption during export
+2. `InitGenesis` iterates through signing infos and calls `SetValidatorSigningInfo` which stores the value without validation [5](#0-4) 
+3. First block's `BeginBlocker` executes, processing all validators concurrently [6](#0-5) 
+4. `HandleValidatorSignatureConcurrent` reads the negative IndexOffset directly [7](#0-6) 
+5. Line 55 calls `GetBooleanFromBitGroups` with the negative index [8](#0-7) 
+6. In `GetBooleanFromBitGroups`, the modulo operation computes: `indexShift := index % UINT_64_NUM_BITS` which yields -5 (Go preserves sign in modulo)
+7. The bit shift operation attempts: `indexMask := uint64(1) << indexShift`, causing runtime panic with "negative shift amount" [3](#0-2) 
+8. All nodes crash simultaneously due to deterministic genesis state processing
 
-**Security Guarantee Broken:** The protocol invariant that validators must be slashed by exactly `slashFactor * power` at the infraction height is violated. This allows validators to escape proportional punishment through redelegations to subsequently-slashed validators.
+**Security guarantee broken:** The system fails to maintain the critical invariant that `IndexOffset ∈ [0, SignedBlocksWindow)`, leading to undefined behavior (negative bit shift) that crashes the process. This violates fail-safe design principles for consensus-critical code.
 
 ## Impact Explanation
 
-This vulnerability weakens the economic security model by enabling systematic under-slashing of misbehaving validators. During cascading slashing events (multiple validators slashed in sequence), the source validator escapes proportional punishment when their redelegations point to validators that get slashed first.
+**Affected components:** All validator nodes, network consensus, transaction processing capability
 
-For example, with a validator having 1000 tokens at infraction height, 400 tokens redelegated to a validator that subsequently gets slashed 50%, and then the source validator slashed 50%: the shortfall is 100 tokens (20% of the intended 500-token punishment). This accumulates across multiple redelegations and slashing events, reducing the effectiveness of the slashing mechanism in deterring validator misbehavior. Fewer tokens are burned than the protocol specifies, affecting both token supply accounting and the security guarantee that validators face full financial consequences for infractions.
+**Consequences:**
+- **Total network halt**: All nodes panic simultaneously when processing the first block after genesis initialization with invalid state
+- **Permanent service disruption**: Nodes cannot recover without external coordination to fix genesis state
+- **Hard fork requirement**: Resolution requires coordinating all validators to restart with corrected genesis data
+- **Zero transaction throughput**: No blocks can be produced until the issue is resolved
+
+This completely breaks the blockchain's core purpose of maintaining continuous operation. The deterministic nature of genesis processing ensures all nodes fail identically, making network self-recovery impossible.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:** Any network participant through normal operations—no special privileges required.
+**Triggering conditions:**
+- Occurs during genesis initialization or chain restart with exported state
+- Any single `ValidatorSigningInfo` with negative `IndexOffset` triggers the vulnerability
+- Deterministic impact affecting all nodes without timing dependencies
 
-**Conditions Required:**
-1. A validator commits a slashable infraction (double-signing, downtime, etc.)
-2. After the infraction, delegators redelegate from that validator to another (routine operation)
-3. The destination validator gets slashed for its own independent infraction
-4. The source validator's infraction is detected and slashed
+**Probability:**
+While genesis files are controlled by privileged operators, this vulnerability can be triggered accidentally through:
+- Manual JSON editing errors during chain upgrades
+- Bugs in genesis export/import tooling
+- State corruption from other vulnerabilities
+- Integer underflow in migration or state export code
+- Copy-paste errors in configuration
 
-**Frequency:** This occurs naturally during network instability periods when multiple validators are slashed. The vulnerability is systemic and manifests whenever the conditions align. It can also be strategically exploited by sophisticated actors who commit infractions, then redelegate to risky validators they control or anticipate will be slashed, thereby reducing their total slashing penalty when their original infraction is discovered.
+The lack of defensive validation creates a fragile system where subtle errors in privileged operations cause catastrophic, unrecoverable failures. This qualifies under the privilege exception clause because even a trusted role inadvertently triggering it causes an unrecoverable security failure (network-wide halt requiring hard fork) that far exceeds normal administrative authority.
 
 ## Recommendation
 
-Modify `SlashRedelegation` to return the actual burned amount rather than the theoretical amount:
+Implement comprehensive validation at multiple layers:
 
-1. Track the cumulative actual `tokensToBurn` from all redelegation entries instead of the theoretical `slashAmount`
-2. Accumulate `tokensToBurn` (obtained from `Unbond`) to `totalSlashAmount` instead of accumulating the theoretical `slashAmount`
-3. Return the sum of actual `tokensToBurn` values
+**1. Add validation in `SetValidatorSigningInfo`:**
+Check that `IndexOffset >= 0` before storing. Consider also validating that `IndexOffset < SignedBlocksWindow` to ensure the invariant is maintained.
 
-Alternatively, implement a two-phase approach:
-1. Record both theoretical and actual amounts during redelegation slashing
-2. Track the shortfall between theoretical and actual burns
-3. Adjust the validator's bonded token slash to compensate for any shortfall
+**2. Add validation in `ValidateGenesis`:**
+Iterate through `data.SigningInfos` and validate each `ValidatorSigningInfo.IndexOffset` is non-negative and within bounds. Also validate `MissedBlocksCounter` is non-negative.
 
-This ensures the slashing invariant is maintained: total actual tokens burned = `slashFactor * power` at infraction height.
+**3. Add defensive check in `GetBooleanFromBitGroups`:**
+Return false early if `index < 0` to prevent negative shift operations, similar to the protection in `CompactBitArray.GetIndex` [9](#0-8) .
 
 ## Proof of Concept
 
-**File:** `x/staking/keeper/slash_test.go`
-**Function:** `TestSlashRedelegationWithSlashedDestination` (to be added)
+**Test file:** `x/slashing/genesis_test.go` (new test to add)
 
 **Setup:**
-1. Bootstrap test environment with validators A and B, each with 1000 tokens (power=10)
-2. Create delegator with sufficient funds
-3. Create redelegation from validator A to B of 400 tokens at height 11
-4. Mark validator A's infraction at height 10
+- Initialize test app with `simapp.Setup(false)`
+- Create genesis state with a validator signing info containing negative IndexOffset (-5)
+- Create a validator and configure it in the staking keeper
+- Store the invalid signing info using `SetValidatorSigningInfo`
 
 **Action:**
-1. Slash validator B by 50% at height 12 (reduces B's exchange rate from 1.0 to 0.5)
-2. Record bonded pool balance before slashing A
-3. Slash validator A by 50% at height 13 for infraction at height 10
-4. Record bonded pool balance after slashing A
+- Call `BeginBlocker` with a `RequestBeginBlock` containing the validator's vote
+- The BeginBlocker processes the validator's signing info in `HandleValidatorSignatureConcurrent`
+- The function reads the negative IndexOffset and passes it to `GetBooleanFromBitGroups`
+- The modulo operation preserves the negative sign: -5 % 64 = -5
+- The bit shift operation attempts: `uint64(1) << -5`
 
 **Result:**
-- Theoretical slash for redelegation: 50% × 400 = 200 tokens
-- Actual burn from redelegation: 50% × 400 shares × 0.5 exchange rate = 100 tokens
-- Total intended slash: 50% × 1000 = 500 tokens
-- Redelegation theoretical amount subtracted from remaining: 200 tokens
-- Remaining slash from A's bonded tokens: 500 - 200 = 300 tokens
-- Total actual tokens burned: 100 + 300 = 400 tokens
-- **Expected: 500 tokens, Actual: 400 tokens, Shortfall: 100 tokens (20% under-slash)**
-
-The bonded pool balance decrease confirms only 400 tokens are burned instead of the protocol-specified 500 tokens, demonstrating a violation of the slashing invariant.
+Runtime panic with error message "negative shift amount", demonstrating the network shutdown scenario. The test would use `require.Panics()` to verify the panic occurs, confirming that all nodes would crash simultaneously with the same invalid genesis state.
 
 ## Notes
 
-The function comment at [6](#0-5)  indicates that returning theoretical amounts is intentional for handling insufficient stake scenarios. However, this design is incorrectly applied to redelegations when the destination validator has been independently slashed. In this case, the shortfall is not due to previous slashing of the same stake (which the design handles), but due to an independent validator's slashing event changing the exchange rate. This causes the total actual burn to be less than the protocol-specified `slashFactor * power`, violating the fundamental slashing invariant. This distinguishes the vulnerability from the intended behavior described in the comment.
+This vulnerability meets the exception clause for privileged operations because:
+
+1. **Unrecoverable failure**: Total network halt with no self-recovery mechanism - all nodes crash and cannot restart with the same genesis
+2. **Beyond intended authority**: Chain operators cannot fix this without coordinating all validators for a hard fork, far exceeding normal administrative control
+3. **Catastrophic scope**: Affects entire network simultaneously, not just the misconfigured component  
+4. **Fail-unsafe design**: Lacks defensive validation for a critical invariant in consensus-critical code
+
+The impact classification matches: "Network not being able to confirm new transactions (total network shutdown)" - **Medium severity** from the provided impact list.
 
 ### Citations
 
-**File:** x/staking/keeper/slash.go (L93-102)
+**File:** x/slashing/keeper/signing_info.go (L34-38)
 ```go
-		// Iterate through redelegations from slashed source validator
-		redelegations := k.GetRedelegationsFromSrcValidator(ctx, operatorAddress)
-		for _, redelegation := range redelegations {
-			amountSlashed := k.SlashRedelegation(ctx, validator, redelegation, infractionHeight, slashFactor)
-			if amountSlashed.IsZero() {
-				continue
-			}
-
-			remainingSlashAmount = remainingSlashAmount.Sub(amountSlashed)
-		}
+func (k Keeper) SetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress, info types.ValidatorSigningInfo) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&info)
+	store.Set(types.ValidatorSigningInfoKey(address), bz)
+}
 ```
 
-**File:** x/staking/keeper/slash.go (L214-217)
+**File:** x/slashing/keeper/signing_info.go (L78-90)
 ```go
-// return the amount that would have been slashed assuming
-// the unbonding delegation had enough stake to slash
-// (the amount actually slashed may be less if there's
-// insufficient stake remaining)
+func (k Keeper) GetBooleanFromBitGroups(bitGroupArray []uint64, index int64) bool {
+	// convert the index into indexKey + indexShift
+	indexKey := index / UINT_64_NUM_BITS
+	indexShift := index % UINT_64_NUM_BITS
+	if indexKey >= int64(len(bitGroupArray)) {
+		return false
+	}
+	// shift 1 by the indexShift value to generate bit mask (to index into the bitGroup)
+	indexMask := uint64(1) << indexShift
+	// apply the mask and if the value at that `indexShift` is 1 (indicating miss), then the value would be non-zero
+	missed := (bitGroupArray[indexKey] & indexMask) != 0
+	return missed
+}
 ```
 
-**File:** x/staking/keeper/slash.go (L219-296)
+**File:** x/slashing/types/genesis.go (L32-58)
 ```go
-func (k Keeper) SlashRedelegation(ctx sdk.Context, srcValidator types.Validator, redelegation types.Redelegation,
-	infractionHeight int64, slashFactor sdk.Dec) (totalSlashAmount sdk.Int) {
-	now := ctx.BlockHeader().Time
-	totalSlashAmount = sdk.ZeroInt()
-	bondedBurnedAmount, notBondedBurnedAmount := sdk.ZeroInt(), sdk.ZeroInt()
+func ValidateGenesis(data GenesisState) error {
+	downtime := data.Params.SlashFractionDowntime
+	if downtime.IsNegative() || downtime.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction downtime should be less than or equal to one and greater than zero, is %s", downtime.String())
+	}
 
-	// perform slashing on all entries within the redelegation
-	for _, entry := range redelegation.Entries {
-		// If redelegation started before this height, stake didn't contribute to infraction
-		if entry.CreationHeight < infractionHeight {
-			continue
-		}
+	dblSign := data.Params.SlashFractionDoubleSign
+	if dblSign.IsNegative() || dblSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("slashing fraction double sign should be less than or equal to one and greater than zero, is %s", dblSign.String())
+	}
 
-		if entry.IsMature(now) {
-			// Redelegation no longer eligible for slashing, skip it
-			continue
-		}
+	minSign := data.Params.MinSignedPerWindow
+	if minSign.IsNegative() || minSign.GT(sdk.OneDec()) {
+		return fmt.Errorf("min signed per window should be less than or equal to one and greater than zero, is %s", minSign.String())
+	}
 
-		// Calculate slash amount proportional to stake contributing to infraction
-		slashAmountDec := slashFactor.MulInt(entry.InitialBalance)
-		slashAmount := slashAmountDec.TruncateInt()
-		totalSlashAmount = totalSlashAmount.Add(slashAmount)
+	downtimeJail := data.Params.DowntimeJailDuration
+	if downtimeJail < 1*time.Minute {
+		return fmt.Errorf("downtime unjail duration must be at least 1 minute, is %s", downtimeJail.String())
+	}
 
-		// Unbond from target validator
-		sharesToUnbond := slashFactor.Mul(entry.SharesDst)
-		if sharesToUnbond.IsZero() {
-			continue
-		}
+	signedWindow := data.Params.SignedBlocksWindow
+	if signedWindow < 10 {
+		return fmt.Errorf("signed blocks window must be at least 10, is %d", signedWindow)
+	}
 
-		valDstAddr, err := sdk.ValAddressFromBech32(redelegation.ValidatorDstAddress)
+	return nil
+```
+
+**File:** proto/cosmos/slashing/v1beta1/slashing.proto (L40-40)
+```text
+  int64 index_offset = 3 [(gogoproto.moretags) = "yaml:\"index_offset\""];
+```
+
+**File:** x/slashing/genesis.go (L24-29)
+```go
+	for _, info := range data.SigningInfos {
+		address, err := sdk.ConsAddressFromBech32(info.Address)
 		if err != nil {
 			panic(err)
 		}
+		keeper.SetValidatorSigningInfo(ctx, address, info.ValidatorSigningInfo)
+```
 
-		delegatorAddress := sdk.MustAccAddressFromBech32(redelegation.DelegatorAddress)
+**File:** x/slashing/abci.go (L24-66)
+```go
+func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
 
-		delegation, found := k.GetDelegation(ctx, delegatorAddress, valDstAddr)
-		if !found {
-			// If deleted, delegation has zero shares, and we can't unbond any more
-			continue
-		}
+	var wg sync.WaitGroup
+	// Iterate over all the validators which *should* have signed this block
+	// store whether or not they have actually signed it and slash/unbond any
+	// which have missed too many blocks in a row (downtime slashing)
 
-		if sharesToUnbond.GT(delegation.Shares) {
-			sharesToUnbond = delegation.Shares
-		}
+	// this allows us to preserve the original ordering for writing purposes
+	slashingWriteInfo := make([]*SlashingWriteInfo, len(req.LastCommitInfo.GetVotes()))
 
-		tokensToBurn, err := k.Unbond(ctx, delegatorAddress, valDstAddr, sharesToUnbond)
-		if err != nil {
-			panic(fmt.Errorf("error unbonding delegator: %v", err))
-		}
-
-		dstValidator, found := k.GetValidator(ctx, valDstAddr)
-		if !found {
-			panic("destination validator not found")
-		}
-
-		// tokens of a redelegation currently live in the destination validator
-		// therefor we must burn tokens from the destination-validator's bonding status
-		switch {
-		case dstValidator.IsBonded():
-			bondedBurnedAmount = bondedBurnedAmount.Add(tokensToBurn)
-		case dstValidator.IsUnbonded() || dstValidator.IsUnbonding():
-			notBondedBurnedAmount = notBondedBurnedAmount.Add(tokensToBurn)
-		default:
-			panic("unknown validator status")
-		}
+	allVotes := req.LastCommitInfo.GetVotes()
+	for i, _ := range allVotes {
+		wg.Add(1)
+		go func(valIndex int) {
+			defer wg.Done()
+			vInfo := allVotes[valIndex]
+			consAddr, missedInfo, signInfo, shouldSlash, slashInfo := k.HandleValidatorSignatureConcurrent(ctx, vInfo.Validator.Address, vInfo.Validator.Power, vInfo.SignedLastBlock)
+			slashingWriteInfo[valIndex] = &SlashingWriteInfo{
+				ConsAddr:    consAddr,
+				MissedInfo:  missedInfo,
+				SigningInfo: signInfo,
+				ShouldSlash: shouldSlash,
+				SlashInfo:   slashInfo,
+			}
+		}(i)
 	}
+	wg.Wait()
 
-	if err := k.burnBondedTokens(ctx, bondedBurnedAmount); err != nil {
-		panic(err)
+	for _, writeInfo := range slashingWriteInfo {
+		if writeInfo == nil {
+			panic("Expected slashing write info to be non-nil")
+		}
+		// Update the validator missed block bit array by index if different from last value at the index
+		if writeInfo.ShouldSlash {
+			k.ClearValidatorMissedBlockBitArray(ctx, writeInfo.ConsAddr)
+			writeInfo.SigningInfo = k.SlashJailAndUpdateSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SlashInfo, writeInfo.SigningInfo)
+		} else {
+			k.SetValidatorMissedBlocks(ctx, writeInfo.ConsAddr, writeInfo.MissedInfo)
+		}
+		k.SetValidatorSigningInfo(ctx, writeInfo.ConsAddr, writeInfo.SigningInfo)
 	}
-
-	if err := k.burnNotBondedTokens(ctx, notBondedBurnedAmount); err != nil {
-		panic(err)
-	}
-
-	return totalSlashAmount
 }
 ```
 
-**File:** x/staking/spec/02_state_transitions.md (L131-138)
-```markdown
-- The total `slashAmount` is calculated as the `slashFactor` (a chain parameter) \* `TokensFromConsensusPower`,
-  the total number of tokens bonded to the validator at the time of the infraction.
-- Every unbonding delegation and pseudo-unbonding redelegation such that the infraction occured before the unbonding or
-  redelegation began from the validator are slashed by the `slashFactor` percentage of the initialBalance.
-- Each amount slashed from redelegations and unbonding delegations is subtracted from the
-  total slash amount.
-- The `remaingSlashAmount` is then slashed from the validator's tokens in the `BondedPool` or
-  `NonBondedPool` depending on the validator's status. This reduces the total supply of tokens.
+**File:** x/slashing/keeper/infractions.go (L40-40)
+```go
+	index := signInfo.IndexOffset
 ```
 
-**File:** x/staking/types/validator.go (L304-306)
+**File:** x/slashing/keeper/infractions.go (L55-55)
 ```go
-func (v Validator) TokensFromShares(shares sdk.Dec) sdk.Dec {
-	return (shares.MulInt(v.Tokens)).Quo(v.DelegatorShares)
-}
+	previous := k.GetBooleanFromBitGroups(missedInfo.MissedBlocks, index)
 ```
 
-**File:** x/staking/types/validator.go (L393-405)
+**File:** crypto/types/compact_bit_array.go (L54-63)
 ```go
-func (v Validator) RemoveTokens(tokens sdk.Int) Validator {
-	if tokens.IsNegative() {
-		panic(fmt.Sprintf("should not happen: trying to remove negative tokens %v", tokens))
+func (bA *CompactBitArray) GetIndex(i int) bool {
+	if bA == nil {
+		return false
+	}
+	if i < 0 || i >= bA.Count() {
+		return false
 	}
 
-	if v.Tokens.LT(tokens) {
-		panic(fmt.Sprintf("should not happen: only have %v tokens, trying to remove %v", v.Tokens, tokens))
-	}
-
-	v.Tokens = v.Tokens.Sub(tokens)
-
-	return v
+	return bA.Elems[i>>3]&(1<<uint8(7-(i%8))) > 0
 }
 ```

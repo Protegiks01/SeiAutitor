@@ -1,255 +1,487 @@
 # Audit Report
 
 ## Title
-OCC Blind Write Vulnerability: Concurrent MsgGrant Transactions Succeed Without Conflict Detection Leading to Silent State Loss
+Permanent Loss of Transaction Fees Due to Missing WriteDeferredBalances Call in EndBlocker
 
 ## Summary
-When Optimistic Concurrency Control (OCC) is enabled, concurrent transactions creating grants for the same (grantee, granter, msgType) tuple both succeed and charge gas fees, but only the highest-indexed transaction's state persists. The `SaveGrant` method performs blind writes without reading first, and OCC validation only detects read-write conflicts, not write-write conflicts, causing silent state loss for lower-indexed transactions despite returning success. [1](#0-0) 
+The banking module's deferred balance system deducts transaction fees from user accounts into persistent storage but caches them in a non-persistent memory-only store. The system is designed to flush these cached amounts to module accounts via `WriteDeferredBalances` during EndBlock, but the bank module does not implement an EndBlock method, and `WriteDeferredBalances` is never called in production code. This results in permanent loss of all accumulated transaction fees when nodes restart.
 
 ## Impact
-Medium
+High
 
 ## Finding Description
 
-**Location:** 
-- Primary vulnerability: `x/authz/keeper/keeper.go:144-160` (SaveGrant method)
-- Missing validation: `store/multiversion/store.go:388-397` (ValidateTransactionState)
-- State persistence logic: `store/multiversion/store.go:399-435` (WriteLatestToStore)
-- Last-write-wins behavior: `store/multiversion/data_structures.go:60-79` (GetLatestNonEstimate)
+**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
 
-**Intended Logic:**
-When a transaction creates or updates an authorization grant, concurrent transactions modifying the same grant should be detected as conflicts and properly serialized. A successful transaction (Code=0) must guarantee its state changes persist to the blockchain.
+**Intended logic:**
+The code documentation explicitly states the intended behavior at [5](#0-4) . The system is designed to: (1) immediately deduct fees from user accounts via `SubUnlockedCoins` to persistent storage, (2) cache the deducted amounts in a deferred cache indexed by module and transaction, and (3) flush all deferred balances to module accounts during EndBlock by calling `WriteDeferredBalances`.
 
-**Actual Logic:**
-The `SaveGrant` method performs a blind write operation by directly calling `store.Set(skey, bz)` without first reading the existing value. [1](#0-0)  This means the transaction's readset for that key remains empty.
+**Actual logic:**
+The deferred cache uses a memory store that is explicitly not persisted as part of app state [6](#0-5) . When transaction fees are processed:
+1. User balance is reduced via `SubUnlockedCoins` which writes to persistent storage [7](#0-6) 
+2. The amount is stored in the memory-only deferred cache via `UpsertBalances` [8](#0-7) 
+3. The bank module has no EndBlock method [3](#0-2) 
+4. `WriteDeferredBalances` is never called in production code [4](#0-3) 
+5. On node restart, the memory store is cleared, losing all deferred amounts
+6. User accounts retain their reduced balances, but module accounts never receive the funds
 
-OCC validation via `ValidateTransactionState` only checks iterator consistency and read value consistency through `checkIteratorAtIndex` and `checkReadsetAtIndex`. [2](#0-1)  There is no validation for write-write conflicts. Since concurrent transactions don't read the grant key before writing, both have empty readsets for that key and both pass validation.
+**Exploitation path:**
+No attacker is required - this occurs during normal blockchain operation:
+1. User submits transaction with fees, processed via ante handler [9](#0-8) 
+2. `DeferredSendCoinsFromAccountToModule` is called [10](#0-9) 
+3. User's balance is immediately reduced and persisted to the IAVL store
+4. Amount is cached in memory-only deferred store [11](#0-10) 
+5. Block processing completes without calling `WriteDeferredBalances`
+6. Node operator performs routine restart, upgrade, or node crashes
+7. Memory store is cleared on restart (not persisted to disk)
+8. Deferred cache loses all accumulated fees since last restart
+9. User accounts show permanently reduced balances, but fee collector module account never received the funds
 
-When `WriteLatestToStore` commits the final state, it calls `GetLatestNonEstimate()` for each key. [3](#0-2)  The `GetLatestNonEstimate` method descends the btree and returns only the highest-indexed value. [4](#0-3)  Earlier writes to the same key are silently discarded.
-
-**Exploitation Path:**
-1. User submits Transaction A: MsgGrant(grantee, granter, MsgSend, limit=100)
-2. User submits Transaction B: MsgGrant(grantee, granter, MsgSend, limit=200) in same block
-3. Both transactions execute in parallel under OCC
-4. Both call `SaveGrant` [5](#0-4)  which performs `store.Set(key, value)` without prior `store.Get(key)`
-5. Neither transaction has read dependency on the key (empty readsets)
-6. Both pass `ValidateTransactionState` (no read conflicts detected)
-7. Both return Code=0 (success) and emit `EventGrant` events
-8. Both charge gas fees
-9. Only Transaction B's grant persists when `WriteLatestToStore` is called
-10. Transaction A's effect is silently lost despite returning success
-
-**Security Guarantee Broken:**
-This violates the atomicity and finality guarantee of blockchain transactions: a successful transaction (Code=0) must guarantee its state changes persist. The vulnerability also causes event log inconsistency where `EventGrant` is emitted for both transactions but only one grant exists in state.
+**Security guarantee broken:**
+This violates the fundamental accounting invariant that all coins deducted from accounts must exist somewhere in the system. The `TotalSupply` invariant correctly includes deferred balances during normal operation [12](#0-11) , but after a node restart when the deferred cache is cleared, the sum of all account balances would be less than the recorded total supply, breaking the invariant.
 
 ## Impact Explanation
 
-This vulnerability constitutes "a bug in the network code that results in unintended smart contract behavior with no concrete funds at direct risk" (Medium severity). The OCC layer (network code) causes unintended behavior in the authz module with significant state inconsistency issues:
+All transaction fees paid by users since the last node restart are permanently and irrecoverably lost. This represents direct loss of funds with severe consequences:
 
-1. **Wasted Gas Fees:** Users pay gas for transactions whose effects are silently discarded. Unlike transaction failures, these transactions return success (Code=0), misleading users.
-
-2. **Event Log Inconsistency:** Both transactions emit `EventGrant` events, causing off-chain applications, indexers, and monitoring systems to have incorrect state. Applications relying on events will believe both grants were created.
-
-3. **State Consistency Violation:** Only one grant persists despite two successful transactions, breaking the invariant that successful transactions persist their changes.
-
-4. **Authorization Security Concern:** Since grants control spending limits and permissions, unpredictable grant persistence could lead to authorization mismatches where applications expect different limits than what exists on-chain.
+- **Permanent fund loss**: Transaction fees are deducted from user accounts but never reach the fee collector module account intended for validator rewards and governance
+- **Accumulates continuously**: Every transaction that pays fees contributes to the loss until node restart
+- **No recovery mechanism**: Once the node restarts and clears the memory store, the deferred amounts cannot be recovered from any source
+- **Network-wide impact**: Every validator and full node experiences this independently on every restart, affecting the entire network's economic model
+- **Economic sustainability**: The blockchain's fee collection mechanism is fundamentally broken, making it economically unsustainable as validators never receive transaction fee rewards
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- OCC must be enabled
-- Multiple transactions targeting the same (grantee, granter, msgType) tuple in the same block
-- Transactions execute concurrently in OCC's parallel execution phase
+**Triggering conditions:**
+- Any transaction that pays fees (essentially all transactions on the network)
+- Any node restart (routine maintenance, crashes, upgrades, hardware failures)
 
-**Who Can Trigger:**
-Any user can trigger this vulnerability by submitting normal MsgGrant transactions. No special privileges, unusual conditions, or attack setup is required.
+**Frequency and scope:**
+- **Every transaction**: Fees are deferred on every single transaction via the ante handler
+- **Every restart**: All accumulated deferred fees are lost on every node restart
+- **Network-wide**: Every validator node and full node experiences this independently
 
-**Frequency:**
-- Occurs naturally when users submit concurrent grant updates or retry transactions
-- More likely under high transaction throughput
-- Particularly probable when frontends submit duplicate transactions
-- In production networks with OCC enabled, this could happen regularly during normal operation
+Node restarts are routine operational requirements that occur regularly for software updates, security patches, network upgrades, crashes, hardware maintenance, and datacenter operations.
 
-The inconsistency with the `update` method [6](#0-5)  which reads before writing suggests this is an oversight rather than intentional design.
+The likelihood is **very high** because this vulnerability is triggered during normal blockchain operation without requiring any special conditions or attacker action. Node restarts are unavoidable operational requirements.
 
 ## Recommendation
 
-Modify `SaveGrant` to read the existing grant first, even if just to check existence. This creates a read dependency that enables existing OCC conflict detection:
+**Immediate fix:**
+Add an EndBlock method to the bank module that calls `WriteDeferredBalances`:
 
+In `x/bank/module.go`, add to the AppModule:
 ```go
-func (k Keeper) SaveGrant(...) error {
-    store := ctx.KVStore(k.storeKey)
-    skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-    
-    // Read to create OCC dependency (enables conflict detection)
-    _ = store.Get(skey)
-    
-    grant, err := authz.NewGrant(authorization, expiration)
-    // ... rest of implementation
+func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
+    am.keeper.WriteDeferredBalances(ctx)
+    return []abci.ValidatorUpdate{}
 }
 ```
 
-This approach is simpler and consistent with the existing `update` method pattern which already follows read-before-write.
+The bank module is already registered in the EndBlocker order [13](#0-12) , so once the method is added, it will be called automatically.
+
+**Alternative fix:**
+Add the call directly in the application's FinalizeBlocker before `SetDeliverStateToCommit()`:
+```go
+deferredEvents := app.BankKeeper.WriteDeferredBalances(ctx)
+events = append(events, deferredEvents...)
+```
+
+**Verification:**
+- Ensure `WriteDeferredBalances` is called exactly once per block
+- Verify fee collector module accounts receive all accumulated fees
+- Confirm TotalSupply invariant passes after node restarts
+- Validate no deferred balances remain in cache at the end of each block
 
 ## Proof of Concept
 
-**Test File:** `x/authz/keeper/keeper_test.go`
-
-**Test Function:** `TestConcurrentGrantsOCCBlindWrite`
+The vulnerability can be demonstrated through code analysis and test file examination:
 
 **Setup:**
-1. Initialize SimApp with OCC enabled (`SetOccEnabled(true)`, `SetConcurrencyWorkers(2)`)
-2. Create test accounts: granter (addr[0]), grantee (addr[1])
-3. Fund granter account for gas fees
-4. Create two MsgGrant transactions for the same (grantee, granter, msgType) with different spend limits
+1. System configured with deferred cache as memory store [11](#0-10) 
+2. Bank keeper uses memory store for deferred cache [14](#0-13) 
 
 **Action:**
-1. Build Transaction A: MsgGrant with SpendLimit=100
-2. Build Transaction B: MsgGrant with SpendLimit=200 (same grantee, granter, msgType)
-3. Submit both transactions in the same block using `DeliverTxBatch` with OCC enabled
-4. Process the batch through the OCC scheduler
+1. Transaction processed, `DeferredSendCoinsFromAccountToModule` called for fee deduction
+2. User balance reduced via persistent storage (`SubUnlockedCoins`)
+3. Amount cached in memory store (`UpsertBalances`)
+4. Block completes without calling `WriteDeferredBalances`
+5. Node restart clears memory store
 
-**Expected Result:**
-1. Both transactions return Code=0 (success)
-2. Both transactions emit EventGrant events
-3. Both transactions charge gas
-4. Query final state shows only ONE grant exists (SpendLimit=200)
-5. Transaction A's SpendLimit=100 is silently lost despite success
-6. This violates the blockchain invariant that successful transactions persist their changes
+**Result:**
+- User balance remains reduced (persisted to disk)
+- Fee collector never receives funds
+- Deferred cache is empty (cleared on restart)
+- Funds permanently lost
+
+**Evidence from test files:**
+Test files explicitly call `WriteDeferredBalances` after ante handler processing with comments stating "deposit coins into the fee collector account" [15](#0-14) , confirming that this call is required for fees to reach the fee collector. The fact that production code never makes this call proves the vulnerability.
 
 ## Notes
 
-The vulnerability is confirmed by the code flow analysis showing SaveGrant's blind write pattern combined with OCC's lack of write-write conflict detection. The inconsistency with the `update` method which reads before writing indicates this is an unintentional oversight rather than a design choice. No existing tests cover concurrent SaveGrant operations with OCC enabled, suggesting this scenario was not considered during development.
+This vulnerability represents a critical implementation gap where the documented design (calling `WriteDeferredBalances` in EndBlocker) was never implemented in production code, despite the deferred balance system being actively used for fee collection on every transaction. The memory store explicitly states it is "not committed as part of app state" [6](#0-5) , confirming that deferred balances are lost on node restart.
 
 ### Citations
 
-**File:** x/authz/keeper/keeper.go (L51-72)
+**File:** x/bank/keeper/keeper.go (L404-432)
 ```go
-func (k Keeper) update(ctx sdk.Context, grantee sdk.AccAddress, granter sdk.AccAddress, updated authz.Authorization) error {
-	skey := grantStoreKey(grantee, granter, updated.MsgTypeURL())
-	grant, found := k.getGrant(ctx, skey)
-	if !found {
-		return sdkerrors.ErrNotFound.Wrap("authorization not found")
+// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
+// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
+// In the EndBlocker, it will then perform one deposit for each module account.
+// It will panic if the module account does not exist.
+func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
+	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
+) error {
+	if k.deferredCache == nil {
+		panic("bank keeper created without deferred cache")
 	}
-
-	msg, ok := updated.(proto.Message)
-	if !ok {
-		sdkerrors.ErrPackAny.Wrapf("cannot proto marshal %T", updated)
+	// Deducts Fees from the Sender Account
+	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
+	if err != nil {
+		return err
 	}
-
-	any, err := codectypes.NewAnyWithValue(msg)
+	// get recipient module address
+	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
+	if moduleAcc == nil {
+		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+	}
+	// get txIndex
+	txIndex := ctx.TxIndex()
+	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
 	if err != nil {
 		return err
 	}
 
-	grant.Authorization = any
-	store := ctx.KVStore(k.storeKey)
-	store.Set(skey, k.cdc.MustMarshal(&grant))
 	return nil
 }
 ```
 
-**File:** x/authz/keeper/keeper.go (L144-160)
+**File:** x/auth/ante/fee.go (L202-214)
 ```go
-func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
-	store := ctx.KVStore(k.storeKey)
+// DeductFees deducts fees from the given account.
+func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
+	if !fees.IsValid() {
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+	}
 
-	grant, err := authz.NewGrant(authorization, expiration)
+	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
 	if err != nil {
-		return err
+		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
 	}
 
-	bz := k.cdc.MustMarshal(&grant)
-	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-	store.Set(skey, bz)
-	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
-		MsgTypeUrl: authorization.MsgTypeURL(),
-		Granter:    granter.String(),
-		Grantee:    grantee.String(),
-	})
+	return nil
 }
 ```
 
-**File:** store/multiversion/store.go (L388-397)
+**File:** x/bank/module.go (L107-210)
 ```go
-func (s *Store) ValidateTransactionState(index int) (bool, []int) {
-	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
+// AppModule implements an application module for the bank module.
+type AppModule struct {
+	AppModuleBasic
 
-	// TODO: can we parallelize for all iterators?
-	iteratorValid := s.checkIteratorAtIndex(index)
-
-	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
-
-	return iteratorValid && readsetValid, conflictIndices
+	keeper        keeper.Keeper
+	accountKeeper types.AccountKeeper
 }
-```
 
-**File:** store/multiversion/store.go (L399-435)
-```go
-func (s *Store) WriteLatestToStore() {
-	// sort the keys
-	keys := []string{}
-	s.multiVersionMap.Range(func(key, value interface{}) bool {
-		keys = append(keys, key.(string))
-		return true
-	})
-	sort.Strings(keys)
+// RegisterServices registers module services.
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
 
-	for _, key := range keys {
-		val, ok := s.multiVersionMap.Load(key)
-		if !ok {
-			continue
-		}
-		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
-		if !found {
-			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
-			continue
-		}
-		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
-		if mvValue.IsEstimate() {
-			panic("should not have any estimate values when writing to parent store")
-		}
-		// if the value is deleted, then delete it from the parent store
-		if mvValue.IsDeleted() {
-			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
-			// be sure if the underlying store might do a save with the byteslice or
-			// not. Once we get confirmation that .Delete is guaranteed not to
-			// save the byteslice, then we can assume only a read-only copy is sufficient.
-			s.parentStore.Delete([]byte(key))
-			continue
-		}
-		if mvValue.Value() != nil {
-			s.parentStore.Set([]byte(key), mvValue.Value())
-		}
+	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
+	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
+}
+
+// NewAppModule creates a new AppModule object
+func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
+	return AppModule{
+		AppModuleBasic: AppModuleBasic{cdc: cdc},
+		keeper:         keeper,
+		accountKeeper:  accountKeeper,
 	}
 }
-```
 
-**File:** store/multiversion/data_structures.go (L60-79)
-```go
-func (item *multiVersionItem) GetLatestNonEstimate() (MultiVersionValueItem, bool) {
-	item.mtx.RLock()
-	defer item.mtx.RUnlock()
+// Name returns the bank module's name.
+func (AppModule) Name() string { return types.ModuleName }
 
-	var vItem *valueItem
-	var found bool
-	item.valueTree.Descend(func(bTreeItem btree.Item) bool {
-		// only return if non-estimate
-		item := bTreeItem.(*valueItem)
-		if item.IsEstimate() {
-			// if estimate, continue
-			return true
-		}
-		// else we want to return
-		vItem = item
-		found = true
-		return false
-	})
-	return vItem, found
+// RegisterInvariants registers the bank module invariants.
+func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
+	keeper.RegisterInvariants(ir, am.keeper)
+}
+
+// Route returns the message routing key for the bank module.
+func (am AppModule) Route() sdk.Route {
+	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
+}
+
+// QuerierRoute returns the bank module's querier route name.
+func (AppModule) QuerierRoute() string { return types.RouterKey }
+
+// LegacyQuerierHandler returns the bank module sdk.Querier.
+func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
+	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
+}
+
+// InitGenesis performs genesis initialization for the bank module. It returns
+// no validator updates.
+func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
+	start := time.Now()
+	var genesisState types.GenesisState
+	cdc.MustUnmarshalJSON(data, &genesisState)
+	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+
+	am.keeper.InitGenesis(ctx, &genesisState)
+	return []abci.ValidatorUpdate{}
+}
+
+// ExportGenesis returns the exported genesis state as raw bytes for the bank
+// module.
+func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
+	gs := am.keeper.ExportGenesis(ctx)
+	return cdc.MustMarshalJSON(gs)
+}
+
+func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
+	ch := make(chan json.RawMessage)
+	go func() {
+		ch <- am.ExportGenesis(ctx, cdc)
+		close(ch)
+	}()
+	return ch
+}
+
+// ConsensusVersion implements AppModule/ConsensusVersion.
+func (AppModule) ConsensusVersion() uint64 { return 2 }
+
+// AppModuleSimulation functions
+
+// GenerateGenesisState creates a randomized GenState of the bank module.
+func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
+	simulation.RandomizedGenState(simState)
+}
+
+// ProposalContents doesn't return any content functions for governance proposals.
+func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	return nil
+}
+
+// RandomizedParams creates randomized bank param changes for the simulator.
+func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
+	return simulation.ParamChanges(r)
+}
+
+// RegisterStoreDecoder registers a decoder for supply module's types
+func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
+
+// WeightedOperations returns the all the gov module operations with their respective weights.
+func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
+	return simulation.WeightedOperations(
+		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
+	)
 }
 ```
 
-**File:** x/authz/keeper/msg_server.go (L36-36)
+**File:** simapp/app.go (L230-230)
 ```go
-	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
+```
+
+**File:** simapp/app.go (L264-266)
+```go
+	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
+		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+	)
+```
+
+**File:** simapp/app.go (L372-379)
+```go
+	app.mm.SetOrderEndBlockers(
+		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
+		capabilitytypes.ModuleName, authtypes.ModuleName, banktypes.ModuleName, distrtypes.ModuleName,
+		slashingtypes.ModuleName, minttypes.ModuleName,
+		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
+		feegrant.ModuleName,
+		paramstypes.ModuleName, upgradetypes.ModuleName, vestingtypes.ModuleName, acltypes.ModuleName,
+	)
+```
+
+**File:** simapp/app.go (L476-574)
+```go
+func (app *SimApp) FinalizeBlocker(ctx sdk.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
+	events := []abci.Event{}
+	beginBlockResp := app.BeginBlock(ctx, abci.RequestBeginBlock{
+		Hash: req.Hash,
+		ByzantineValidators: utils.Map(req.ByzantineValidators, func(mis abci.Misbehavior) abci.Evidence {
+			return abci.Evidence{
+				Type:             abci.MisbehaviorType(mis.Type),
+				Validator:        abci.Validator(mis.Validator),
+				Height:           mis.Height,
+				Time:             mis.Time,
+				TotalVotingPower: mis.TotalVotingPower,
+			}
+		}),
+		LastCommitInfo: abci.LastCommitInfo{
+			Round: req.DecidedLastCommit.Round,
+			Votes: utils.Map(req.DecidedLastCommit.Votes, func(vote abci.VoteInfo) abci.VoteInfo {
+				return abci.VoteInfo{
+					Validator:       abci.Validator(vote.Validator),
+					SignedLastBlock: vote.SignedLastBlock,
+				}
+			}),
+		},
+		Header: tmproto.Header{
+			ChainID:         app.ChainID,
+			Height:          req.Height,
+			Time:            req.Time,
+			ProposerAddress: ctx.BlockHeader().ProposerAddress,
+		},
+	})
+	events = append(events, beginBlockResp.Events...)
+
+	typedTxs := []sdk.Tx{}
+	for _, tx := range req.Txs {
+		typedTx, err := app.txDecoder(tx)
+		if err != nil {
+			typedTxs = append(typedTxs, nil)
+		} else {
+			typedTxs = append(typedTxs, typedTx)
+		}
+	}
+
+	txResults := []*abci.ExecTxResult{}
+	for i, tx := range req.Txs {
+		ctx = ctx.WithContext(context.WithValue(ctx.Context(), ante.ContextKeyTxIndexKey, i))
+		if typedTxs[i] == nil {
+			txResults = append(txResults, &abci.ExecTxResult{}) // empty result
+			continue
+		}
+		deliverTxResp := app.DeliverTx(ctx, abci.RequestDeliverTx{
+			Tx: tx,
+		}, typedTxs[i], sha256.Sum256(tx))
+		txResults = append(txResults, &abci.ExecTxResult{
+			Code:      deliverTxResp.Code,
+			Data:      deliverTxResp.Data,
+			Log:       deliverTxResp.Log,
+			Info:      deliverTxResp.Info,
+			GasWanted: deliverTxResp.GasWanted,
+			GasUsed:   deliverTxResp.GasUsed,
+			Events:    deliverTxResp.Events,
+			Codespace: deliverTxResp.Codespace,
+		})
+	}
+	endBlockResp := app.EndBlock(ctx, abci.RequestEndBlock{
+		Height: req.Height,
+	})
+	events = append(events, endBlockResp.Events...)
+
+	app.SetDeliverStateToCommit()
+	app.WriteState()
+	appHash := app.GetWorkingHash()
+	return &abci.ResponseFinalizeBlock{
+		Events:    events,
+		TxResults: txResults,
+		ValidatorUpdates: utils.Map(endBlockResp.ValidatorUpdates, func(v abci.ValidatorUpdate) abci.ValidatorUpdate {
+			return abci.ValidatorUpdate{
+				PubKey: v.PubKey,
+				Power:  v.Power,
+			}
+		}),
+		ConsensusParamUpdates: &tmproto.ConsensusParams{
+			Block: &tmproto.BlockParams{
+				MaxBytes: endBlockResp.ConsensusParamUpdates.Block.MaxBytes,
+				MaxGas:   endBlockResp.ConsensusParamUpdates.Block.MaxGas,
+			},
+			Evidence: &tmproto.EvidenceParams{
+				MaxAgeNumBlocks: endBlockResp.ConsensusParamUpdates.Evidence.MaxAgeNumBlocks,
+				MaxAgeDuration:  endBlockResp.ConsensusParamUpdates.Evidence.MaxAgeDuration,
+				MaxBytes:        endBlockResp.ConsensusParamUpdates.Block.MaxBytes,
+			},
+			Validator: &tmproto.ValidatorParams{
+				PubKeyTypes: endBlockResp.ConsensusParamUpdates.Validator.PubKeyTypes,
+			},
+			Version: &tmproto.VersionParams{
+				AppVersion: endBlockResp.ConsensusParamUpdates.Version.AppVersion,
+			},
+		},
+		AppHash: appHash,
+	}, nil
+}
+```
+
+**File:** store/mem/store.go (L20-21)
+```go
+// Store implements an in-memory only KVStore. Entries are persisted between
+// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
+```
+
+**File:** x/bank/keeper/send.go (L209-239)
+```go
+func (k BaseSendKeeper) SubUnlockedCoins(ctx sdk.Context, addr sdk.AccAddress, amt sdk.Coins, checkNeg bool) error {
+	if !amt.IsValid() {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
+	}
+
+	lockedCoins := k.LockedCoins(ctx, addr)
+
+	for _, coin := range amt {
+		balance := k.GetBalance(ctx, addr, coin.Denom)
+		if checkNeg {
+			locked := sdk.NewCoin(coin.Denom, lockedCoins.AmountOf(coin.Denom))
+			spendable := balance.Sub(locked)
+
+			_, hasNeg := sdk.Coins{spendable}.SafeSub(sdk.Coins{coin})
+			if hasNeg {
+				return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, "%s is smaller than %s", spendable, coin)
+			}
+		}
+
+		var newBalance sdk.Coin
+		if checkNeg {
+			newBalance = balance.Sub(coin)
+		} else {
+			newBalance = balance.SubUnsafe(coin)
+		}
+
+		err := k.setBalance(ctx, addr, newBalance, checkNeg)
+		if err != nil {
+			return err
+		}
+	}
+```
+
+**File:** x/auth/ante/ante.go (L47-64)
+```go
+	anteDecorators := []sdk.AnteFullDecorator{
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
+		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
+		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
+		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
+		NewIncrementSequenceDecorator(options.AccountKeeper),
+	}
+	anteHandler, anteDepGenerator := sdk.ChainAnteDecorators(anteDecorators...)
+
+	return anteHandler, anteDepGenerator, nil
+}
+```
+
+**File:** x/bank/keeper/invariants.go (L74-78)
+```go
+		// also iterate over deferred balances
+		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
+			expectedTotal = expectedTotal.Add(coin)
+			return false
+		})
+```
+
+**File:** x/auth/ante/testutil_test.go (L176-177)
+```go
+		// Fee Collector actual account balance deposit coins into the fee collector account
+		suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
 ```

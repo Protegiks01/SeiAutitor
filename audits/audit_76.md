@@ -1,224 +1,273 @@
-# Audit Report
+# NoVulnerability found for this question.
 
-## Title
-Division by Zero Panic in Governance Tally Causes Network Halt When Bonded Validator Has Zero Delegator Shares
+## Validation Analysis
 
-## Summary
-The governance module's tally function performs unguarded division by a validator's `DelegatorShares` without checking for zero. When a bonded validator with zero shares has voted on a proposal, the tally function panics during EndBlocker execution, causing complete network shutdown across all validator nodes.
+After thorough investigation of the codebase and execution flow, I confirm the report's conclusion is **correct**. While a technical gap exists, this does NOT constitute a valid security vulnerability.
 
-## Impact
-High
+## Technical Verification
 
-## Finding Description
+### 1. Gap Confirmed
+The validation gap exists as described:
+- `CollectTxs` only checks for empty memo [1](#0-0) 
+- Normal transactions validate memo size via `ValidateMemoDecorator` [2](#0-1) 
+- Default limit is 256 characters [3](#0-2) 
 
-**Location:** `x/gov/keeper/tally.go` lines 57 and 80 [1](#0-0) 
+### 2. Execution Flow Analysis
 
-**Intended Logic:** The tally function should safely compute voting power for all bonded validators who have voted on proposals, handling edge cases where validators may have zero delegator shares gracefully.
+**During `collect-gentxs`:**
+- No ante handlers run (no blockchain yet)
+- Only checks memo is not empty
+- Large memo would pass through to genesis.json
 
-**Actual Logic:** The code performs division by `val.DelegatorShares` without checking if it equals zero. The `Dec.Quo()` method panics when the divisor is zero [2](#0-1) , causing immediate EndBlock failure.
+**During network start:**
+- `InitGenesis` calls `DeliverGenTxs` [4](#0-3) 
+- Which calls `app.BaseApp.DeliverTx` [5](#0-4) 
+- Which executes ante handlers [6](#0-5) 
+- Oversized memo triggers `ErrMemoTooLarge`
+- `DeliverGenTxs` panics [7](#0-6) 
+- **Network fails to start** (but can be restarted with corrected files)
 
-**Exploitation Path:**
-1. A validator operates normally with delegations and is in bonded status
-2. The validator casts a vote on an active governance proposal using standard `AddVote()` transaction
-3. All delegators remove their delegations via standard `Undelegate` transactions
-4. After the final undelegation, the validator has both `Tokens = 0` and `DelegatorShares = 0` [3](#0-2) 
-5. The validator remains in bonded status because validators with zero shares are only removed if unbonded [4](#0-3) , and status changes only occur in the staking EndBlocker
-6. The proposal's voting period ends, triggering EndBlock processing
-7. The governance EndBlocker executes before the staking EndBlocker [5](#0-4) 
-8. The governance EndBlocker calls `Tally()` [6](#0-5) 
-9. The tally function iterates over bonded validators using `IterateBondedValidatorsByPower()` [7](#0-6) , which only checks `IsBonded()` status [8](#0-7)  without verifying shares or voting power
-10. The zero-share validator with a recorded vote triggers the division calculation at line 80
-11. Division by zero occurs: `votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)`
-12. All validator nodes panic at the same block height, completely halting the chain
+### 3. Critical Failures Against Validation Criteria
 
-**Security Guarantee Broken:** The network's availability and liveness guarantees are violated. The chain cannot progress past the problematic block, and consensus is permanently stalled until coordinated emergency action.
+**❌ Requires Malicious Privileged Actor:**
+- Requires genesis validator (explicitly trusted role)
+- Requires intentional post-generation JSON file manipulation
+- Memos are auto-generated in standard format `nodeID@IP:port` (50-70 chars) [8](#0-7) [9](#0-8) 
+- Platform rules: "No credit for scenarios that require malicious privileged actors"
 
-## Impact Explanation
+**❌ Does Not Meet Required Impact Criteria:**
+Evaluating against mandated impacts:
+- ❌ Not "Direct loss of funds" - no network running, no funds exist
+- ❌ Not "Network shutdown" - network hasn't started
+- ❌ Not "Resource consumption" - one-time init, fully recoverable
+- ❌ Not "Node shutdown" - nodes haven't started
+- ❌ None of the required impacts apply
 
-This vulnerability causes complete network shutdown qualifying as HIGH severity under "Network not being able to confirm new transactions (total network shutdown)". When the panic occurs during EndBlock execution:
+**❌ Fully Recoverable:**
+- Network hasn't started
+- Genesis ceremony can be restarted with corrected gentx files
+- No lasting damage possible
 
-- All validator nodes crash simultaneously at the same block height due to the unhandled panic
-- No new blocks can be produced or transactions processed
-- The entire network becomes unavailable to users
-- Recovery requires emergency coordination among validators to upgrade to a patched version
-- This represents a critical denial-of-service vulnerability affecting the entire blockchain
+**❌ No Proof of Concept:**
+- No test demonstrating actual crashes or DoS
+- Speculative impact only
+- Existing test only validates directory handling [10](#0-9) 
 
-The impact is severe because it breaks the fundamental availability guarantee of the blockchain network.
+### 4. Platform Rules Violation
 
-## Likelihood Explanation
+Per strict validation criteria:
+- Genesis validators are **trusted privileged roles**
+- Exploiting this requires **intentional malicious insider action**
+- This is **explicitly out of scope** for vulnerability programs
+- Exception requires inadvertent triggering causing unrecoverable failure - this is neither
 
-**Triggering Actors:** Any network participants using standard, permissionless operations - validators voting on proposals and delegators undelegating through normal transactions.
+## Notes
 
-**Required Conditions:**
-- An active governance proposal in voting period (common occurrence in live chains)
-- A bonded validator that votes on the proposal (standard validator behavior)
-- All delegators of that validator undelegate before voting period ends (achievable through normal operations)
-- Voting period ends, triggering automatic tally computation
+The ante handler test confirms that memos exceeding limits trigger `ErrMemoTooLarge` during normal transaction processing [11](#0-10) , but this protection also applies during InitGenesis, causing a recoverable startup failure rather than a running vulnerable network.
 
-**Likelihood Assessment:** While requiring specific timing, this scenario is realistic:
-- **Accidental trigger**: Could occur during market stress when mass undelegations happen, or with validators having few delegators who all exit
-- **Deliberate attack**: An attacker can trivially trigger this by operating their own validator with minimal self-delegation, voting on any proposal, then self-undelegating before the proposal's voting period ends
-- **No privileges required**: Uses only standard, permissionless blockchain operations
-- **Low cost**: Attacker only needs enough tokens to run a validator temporarily (can be reclaimed after undelegating)
-
-The vulnerability is exploitable through standard transaction flows without any special access or conditions beyond normal blockchain operations.
-
-## Recommendation
-
-Add a zero-check before performing division in the tally computation:
-
-```go
-// In x/gov/keeper/tally.go at line 74-86:
-for _, val := range currValidators {
-    if len(val.Vote) == 0 {
-        continue
-    }
-    
-    // Skip validators with zero delegator shares to avoid division by zero
-    if val.DelegatorShares.IsZero() {
-        continue
-    }
-
-    sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
-    votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
-    
-    for _, option := range val.Vote {
-        subPower := votingPower.Mul(option.Weight)
-        results[option.Option] = results[option.Option].Add(subPower)
-    }
-    totalVotingPower = totalVotingPower.Add(votingPower)
-}
-```
-
-Similarly, add a check at line 50-57 where delegator voting power is calculated, though this is less critical as zero-share validators should have no remaining delegations.
-
-## Proof of Concept
-
-**File:** `x/gov/keeper/tally_test.go`
-
-**Test Function:** `TestTallyPanicWithZeroShareValidator`
-
-**Setup:**
-- Create a validator with initial delegation using the existing `createValidators()` helper function [9](#0-8) 
-- Create and activate a governance proposal in voting period using `SubmitProposal()`
-- Validator casts a vote on the proposal using `AddVote()`
-
-**Action:**
-- Retrieve the validator's delegation using `GetDelegation()`
-- Call `Undelegate()` to remove all shares from the validator
-- Verify the validator has `DelegatorShares.IsZero() == true` and `IsBonded() == true`
-- Call `Tally()` on the proposal
-
-**Result:**
-- The test will panic when `Tally()` attempts division by zero at line 80
-- The panic demonstrates that this vulnerability would cause chain halt during EndBlock execution in production
-- In a live environment, this would crash all validator nodes simultaneously at the same block height, halting the network
-
-The PoC confirms the scenario is reproducible and would cause the described network shutdown.
+The fundamental issue: **exploiting this requires a malicious trusted insider (genesis validator) intentionally sabotaging the genesis ceremony**, which is explicitly out of scope per industry-standard platform rules.
 
 ### Citations
 
-**File:** x/gov/keeper/tally.go (L24-34)
+**File:** x/genutil/collect.go (L130-133)
 ```go
-	keeper.sk.IterateBondedValidatorsByPower(ctx, func(index int64, validator stakingtypes.ValidatorI) (stop bool) {
-		currValidators[validator.GetOperator().String()] = types.NewValidatorGovInfo(
-			validator.GetOperator(),
-			validator.GetBondedTokens(),
-			validator.GetDelegatorShares(),
-			sdk.ZeroDec(),
-			types.WeightedVoteOptions{},
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
+		}
+```
+
+**File:** x/auth/ante/basic.go (L62-68)
+```go
+	memoLength := len(memoTx.GetMemo())
+	if uint64(memoLength) > params.MaxMemoCharacters {
+		return ctx, sdkerrors.Wrapf(sdkerrors.ErrMemoTooLarge,
+			"maximum number of characters is %d but received %d characters",
+			params.MaxMemoCharacters, memoLength,
 		)
-
-		return false
-	})
-```
-
-**File:** x/gov/keeper/tally.go (L79-80)
-```go
-		sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
-		votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
-```
-
-**File:** types/decimal_test.go (L238-239)
-```go
-		if tc.d2.IsZero() { // panic for divide by zero
-			s.Require().Panics(func() { tc.d1.Quo(tc.d2) })
-```
-
-**File:** x/staking/types/validator.go (L415-418)
-```go
-	if remainingShares.IsZero() {
-		// last delegation share gets any trimmings
-		issuedTokens = v.Tokens
-		v.Tokens = sdk.ZeroInt()
-```
-
-**File:** x/staking/keeper/delegation.go (L789-792)
-```go
-	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
-		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
-		k.RemoveValidator(ctx, validator.GetOperator())
 	}
 ```
 
-**File:** simapp/app.go (L372-373)
+**File:** x/auth/types/params.go (L13-13)
 ```go
-	app.mm.SetOrderEndBlockers(
-		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
+	DefaultMaxMemoCharacters      uint64 = 256
 ```
 
-**File:** x/gov/abci.go (L48-51)
+**File:** x/genutil/gentx.go (L96-128)
 ```go
-	keeper.IterateActiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
-		var tagValue, logMsg string
+func DeliverGenTxs(
+	ctx sdk.Context, genTxs []json.RawMessage,
+	stakingKeeper types.StakingKeeper, deliverTx deliverTxfn,
+	txEncodingConfig client.TxEncodingConfig,
+) ([]abci.ValidatorUpdate, error) {
 
-		passes, burnDeposits, tallyResults := keeper.Tally(ctx, proposal)
+	for _, genTx := range genTxs {
+		tx, err := txEncodingConfig.TxJSONDecoder()(genTx)
+		if err != nil {
+			panic(err)
+		}
+
+		bz, err := txEncodingConfig.TxEncoder()(tx)
+		if err != nil {
+			panic(err)
+		}
+
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
+		}
+	}
+
+	legacyUpdates, err := stakingKeeper.ApplyAndReturnValidatorSetUpdates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return utils.Map(legacyUpdates, func(v abci.ValidatorUpdate) abci.ValidatorUpdate {
+		return abci.ValidatorUpdate{
+			PubKey: v.PubKey,
+			Power:  v.Power,
+		}
+	}), nil
 ```
 
-**File:** x/staking/keeper/alias_functions.go (L45-46)
+**File:** baseapp/abci.go (L284-304)
 ```go
-		if validator.IsBonded() {
-			stop := fn(i, validator) // XXX is this safe will the validator unexposed fields be able to get written to?
+func (app *BaseApp) DeliverTx(ctx sdk.Context, req abci.RequestDeliverTx, tx sdk.Tx, checksum [32]byte) (res abci.ResponseDeliverTx) {
+	defer telemetry.MeasureSince(time.Now(), "abci", "deliver_tx")
+	defer func() {
+		for _, streamingListener := range app.abciListeners {
+			if err := streamingListener.ListenDeliverTx(app.deliverState.ctx, req, res); err != nil {
+				app.logger.Error("DeliverTx listening hook failed", "err", err)
+			}
+		}
+	}()
+
+	gInfo := sdk.GasInfo{}
+	resultStr := "successful"
+
+	defer func() {
+		telemetry.IncrCounter(1, "tx", "count")
+		telemetry.IncrCounter(1, "tx", resultStr)
+		telemetry.SetGauge(float32(gInfo.GasUsed), "tx", "gas", "used")
+		telemetry.SetGauge(float32(gInfo.GasWanted), "tx", "gas", "wanted")
+	}()
+
+	gInfo, result, anteEvents, _, _, _, resCtx, err := app.runTx(ctx.WithTxBytes(req.Tx).WithTxSum(checksum).WithVoteInfos(app.voteInfos), runTxModeDeliver, tx, checksum)
 ```
 
-**File:** x/gov/keeper/common_test.go (L21-58)
+**File:** baseapp/baseapp.go (L927-973)
 ```go
-func createValidators(t *testing.T, ctx sdk.Context, app *simapp.SimApp, powers []int64) ([]sdk.AccAddress, []sdk.ValAddress) {
-	addrs := simapp.AddTestAddrsIncremental(app, ctx, 5, sdk.NewInt(30000000))
-	valAddrs := simapp.ConvertAddrsToValAddrs(addrs)
-	pks := simapp.CreateTestPubKeys(5)
-	cdc := simapp.MakeTestEncodingConfig().Marshaler
+	if app.anteHandler != nil {
+		var anteSpan trace.Span
+		if app.TracingEnabled {
+			// trace AnteHandler
+			_, anteSpan = app.TracingInfo.StartWithContext("AnteHandler", ctx.TraceSpanContext())
+			defer anteSpan.End()
+		}
+		var (
+			anteCtx sdk.Context
+			msCache sdk.CacheMultiStore
+		)
+		// Branch context before AnteHandler call in case it aborts.
+		// This is required for both CheckTx and DeliverTx.
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2772
+		//
+		// NOTE: Alternatively, we could require that AnteHandler ensures that
+		// writes do not happen if aborted/failed.  This may have some
+		// performance benefits, but it'll be more difficult to get right.
+		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
+		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
+		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
 
-	app.StakingKeeper = stakingkeeper.NewKeeper(
-		cdc,
-		app.GetKey(stakingtypes.StoreKey),
-		app.AccountKeeper,
-		app.BankKeeper,
-		app.GetSubspace(stakingtypes.ModuleName),
-	)
+		if !newCtx.IsZero() {
+			// At this point, newCtx.MultiStore() is a store branch, or something else
+			// replaced by the AnteHandler. We want the original multistore.
+			//
+			// Also, in the case of the tx aborting, we need to track gas consumed via
+			// the instantiated gas meter in the AnteHandler, so we update the context
+			// prior to returning.
+			//
+			// This also replaces the GasMeter in the context where GasUsed was initalized 0
+			// and updated with gas consumed in the ante handler runs
+			// The GasMeter is a pointer and its passed to the RunMsg and tracks the consumed
+			// gas there too.
+			ctx = newCtx.WithMultiStore(ms)
+		}
+		defer func() {
+			if newCtx.DeliverTxCallback() != nil {
+				newCtx.DeliverTxCallback()(ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx)))
+			}
+		}()
 
-	val1, err := stakingtypes.NewValidator(valAddrs[0], pks[0], stakingtypes.Description{})
-	require.NoError(t, err)
-	val2, err := stakingtypes.NewValidator(valAddrs[1], pks[1], stakingtypes.Description{})
-	require.NoError(t, err)
-	val3, err := stakingtypes.NewValidator(valAddrs[2], pks[2], stakingtypes.Description{})
-	require.NoError(t, err)
+		events := ctx.EventManager().Events()
 
-	app.StakingKeeper.SetValidator(ctx, val1)
-	app.StakingKeeper.SetValidator(ctx, val2)
-	app.StakingKeeper.SetValidator(ctx, val3)
-	app.StakingKeeper.SetValidatorByConsAddr(ctx, val1)
-	app.StakingKeeper.SetValidatorByConsAddr(ctx, val2)
-	app.StakingKeeper.SetValidatorByConsAddr(ctx, val3)
-	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val1)
-	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val2)
-	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val3)
+		if err != nil {
+			return gInfo, nil, nil, 0, nil, nil, ctx, err
+		}
+```
 
-	_, _ = app.StakingKeeper.Delegate(ctx, addrs[0], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[0]), stakingtypes.Unbonded, val1, true)
-	_, _ = app.StakingKeeper.Delegate(ctx, addrs[1], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[1]), stakingtypes.Unbonded, val2, true)
-	_, _ = app.StakingKeeper.Delegate(ctx, addrs[2], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[2]), stakingtypes.Unbonded, val3, true)
+**File:** x/staking/client/cli/tx.go (L548-556)
+```go
+	if generateOnly {
+		ip := config.IP
+		p2pPort := config.P2PPort
+		nodeID := config.NodeID
 
-	_ = staking.EndBlocker(ctx, app.StakingKeeper)
+		if nodeID != "" && ip != "" && p2pPort != "" {
+			txBldr = txBldr.WithMemo(fmt.Sprintf("%s@%s:%s", nodeID, ip, p2pPort))
+		}
+	}
+```
 
-	return addrs, valAddrs
+**File:** simapp/simd/cmd/testnet.go (L169-169)
+```go
+		memo := fmt.Sprintf("%s@%s:26656", nodeIDs[i], ip)
+```
+
+**File:** x/genutil/collect_test.go (L39-68)
+```go
+// a directory during traversal of the first level. See issue https://github.com/cosmos/cosmos-sdk/issues/6788.
+func TestCollectTxsHandlesDirectories(t *testing.T) {
+	testDir, err := ioutil.TempDir(os.TempDir(), "testCollectTxs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testDir)
+
+	// 1. We'll insert a directory as the first element before JSON file.
+	subDirPath := filepath.Join(testDir, "_adir")
+	if err := os.MkdirAll(subDirPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	txDecoder := types.TxDecoder(func(txBytes []byte) (types.Tx, error) {
+		return nil, nil
+	})
+
+	// 2. Ensure that we don't encounter any error traversing the directory.
+	srvCtx := server.NewDefaultContext()
+	_ = srvCtx
+	cdc := codec.NewProtoCodec(cdctypes.NewInterfaceRegistry())
+	gdoc := tmtypes.GenesisDoc{AppState: []byte("{}")}
+	balItr := new(doNothingIterator)
+
+	dnc := &doNothingUnmarshalJSON{cdc}
+	if _, _, err := genutil.CollectTxs(dnc, txDecoder, "foo", testDir, gdoc, balItr); err != nil {
+		t.Fatal(err)
+	}
+}
+```
+
+**File:** x/auth/ante/ante_test.go (L562-571)
+```go
+			"memo too large",
+			func() {
+				feeAmount = sdk.NewCoins(sdk.NewInt64Coin("usei", 0))
+				gasLimit = 60000
+				suite.txBuilder.SetMemo(strings.Repeat("01234567890", 500))
+			},
+			false,
+			false,
+			sdkerrors.ErrMemoTooLarge,
+		},
 ```

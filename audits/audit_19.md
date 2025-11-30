@@ -1,505 +1,207 @@
 # Audit Report
 
 ## Title
-Deferred Fee Cache Never Flushed Leading to Permanent Loss of Transaction Fees
+Race Condition in CommitKVStoreCache Due to Improper Read Lock Usage During Cache Write Operations
 
 ## Summary
-The bank module's deferred cache mechanism collects transaction fees but fails to flush them to persistent storage because the bank module lacks an EndBlock implementation. Fees are deducted from user balances but remain trapped in a memory cache storage location (prefix 0x03) that the distribution module cannot read from, resulting in complete loss of all transaction fees with validators receiving no compensation.
+The `getAndWriteToCache` method uses `RLock()` (read lock) while performing write operations on a non-thread-safe LRU cache, allowing multiple goroutines to concurrently corrupt the cache during parallel transaction execution. [1](#0-0) 
 
 ## Impact
-High - Direct loss of funds (all transaction fees)
+Medium
 
 ## Finding Description
 
-**Location:**
-- Primary vulnerability: Bank module missing EndBlock method [1](#0-0) 
-
-- Fee deduction entry point using deferred cache [2](#0-1) 
-
-- Distribution reading fees from wrong storage location [3](#0-2) 
+**Location:** `store/cache/cache.go`, lines 113-119
 
 **Intended Logic:**
-The deferred cache system batches module transfers for gas optimization. The code explicitly states: "In the EndBlocker, it will then perform one deposit for each module account" [4](#0-3) 
-
-The intended flow:
-1. Fees deducted from users, stored in deferred cache (prefix 0x03)
-2. At EndBlock, `WriteDeferredBalances` flushes cache to actual balances (prefix 0x02) [5](#0-4) 
-3. Distribution module reads fees from actual balances and distributes to validators
+The `CommitKVStoreCache` should safely handle concurrent access during transaction parallelization by using proper synchronization. When populating the cache with uncached keys, only one goroutine should modify the cache at a time. [2](#0-1) 
 
 **Actual Logic:**
-1. Ante handler deducts fees using `DeferredSendCoinsFromAccountToModule`, decreasing user balance and storing in deferred cache [6](#0-5) 
+The `getAndWriteToCache` method acquires `RLock()` before calling `cache.Add()`. Since `RLock()` allows multiple goroutines to hold the read lock simultaneously, multiple threads can execute `cache.Add()` concurrently on the non-thread-safe `lru.TwoQueueCache` from hashicorp/golang-lru/v2. [3](#0-2) 
 
-2. Bank module has NO EndBlock method - the module manager skips it during EndBlock processing [7](#0-6) 
-
-3. `WriteDeferredBalances` is never called in production (only in tests)
-
-4. Distribution's `AllocateTokens` (called in BeginBlock) reads fee collector balance via `GetAllBalances` [8](#0-7) 
-
-5. `GetAllBalances` only reads from BalancesPrefix (0x02), not DeferredCachePrefix (0x03) [9](#0-8) [10](#0-9) [11](#0-10) 
-
-6. Fee collector balance reads as zero, validators receive nothing
+This contradicts the synchronization pattern used in other cache-modifying methods which correctly use exclusive `Lock()`: [4](#0-3) [5](#0-4) [6](#0-5) 
 
 **Exploitation Path:**
-1. Any user submits a transaction with fees (normal network operation)
-2. Ante handler deducts fees, storing them in deferred cache (memory store) [12](#0-11) 
-3. Block ends, but bank module's EndBlock never called (doesn't exist)
-4. Deferred cache never flushed to actual balance storage
-5. Next block's BeginBlock: distribution module reads zero balance for fee collector
-6. Fees remain permanently inaccessible in wrong storage location
+1. The scheduler spawns worker goroutines for concurrent transaction execution [7](#0-6) 
+
+2. Each transaction uses a `VersionIndexedStore` with a shared `CommitKVStoreCache` as parent [8](#0-7) 
+
+3. When a key is not in the multiversion store, it reads from the parent store [9](#0-8) 
+
+4. If the key is not cached, `getAndWriteToCache()` is called [10](#0-9) 
+
+5. Multiple goroutines acquire `RLock` concurrently and call `cache.Add()` without mutual exclusion, corrupting the cache's internal data structures
 
 **Security Guarantee Broken:**
-Fundamental accounting invariant violated - transaction fees collected from users must be distributed to validators. User balances decrease but no corresponding increase occurs in any accessible account balance, breaking token conservation.
+This violates the thread-safety guarantee for concurrent access documented in the code. The hashicorp/golang-lru library requires external synchronization, which is not provided when using `RLock` for write operations.
 
 ## Impact Explanation
 
-**Direct Financial Loss:**
-- Every transaction fee deducted from users is permanently lost
-- Fees accumulate in an inaccessible storage location (DeferredCachePrefix 0x03)
-- Validators receive zero fee rewards, completely breaking the network's economic incentive model
-- Cumulative loss grows with every transaction across all blocks
+This vulnerability causes cache corruption during concurrent transaction processing, leading to:
 
-**System-Wide Effects:**
-- Validator economics fundamentally broken (no fee revenue despite processing transactions)
-- User funds extracted without corresponding value delivery
-- Network sustainability threatened as validators receive no compensation for block production
+1. **Node Instability**: Corrupted cache internal structures (linked lists, hash maps) cause panics from nil pointer dereferences or invalid memory access
+2. **Non-Deterministic Behavior**: Corrupted cache state leads to unpredictable transaction execution results
+3. **Network Degradation**: During high transaction throughput, multiple nodes experiencing this race condition can crash, impacting network availability
 
-**Scope:**
-Affects 100% of transactions with fees across the entire network. This occurs automatically during normal operation.
+This qualifies as **Medium severity** under "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**Probability:** Certain (100%)
-- Triggered automatically by the normal transaction processing pipeline
-- No special conditions, configurations, or attacker actions required
-- Occurs on every single transaction that includes fees
-- Bank keeper is initialized with deferred cache in production [13](#0-12) 
+**Triggering Conditions:**
+- Any network participant can trigger this by submitting normal transactions
+- No special privileges required
+- Concurrent transaction processing is the default operational mode
+- Multiple transactions must access the same uncached keys simultaneously
 
-**Evidence from Tests:**
-The test explicitly demonstrates the issue - after fee deduction, the fee collector balance has NOT increased. Only after manually calling `WriteDeferredBalances` does the balance increase, proving that without this call, fees remain inaccessible: [14](#0-13) 
+**Frequency:**
+The race occurs during:
+- High transaction throughput periods
+- After cache evictions or node restarts when cache is cold
+- When accessing newly introduced keys
+
+The vulnerability is more exploitable than typical race conditions because `RLock` allows unlimited concurrent access, maximizing collision probability. With sufficient transaction volume, the likelihood of triggering this race increases significantly.
 
 ## Recommendation
 
-Add EndBlock implementation to the bank module in `x/bank/module.go`:
+Change `getAndWriteToCache` to use an exclusive write lock:
 
 ```go
-func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
-    am.keeper.WriteDeferredBalances(ctx)
-    return []abci.ValidatorUpdate{}
+func (ckv *CommitKVStoreCache) getAndWriteToCache(key []byte) []byte {
+    ckv.mtx.Lock()  // Changed from RLock
+    defer ckv.mtx.Unlock()  // Changed from RUnlock
+    value := ckv.CommitKVStore.Get(key)
+    ckv.cache.Add(string(key), value)
+    return value
 }
 ```
 
-This ensures the `AppModule` implements the `EndBlockAppModule` interface, allowing the module manager to invoke it during block finalization and flush the deferred cache to actual balances.
-
-**Verification:**
-1. Confirm `WriteDeferredBalances` is called at end of every block
-2. Add invariant checks to detect any remaining balance in deferred cache after EndBlock
-3. Verify fee collector balance increases correctly after transactions
-4. Confirm distribution module successfully reads and allocates fees to validators
-
-**Deployment:**
-This fix requires a coordinated network upgrade as it changes the state transition function.
+This ensures only one goroutine can modify the cache at a time, matching the pattern in `Set()`, `Delete()`, and `Reset()` methods.
 
 ## Proof of Concept
 
-The existing test `TestDeductFeeCollectorNotCreated` in `x/auth/ante/fee_test.go` demonstrates this exact scenario. The test shows:
-
 **Setup:**
-- Bank keeper with deferred cache enabled
-- User account with balance
-- Fee collector module account
+1. Create a `CommitKVStoreCache` with an underlying store
+2. Populate the underlying store with keys not yet in the cache
+3. Launch multiple goroutines (10+) simulating concurrent transaction execution
 
 **Action:**
-- Call ante handler twice to deduct fees
-- Fees stored in deferred cache
+1. All goroutines concurrently call `Get()` on the same uncached keys
+2. This triggers concurrent calls to `getAndWriteToCache()`
+3. Multiple goroutines acquire `RLock` simultaneously and call `cache.Add()` concurrently
 
 **Result:**
-- Lines 175-180: Fee collector balance has NOT increased after fee deduction (still equals expected starting balance)
-- Line 183: Manually call `WriteDeferredBalances` (this call should happen in EndBlock but doesn't)
-- Lines 185-194: Only after manual flush does fee collector balance increase
-
-This proves that in production code (without manual `WriteDeferredBalances` call), fees remain inaccessible.
-
-## Notes
-
-**Multiple Lines of Evidence:**
-1. Code comment explicitly states "In the EndBlocker, it will then perform one deposit" but EndBlock doesn't exist
-2. Bank module completely lacks EndBlock method implementation
-3. All test files manually invoke `WriteDeferredBalances` as a workaround
-4. Deferred cache (prefix 0x03) and actual balances (prefix 0x02) use separate storage with no automatic synchronization
-5. Deferred cache registered as memory store
-
-This represents a critical architectural flaw where an optimization mechanism was partially implemented without the essential flush mechanism, resulting in complete loss of all transaction fees.
+Running with Go's race detector (`go test -race`) would report data races in cache operations. Without the race detector, the test can observe panics from corrupted cache state during high concurrency. The race occurs because `RLock` allows multiple concurrent holders, enabling simultaneous execution of the write operation `cache.Add()` on the non-thread-safe LRU cache.
 
 ### Citations
 
-**File:** x/bank/module.go (L107-210)
+**File:** store/cache/cache.go (L34-36)
 ```go
-// AppModule implements an application module for the bank module.
-type AppModule struct {
-	AppModuleBasic
+		// the same CommitKVStoreCache may be accessed concurrently by multiple
+		// goroutines due to transaction parallelization
+		mtx sync.RWMutex
+```
 
-	keeper        keeper.Keeper
-	accountKeeper types.AccountKeeper
-}
-
-// RegisterServices registers module services.
-func (am AppModule) RegisterServices(cfg module.Configurator) {
-	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
-	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
-
-	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
-	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
-}
-
-// NewAppModule creates a new AppModule object
-func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
-	return AppModule{
-		AppModuleBasic: AppModuleBasic{cdc: cdc},
-		keeper:         keeper,
-		accountKeeper:  accountKeeper,
-	}
-}
-
-// Name returns the bank module's name.
-func (AppModule) Name() string { return types.ModuleName }
-
-// RegisterInvariants registers the bank module invariants.
-func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
-	keeper.RegisterInvariants(ir, am.keeper)
-}
-
-// Route returns the message routing key for the bank module.
-func (am AppModule) Route() sdk.Route {
-	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
-}
-
-// QuerierRoute returns the bank module's querier route name.
-func (AppModule) QuerierRoute() string { return types.RouterKey }
-
-// LegacyQuerierHandler returns the bank module sdk.Querier.
-func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
-	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
-}
-
-// InitGenesis performs genesis initialization for the bank module. It returns
-// no validator updates.
-func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
-	start := time.Now()
-	var genesisState types.GenesisState
-	cdc.MustUnmarshalJSON(data, &genesisState)
-	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
-
-	am.keeper.InitGenesis(ctx, &genesisState)
-	return []abci.ValidatorUpdate{}
-}
-
-// ExportGenesis returns the exported genesis state as raw bytes for the bank
-// module.
-func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
-	gs := am.keeper.ExportGenesis(ctx)
-	return cdc.MustMarshalJSON(gs)
-}
-
-func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
-	ch := make(chan json.RawMessage)
-	go func() {
-		ch <- am.ExportGenesis(ctx, cdc)
-		close(ch)
-	}()
-	return ch
-}
-
-// ConsensusVersion implements AppModule/ConsensusVersion.
-func (AppModule) ConsensusVersion() uint64 { return 2 }
-
-// AppModuleSimulation functions
-
-// GenerateGenesisState creates a randomized GenState of the bank module.
-func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
-	simulation.RandomizedGenState(simState)
-}
-
-// ProposalContents doesn't return any content functions for governance proposals.
-func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
-	return nil
-}
-
-// RandomizedParams creates randomized bank param changes for the simulator.
-func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
-	return simulation.ParamChanges(r)
-}
-
-// RegisterStoreDecoder registers a decoder for supply module's types
-func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
-
-// WeightedOperations returns the all the gov module operations with their respective weights.
-func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
-	return simulation.WeightedOperations(
-		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
-	)
+**File:** store/cache/cache.go (L113-119)
+```go
+func (ckv *CommitKVStoreCache) getAndWriteToCache(key []byte) []byte {
+	ckv.mtx.RLock()
+	defer ckv.mtx.RUnlock()
+	value := ckv.CommitKVStore.Get(key)
+	ckv.cache.Add(string(key), value)
+	return value
 }
 ```
 
-**File:** x/auth/ante/fee.go (L202-214)
+**File:** store/cache/cache.go (L124-133)
 ```go
-// DeductFees deducts fees from the given account.
-func DeductFees(bankKeeper types.BankKeeper, ctx sdk.Context, acc types.AccountI, fees sdk.Coins) error {
-	if !fees.IsValid() {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFee, "invalid fee amount: %s", fees)
+func (ckv *CommitKVStoreCache) Get(key []byte) []byte {
+	types.AssertValidKey(key)
+
+	if value, ok := ckv.getFromCache(key); ok {
+		return value
 	}
 
-	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
-	if err != nil {
-		return sdkerrors.Wrapf(sdkerrors.ErrInsufficientFunds, err.Error())
-	}
-
-	return nil
+	// if not found in the cache, query the underlying CommitKVStore and init cache value
+	return ckv.getAndWriteToCache(key)
 }
 ```
 
-**File:** x/distribution/keeper/allocation.go (L25-33)
+**File:** store/cache/cache.go (L137-146)
 ```go
-	feeCollector := k.authKeeper.GetModuleAccount(ctx, k.feeCollectorName)
-	feesCollectedInt := k.bankKeeper.GetAllBalances(ctx, feeCollector.GetAddress())
-	feesCollected := sdk.NewDecCoinsFromCoins(feesCollectedInt...)
+func (ckv *CommitKVStoreCache) Set(key, value []byte) {
+	ckv.mtx.Lock()
+	defer ckv.mtx.Unlock()
 
-	// transfer collected fees to the distribution module account
-	err := k.bankKeeper.SendCoinsFromModuleToModule(ctx, k.feeCollectorName, types.ModuleName, feesCollectedInt)
-	if err != nil {
-		panic(err)
-	}
-```
+	types.AssertValidKey(key)
+	types.AssertValidValue(value)
 
-**File:** x/bank/keeper/keeper.go (L404-432)
-```go
-// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
-// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
-// In the EndBlocker, it will then perform one deposit for each module account.
-// It will panic if the module account does not exist.
-func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
-	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
-) error {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
-	}
-	// Deducts Fees from the Sender Account
-	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
-	if err != nil {
-		return err
-	}
-	// get recipient module address
-	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
-	if moduleAcc == nil {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
-	}
-	// get txIndex
-	txIndex := ctx.TxIndex()
-	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	ckv.cache.Add(string(key), value)
+	ckv.CommitKVStore.Set(key, value)
 }
 ```
 
-**File:** x/bank/keeper/keeper.go (L434-483)
+**File:** store/cache/cache.go (L150-156)
 ```go
-// WriteDeferredDepositsToModuleAccounts Iterates on all the deferred deposits and deposit them into the store
-func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
-	}
-	ctx = ctx.WithEventManager(sdk.NewEventManager())
+func (ckv *CommitKVStoreCache) Delete(key []byte) {
+	ckv.mtx.Lock()
+	defer ckv.mtx.Unlock()
 
-	// maps between bech32 stringified module account address and balance
-	moduleAddrBalanceMap := make(map[string]sdk.Coins)
-	// slice of modules to be sorted for consistent write order later
-	moduleList := []string{}
-
-	// iterate over deferred cache and accumulate totals per module
-	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
-		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
-		if !ok {
-			// add to list of modules
-			moduleList = append(moduleList, moduleAddr.String())
-			// set the map value
-			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
-			return false
-		}
-		// add to currCoins
-		newCoins := currCoins.Add(amount)
-		// update map
-		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
-		return false
-	})
-	// sort module list
-	sort.Strings(moduleList)
-
-	// iterate through module list and add the balance to module bank balances in sorted order
-	for _, moduleBech32Addr := range moduleList {
-		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
-		if !ok {
-			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
-			ctx.Logger().Error(err.Error())
-			panic(err)
-		}
-		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
-		if err != nil {
-			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
-			panic(err)
-		}
-	}
-
-	// clear deferred cache
-	k.deferredCache.Clear(ctx)
-	return ctx.EventManager().ABCIEvents()
+	ckv.cache.Remove(string(key))
+	ckv.CommitKVStore.Delete(key)
 }
 ```
 
-**File:** x/auth/ante/ante.go (L47-60)
+**File:** store/cache/cache.go (L158-163)
 ```go
-	anteDecorators := []sdk.AnteFullDecorator{
-		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
-		sdk.DefaultWrappedAnteDecorator(NewRejectExtensionOptionsDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateBasicDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewTxTimeoutHeightDecorator()),
-		sdk.DefaultWrappedAnteDecorator(NewValidateMemoDecorator(options.AccountKeeper)),
-		NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
-		NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.ParamsKeeper.(paramskeeper.Keeper), options.TxFeeChecker),
-		sdk.DefaultWrappedAnteDecorator(NewSetPubKeyDecorator(options.AccountKeeper)), // SetPubKeyDecorator must be called before all signature verification decorators
-		sdk.DefaultWrappedAnteDecorator(NewValidateSigCountDecorator(options.AccountKeeper)),
-		sdk.DefaultWrappedAnteDecorator(NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer)),
-		sdk.DefaultWrappedAnteDecorator(sigVerifyDecorator),
-		NewIncrementSequenceDecorator(options.AccountKeeper),
-	}
+func (ckv *CommitKVStoreCache) Reset() {
+	ckv.mtx.Lock()
+	defer ckv.mtx.Unlock()
+
+	ckv.cache.Purge()
+}
 ```
 
-**File:** types/module/module.go (L642-664)
+**File:** go.mod (L28-28)
+```text
+	github.com/hashicorp/golang-lru/v2 v2.0.1
+```
+
+**File:** tasks/scheduler.go (L135-148)
 ```go
-func (m *Manager) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) abci.ResponseEndBlock {
-	ctx = ctx.WithEventManager(sdk.NewEventManager())
-	validatorUpdates := []abci.ValidatorUpdate{}
-	defer telemetry.MeasureSince(time.Now(), "module", "total_end_block")
-	for _, moduleName := range m.OrderEndBlockers {
-		module, ok := m.Modules[moduleName].(EndBlockAppModule)
-		if !ok {
-			continue
-		}
-		moduleStartTime := time.Now()
-		moduleValUpdates := module.EndBlock(ctx, req)
-		telemetry.ModuleMeasureSince(moduleName, moduleStartTime, "module", "end_block")
-		// use these validator updates if provided, the module manager assumes
-		// only one module will update the validator set
-		if len(moduleValUpdates) > 0 {
-			if len(validatorUpdates) > 0 {
-				panic("validator EndBlock updates already set by a previous module")
+func start(ctx context.Context, ch chan func(), workers int) {
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case work := <-ch:
+					work()
+				}
 			}
-
-			validatorUpdates = moduleValUpdates
-		}
-
+		}()
 	}
+}
 ```
 
-**File:** x/distribution/abci.go (L15-37)
+**File:** tasks/scheduler.go (L217-227)
 ```go
-func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
-	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
-
-	// determine the total power signing the block
-	var previousTotalPower, sumPreviousPrecommitPower int64
-	for _, voteInfo := range req.LastCommitInfo.GetVotes() {
-		previousTotalPower += voteInfo.Validator.Power
-		if voteInfo.SignedLastBlock {
-			sumPreviousPrecommitPower += voteInfo.Validator.Power
-		}
+func (s *scheduler) tryInitMultiVersionStore(ctx sdk.Context) {
+	if s.multiVersionStores != nil {
+		return
 	}
-
-	// TODO this is Tendermint-dependent
-	// ref https://github.com/cosmos/cosmos-sdk/issues/3095
-	if ctx.BlockHeight() > 1 {
-		previousProposer := k.GetPreviousProposerConsAddr(ctx)
-		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+	mvs := make(map[sdk.StoreKey]multiversion.MultiVersionStore)
+	keys := ctx.MultiStore().StoreKeys()
+	for _, sk := range keys {
+		mvs[sk] = multiversion.NewMultiVersionStore(ctx.MultiStore().GetKVStore(sk))
 	}
-
-	// record the proposer for when we payout on the next block
-	consAddr := sdk.ConsAddress(req.Header.ProposerAddress)
-	k.SetPreviousProposerConsAddr(ctx, consAddr)
+	s.multiVersionStores = mvs
 }
 ```
 
-**File:** x/bank/keeper/view.go (L63-72)
+**File:** store/multiversion/mvkv.go (L173-175)
 ```go
-// GetAllBalances returns all the account balances for the given account address.
-func (k BaseViewKeeper) GetAllBalances(ctx sdk.Context, addr sdk.AccAddress) sdk.Coins {
-	balances := sdk.NewCoins()
-	k.IterateAccountBalances(ctx, addr, func(balance sdk.Coin) bool {
-		balances = append(balances, balance)
-		return false
-	})
-
-	return balances.Sort()
-}
-```
-
-**File:** x/bank/keeper/view.go (L231-236)
-```go
-// getAccountStore gets the account store of the given address.
-func (k BaseViewKeeper) getAccountStore(ctx sdk.Context, addr sdk.AccAddress) prefix.Store {
-	store := ctx.KVStore(k.storeKey)
-
-	return prefix.NewStore(store, types.CreateAccountBalancesPrefix(addr))
-}
-```
-
-**File:** x/bank/types/key.go (L26-36)
-```go
-// KVStore keys
-var (
-	WeiBalancesPrefix = []byte{0x04}
-	// BalancesPrefix is the prefix for the account balances store. We use a byte
-	// (instead of `[]byte("balances")` to save some disk space).
-	DeferredCachePrefix  = []byte{0x03}
-	BalancesPrefix       = []byte{0x02}
-	SupplyKey            = []byte{0x00}
-	DenomMetadataPrefix  = []byte{0x1}
-	DenomAllowListPrefix = []byte{0x11}
-)
-```
-
-**File:** simapp/app.go (L230-230)
-```go
-	memKeys := sdk.NewMemoryStoreKeys(capabilitytypes.MemStoreKey, "testingkey", banktypes.DeferredCacheStoreKey)
-```
-
-**File:** simapp/app.go (L264-266)
-```go
-	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
-		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
-	)
-```
-
-**File:** x/auth/ante/fee_test.go (L175-194)
-```go
-	// Fee Collector actual account balance should not have increased
-	resultFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
-	suite.Assert().Equal(
-		expectedFeeCollectorBalance,
-		resultFeeCollectorBalance,
-	)
-
-	// Fee Collector actual account balance deposit coins into the fee collector account
-	suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
-
-	depositFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
-
-	expectedAtomFee := feeAmount.AmountOf("usei")
-
-	suite.Assert().Equal(
-		// Called antehandler twice, expect fees to be deducted twice
-		expectedFeeCollectorBalance.Add(sdk.NewCoin("usei", expectedAtomFee)).Add(sdk.NewCoin("usei", expectedAtomFee)),
-		depositFeeCollectorBalance,
-	)
-}
+	parentValue := store.parent.Get(key)
+	store.UpdateReadSet(key, parentValue)
+	return parentValue
 ```

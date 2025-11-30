@@ -1,164 +1,242 @@
 # Audit Report
 
 ## Title
-Non-Deterministic Iterator Validation Causing Consensus Failures Due to Race Condition in Channel Selection
+Unmetered Storage Access Operations During Parallel Execution Validation Phase
 
 ## Summary
-The `validateIterator` function contains a critical race condition where both `abortChannel` and `validChannel` can simultaneously have ready values, causing Go's `select` statement to non-deterministically choose between them. This breaks consensus determinism as different validator nodes reach different validation decisions for identical transactions, leading to chain splits.
+The OCC parallel execution system's validation logic performs storage read and iterator operations without gas metering, allowing any user to force validators to perform up to 11× more computational work than what was paid for in gas fees, enabling resource exhaustion attacks across the entire validator network.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
 **Location:**
-- Primary: [1](#0-0) 
-- Contributing: [2](#0-1) 
+- `store/multiversion/store.go` lines 279-281, 286, 355
+- `tasks/scheduler.go` lines 40, 166-183, 217-227
 
-**Intended logic:**
-When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically return `false` across all validator nodes to trigger re-execution.
+**Intended Logic:**
+All storage operations should be gas-metered through the `gaskv.Store` wrapper to ensure users pay for computational resources consumed. The system should prevent users from forcing validators to perform unbounded work without corresponding payment. [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) 
 
-**Actual logic:**
-When the validation iterator's `Value()` method encounters an estimate, it sends an abort signal to `abortChannel` [3](#0-2)  but does not terminate execution. The method continues to execute [4](#0-3)  and returns the value, allowing the validation goroutine to continue iterating. The goroutine eventually completes and sends the final validation result to `validChannel` [5](#0-4) . Since both channels are buffered with capacity 1 [6](#0-5) , both sends succeed without blocking. The `select` statement [7](#0-6)  then receives from whichever channel the Go runtime pseudo-randomly selects when multiple cases are simultaneously ready.
+**Actual Logic:**
+The multiversion store's parent store is initialized using `ctx.MultiStore().GetKVStore(sk)` which bypasses the gas metering wrapper that would be provided by `ctx.KVStore(sk)`. During validation, the system directly accesses this unmetered parent store: [5](#0-4) 
 
-**Exploitation path:**
-1. Transaction A writes to keys and undergoes re-execution, creating estimate values in the multiversion store
-2. Transaction B's validation performs iterator operations that encounter Transaction A's estimate values
-3. During validation replay in the goroutine, `mergeIterator.Valid()` or `mergeIterator.Key()` internally calls `skipUntilExistsOrInvalid()` [8](#0-7) 
-4. This triggers `iter.cache.Value()` calls which invoke the validation iterator's `Value()` method
-5. The estimate detection sends to `abortChannel` but execution continues without stopping
-6. The goroutine completes iteration and sends to `validChannel`
-7. Both channels now have ready values simultaneously
-8. Different validator nodes execute the `select` at different runtime scheduling states
-9. Some validators' `select` reads from `abortChannel` (returns false, marks validation as failed, triggers re-execution)
-10. Other validators' `select` reads from `validChannel` (may return true, marks validation as passed)
-11. Validators diverge on transaction validation states
-12. Different final block states emerge across validators
-13. Consensus cannot be reached, causing network partition
+In validation operations, storage reads and iterations occur without any gas consumption: [6](#0-5) [7](#0-6) 
 
-**Security guarantee broken:**
-Consensus determinism - the fundamental requirement that all honest validator nodes processing identical block inputs must reach identical state transitions and validation decisions.
+**Exploitation Path:**
+1. Attacker submits transaction T1 that iterates over 10,000+ keys, paying gas during execution
+2. T1's iterateset is recorded with all accessed keys
+3. Attacker submits transaction T2 that writes to keys within T1's iteration range
+4. Conflict detection triggers via `findConflicts()` → `ValidateTransactionState()`
+5. Validation creates parent store iterators and iterates through all keys without consuming gas
+6. With `maximumIterations = 10`, this validation can repeat up to 10 times
+7. Result: Attacker pays gas for 1 execution but forces 1-10 unmetered validations [8](#0-7) [9](#0-8) 
+
+**Security Guarantee Broken:**
+The fundamental economic security principle that users must pay for all computational resources they cause validators to consume is violated. Validation operations scale linearly with transaction complexity but are completely unaccounted for in gas costs.
 
 ## Impact Explanation
 
-This vulnerability causes different validator nodes to produce divergent validation results for the same transaction within the same block. When some validators mark a transaction as invalid (triggering re-execution) while others validate it successfully (committing to final state), the nodes diverge on which transactions are included in the canonical state. This results in:
+This vulnerability enables resource exhaustion attacks affecting all validator nodes:
 
-1. **Immediate consensus failure** - Validators cannot agree on the block's state root
-2. **Permanent chain split** - The network partitions into incompatible forks following different validation paths  
-3. **Requires hard fork to resolve** - No automatic recovery mechanism exists; manual network coordination and upgrade required
-4. **Complete loss of transaction finality** - All transactions after the split point become uncertain across the network
-5. **Network-wide impact** - Affects all users, applications, and services running on the blockchain
+- **Resource Multiplier**: With standard gas costs of 30 gas per iteration (`IterNextCostFlat`), iterating 10,000 keys represents 300,000+ gas of work. With up to 10 validations, this becomes 3,000,000 gas of unmetered operations per transaction.
 
-The vulnerability is invoked during block execution via the scheduler's optimistic concurrency control system [9](#0-8) , making it part of the consensus-critical path.
+- **Network-wide Impact**: All validators must perform these unmetered validation operations when processing blocks, causing simultaneous CPU, I/O, and memory consumption increases across the entire network.
+
+- **Economic Violation**: Attackers pay for X work but force validators to perform up to 11X work (1 execution + 10 validations), creating a massive resource consumption asymmetry.
+
+- **Concrete Impact**: Batches of transactions with large iteratesets causing multiple validations can easily increase network-wide resource consumption by 300-1000%, far exceeding the Medium severity threshold of 30% resource consumption increase.
 
 ## Likelihood Explanation
 
-**Triggering conditions:**
-- Multiple concurrent transactions accessing overlapping key ranges (common in high-throughput blocks)
-- Transaction usage of iterators for range queries, state migrations, or batch deletions (standard blockchain operations)
-- Transaction re-execution creating estimate values (inherent to the OCC design pattern)
-- No special privileges or adversarial behavior required
+**Triggering Conditions:**
+- Any unprivileged user can submit transactions with arbitrarily large iteratesets (no size limits enforced)
+- Conflicts are trivially induced by submitting transactions accessing overlapping key ranges
+- Scheduler automatically triggers validation during parallel execution
+- No special permissions or edge-case conditions required
 
 **Frequency:**
-The race condition window opens whenever a validation iterator encounters an estimate value during replay. On networks with parallel transaction execution using optimistic concurrency control, this occurs regularly - potentially multiple times per block under load. The actual manifestation depends on Go runtime scheduling variability and is unpredictable but statistically inevitable over time.
+- Occurs whenever transactions conflict during parallel execution
+- Attacker can deliberately maximize by submitting batches of conflicting transactions with large iteratesets per block
+- Every block with parallel execution enabled is vulnerable
 
-**Who can trigger:**
-Any user submitting normal transactions can inadvertently trigger this through routine system operation. This is not an attack vector requiring malicious intent, but rather a fundamental non-determinism in consensus-critical validation logic. The probability increases with:
-- Higher transaction throughput
-- More complex transactions using iterator operations
-- Longer validation processing times
-- Increased parallel execution depth
+**Accessibility:**
+- Exploitable through normal transaction submission
+- No privileged access needed
+- Works with default parallel execution settings
+- Attack cost bounded only by transaction gas limits, but 11× multiplier makes DoS economically viable
 
 ## Recommendation
 
-**Immediate fix:**
-Modify `validationIterator.Value()` to immediately terminate execution after detecting an estimate:
+Implement gas metering for validation operations:
 
-```go
-// In store/multiversion/memiterator.go, line 115-117
-if val.IsEstimate() {
-    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-    panic(occtypes.NewEstimateAbort(val.Index())) // Immediately terminate goroutine
-}
-```
+1. **Meter validation storage operations**: Modify `ValidateTransactionState`, `checkReadsetAtIndex`, and `validateIterator` to accept and use a gas meter parameter. Wrap parent store accesses with `gaskv.NewStore()` or directly charge gas for each operation.
 
-**Alternative fix:**
-Add abort signal checking within the validation loop:
+2. **Charge against transaction gas limit**: Validation gas should count against the original transaction's gas limit. Transactions exceeding their gas budget during validation should fail.
 
-```go
-// In store/multiversion/store.go, inside the validation goroutine loop
-for ; mergeIterator.Valid(); mergeIterator.Next() {
-    select {
-    case <-abortChan:
-        returnChan <- false
-        return
-    default:
-    }
-    // ... existing iteration logic
-}
-```
-
-**Root cause fix:**
-Redesign the validation flow to ensure estimate detection always takes precedence before any result reaches `validChannel`. Consider:
-- Using a single channel with typed responses (success/abort)
-- Implementing context-based cancellation on abort detection
-- Adding explicit goroutine termination on estimate detection
+3. **Alternative mitigations** (if architectural constraints exist):
+   - Impose hard limits on readset/iterateset sizes per transaction
+   - Reduce `maximumIterations` from 10 to a lower value (e.g., 3)
+   - Implement exponential backoff for repeated validations
+   - Rate-limit transactions causing frequent validation failures
 
 ## Proof of Concept
 
-The existing test [10](#0-9)  demonstrates the scenario but expects deterministic behavior by running only once.
+**Conceptual Test** (implementable in `tasks/scheduler_test.go`):
 
 **Setup:**
-1. Initialize multiversion store with parent keys (key2-key5)
-2. Transaction 2 writes to key2 creating a writeset
-3. Transaction 5 creates an iterator that includes key2
-4. Invalidate transaction 2's writeset by setting it as an estimate
+1. Initialize test context with tracked gas meter
+2. Create multiversion store with 1,000 pre-populated keys
+3. Create transaction T1: Iterates over all 1,000 keys
+4. Create transaction T2: Writes to key within T1's iteration range
 
 **Action:**
-Call `mvs.ValidateTransactionState(5)` which triggers the vulnerable `validateIterator` code path
+1. Execute T1 through scheduler - record gas consumed (~300,000 gas for 1,000 keys × 30 gas/key)
+2. Execute T2 - creates write conflict with T1's iteration range
+3. Scheduler validates T1 via `findConflicts()` → `ValidateTransactionState()` → `validateIterator()`
+4. Monitor gas meter during validation phase
 
-**Expected result (deterministic):**
-Should consistently return `false` due to estimate detection
+**Expected Result:**
+- T1 execution: Gas meter increases by ~300,000+ gas
+- T1 validation: Gas meter does NOT increase despite performing identical iteration operations
+- Validation performs `parentStore.Iterator()` and loop with `Next()` calls without gas charges
+- Multiple validations multiply unmetered work linearly
 
-**Actual result (non-deterministic):**
-The code structure proves both channels can have values simultaneously:
-- Estimate detection sends to `abortChannel` (non-blocking, buffer capacity 1)
-- Goroutine continues execution and completes
-- Validation result is sent to `validChannel` (non-blocking, buffer capacity 1)
-- Go's `select` statement chooses non-deterministically when both cases are ready
-
-Running the validation multiple times across different validator nodes with different runtime scheduling would produce inconsistent results, demonstrating the non-deterministic behavior that causes consensus failures.
+**Observation:**
+Validation work (storage reads, iterator creation, key iteration) occurs completely outside gas accounting, allowing attackers to force validators to perform 2-11× more work than gas payment covers.
 
 ## Notes
 
-This vulnerability is particularly critical because:
-1. It affects the core consensus mechanism used during block execution
-2. It can be triggered through normal operation without malicious intent
-3. No existing safeguards prevent the non-deterministic behavior
-4. The Go language specification explicitly defines `select` as non-deterministic when multiple cases are ready
-5. Different validator nodes running at different times with different runtime scheduling will make different choices
-6. The impact matches the high-severity category: "Unintended permanent chain split requiring hard fork"
+The validation phase is architecturally necessary for OCC consistency, but the current implementation performs operations scaling linearly with transaction complexity without cost accounting. Since validation work is proportional to execution work and can occur up to 10 times per transaction, this creates a significant DoS vector violating the economic security model. The lack of readset/iterateset size limits exacerbates the issue, allowing attackers to maximize the resource consumption multiplier effect.
 
 ### Citations
 
-**File:** store/multiversion/store.go (L262-318)
+**File:** types/context.go (L567-574)
 ```go
-func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
-	// collect items from multiversion store
-	sortedItems := s.CollectIteratorItems(index)
-	// add the iterationtracker writeset keys to the sorted items
-	for key := range tracker.writeset {
-		sortedItems.Set([]byte(key), []byte{})
+func (c Context) KVStore(key StoreKey) KVStore {
+	if c.isTracing {
+		if _, ok := c.nextStoreKeys[key.Name()]; ok {
+			return gaskv.NewStore(c.nextMs.GetKVStore(key), c.GasMeter(), stypes.KVGasConfig(), key.Name(), c.StoreTracer())
+		}
 	}
-	validChannel := make(chan bool, 1)
-	abortChannel := make(chan occtypes.Abort, 1)
+	return gaskv.NewStore(c.MultiStore().GetKVStore(key), c.GasMeter(), stypes.KVGasConfig(), key.Name(), c.StoreTracer())
+}
+```
 
-	// listen for abort while iterating
-	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
-		var parentIter types.Iterator
-		expectedKeys := iterationTracker.iteratedKeys
-		foundKeys := 0
-		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+**File:** store/gaskv/store.go (L54-66)
+```go
+func (gs *Store) Get(key []byte) (value []byte) {
+	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostFlat, types.GasReadCostFlatDesc)
+	value = gs.parent.Get(key)
+
+	// TODO overflow-safe math?
+	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(key)), types.GasReadPerByteDesc)
+	gs.gasMeter.ConsumeGas(gs.gasConfig.ReadCostPerByte*types.Gas(len(value)), types.GasReadPerByteDesc)
+	if gs.tracer != nil {
+		gs.tracer.Get(key, value, gs.moduleName)
+	}
+
+	return value
+}
+```
+
+**File:** store/gaskv/store.go (L134-153)
+```go
+func (gs *Store) iterator(start, end []byte, ascending bool) types.Iterator {
+	var parent types.Iterator
+	if ascending {
+		parent = gs.parent.Iterator(start, end)
+	} else {
+		parent = gs.parent.ReverseIterator(start, end)
+	}
+
+	gi := newGasIterator(gs.gasMeter, gs.gasConfig, parent, gs.moduleName, gs.tracer)
+	defer func() {
+		if err := recover(); err != nil {
+			// if there is a panic, we close the iterator then reraise
+			gi.Close()
+			panic(err)
+		}
+	}()
+	gi.(*gasIterator).consumeSeekGas()
+
+	return gi
+}
+```
+
+**File:** store/types/gas.go (L329-351)
+```go
+// GasConfig defines gas cost for each operation on KVStores
+type GasConfig struct {
+	HasCost          Gas
+	DeleteCost       Gas
+	ReadCostFlat     Gas
+	ReadCostPerByte  Gas
+	WriteCostFlat    Gas
+	WriteCostPerByte Gas
+	IterNextCostFlat Gas
+}
+
+// KVGasConfig returns a default gas config for KVStores.
+func KVGasConfig() GasConfig {
+	return GasConfig{
+		HasCost:          1000,
+		DeleteCost:       1000,
+		ReadCostFlat:     1000,
+		ReadCostPerByte:  3,
+		WriteCostFlat:    2000,
+		WriteCostPerByte: 30,
+		IterNextCostFlat: 30,
+	}
+}
+```
+
+**File:** tasks/scheduler.go (L38-40)
+```go
+	statusWaiting status = "waiting"
+	// maximumIterations before we revert to sequential (for high conflict rates)
+	maximumIterations = 10
+```
+
+**File:** tasks/scheduler.go (L166-183)
+```go
+func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
+	var conflicts []int
+	uniq := make(map[int]struct{})
+	valid := true
+	for _, mv := range s.multiVersionStores {
+		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
+		for _, c := range mvConflicts {
+			if _, ok := uniq[c]; !ok {
+				conflicts = append(conflicts, c)
+				uniq[c] = struct{}{}
+			}
+		}
+		// any non-ok value makes valid false
+		valid = valid && ok
+	}
+	sort.Ints(conflicts)
+	return valid, conflicts
+}
+```
+
+**File:** tasks/scheduler.go (L217-227)
+```go
+func (s *scheduler) tryInitMultiVersionStore(ctx sdk.Context) {
+	if s.multiVersionStores != nil {
+		return
+	}
+	mvs := make(map[sdk.StoreKey]multiversion.MultiVersionStore)
+	keys := ctx.MultiStore().StoreKeys()
+	for _, sk := range keys {
+		mvs[sk] = multiversion.NewMultiVersionStore(ctx.MultiStore().GetKVStore(sk))
+	}
+	s.multiVersionStores = mvs
+}
+```
+
+**File:** store/multiversion/store.go (L278-307)
+```go
 		if iterationTracker.ascending {
 			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
 		} else {
@@ -189,191 +267,15 @@ func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
 				break
 			}
 		}
-		// return whether we found the exact number of expected keys
-		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
-	}(tracker, sortedItems, validChannel, abortChannel)
-	select {
-	case <-abortChannel:
-		// if we get an abort, then we know that the iterator is invalid
-		return false
-	case valid := <-validChannel:
-		return valid
-	}
-}
 ```
 
-**File:** store/multiversion/memiterator.go (L114-125)
+**File:** store/multiversion/store.go (L352-358)
 ```go
-	// if we have an estimate, write to abort channel
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-	}
-
-	// if we have a deleted value, return nil
-	if val.IsDeleted() {
-		vi.readCache[string(key)] = nil
-		return nil
-	}
-	vi.readCache[string(key)] = val.Value()
-	return val.Value()
-```
-
-**File:** store/multiversion/mergeiterator.go (L218-263)
-```go
-func (iter *mvsMergeIterator) skipUntilExistsOrInvalid() bool {
-	for {
-		// If parent is invalid, fast-forward cache.
-		if !iter.parent.Valid() {
-			iter.skipCacheDeletes(nil)
-			return iter.cache.Valid()
-		}
-		// Parent is valid.
-		if !iter.cache.Valid() {
-			return true
-		}
-		// Parent is valid, cache is valid.
-
-		// Compare parent and cache.
-		keyP := iter.parent.Key()
-		keyC := iter.cache.Key()
-
-		switch iter.compare(keyP, keyC) {
-		case -1: // parent < cache.
-			return true
-
-		case 0: // parent == cache.
-			// Skip over if cache item is a delete.
-			valueC := iter.cache.Value()
-			if valueC == nil {
-				iter.parent.Next()
-				iter.cache.Next()
-
-				continue
+		latestValue := s.GetLatestBeforeIndex(index, []byte(key))
+		if latestValue == nil {
+			// this is possible if we previously read a value from a transaction write that was later reverted, so this time we read from parent store
+			parentVal := s.parentStore.Get([]byte(key))
+			if !bytes.Equal(parentVal, value) {
+				valid = false
 			}
-			// Cache is not a delete.
-
-			return true // cache exists.
-		case 1: // cache < parent
-			// Skip over if cache item is a delete.
-			valueC := iter.cache.Value()
-			if valueC == nil {
-				iter.skipCacheDeletes(keyP)
-				continue
-			}
-			// Cache is not a delete.
-
-			return true // cache exists.
-		}
-	}
-}
-```
-
-**File:** tasks/scheduler.go (L284-352)
-```go
-func (s *scheduler) ProcessAll(ctx sdk.Context, reqs []*sdk.DeliverTxEntry) ([]types.ResponseDeliverTx, error) {
-	startTime := time.Now()
-	var iterations int
-	// initialize mutli-version stores if they haven't been initialized yet
-	s.tryInitMultiVersionStore(ctx)
-	// prefill estimates
-	// This "optimization" path is being disabled because we don't have a strong reason to have it given that it
-	// s.PrefillEstimates(reqs)
-	tasks, tasksMap := toTasks(reqs)
-	s.allTasks = tasks
-	s.allTasksMap = tasksMap
-	s.executeCh = make(chan func(), len(tasks))
-	s.validateCh = make(chan func(), len(tasks))
-	defer s.emitMetrics()
-
-	// default to number of tasks if workers is negative or 0 by this point
-	workers := s.workers
-	if s.workers < 1 || len(tasks) < s.workers {
-		workers = len(tasks)
-	}
-
-	workerCtx, cancel := context.WithCancel(ctx.Context())
-	defer cancel()
-
-	// execution tasks are limited by workers
-	start(workerCtx, s.executeCh, workers)
-
-	// validation tasks uses length of tasks to avoid blocking on validation
-	start(workerCtx, s.validateCh, len(tasks))
-
-	toExecute := tasks
-	for !allValidated(tasks) {
-		// if the max incarnation >= x, we should revert to synchronous
-		if iterations >= maximumIterations {
-			// process synchronously
-			s.synchronous = true
-			startIdx, anyLeft := s.findFirstNonValidated()
-			if !anyLeft {
-				break
-			}
-			toExecute = tasks[startIdx:]
-		}
-
-		// execute sets statuses of tasks to either executed or aborted
-		if err := s.executeAll(ctx, toExecute); err != nil {
-			return nil, err
-		}
-
-		// validate returns any that should be re-executed
-		// note this processes ALL tasks, not just those recently executed
-		var err error
-		toExecute, err = s.validateAll(ctx, tasks)
-		if err != nil {
-			return nil, err
-		}
-		// these are retries which apply to metrics
-		s.metrics.retries += len(toExecute)
-		iterations++
-	}
-
-	for _, mv := range s.multiVersionStores {
-		mv.WriteLatestToStore()
-	}
-	s.metrics.maxIncarnation = s.maxIncarnation
-
-	ctx.Logger().Info("occ scheduler", "height", ctx.BlockHeight(), "txs", len(tasks), "latency_ms", time.Since(startTime).Milliseconds(), "retries", s.metrics.retries, "maxIncarnation", s.maxIncarnation, "iterations", iterations, "sync", s.synchronous, "workers", s.workers)
-
-	return s.collectResponses(tasks), nil
-}
-```
-
-**File:** store/multiversion/store_test.go (L375-407)
-```go
-func TestMVSIteratorValidationWithEstimate(t *testing.T) {
-	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
-	mvs := multiversion.NewMultiVersionStore(parentKVStore)
-	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
-
-	parentKVStore.Set([]byte("key2"), []byte("value0"))
-	parentKVStore.Set([]byte("key3"), []byte("value3"))
-	parentKVStore.Set([]byte("key4"), []byte("value4"))
-	parentKVStore.Set([]byte("key5"), []byte("value5"))
-
-	writeset := make(multiversion.WriteSet)
-	writeset["key1"] = []byte("value1")
-	writeset["key2"] = []byte("value2")
-	writeset["key3"] = nil
-	mvs.SetWriteset(1, 2, writeset)
-
-	iter := vis.Iterator([]byte("key1"), []byte("key6"))
-	for ; iter.Valid(); iter.Next() {
-		// read value
-		iter.Value()
-	}
-	iter.Close()
-	vis.WriteToMultiVersionStore()
-
-	writeset2 := make(multiversion.WriteSet)
-	writeset2["key2"] = []byte("value2")
-	mvs.SetEstimatedWriteset(2, 2, writeset2)
-
-	// should be invalid
-	valid, conflicts := mvs.ValidateTransactionState(5)
-	require.False(t, valid)
-	require.Equal(t, []int{2}, conflicts)
-}
 ```

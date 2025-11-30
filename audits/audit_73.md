@@ -1,185 +1,214 @@
 # Audit Report
 
 ## Title
-Denial-of-Service via Front-Running Module Account Creation During Chain Upgrades
+Chain Halt Due to Missing Nil Check When Allocating Rewards to Removed Validators
 
 ## Summary
-An attacker can halt the entire blockchain during upgrades that introduce new modules by sending coins to the predicted module account address before the upgrade executes. This creates a BaseAccount at that address, causing the upgrade to panic when the new module's InitGenesis attempts to retrieve or create a ModuleAccount, resulting in total network shutdown.
+The distribution module's `AllocateTokens` function lacks nil validation for validators in the voting loop, while the same protection exists for the proposer. When a validator participates in consensus but is removed before reward distribution (possible with short unbonding periods), the code panics on `val.GetCommission()`, causing a total network shutdown.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:**
-- Module address derivation: [1](#0-0) 
-- Panic on type mismatch: [2](#0-1) 
-- Auto-account creation: [3](#0-2) 
-- Upgrade calls InitGenesis: [4](#0-3) 
-- InitGenesis calls GetModuleAccount: [5](#0-4) 
-- Upgrade handler propagates panic: [6](#0-5) 
-- Blocked addresses mechanism: [7](#0-6) 
+**Location:** [1](#0-0) 
 
-**Intended logic:**
-When a chain upgrade adds a new module, the upgrade handler should call RunMigrations, which invokes InitGenesis for the new module. InitGenesis calls GetModuleAccount, which should either find an existing ModuleAccount or create a new one if the address is unused.
+**Intended Logic:** The `AllocateTokens` function should safely distribute rewards to all validators that participated in the previous block, gracefully handling cases where validators may have been removed from state between block production and reward distribution.
 
-**Actual logic:**
-Module account addresses are deterministically derived using crypto.AddressHash([]byte(moduleName)) [8](#0-7) . Before the upgrade, the new module is not in the old binary's maccPerms map [9](#0-8) , so its address is not in the blockedAddrs map. This allows an attacker to send coins to the predicted address, which automatically creates a BaseAccount [3](#0-2) . When the upgrade executes with the new binary (which includes the module in maccPerms), GetModuleAccount retrieves the existing account and attempts to cast it to ModuleAccountI. Since a BaseAccount exists instead, the type assertion fails and the code panics [10](#0-9) .
+**Actual Logic:** The function retrieves each validator from `bondedVotes` via `ValidatorByConsAddr` without verifying the returned value is non-nil before usage. [2](#0-1)  When `ValidatorByConsAddr` returns nil (validator was removed), this nil value is passed to `AllocateTokensToValidator`, which immediately panics when calling `val.GetCommission()` on the nil interface. [3](#0-2) 
 
-**Exploitation path:**
-1. Attacker monitors governance for upgrade proposals adding new modules
-2. Attacker extracts new module names from the publicly released upgrade binary
-3. Attacker computes module address using crypto.AddressHash([]byte(moduleName))
-4. Before upgrade height, attacker submits MsgSend transferring dust amount to predicted address
-5. MsgSend handler checks BlockedAddr [11](#0-10)  which returns false (address not in blockedAddrs yet)
-6. SendCoins creates BaseAccount at target address
-7. At upgrade height, BeginBlocker calls applyUpgrade [12](#0-11) 
-8. RunMigrations detects new module and calls its InitGenesis [4](#0-3) 
-9. InitGenesis calls GetModuleAccount, which finds BaseAccount and panics
-10. Panic propagates through ApplyUpgrade, halting all validators at the same height deterministically
+**Exploitation Path:**
+1. Validator V is active at block N and votes
+2. At block N EndBlock, V may transition to Unbonding state
+3. At a subsequent block EndBlock, V completes unbonding with zero delegations and is removed [4](#0-3) 
+4. The removal deletes V from the consensus address index [5](#0-4) 
+5. At next block BeginBlock, `AllocateTokens` is called with votes including V [6](#0-5) 
+6. `ValidatorByConsAddr` returns nil for V
+7. No nil check exists, code calls `AllocateTokensToValidator(ctx, nil, reward)`
+8. Panic occurs at `val.GetCommission()`, all nodes crash simultaneously
 
-**Security guarantee broken:**
-The system assumes governance-approved upgrades will execute successfully. This vulnerability allows any unprivileged user to prevent upgrade execution, breaking the chain's liveness guarantee and governance security model.
+**Security Guarantee Broken:** Chain liveness guarantee. BeginBlock must never panic as it executes identically on all nodes.
 
 ## Impact Explanation
 
-This vulnerability causes **total network shutdown** at the upgrade height. When the upgrade handler panics in BeginBlocker, the chain cannot progress. All validators experience the same deterministic panic, resulting in:
-
-- Complete halt of block production at upgrade height
-- No new transactions can be confirmed or processed
-- All validator nodes stuck in identical failed state
-- Economic activity ceases until emergency intervention
-- Requires coordinated rollback or emergency hotfix deployment
-
-The attack cost is minimal (only gas fees plus dust amount for transfer), while the impact is catastrophic. This matches the "Network not being able to confirm new transactions (total network shutdown)" impact criterion at High severity.
+A panic in BeginBlock causes all validator nodes to crash at the same block height deterministically. The entire network halts and cannot confirm new transactions. Recovery requires coordinated manual intervention (hard fork to skip the problematic block or restart from previous state). This matches the "Network not being able to confirm new transactions (total network shutdown)" impact criterion defined as Medium severity.
 
 ## Likelihood Explanation
 
-**High Likelihood:**
+**Triggering Conditions:**
+- Short unbonding period (1-2 blocks) - common in test networks, possible in production if governance reduces the parameter [7](#0-6) 
+- Any validator fully unbonds during the critical timing window
+- Can occur naturally or be deliberately triggered by any validator operator
 
-**Who can trigger:** Any network participant with minimal funds to submit one transaction
-
-**Required conditions:**
-- Pending upgrade proposal visible in on-chain governance (public information)
-- New module name visible in upgrade binary (publicly released before upgrade height)
-- Ability to submit transaction before upgrade (normal network operation)
-
-**Attack feasibility:**
-- Extremely low barrier to entry (no special privileges required)
-- Module names are trivially predictable from public upgrade binaries
-- Upgrades are publicly announced with advance notice via governance
-- The attacker's transaction appears as a normal coin transfer, making pre-emptive detection challenging
+**Evidence of Awareness:** The code explicitly handles this exact scenario for the proposer validator [8](#0-7) , proving developers were aware of the timing issue but failed to apply the protection consistently to regular voters.
 
 ## Recommendation
 
-**Primary Fix:** Modify GetModuleAccountAndPermissions to handle the case where a regular account exists at a module address gracefully rather than panicking. Check if the account is an empty BaseAccount and can be safely converted to a ModuleAccount. If the account has been used (non-zero sequence or has pubkey), return an error instead of panicking.
+Add nil check in the `bondedVotes` loop mirroring the proposer protection:
 
-**Additional Mitigations:**
-
-1. **Pre-upgrade validation:** Add a check in the upgrade handler that validates new module addresses are either unused or already proper ModuleAccounts before executing migrations
-
-2. **Address derivation enhancement:** Consider adding a chain-specific salt or version parameter to module address derivation to make addresses unpredictable until upgrade execution
-
-3. **Blocked addresses proactive update:** Add a mechanism to dynamically block predicted new module addresses once an upgrade proposal passes governance, or implement a grace period check
+```go
+for _, vote := range bondedVotes {
+    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+    
+    if validator == nil {
+        logger.Error(fmt.Sprintf(
+            "WARNING: Attempt to allocate rewards to unknown validator %s. "+
+            "This can happen if the validator unbonded completely within a short period.",
+            vote.Validator.Address))
+        continue
+    }
+    
+    powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+    reward := feeMultiplier.MulDecTruncate(powerFraction)
+    k.AllocateTokensToValidator(ctx, validator, reward)
+    remaining = remaining.Sub(reward)
+}
+```
 
 ## Proof of Concept
 
+**Test Function:** `TestAllocateTokensToRemovedValidator` (to add to `x/distribution/keeper/allocation_test.go`)
+
 **Setup:**
-1. Create test app with AccountKeeper initialized with existing modules in maccPerms
-2. Define a new module name not in current maccPerms: `newModuleName := "futuremodule"`
-3. Compute predicted address: `predictedAddr := types.NewModuleAddress(newModuleName)`
-4. Simulate attacker's front-running by creating BaseAccount at predicted address
-5. Save the account to state
+1. Initialize test app with very short unbonding period (e.g., 1 second)
+2. Create validator with self-delegation
+3. Fund fee collector with distribution tokens
 
 **Action:**
-1. Simulate new binary by adding the new module to AccountKeeper's permAddrs map
-2. Call `GetModuleAccount(ctx, newModuleName)` (as would happen during upgrade InitGenesis)
+1. Undelegate all tokens from validator
+2. Call `BlockValidatorUpdates` to transition to Unbonding [9](#0-8) 
+3. Advance time past unbonding period
+4. Call `UnbondAllMatureValidators` to remove validator
+5. Verify validator removal via `ValidatorByConsAddr` returning nil
+6. Create `VoteInfo` including the removed validator's consensus address
+7. Call `AllocateTokens` with these votes
 
 **Result:**
-The call panics with "account is not a module account" because it finds a BaseAccount at the module address instead of a ModuleAccountI. This demonstrates that an attacker-created BaseAccount prevents proper module account initialization during upgrades, causing the chain to halt.
+Panic at line 113 when calling `val.GetCommission()` on nil interface, demonstrating chain-halting vulnerability. The panic is deterministic and would occur on all nodes simultaneously.
 
-**Notes:**
-The vulnerability exists at the intersection of: (1) deterministic module address derivation, (2) automatic BaseAccount creation when transferring coins, and (3) panic-based error handling in GetModuleAccount. The timing window between proposal passage and upgrade execution creates an exploitable race condition where any user can poison the module address before the upgrade protections activate.
+## Notes
+
+**Critical Inconsistency:** The code implements proper nil handling for the proposer case with detailed error logging explaining the timing scenario, but completely omits this protection for regular voters, indicating an incomplete fix to a known timing issue. This inconsistency strongly suggests the vulnerability is unintentional rather than by design. The comment at [10](#0-9)  explicitly describes the exact timing scenario that can occur, yet the same protection was not applied to the voters loop.
 
 ### Citations
 
-**File:** x/auth/types/account.go (L162-165)
+**File:** x/distribution/keeper/allocation.go (L57-79)
 ```go
-// NewModuleAddress creates an AccAddress from the hash of the module's name
-func NewModuleAddress(name string) sdk.AccAddress {
-	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
-}
-```
+	if proposerValidator != nil {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeProposerReward,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, proposerReward.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, proposerValidator.GetOperator().String()),
+			),
+		)
 
-**File:** x/auth/keeper/keeper.go (L187-192)
-```go
-	acc := ak.GetAccount(ctx, addr)
-	if acc != nil {
-		macc, ok := acc.(types.ModuleAccountI)
-		if !ok {
-			panic("account is not a module account")
-		}
-```
-
-**File:** x/bank/keeper/send.go (L166-170)
-```go
-	accExists := k.ak.HasAccount(ctx, toAddr)
-	if !accExists {
-		defer telemetry.IncrCounter(1, "new", "account")
-		k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
+		k.AllocateTokensToValidator(ctx, proposerValidator, proposerReward)
+		remaining = remaining.Sub(proposerReward)
+	} else {
+		// previous proposer can be unknown if say, the unbonding period is 1 block, so
+		// e.g. a validator undelegates at block X, it's removed entirely by
+		// block X+1's endblock, then X+2 we need to refer to the previous
+		// proposer for X+1, but we've forgotten about them.
+		logger.Error(fmt.Sprintf(
+			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
+				"This should happen only if the proposer unbonded completely within a single block, "+
+				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
+				"We recommend you investigate immediately.",
+			previousProposer.String()))
 	}
 ```
 
-**File:** types/module/module.go (L583-584)
+**File:** x/distribution/keeper/allocation.go (L91-102)
 ```go
-			moduleValUpdates := module.InitGenesis(ctx, cfgtor.cdc, module.DefaultGenesis(cfgtor.cdc))
-			ctx.Logger().Info(fmt.Sprintf("adding a new module: %s", moduleName))
+	for _, vote := range bondedVotes {
+		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
+
+		// TODO: Consider micro-slashing for missing votes.
+		//
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
+		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+		reward := feeMultiplier.MulDecTruncate(powerFraction)
+
+		k.AllocateTokensToValidator(ctx, validator, reward)
+		remaining = remaining.Sub(reward)
+	}
 ```
 
-**File:** x/mint/genesis.go (L13-13)
+**File:** x/distribution/keeper/allocation.go (L111-114)
 ```go
-	ak.GetModuleAccount(ctx, types.ModuleName)
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
 ```
 
-**File:** x/upgrade/keeper/keeper.go (L371-374)
+**File:** x/staking/keeper/alias_functions.go (L88-96)
 ```go
-	updatedVM, err := handler(ctx, plan, k.GetModuleVersionMap(ctx))
+// ValidatorByConsAddr gets the validator interface for a particular pubkey
+func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
+	val, found := k.GetValidatorByConsAddr(ctx, addr)
+	if !found {
+		return nil
+	}
+
+	return val
+}
+```
+
+**File:** x/staking/keeper/validator.go (L168-177)
+```go
+	valConsAddr, err := validator.GetConsAddr()
 	if err != nil {
 		panic(err)
 	}
+
+	// delete the old validator record
+	store := ctx.KVStore(k.storeKey)
+	store.Delete(types.GetValidatorKey(address))
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+	store.Delete(types.GetValidatorsByPowerIndexKey(validator, k.PowerReduction(ctx)))
 ```
 
-**File:** simapp/app.go (L135-142)
+**File:** x/staking/keeper/validator.go (L441-444)
 ```go
-	maccPerms = map[string][]string{
-		authtypes.FeeCollectorName:     nil,
-		distrtypes.ModuleName:          nil,
-		minttypes.ModuleName:           {authtypes.Minter},
-		stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
-		stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
-		govtypes.ModuleName:            {authtypes.Burner},
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
+
+**File:** x/distribution/abci.go (L29-32)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
 	}
 ```
 
-**File:** simapp/app.go (L606-614)
+**File:** x/staking/types/params.go (L167-178)
 ```go
-// ModuleAccountAddrs returns all the app's module account addresses.
-func (app *SimApp) ModuleAccountAddrs() map[string]bool {
-	modAccAddrs := make(map[string]bool)
-	for acc := range maccPerms {
-		modAccAddrs[authtypes.NewModuleAddress(acc).String()] = true
+func validateUnbondingTime(i interface{}) error {
+	v, ok := i.(time.Duration)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	return modAccAddrs
+	if v <= 0 {
+		return fmt.Errorf("unbonding time must be positive: %d", v)
+	}
+
+	return nil
 }
 ```
 
-**File:** x/bank/keeper/msg_server.go (L47-47)
+**File:** x/staking/keeper/val_state_change.go (L27-33)
 ```go
-	if k.BlockedAddr(to) || !k.IsInDenomAllowList(ctx, to, msg.Amount, allowListCache) {
-```
+	validatorUpdates, err := k.ApplyAndReturnValidatorSetUpdates(ctx)
+	if err != nil {
+		panic(err)
+	}
 
-**File:** x/upgrade/abci.go (L71-71)
-```go
-		applyUpgrade(k, ctx, plan)
+	// unbond all mature validators from the unbonding queue
+	k.UnbondAllMatureValidators(ctx)
 ```

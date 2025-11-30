@@ -1,223 +1,273 @@
-Based on my thorough investigation of the sei-cosmos codebase, I have validated all claims in the security report and determined this is a **valid vulnerability**.
+# NoVulnerability found for this question.
 
-# Audit Report
+## Validation Analysis
 
-## Title
-Missing Cumulative Block Gas Limit Enforcement Allows Resource Exhaustion Through Multiple High-Gas Transactions
+After thorough investigation of the codebase and execution flow, I confirm the report's conclusion is **correct**. While a technical gap exists, this does NOT constitute a valid security vulnerability.
 
-## Summary
-The block gas meter enforcement mechanism has been removed from the Cosmos SDK implementation in sei-cosmos, eliminating cumulative gas tracking across transactions within a block. While individual transactions are validated against the MaxGas consensus parameter, multiple transactions can collectively consume gas far beyond this limit, forcing all network nodes to process blocks that violate configured resource parameters.
+## Technical Verification
 
-## Impact
-Medium
+### 1. Gap Confirmed
+The validation gap exists as described:
+- `CollectTxs` only checks for empty memo [1](#0-0) 
+- Normal transactions validate memo size via `ValidateMemoDecorator` [2](#0-1) 
+- Default limit is 256 characters [3](#0-2) 
 
-## Finding Description
+### 2. Execution Flow Analysis
 
-**Location:**
-- Transaction execution loop without cumulative gas tracking: [1](#0-0) 
-- Missing block gas meter initialization: [2](#0-1) 
-- Per-transaction validation only: [3](#0-2) 
-- Explicit removal documented: [4](#0-3) 
-- No validation in ProcessProposal: [5](#0-4) 
+**During `collect-gentxs`:**
+- No ante handlers run (no blockchain yet)
+- Only checks memo is not empty
+- Large memo would pass through to genesis.json
 
-**Intended Logic:**
-The MaxGas consensus parameter should limit total computational resources consumed by all transactions in a block. According to the documentation [6](#0-5) , the BlockGasMeter should track cumulative gas consumption and enforce the MaxGas limit during block execution, stopping transaction processing when the limit is reached.
+**During network start:**
+- `InitGenesis` calls `DeliverGenTxs` [4](#0-3) 
+- Which calls `app.BaseApp.DeliverTx` [5](#0-4) 
+- Which executes ante handlers [6](#0-5) 
+- Oversized memo triggers `ErrMemoTooLarge`
+- `DeliverGenTxs` panics [7](#0-6) 
+- **Network fails to start** (but can be restarted with corrected files)
 
-**Actual Logic:**
-The block gas meter is never initialized in setDeliverState, and the FinalizeBlock transaction loop processes all transactions sequentially without any cumulative gas tracking. Only per-transaction validation exists in the ante handler, which checks if individual GasWanted exceeds MaxGas. The Context struct contains a blockGasMeter field [7](#0-6)  but it is never initialized or used. This allows total gas consumption to exceed MaxGas arbitrarily when multiple high-gas transactions are included in a block.
+### 3. Critical Failures Against Validation Criteria
 
-**Exploitation Path:**
-1. Multiple users submit transactions to mempool, each with GasWanted below MaxGas (e.g., 9,000,000 when MaxGas = 10,000,000)
-2. Each transaction individually passes ante handler validation: GasWanted ≤ MaxGas ✓
-3. Validator includes N such transactions in PrepareProposal without cumulative gas checking
-4. ProcessProposal accepts the proposal without validating cumulative gas
-5. Consensus is reached on the block
-6. FinalizeBlock processes all N transactions without cumulative limit enforcement
-7. Block executes with total gas = N × 9,000,000, potentially 5-10x the MaxGas limit
-8. All network nodes are forced to process this resource-intensive block
+**❌ Requires Malicious Privileged Actor:**
+- Requires genesis validator (explicitly trusted role)
+- Requires intentional post-generation JSON file manipulation
+- Memos are auto-generated in standard format `nodeID@IP:port` (50-70 chars) [8](#0-7) [9](#0-8) 
+- Platform rules: "No credit for scenarios that require malicious privileged actors"
 
-**Security Guarantee Broken:**
-The consensus invariant that total block gas consumption ≤ MaxGas is violated. This undermines the resource consumption guarantees that ensure predictable block processing times and prevent denial-of-service through computational resource exhaustion.
+**❌ Does Not Meet Required Impact Criteria:**
+Evaluating against mandated impacts:
+- ❌ Not "Direct loss of funds" - no network running, no funds exist
+- ❌ Not "Network shutdown" - network hasn't started
+- ❌ Not "Resource consumption" - one-time init, fully recoverable
+- ❌ Not "Node shutdown" - nodes haven't started
+- ❌ None of the required impacts apply
 
-## Impact Explanation
+**❌ Fully Recoverable:**
+- Network hasn't started
+- Genesis ceremony can be restarted with corrected gentx files
+- No lasting damage possible
 
-This vulnerability directly matches the Medium severity impact criterion: **"Causing network processing nodes to process transactions from the mempool beyond set parameters"**.
+**❌ No Proof of Concept:**
+- No test demonstrating actual crashes or DoS
+- Speculative impact only
+- Existing test only validates directory handling [10](#0-9) 
 
-The MaxGas consensus parameter exists specifically to limit computational resources per block. Its non-enforcement means:
+### 4. Platform Rules Violation
 
-1. All network nodes must process blocks with cumulative gas consumption far exceeding the configured limit
-2. Resource-constrained nodes experience significantly longer block execution times
-3. The consensus parameter's intended protection against resource exhaustion is defeated
-4. Blocks can consume 5-10x the intended resource limit
-5. During sustained submission of high-gas transactions, network-wide resource consumption can increase by 30% or more compared to normal operation
+Per strict validation criteria:
+- Genesis validators are **trusted privileged roles**
+- Exploiting this requires **intentional malicious insider action**
+- This is **explicitly out of scope** for vulnerability programs
+- Exception requires inadvertent triggering causing unrecoverable failure - this is neither
 
-The commented-out test cases [8](#0-7)  demonstrate that cumulative gas enforcement was previously implemented and tested, confirming this is a regression rather than intentional design.
+## Notes
 
-## Likelihood Explanation
+The ante handler test confirms that memos exceeding limits trigger `ErrMemoTooLarge` during normal transaction processing [11](#0-10) , but this protection also applies during InitGenesis, causing a recoverable startup failure rather than a running vulnerable network.
 
-**Trigger Requirements:**
-- Any network participant can submit high-gas transactions to the mempool (no special privileges required)
-- Multiple high-gas transactions need to be available in the mempool (easily achievable through normal usage or deliberate submission)
-- Validator includes them based on standard selection criteria (e.g., highest fees)
-
-**Frequency:**
-This can occur in any block where multiple high-gas transactions are present. The vulnerability does not require a malicious validator - even honest validators selecting high-fee transactions can trigger this condition. An attacker can sustain this by continuously submitting high-gas transactions. The economic cost is only transaction fees, which scale linearly while the resource impact scales multiplicatively.
-
-## Recommendation
-
-Restore cumulative block gas tracking by re-implementing block gas meter functionality:
-
-1. Initialize block gas meter in `setDeliverState` with limit from consensus params MaxGas
-2. Add `BlockGasMeter()` accessor method to Context
-3. In the FinalizeBlock transaction loop, check cumulative gas before processing each transaction
-4. Track cumulative gas consumption after each transaction execution
-5. Stop processing transactions when cumulative limit is reached
-6. Update PrepareProposal to account for cumulative gas when selecting transactions
-7. Add validation in ProcessProposal to reject blocks exceeding MaxGas
-
-Alternatively, implement a lightweight cumulative gas counter that tracks the sum of GasUsed across all transactions and enforces the MaxGas limit without the full gas meter infrastructure.
-
-## Proof of Concept
-
-The vulnerability is evident from code inspection. The commented-out test cases [8](#0-7)  show test scenarios where cumulative gas enforcement was previously verified, including cases that expected failure when cumulative gas exceeded MaxGas (e.g., 11 deliveries of 10 gas each with MaxGas=100).
-
-**Setup:**
-- Initialize BaseApp with consensus parameter MaxGas = 10,000,000
-- Prepare 12 transactions, each with GasWanted = 9,000,000 (90% of block limit)
-
-**Action:**
-- Validator includes all 12 transactions in PrepareProposal
-- ProcessProposal accepts the proposal (no validation implemented)
-- FinalizeBlock executes all transactions in the loop
-
-**Result:**
-- Total gas consumed = 108,000,000 (10.8x the MaxGas limit)
-- Block processes successfully despite violating the consensus parameter
-- All network nodes must process computational work far exceeding configured limits
-- Demonstrates MaxGas is advisory rather than enforced during block execution
-
----
-
-**Notes:**
-
-The removal of block gas meter enforcement appears to have been intentional based on the comment [4](#0-3) , which states "gasWanted < max block gas is still fulfilled by various other checks." However, my investigation confirms this statement is incorrect - the only existing check is per-transaction validation in the ante handler, which does not prevent cumulative excess.
-
-This vulnerability is particularly concerning because it defeats a fundamental consensus-level safety mechanism. Even if validators are generally trusted, the lack of validation in ProcessProposal means the network has no defense against blocks that violate resource parameters, whether created maliciously or accidentally.
+The fundamental issue: **exploiting this requires a malicious trusted insider (genesis validator) intentionally sabotaging the genesis ceremony**, which is explicitly out of scope per industry-standard platform rules.
 
 ### Citations
 
-**File:** simapp/app.go (L470-474)
+**File:** x/genutil/collect.go (L130-133)
 ```go
-func (app *SimApp) ProcessProposalHandler(ctx sdk.Context, req *abci.RequestProcessProposal) (*abci.ResponseProcessProposal, error) {
-	return &abci.ResponseProcessProposal{
-		Status: abci.ResponseProcessProposal_ACCEPT,
-	}, nil
-}
+		nodeAddrIP := memoTx.GetMemo()
+		if len(nodeAddrIP) == 0 {
+			return appGenTxs, persistentPeers, fmt.Errorf("failed to find node's address and IP in %s", fo.Name())
+		}
 ```
 
-**File:** simapp/app.go (L518-537)
+**File:** x/auth/ante/basic.go (L62-68)
 ```go
-	for i, tx := range req.Txs {
-		ctx = ctx.WithContext(context.WithValue(ctx.Context(), ante.ContextKeyTxIndexKey, i))
-		if typedTxs[i] == nil {
-			txResults = append(txResults, &abci.ExecTxResult{}) // empty result
-			continue
-		}
-		deliverTxResp := app.DeliverTx(ctx, abci.RequestDeliverTx{
-			Tx: tx,
-		}, typedTxs[i], sha256.Sum256(tx))
-		txResults = append(txResults, &abci.ExecTxResult{
-			Code:      deliverTxResp.Code,
-			Data:      deliverTxResp.Data,
-			Log:       deliverTxResp.Log,
-			Info:      deliverTxResp.Info,
-			GasWanted: deliverTxResp.GasWanted,
-			GasUsed:   deliverTxResp.GasUsed,
-			Events:    deliverTxResp.Events,
-			Codespace: deliverTxResp.Codespace,
-		})
+	memoLength := len(memoTx.GetMemo())
+	if uint64(memoLength) > params.MaxMemoCharacters {
+		return ctx, sdkerrors.Wrapf(sdkerrors.ErrMemoTooLarge,
+			"maximum number of characters is %d but received %d characters",
+			params.MaxMemoCharacters, memoLength,
+		)
 	}
 ```
 
-**File:** baseapp/baseapp.go (L580-593)
+**File:** x/auth/types/params.go (L13-13)
 ```go
-func (app *BaseApp) setDeliverState(header tmproto.Header) {
-	ms := app.cms.CacheMultiStore()
-	ctx := sdk.NewContext(ms, header, false, app.logger)
-	if app.deliverState == nil {
-		app.deliverState = &state{
-			ms:  ms,
-			ctx: ctx,
-			mtx: &sync.RWMutex{},
+	DefaultMaxMemoCharacters      uint64 = 256
+```
+
+**File:** x/genutil/gentx.go (L96-128)
+```go
+func DeliverGenTxs(
+	ctx sdk.Context, genTxs []json.RawMessage,
+	stakingKeeper types.StakingKeeper, deliverTx deliverTxfn,
+	txEncodingConfig client.TxEncodingConfig,
+) ([]abci.ValidatorUpdate, error) {
+
+	for _, genTx := range genTxs {
+		tx, err := txEncodingConfig.TxJSONDecoder()(genTx)
+		if err != nil {
+			panic(err)
 		}
-		return
+
+		bz, err := txEncodingConfig.TxEncoder()(tx)
+		if err != nil {
+			panic(err)
+		}
+
+		res := deliverTx(ctx, abci.RequestDeliverTx{Tx: bz}, tx, sha256.Sum256(bz))
+		if !res.IsOK() {
+			panic(res.Log)
+		}
 	}
-	app.deliverState.SetMultiStore(ms)
-	app.deliverState.SetContext(ctx)
+
+	legacyUpdates, err := stakingKeeper.ApplyAndReturnValidatorSetUpdates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return utils.Map(legacyUpdates, func(v abci.ValidatorUpdate) abci.ValidatorUpdate {
+		return abci.ValidatorUpdate{
+			PubKey: v.PubKey,
+			Power:  v.Power,
+		}
+	}), nil
+```
+
+**File:** baseapp/abci.go (L284-304)
+```go
+func (app *BaseApp) DeliverTx(ctx sdk.Context, req abci.RequestDeliverTx, tx sdk.Tx, checksum [32]byte) (res abci.ResponseDeliverTx) {
+	defer telemetry.MeasureSince(time.Now(), "abci", "deliver_tx")
+	defer func() {
+		for _, streamingListener := range app.abciListeners {
+			if err := streamingListener.ListenDeliverTx(app.deliverState.ctx, req, res); err != nil {
+				app.logger.Error("DeliverTx listening hook failed", "err", err)
+			}
+		}
+	}()
+
+	gInfo := sdk.GasInfo{}
+	resultStr := "successful"
+
+	defer func() {
+		telemetry.IncrCounter(1, "tx", "count")
+		telemetry.IncrCounter(1, "tx", resultStr)
+		telemetry.SetGauge(float32(gInfo.GasUsed), "tx", "gas", "used")
+		telemetry.SetGauge(float32(gInfo.GasWanted), "tx", "gas", "wanted")
+	}()
+
+	gInfo, result, anteEvents, _, _, _, resCtx, err := app.runTx(ctx.WithTxBytes(req.Tx).WithTxSum(checksum).WithVoteInfos(app.voteInfos), runTxModeDeliver, tx, checksum)
+```
+
+**File:** baseapp/baseapp.go (L927-973)
+```go
+	if app.anteHandler != nil {
+		var anteSpan trace.Span
+		if app.TracingEnabled {
+			// trace AnteHandler
+			_, anteSpan = app.TracingInfo.StartWithContext("AnteHandler", ctx.TraceSpanContext())
+			defer anteSpan.End()
+		}
+		var (
+			anteCtx sdk.Context
+			msCache sdk.CacheMultiStore
+		)
+		// Branch context before AnteHandler call in case it aborts.
+		// This is required for both CheckTx and DeliverTx.
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2772
+		//
+		// NOTE: Alternatively, we could require that AnteHandler ensures that
+		// writes do not happen if aborted/failed.  This may have some
+		// performance benefits, but it'll be more difficult to get right.
+		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
+		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
+		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
+
+		if !newCtx.IsZero() {
+			// At this point, newCtx.MultiStore() is a store branch, or something else
+			// replaced by the AnteHandler. We want the original multistore.
+			//
+			// Also, in the case of the tx aborting, we need to track gas consumed via
+			// the instantiated gas meter in the AnteHandler, so we update the context
+			// prior to returning.
+			//
+			// This also replaces the GasMeter in the context where GasUsed was initalized 0
+			// and updated with gas consumed in the ante handler runs
+			// The GasMeter is a pointer and its passed to the RunMsg and tracks the consumed
+			// gas there too.
+			ctx = newCtx.WithMultiStore(ms)
+		}
+		defer func() {
+			if newCtx.DeliverTxCallback() != nil {
+				newCtx.DeliverTxCallback()(ctx.WithGasMeter(sdk.NewInfiniteGasMeterWithMultiplier(ctx)))
+			}
+		}()
+
+		events := ctx.EventManager().Events()
+
+		if err != nil {
+			return gInfo, nil, nil, 0, nil, nil, ctx, err
+		}
+```
+
+**File:** x/staking/client/cli/tx.go (L548-556)
+```go
+	if generateOnly {
+		ip := config.IP
+		p2pPort := config.P2PPort
+		nodeID := config.NodeID
+
+		if nodeID != "" && ip != "" && p2pPort != "" {
+			txBldr = txBldr.WithMemo(fmt.Sprintf("%s@%s:%s", nodeID, ip, p2pPort))
+		}
+	}
+```
+
+**File:** simapp/simd/cmd/testnet.go (L169-169)
+```go
+		memo := fmt.Sprintf("%s@%s:26656", nodeIDs[i], ip)
+```
+
+**File:** x/genutil/collect_test.go (L39-68)
+```go
+// a directory during traversal of the first level. See issue https://github.com/cosmos/cosmos-sdk/issues/6788.
+func TestCollectTxsHandlesDirectories(t *testing.T) {
+	testDir, err := ioutil.TempDir(os.TempDir(), "testCollectTxs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testDir)
+
+	// 1. We'll insert a directory as the first element before JSON file.
+	subDirPath := filepath.Join(testDir, "_adir")
+	if err := os.MkdirAll(subDirPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	txDecoder := types.TxDecoder(func(txBytes []byte) (types.Tx, error) {
+		return nil, nil
+	})
+
+	// 2. Ensure that we don't encounter any error traversing the directory.
+	srvCtx := server.NewDefaultContext()
+	_ = srvCtx
+	cdc := codec.NewProtoCodec(cdctypes.NewInterfaceRegistry())
+	gdoc := tmtypes.GenesisDoc{AppState: []byte("{}")}
+	balItr := new(doNothingIterator)
+
+	dnc := &doNothingUnmarshalJSON{cdc}
+	if _, _, err := genutil.CollectTxs(dnc, txDecoder, "foo", testDir, gdoc, balItr); err != nil {
+		t.Fatal(err)
+	}
 }
 ```
 
-**File:** x/auth/ante/setup.go (L54-59)
+**File:** x/auth/ante/ante_test.go (L562-571)
 ```go
-	if cp := ctx.ConsensusParams(); cp != nil && cp.Block != nil {
-		// If there exists a maximum block gas limit, we must ensure that the tx
-		// does not exceed it.
-		if cp.Block.MaxGas > 0 && gasTx.GetGas() > uint64(cp.Block.MaxGas) {
-			return newCtx, sdkerrors.Wrapf(sdkerrors.ErrOutOfGas, "tx gas wanted %d exceeds block max gas limit %d", gasTx.GetGas(), cp.Block.MaxGas)
-		}
-```
-
-**File:** baseapp/deliver_tx_test.go (L790-812)
-```go
-// 			Block: &tmproto.BlockParams{
-// 				MaxGas: 100,
-// 			},
-// 		},
-// 	})
-
-// 	testCases := []struct {
-// 		tx                *txTest
-// 		numDelivers       int
-// 		gasUsedPerDeliver uint64
-// 		fail              bool
-// 		failAfterDeliver  int
-// 	}{
-// 		{newTxCounter(0, 0), 0, 0, false, 0},
-// 		{newTxCounter(9, 1), 2, 10, false, 0},
-// 		{newTxCounter(10, 0), 3, 10, false, 0},
-// 		{newTxCounter(10, 0), 10, 10, false, 0},
-// 		{newTxCounter(2, 7), 11, 9, false, 0},
-// 		{newTxCounter(10, 0), 10, 10, false, 0}, // hit the limit but pass
-
-// 		{newTxCounter(10, 0), 11, 10, true, 10},
-// 		{newTxCounter(10, 0), 15, 10, true, 10},
-// 		{newTxCounter(9, 0), 12, 9, true, 11}, // fly past the limit
-```
-
-**File:** baseapp/deliver_tx_test.go (L1144-1144)
-```go
-	// removed the block gas exceeded because of removal of block gas meter, gasWanted < max block gas is still fulfilled by various other checks
-```
-
-**File:** docs/basics/gas-fees.md (L49-62)
-```markdown
-### Block Gas Meter
-
-`ctx.BlockGasMeter()` is the gas meter used to track gas consumption per block and make sure it does not go above a certain limit. A new instance of the `BlockGasMeter` is created each time [`BeginBlock`](../core/baseapp.md#beginblock) is called. The `BlockGasMeter` is finite, and the limit of gas per block is defined in the application's consensus parameters. By default Cosmos SDK applications use the default consensus parameters provided by Tendermint:
-
-+++ https://github.com/tendermint/tendermint/blob/v0.34.0-rc6/types/params.go#L34-L41
-
-When a new [transaction](../core/transactions.md) is being processed via `DeliverTx`, the current value of `BlockGasMeter` is checked to see if it is above the limit. If it is, `DeliverTx` returns immediately. This can happen even with the first transaction in a block, as `BeginBlock` itself can consume gas. If not, the transaction is processed normally. At the end of `DeliverTx`, the gas tracked by `ctx.BlockGasMeter()` is increased by the amount consumed to process the transaction:
-
-```go
-ctx.BlockGasMeter().ConsumeGas(
-	ctx.GasMeter().GasConsumedToLimit(),
-	"block gas meter",
-)
-```
-```
-
-**File:** types/context.go (L41-41)
-```go
-	blockGasMeter     GasMeter
+			"memo too large",
+			func() {
+				feeAmount = sdk.NewCoins(sdk.NewInt64Coin("usei", 0))
+				gasLimit = 60000
+				suite.txBuilder.SetMemo(strings.Repeat("01234567890", 500))
+			},
+			false,
+			false,
+			sdkerrors.ErrMemoTooLarge,
+		},
 ```

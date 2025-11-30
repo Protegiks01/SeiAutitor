@@ -1,12 +1,10 @@
-Based on my systematic validation of this security claim, I have traced through the complete execution flow and verified all technical assertions. Let me provide my final assessment:
-
 # Audit Report
 
 ## Title
-OCC Blind Write Vulnerability: Concurrent MsgGrant Transactions Succeed Without Conflict Detection Leading to Silent State Loss
+Scheduler Commits State Changes from Failed Transactions Due to Missing Response Code Validation
 
 ## Summary
-When Optimistic Concurrency Control (OCC) is enabled, concurrent transactions creating grants for the same (grantee, granter, msgType) tuple both succeed and return Code=0, but only the highest-indexed transaction's state persists to the blockchain. This occurs because `SaveGrant` performs blind writes without creating read dependencies, and OCC's validation only detects read-write conflicts, not write-write conflicts.
+The concurrent transaction scheduler in the Sei blockchain fails to validate transaction response codes when determining whether to commit state changes. Failed transactions (with non-zero response codes) have their state modifications permanently committed to the blockchain if they don't trigger OCC conflicts, violating the fundamental invariant that only successful transactions should modify state.
 
 ## Impact
 Medium
@@ -14,386 +12,257 @@ Medium
 ## Finding Description
 
 **Location:**
-- Primary vulnerability: [1](#0-0) 
-- OCC validation logic: [2](#0-1) 
-- Final persistence logic: [3](#0-2) 
-- Last-write-wins implementation: [4](#0-3) 
+- `tasks/scheduler.go`, `shouldRerun` method (lines 354-390)
+- `tasks/scheduler.go`, unconditional write (line 576)  
+- `tasks/scheduler.go`, final commitment (line 345) [1](#0-0) [2](#0-1) [3](#0-2) 
 
-**Intended Logic:**
-When a transaction creates or updates an authorization grant, concurrent transactions modifying the same grant key should either (a) be detected as conflicts and serialized through retry mechanisms, or (b) only the first transaction should succeed while subsequent ones fail. A successful transaction (Code=0) must guarantee its state changes persist to the blockchain.
+**Intended logic:**
+Only transactions that complete successfully should have state changes committed to the blockchain. The documented invariant states: "State only gets persisted if all messages are valid and get executed successfully." [4](#0-3) 
 
-**Actual Logic:**
-The `SaveGrant` method performs blind writes by calling `store.Set(skey, bz)` directly without reading the existing value first. [5](#0-4)  This means concurrent transactions writing to the same grant key have empty readsets for that key. 
+In normal sequential execution, when a transaction fails and returns an error, the cached state changes are not written to the parent store: [5](#0-4) 
 
-OCC's `ValidateTransactionState` method only validates iterator consistency and readset consistency through `checkIteratorAtIndex` and `checkReadsetAtIndex`. [2](#0-1)  There is no validation for write-write conflicts. Since neither concurrent transaction reads the grant key before writing, both have empty readsets and both pass validation.
+**Actual logic:**
+In the OCC concurrent execution path:
 
-During final commitment, `WriteLatestToStore` calls `GetLatestNonEstimate()` for each key, [6](#0-5)  which descends the btree and returns only the highest-indexed value. [7](#0-6)  Earlier writes to the same key are silently discarded despite their transactions having returned success.
+1. Transactions execute and write to VersionIndexedStore, potentially failing validation [6](#0-5) [7](#0-6) 
 
-**Exploitation Path:**
-1. User submits Transaction A (index 0): `MsgGrant(grantee, granter, MsgSend, limit=100)` via message handler [8](#0-7) 
-2. User submits Transaction B (index 1): `MsgGrant(grantee, granter, MsgSend, limit=200)` in the same block
-3. Both transactions execute concurrently under OCC scheduler [9](#0-8) 
-4. Both call `SaveGrant` which performs `store.Set(key, value)` without prior `store.Get(key)` [5](#0-4) 
-5. Neither transaction has read dependencies on the grant key (empty readsets)
-6. Both pass `ValidateTransactionState` via scheduler's conflict detection [10](#0-9)  because no read conflicts exist
-7. Both return Code=0 (success) and emit `EventGrant` events [11](#0-10) 
-8. Both charge gas fees to users
-9. `WriteLatestToStore` is called after all validation completes [12](#0-11) 
-10. Only Transaction B's (index 1) grant persists because `GetLatestNonEstimate` returns the highest-indexed value [7](#0-6) 
-11. Transaction A's effect is silently lost despite returning success
+2. Errors are converted to ResponseDeliverTx with non-zero code [8](#0-7) 
 
-**Security Guarantee Broken:**
-This violates the atomicity and finality guarantee of blockchain transactions: a successful transaction (Code=0) must guarantee its state changes persist to the blockchain. The vulnerability also causes event log inconsistency where `EventGrant` events are emitted for both transactions but only one grant exists in final state.
+3. `WriteToMultiVersionStore()` is called unconditionally after execution, persisting all writes regardless of response code [2](#0-1) 
+
+4. The `shouldRerun` method only checks for OCC conflicts via `findConflicts` and never examines `task.Response.Code` [1](#0-0) 
+
+5. If no OCC conflicts detected, the transaction is marked as "validated" (line 379)
+
+6. `WriteLatestToStore()` commits all "validated" transactions' writes to blockchain state [3](#0-2) 
+
+**Exploitation path:**
+1. User submits transaction T1 that will fail during execution (e.g., due to access operation validation failure, message handler error, or any other execution error)
+2. T1 executes and makes state modifications via VersionIndexedStore before failing
+3. Execution fails and returns error, which is converted to ResponseDeliverTx with non-zero code
+4. `WriteToMultiVersionStore()` persists T1's writes to multiversion store unconditionally (line 576)
+5. Scheduler's `shouldRerun(T1)` checks only for OCC conflicts, ignoring the non-zero response code
+6. If no OCC conflicts detected, T1 is marked as "validated" (line 379)
+7. `WriteLatestToStore()` commits T1's writes to blockchain state despite the transaction failure (line 345)
+8. Subsequent transactions read and operate on the corrupted state
+
+**Security guarantee broken:**
+The documented invariant that "State only gets persisted if all messages are valid and get executed successfully" is violated. Failed transactions (with non-zero response codes) have their state changes permanently committed.
 
 ## Impact Explanation
 
-This vulnerability constitutes "a bug in the network code that results in unintended smart contract behavior with no concrete funds at direct risk" per the Medium severity classification. The OCC layer (network code) causes unintended behavior in the authz module:
+This vulnerability results in permanent state corruption with cascading effects:
 
-1. **Atomicity Violation**: Users receive success responses (Code=0) for transactions whose state changes are silently discarded, violating the fundamental blockchain guarantee that successful transactions persist.
+1. **State Corruption**: Transactions that fail execution (access operation validation, message handler errors, etc.) have their writes permanently committed despite returning error codes
+2. **Cascading Effects**: Valid subsequent transactions read and execute based on corrupted state, propagating incorrect data
+3. **Smart Contract Integrity**: Smart contracts relying on accurate state produce incorrect results and outcomes
+4. **Detection Difficulty**: Failed transactions appear "validated" by the scheduler, making the corruption subtle and hard to detect
 
-2. **Wasted Gas Fees**: Users pay gas for transactions whose effects never materialize, without receiving any error indication that would allow them to retry or detect the issue.
-
-3. **Event Log Inconsistency**: Both transactions emit `EventGrant` events, causing off-chain applications, indexers, and monitoring systems to have incorrect views of on-chain state. Applications relying on event logs will believe both grants were created.
-
-4. **Authorization Security Risk**: Since grants control spending limits and permissions, unpredictable grant persistence could lead to authorization mismatches where applications expect different limits than what exists on-chain, potentially enabling unauthorized actions or blocking authorized ones.
-
-The inconsistency with the `update` method [13](#0-12)  which reads before writing via `k.getGrant(ctx, skey)` at line 53, indicates this is an oversight rather than intentional design.
+This matches the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- OCC must be enabled (a standard configuration option, not a misconfiguration)
-- Multiple transactions targeting the same (grantee, granter, msgType) tuple in the same block
-- Transactions execute concurrently in OCC's parallel execution phase
+**Who can trigger:**
+Any user submitting transactions during normal network operation. This can occur when:
+- Access operation dependency mappings contain bugs
+- WASM contracts have incorrect dependency declarations  
+- Message handlers return errors during execution
+- Any transaction validation fails after state modifications have begun
 
-**Who Can Trigger:**
-Any user can trigger this vulnerability by submitting normal `MsgGrant` transactions. No special privileges, unusual conditions, or attack setup is required. Even a single user retrying a transaction can trigger this accidentally.
+**Conditions required:**
+- Transaction must fail during execution (returning error/non-zero response code)
+- The multiversion store OCC validation must not detect a conflict
+- Concurrent transaction execution must be enabled (OCC mode)
 
 **Frequency:**
-- Occurs naturally when users submit concurrent grant updates or retry transactions
-- More likely under high transaction throughput conditions
-- Particularly probable when frontend applications submit duplicate transactions for reliability
-- In production networks with OCC enabled, this could happen regularly during normal operations
+Can occur during normal block production whenever transactions fail execution. Given the complexity of:
+- Maintaining accurate access operation declarations for WASM contracts
+- Complex message handler logic that can fail mid-execution
+- The TODO comments indicating the OCC validation system is still under development
 
-While the authz specification states that grants can be overwritten, [14](#0-13)  the issue is not overwriting itself but rather that both transactions succeed while only one persists, which is clearly unintended.
+The likelihood is moderate - transaction failures are not uncommon, and each failure in OCC mode potentially commits corrupted state.
 
 ## Recommendation
 
-Implement a read-before-write pattern in `SaveGrant` to create OCC read dependencies that enable existing conflict detection:
-
-Modify the `SaveGrant` method to read the existing grant first, even if just to check existence. This creates a read dependency in the transaction's readset, enabling OCC to detect conflicts:
+**Option 1:** Modify the `shouldRerun` method to check transaction response code before marking as validated:
 
 ```go
-func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
-    store := ctx.KVStore(k.storeKey)
-    skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-    
-    // Read to create OCC dependency (enables conflict detection)
-    _ = store.Get(skey)
-    
-    grant, err := authz.NewGrant(authorization, expiration)
-    if err != nil {
-        return err
+case statusExecuted, statusValidated:
+    // Check if response has an error code
+    if task.Response != nil && task.Response.Code != 0 {
+        s.invalidateTask(task)
+        task.Reset()
+        task.Increment()
+        return true
     }
-
-    bz := k.cdc.MustMarshal(&grant)
-    store.Set(skey, bz)
-    return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
-        MsgTypeUrl: authorization.MsgTypeURL(),
-        Granter:    granter.String(),
-        Grantee:    grantee.String(),
-    })
-}
+    
+    // Existing OCC conflict check
+    if valid, conflicts := s.findConflicts(task); !valid {
+        // ... existing logic
+    }
 ```
 
-This approach is consistent with the existing `update` method pattern which already reads before writing.
+**Option 2:** Modify `executeTask` to conditionally call `WriteToMultiVersionStore()` only for successful transactions:
+
+```go
+if resp.Code == 0 {
+    for _, v := range task.VersionStores {
+        v.WriteToMultiVersionStore()
+    }
+} else {
+    // Failed transaction - write estimates only or invalidate
+    for _, v := range task.VersionStores {
+        v.WriteEstimatesToMultiVersionStore()
+    }
+}
+```
 
 ## Proof of Concept
 
-**Test File:** `x/authz/keeper/keeper_test.go`
-
-**Test Function:** `TestConcurrentGrantsOCCBlindWrite`
+The vulnerability is demonstrable through code analysis:
 
 **Setup:**
-1. Initialize SimApp with OCC enabled (`SetOccEnabled(true)`, `SetConcurrencyWorkers(2)`)
-2. Create test accounts: granter (addr[0]), grantee (addr[1])
-3. Fund granter account with sufficient tokens for gas fees
-4. Create two MsgGrant transactions for identical (grantee, granter, msgType) tuple with different spend limits
+- Normal execution path: Cache writes only committed if `err == nil` [5](#0-4) 
 
 **Action:**
-1. Build Transaction A: MsgGrant with authorization spend limit = 100 coins
-2. Build Transaction B: MsgGrant with authorization spend limit = 200 coins (same grantee, granter, msgType)
-3. Submit both transactions in the same block using `DeliverTxBatch` with OCC enabled
-4. Process the complete batch through the OCC scheduler's parallel execution and validation phases
+- OCC execution path: Writes committed unconditionally regardless of response code [2](#0-1) 
 
-**Expected Result:**
-1. Both transactions return Code=0 (success response)
-2. Both transactions emit `EventGrant` events (verifiable from event manager)
-3. Both transactions charge gas fees (verifiable from account balance changes)
-4. Query final blockchain state using `GetCleanAuthorization(ctx, grantee, granter, msgType)`
-5. Only ONE grant exists in state with SpendLimit=200 (from Transaction B, index 1)
-6. Transaction A's SpendLimit=100 is silently lost despite success response
-7. This demonstrates violation of the blockchain invariant that successful transactions persist their state changes
+- Validation only checks OCC conflicts, not response codes [1](#0-0) 
+
+**Result:**
+Failed transactions (response code != 0) have writes committed via `WriteLatestToStore()` because the scheduler marks them "validated" based solely on absence of OCC conflicts, breaking the documented invariant that state only persists for successful transactions.
 
 ## Notes
 
-The vulnerability is confirmed through code flow analysis showing SaveGrant's blind write pattern combined with OCC's exclusive focus on read-write conflict detection. No existing tests cover concurrent SaveGrant operations with OCC enabled, suggesting this scenario was not considered during development. The technical claims are fully verifiable from the codebase at the cited locations.
+The vulnerability is validated through comprehensive code analysis showing the scheduler bypasses response code validation that exists in normal sequential execution. The TODO comments in the codebase indicate the OCC validation system is still under development, suggesting this validation gap was likely unintentional. The divergence between normal execution (which checks `err == nil` before writing state) and OCC execution (which writes unconditionally) represents a critical security flaw that allows state corruption from failed transactions.
 
 ### Citations
 
-**File:** x/authz/keeper/keeper.go (L51-72)
+**File:** tasks/scheduler.go (L344-346)
 ```go
-func (k Keeper) update(ctx sdk.Context, grantee sdk.AccAddress, granter sdk.AccAddress, updated authz.Authorization) error {
-	skey := grantStoreKey(grantee, granter, updated.MsgTypeURL())
-	grant, found := k.getGrant(ctx, skey)
-	if !found {
-		return sdkerrors.ErrNotFound.Wrap("authorization not found")
-	}
-
-	msg, ok := updated.(proto.Message)
-	if !ok {
-		sdkerrors.ErrPackAny.Wrapf("cannot proto marshal %T", updated)
-	}
-
-	any, err := codectypes.NewAnyWithValue(msg)
-	if err != nil {
-		return err
-	}
-
-	grant.Authorization = any
-	store := ctx.KVStore(k.storeKey)
-	store.Set(skey, k.cdc.MustMarshal(&grant))
-	return nil
-}
-```
-
-**File:** x/authz/keeper/keeper.go (L144-160)
-```go
-func (k Keeper) SaveGrant(ctx sdk.Context, grantee, granter sdk.AccAddress, authorization authz.Authorization, expiration time.Time) error {
-	store := ctx.KVStore(k.storeKey)
-
-	grant, err := authz.NewGrant(authorization, expiration)
-	if err != nil {
-		return err
-	}
-
-	bz := k.cdc.MustMarshal(&grant)
-	skey := grantStoreKey(grantee, granter, authorization.MsgTypeURL())
-	store.Set(skey, bz)
-	return ctx.EventManager().EmitTypedEvent(&authz.EventGrant{
-		MsgTypeUrl: authorization.MsgTypeURL(),
-		Granter:    granter.String(),
-		Grantee:    grantee.String(),
-	})
-}
-```
-
-**File:** store/multiversion/store.go (L388-397)
-```go
-func (s *Store) ValidateTransactionState(index int) (bool, []int) {
-	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
-
-	// TODO: can we parallelize for all iterators?
-	iteratorValid := s.checkIteratorAtIndex(index)
-
-	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
-
-	return iteratorValid && readsetValid, conflictIndices
-}
-```
-
-**File:** store/multiversion/store.go (L399-435)
-```go
-func (s *Store) WriteLatestToStore() {
-	// sort the keys
-	keys := []string{}
-	s.multiVersionMap.Range(func(key, value interface{}) bool {
-		keys = append(keys, key.(string))
-		return true
-	})
-	sort.Strings(keys)
-
-	for _, key := range keys {
-		val, ok := s.multiVersionMap.Load(key)
-		if !ok {
-			continue
-		}
-		mvValue, found := val.(MultiVersionValue).GetLatestNonEstimate()
-		if !found {
-			// this means that at some point, there was an estimate, but we have since removed it so there isn't anything writeable at the key, so we can skip
-			continue
-		}
-		// we shouldn't have any ESTIMATE values when performing the write, because we read the latest non-estimate values only
-		if mvValue.IsEstimate() {
-			panic("should not have any estimate values when writing to parent store")
-		}
-		// if the value is deleted, then delete it from the parent store
-		if mvValue.IsDeleted() {
-			// We use []byte(key) instead of conv.UnsafeStrToBytes because we cannot
-			// be sure if the underlying store might do a save with the byteslice or
-			// not. Once we get confirmation that .Delete is guaranteed not to
-			// save the byteslice, then we can assume only a read-only copy is sufficient.
-			s.parentStore.Delete([]byte(key))
-			continue
-		}
-		if mvValue.Value() != nil {
-			s.parentStore.Set([]byte(key), mvValue.Value())
-		}
-	}
-}
-```
-
-**File:** store/multiversion/data_structures.go (L60-79)
-```go
-func (item *multiVersionItem) GetLatestNonEstimate() (MultiVersionValueItem, bool) {
-	item.mtx.RLock()
-	defer item.mtx.RUnlock()
-
-	var vItem *valueItem
-	var found bool
-	item.valueTree.Descend(func(bTreeItem btree.Item) bool {
-		// only return if non-estimate
-		item := bTreeItem.(*valueItem)
-		if item.IsEstimate() {
-			// if estimate, continue
-			return true
-		}
-		// else we want to return
-		vItem = item
-		found = true
-		return false
-	})
-	return vItem, found
-}
-```
-
-**File:** x/authz/keeper/msg_server.go (L14-42)
-```go
-func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
-	}
-
-	granter, err := sdk.AccAddressFromBech32(msg.Granter)
-	if err != nil {
-		return nil, err
-	}
-
-	authorization := msg.GetAuthorization()
-	if authorization == nil {
-		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
-	}
-
-	t := authorization.MsgTypeURL()
-	if k.router.HandlerByTypeURL(t) == nil {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
-	}
-
-	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgGrantResponse{}, nil
-}
-```
-
-**File:** tasks/scheduler.go (L166-183)
-```go
-func (s *scheduler) findConflicts(task *deliverTxTask) (bool, []int) {
-	var conflicts []int
-	uniq := make(map[int]struct{})
-	valid := true
-	for _, mv := range s.multiVersionStores {
-		ok, mvConflicts := mv.ValidateTransactionState(task.AbsoluteIndex)
-		for _, c := range mvConflicts {
-			if _, ok := uniq[c]; !ok {
-				conflicts = append(conflicts, c)
-				uniq[c] = struct{}{}
-			}
-		}
-		// any non-ok value makes valid false
-		valid = valid && ok
-	}
-	sort.Ints(conflicts)
-	return valid, conflicts
-}
-```
-
-**File:** tasks/scheduler.go (L284-350)
-```go
-func (s *scheduler) ProcessAll(ctx sdk.Context, reqs []*sdk.DeliverTxEntry) ([]types.ResponseDeliverTx, error) {
-	startTime := time.Now()
-	var iterations int
-	// initialize mutli-version stores if they haven't been initialized yet
-	s.tryInitMultiVersionStore(ctx)
-	// prefill estimates
-	// This "optimization" path is being disabled because we don't have a strong reason to have it given that it
-	// s.PrefillEstimates(reqs)
-	tasks, tasksMap := toTasks(reqs)
-	s.allTasks = tasks
-	s.allTasksMap = tasksMap
-	s.executeCh = make(chan func(), len(tasks))
-	s.validateCh = make(chan func(), len(tasks))
-	defer s.emitMetrics()
-
-	// default to number of tasks if workers is negative or 0 by this point
-	workers := s.workers
-	if s.workers < 1 || len(tasks) < s.workers {
-		workers = len(tasks)
-	}
-
-	workerCtx, cancel := context.WithCancel(ctx.Context())
-	defer cancel()
-
-	// execution tasks are limited by workers
-	start(workerCtx, s.executeCh, workers)
-
-	// validation tasks uses length of tasks to avoid blocking on validation
-	start(workerCtx, s.validateCh, len(tasks))
-
-	toExecute := tasks
-	for !allValidated(tasks) {
-		// if the max incarnation >= x, we should revert to synchronous
-		if iterations >= maximumIterations {
-			// process synchronously
-			s.synchronous = true
-			startIdx, anyLeft := s.findFirstNonValidated()
-			if !anyLeft {
-				break
-			}
-			toExecute = tasks[startIdx:]
-		}
-
-		// execute sets statuses of tasks to either executed or aborted
-		if err := s.executeAll(ctx, toExecute); err != nil {
-			return nil, err
-		}
-
-		// validate returns any that should be re-executed
-		// note this processes ALL tasks, not just those recently executed
-		var err error
-		toExecute, err = s.validateAll(ctx, tasks)
-		if err != nil {
-			return nil, err
-		}
-		// these are retries which apply to metrics
-		s.metrics.retries += len(toExecute)
-		iterations++
-	}
-
 	for _, mv := range s.multiVersionStores {
 		mv.WriteLatestToStore()
 	}
-	s.metrics.maxIncarnation = s.maxIncarnation
-
-	ctx.Logger().Info("occ scheduler", "height", ctx.BlockHeight(), "txs", len(tasks), "latency_ms", time.Since(startTime).Milliseconds(), "retries", s.metrics.retries, "maxIncarnation", s.maxIncarnation, "iterations", iterations, "sync", s.synchronous, "workers", s.workers)
-
 ```
 
-**File:** x/authz/spec/03_messages.md (L12-12)
-```markdown
-If there is already a grant for the `(granter, grantee, Authorization)` triple, then the new grant will overwrite the previous one. To update or extend an existing grant, a new grant with the same `(granter, grantee, Authorization)` triple should be created.
+**File:** tasks/scheduler.go (L354-390)
+```go
+func (s *scheduler) shouldRerun(task *deliverTxTask) bool {
+	switch task.Status {
+
+	case statusAborted, statusPending:
+		return true
+
+	// validated tasks can become unvalidated if an earlier re-run task now conflicts
+	case statusExecuted, statusValidated:
+		// With the current scheduler, we won't actually get to this step if a previous task has already been determined to be invalid,
+		// since we choose to fail fast and mark the subsequent tasks as invalid as well.
+		// TODO: in a future async scheduler that no longer exhaustively validates in order, we may need to carefully handle the `valid=true` with conflicts case
+		if valid, conflicts := s.findConflicts(task); !valid {
+			s.invalidateTask(task)
+			task.AppendDependencies(conflicts)
+
+			// if the conflicts are now validated, then rerun this task
+			if dependenciesValidated(s.allTasksMap, task.Dependencies) {
+				return true
+			} else {
+				// otherwise, wait for completion
+				task.SetStatus(statusWaiting)
+				return false
+			}
+		} else if len(conflicts) == 0 {
+			// mark as validated, which will avoid re-validating unless a lower-index re-validates
+			task.SetStatus(statusValidated)
+			return false
+		}
+		// conflicts and valid, so it'll validate next time
+		return false
+
+	case statusWaiting:
+		// if conflicts are done, then this task is ready to run again
+		return dependenciesValidated(s.allTasksMap, task.Dependencies)
+	}
+	panic("unexpected status: " + task.Status)
+}
+```
+
+**File:** tasks/scheduler.go (L571-577)
+```go
+	task.SetStatus(statusExecuted)
+	task.Response = &resp
+
+	// write from version store to multiversion stores
+	for _, v := range task.VersionStores {
+		v.WriteToMultiVersionStore()
+	}
+```
+
+**File:** baseapp/abci.go (L280-283)
+```go
+// State only gets persisted if all messages are valid and get executed successfully.
+// Otherwise, the ResponseDeliverTx will contain relevant error information.
+// Regardless of tx execution outcome, the ResponseDeliverTx will contain relevant
+// gas execution context.
+```
+
+**File:** baseapp/abci.go (L304-311)
+```go
+	gInfo, result, anteEvents, _, _, _, resCtx, err := app.runTx(ctx.WithTxBytes(req.Tx).WithTxSum(checksum).WithVoteInfos(app.voteInfos), runTxModeDeliver, tx, checksum)
+	if err != nil {
+		resultStr = "failed"
+		// if we have a result, use those events instead of just the anteEvents
+		if result != nil {
+			return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(result.Events, app.indexEvents), app.trace)
+		}
+		return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(anteEvents, app.indexEvents), app.trace)
+```
+
+**File:** baseapp/baseapp.go (L978-992)
+```go
+		// Dont need to validate in checkTx mode
+		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
+			storeAccessOpEvents := msCache.GetEvents()
+			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
+
+			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
+			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+			if len(missingAccessOps) != 0 {
+				for op := range missingAccessOps {
+					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
+					op.EmitValidationFailMetrics()
+				}
+				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
+				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
+			}
+```
+
+**File:** baseapp/baseapp.go (L1015-1017)
+```go
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
+	}
+```
+
+**File:** baseapp/baseapp.go (L1155-1174)
+```go
+		if ctx.MsgValidator() == nil {
+			continue
+		}
+		storeAccessOpEvents := msgMsCache.GetEvents()
+		accessOps := ctx.TxMsgAccessOps()[i]
+		missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
+		// TODO: (occ) This is where we are currently validating our per message dependencies,
+		// whereas validation will be done holistically based on the mvkv for OCC approach
+		if len(missingAccessOps) != 0 {
+			for op := range missingAccessOps {
+				ctx.Logger().Info((fmt.Sprintf("eventMsgName=%s Missing Access Operation:%s ", eventMsgName, op.String())))
+				op.EmitValidationFailMetrics()
+			}
+			errMessage := fmt.Sprintf("Invalid Concurrent Execution messageIndex=%d, missing %d access operations", i, len(missingAccessOps))
+			// we need to bubble up the events for inspection
+			return &sdk.Result{
+				Log:    strings.TrimSpace(msgLogs.String()),
+				Events: events.ToABCIEvents(),
+			}, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
+		}
 ```

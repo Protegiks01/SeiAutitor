@@ -1,376 +1,354 @@
 # Audit Report
 
 ## Title
-Permanent Loss of Transaction Fees Due to Missing EndBlock Implementation in Bank Module
+Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
 
 ## Summary
-The bank module's deferred balance system deducts transaction fees from user accounts immediately (persisted to disk) and caches them in a memory-only store with the documented intent to flush to module accounts during EndBlock. However, the bank module completely lacks an EndBlock method implementation, causing `WriteDeferredBalances` to never be called in production. This results in permanent loss of all accumulated transaction fees when nodes restart, as the memory-only cache is cleared while user deductions remain persisted to disk.
+The distribution module's governance parameter update mechanism fails to validate that `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0`, allowing individual parameter changes to collectively violate this invariant. When the sum exceeds 1.0, the `AllocateTokens` function in BeginBlock calculates a negative `voteMultiplier`, resulting in negative token amounts that trigger a panic, halting the entire network. [1](#0-0) [2](#0-1) 
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
 **Location:**
-- Fee deduction entry point: [1](#0-0) 
-- Deferred send implementation: [2](#0-1) 
-- Bank module structure (no EndBlock): [3](#0-2) 
-- Memory store characteristics: [4](#0-3) 
+- Vulnerable calculation: `x/distribution/keeper/allocation.go` lines 82-84
+- Panic trigger: `types/dec_coin.go` lines 303-309  
+- Validation gap: `x/distribution/types/params.go` lines 76-131
+- Governance handler: `x/params/proposal_handler.go` lines 26-43
 
 **Intended logic:**
-The code documentation explicitly states the intended behavior: [5](#0-4) 
-
-The system is designed to: (1) immediately deduct fees via `SubUnlockedCoins` which persists to the IAVL store, (2) cache amounts in a deferred memory store indexed by transaction, and (3) flush all deferred balances to module accounts in EndBlock via `WriteDeferredBalances`.
+The distribution module should enforce the invariant that `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. The `ValidateBasic()` method explicitly checks this constraint. [3](#0-2) 
 
 **Actual logic:**
-- User fees are deducted immediately and persisted to disk through the SubUnlockedCoins call
-- Amounts are stored in a memory-only deferred cache that is "not committed as part of app state but maintained privately by each node"
-- The bank module AppModule struct (lines 107-210) contains no EndBlock method, failing to implement the `EndBlockAppModule` interface
-- Module manager skips modules lacking EndBlock: [6](#0-5) 
-- `WriteDeferredBalances` is never called in production code (verified by comprehensive grep - only appears in test files)
-- On node restart, memory stores are recreated fresh: [7](#0-6) 
-- User accounts retain reduced balances but module accounts never receive funds
+When parameters are updated through governance proposals, the system validates each parameter individually (checking 0 ≤ value ≤ 1.0) but does not verify the combined sum constraint. The `ValidateBasic()` method that checks the sum is only called during genesis initialization, not during governance parameter updates. [4](#0-3) [5](#0-4) [6](#0-5) 
+
+Genesis validation correctly applies the constraint: [7](#0-6) 
+
+However, governance updates bypass this validation by calling `Subspace.Update()` which only invokes individual parameter validators.
 
 **Exploitation path:**
-No attacker required - occurs during normal blockchain operation:
-1. User submits transaction with fees
-2. Ante handler calls DeductFees which invokes `DeferredSendCoinsFromAccountToModule`
-3. User balance reduced via SubUnlockedCoins (persisted to IAVL store)
-4. Amount cached in memory-only deferred store
-5. Block processing completes, EndBlock is called: [8](#0-7) 
-6. Bank module is skipped during EndBlock iteration (no EndBlock implementation)
-7. `WriteDeferredBalances` never called
-8. State committed with user balance reduced but module account unchanged
-9. Fees accumulate in memory cache across multiple blocks
-10. Node restarts (maintenance, upgrade, crash, or hardware operations)
-11. Memory store cleared, deferred cache emptied
-12. All accumulated fees permanently lost
+1. Governance passes three separate proposals that individually appear valid:
+   - `baseProposerReward = 0.5` (valid: 0 ≤ 0.5 ≤ 1.0)
+   - `bonusProposerReward = 0.5` (valid: 0 ≤ 0.5 ≤ 1.0)  
+   - `communityTax = 0.1` (valid: 0 ≤ 0.1 ≤ 1.0)
+   - Combined sum: 1.1 > 1.0 (violates invariant)
+
+2. On the next block, BeginBlock calls `AllocateTokens()`: [8](#0-7) 
+
+3. With high validator participation (e.g., 100%):
+   - `proposerMultiplier = 0.5 + 0.5 × 1.0 = 1.0`
+   - `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1` (negative)
+   - `feeMultiplier` becomes negative DecCoins
+   - Validators receive negative reward tokens
+
+4. When `AllocateTokensToValidator` calls `tokens.Sub(commission)` with negative tokens: [9](#0-8) 
+
+The `Sub()` operation panics with "negative coin amount", halting all nodes simultaneously.
 
 **Security guarantee broken:**
-Violates the fundamental accounting invariant that all deducted coins must exist somewhere in the system. The TotalSupply invariant correctly includes deferred balances during normal operation: [9](#0-8) 
-
-However, after restart when the cache is cleared, the invariant would fail as the sum of account balances would be less than total supply (user balances reduced without corresponding module credits).
+The system fails to enforce its explicitly documented invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates.
 
 ## Impact Explanation
 
-All transaction fees paid since the last node restart are permanently lost. This includes fees intended for the fee collector module which funds validator rewards and governance operations. The impact is severe because:
+The vulnerability causes total network shutdown with the following consequences:
 
-- **Direct permanent fund loss**: Fees deducted from users never reach module accounts
-- **Continuous accumulation**: Every transaction contributes to the growing loss
-- **No recovery mechanism**: Once the memory store is cleared on restart, amounts are irrecoverable
-- **Network-wide issue**: Affects every validator and full node independently on each restart
-- **Invariant violation**: After restart, total supply accounting breaks (user balances reduced without corresponding module credits)
+- **Complete consensus halt**: All validator nodes panic simultaneously when processing any block after the misconfigured parameters take effect
+- **Transaction processing stops**: No new transactions can be confirmed
+- **Governance cannot self-repair**: Emergency governance proposals cannot pass because the network is halted
+- **Requires coordinated manual intervention**: Validators must coordinate off-chain to manually reset parameters in state or restart with corrected genesis, similar to a hard fork recovery process
 
-The deferred cache is confirmed to be used in production: [10](#0-9) 
+The developers explicitly recognized this pattern for ConsensusParams and implemented special validation, confirming the severity: [10](#0-9) 
 
 ## Likelihood Explanation
 
-**Very High** - Triggered continuously during normal blockchain operation:
+**Who can trigger:** Governance (requires democratic proposal voting to pass)
 
-- **Frequency**: Every transaction that pays fees (essentially all transactions) uses the deferred system via the ante handler
-- **Restart triggers**: Node restarts occur regularly for software updates, network upgrades, crashes, hardware maintenance, and datacenter operations
-- **No special conditions**: Happens automatically without attacker involvement or special circumstances
-- **Network-wide**: Every validator and full node experiences this loss independently
+**Realistic scenario (non-malicious):**
+- Month 1: Proposal to increase proposer rewards passes (`baseProposerReward = 0.5`)
+- Month 2: Proposal to add voting bonuses passes (`bonusProposerReward = 0.5`)  
+- Month 3: Proposal to fund community pool passes (`communityTax = 0.1`)
+- Each proposal appears valid when reviewed individually (0 ≤ value ≤ 1.0)
+- No reviewer checks the combined constraint across all three parameters
+- Network inadvertently halts
 
-The test file demonstrates that developers were aware `WriteDeferredBalances` must be called to credit module accounts: [11](#0-10) 
+**Likelihood:** Moderate - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint without malicious intent. The fact that each individual change appears valid makes this particularly dangerous.
 
-However, this call was only implemented in tests (line 183), never in production EndBlock code.
+While governance-controlled, this meets the trusted role exception because: (1) it can occur inadvertently without malicious intent, (2) it causes unrecoverable network failure beyond governance's intended authority, and (3) the system has an explicit invariant that should be automatically enforced.
 
 ## Recommendation
 
-Add an EndBlock method to the bank module that calls `WriteDeferredBalances`. In `x/bank/module.go`, add:
+1. **Immediate Fix**: Add special validation for distribution parameters in the governance proposal handler, similar to the ConsensusParams pattern. When any distribution parameter is updated via governance, retrieve all current distribution parameters, apply the proposed change, and validate the complete `Params` struct using `ValidateBasic()`.
 
-```go
-func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
-    am.keeper.WriteDeferredBalances(ctx)
-    return []abci.ValidatorUpdate{}
-}
-```
+2. **Alternative Approach**: Modify individual validator functions to query current values of other distribution parameters and validate that the combined sum will not exceed 1.0 after the update is applied.
 
-Verification steps:
-1. Confirm `WriteDeferredBalances` is called exactly once per block
-2. Verify fee collector module accounts receive all accumulated fees
-3. Ensure TotalSupply invariant passes consistently after node restarts
-4. Confirm deferred cache is empty at the end of each block
-5. Add monitoring to alert if deferred cache accumulates unexpectedly
+3. **Defensive Programming**: Add a safety check in `AllocateTokens` to detect negative `voteMultiplier` and handle gracefully (e.g., clamp to zero with error event) rather than allowing the panic to propagate and halt the network.
+
+4. **Apply Existing Pattern**: Extend the ConsensusParams validation pattern to distribution parameters, as both can cause chain halts if misconfigured.
 
 ## Proof of Concept
 
-The existing test demonstrates the vulnerability: [11](#0-10) 
+**Test File:** `x/distribution/keeper/allocation_test.go`
 
 **Setup:**
-1. Initialize test app with bank keeper configured with deferred cache
-2. Create user account and fee collector module account  
-3. Fund user account with initial balance (900 usei)
+- Initialize test application: `app := simapp.Setup(false)`
+- Create two validators with equal voting power
+- Set misconfigured parameters directly (to simulate post-governance state):
+  ```go
+  params := disttypes.Params{
+      CommunityTax:        sdk.NewDecWithPrec(10, 2),  // 0.1 (10%)
+      BaseProposerReward:  sdk.NewDecWithPrec(50, 2),  // 0.5 (50%)
+      BonusProposerReward: sdk.NewDecWithPrec(50, 2),  // 0.5 (50%)
+      WithdrawAddrEnabled: true,
+  }
+  // Sum: 1.1 > 1.0 (violates invariant)
+  app.DistrKeeper.SetParams(ctx, params)
+  ```
+- Fund fee collector module with tokens
 
 **Action:**
-1. Call ante handler twice (lines 170-171), which invokes `DeferredSendCoinsFromAccountToModule` each time
-2. Verify fee collector balance unchanged (lines 176-180) - fees are deferred, not immediately credited
-3. Manually call `WriteDeferredBalances` (line 183) - **THIS MANUAL CALL IS ONLY DONE IN TESTS**
-4. Verify fee collector balance increased by 2x fee amount (lines 185-193)
+- Call `app.DistrKeeper.AllocateTokens(ctx, 200, 200, proposerConsAddr, votes)` with 100% validator participation
+- This results in `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1`
 
 **Result:**
-The test proves that without calling `WriteDeferredBalances`, module accounts never receive deferred fees. In production code, this call never happens because the bank module has no EndBlock method. When a node restarts, the memory store is cleared and all deferred fees are permanently lost while user account deductions remain persisted.
+- Panic with message "negative coin amount" when `AllocateTokensToValidator` attempts `tokens.Sub(commission)` on negative token amounts
+- This panic would halt all nodes processing blocks with these parameters in production
+
+**Note:**
+Existing allocation tests use valid parameters with sum = 0.07: [11](#0-10) 
+
+Test validation confirms the invariant exists: [12](#0-11) 
 
 ## Notes
 
-This vulnerability represents a critical architectural flaw where the implementation is incomplete relative to the documented design. The deferred balance system was clearly intended to optimize gas costs by batching transfers to module accounts, but the critical EndBlock flush operation was never implemented in the bank module itself, only in test code. The memory-only nature of the deferred cache combined with the missing EndBlock creates an accounting black hole that permanently destroys transaction fees on every node restart.
+This vulnerability represents a gap in the parameter validation system where the protection applied to ConsensusParams (to prevent chain halts) was not extended to distribution parameters despite the same risk. The system has an explicit invariant documented in code and tests, but the governance update path bypasses this validation, allowing incremental changes to collectively violate the constraint. Recovery requires coordinated off-chain intervention by validators, making this a significant availability issue despite being governance-controlled.
 
 ### Citations
 
-**File:** x/auth/ante/fee.go (L208-208)
+**File:** x/distribution/keeper/allocation.go (L82-84)
 ```go
-	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
+	communityTax := k.GetCommunityTax(ctx)
+	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
+	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
 ```
 
-**File:** x/bank/keeper/keeper.go (L404-407)
+**File:** x/distribution/keeper/allocation.go (L111-114)
 ```go
-// DeferredSendCoinsFromAccountToModule transfers coins from an AccAddress to a ModuleAccount.
-// It deducts the balance from an accAddress and stores the balance in a mapping for ModuleAccounts.
-// In the EndBlocker, it will then perform one deposit for each module account.
-// It will panic if the module account does not exist.
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
 ```
 
-**File:** x/bank/keeper/keeper.go (L408-432)
+**File:** types/dec_coin.go (L303-309)
 ```go
-func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
-	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
-) error {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
 	}
-	// Deducts Fees from the Sender Account
-	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
-	if err != nil {
-		return err
+
+	return diff
+```
+
+**File:** x/distribution/types/params.go (L67-71)
+```go
+	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
+		)
 	}
-	// get recipient module address
-	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
-	if moduleAcc == nil {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
+```
+
+**File:** x/distribution/types/params.go (L76-131)
+```go
+func validateCommunityTax(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
-	// get txIndex
-	txIndex := ctx.TxIndex()
-	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
-	if err != nil {
-		return err
+
+	if v.IsNil() {
+		return fmt.Errorf("community tax must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("community tax must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("community tax too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBaseProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("base proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("base proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("base proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBonusProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("bonus proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("bonus proposer reward too large: %s", v)
 	}
 
 	return nil
 }
 ```
 
-**File:** x/bank/module.go (L107-210)
+**File:** x/params/types/subspace.go (L196-219)
 ```go
-// AppModule implements an application module for the bank module.
-type AppModule struct {
-	AppModuleBasic
-
-	keeper        keeper.Keeper
-	accountKeeper types.AccountKeeper
-}
-
-// RegisterServices registers module services.
-func (am AppModule) RegisterServices(cfg module.Configurator) {
-	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
-	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
-
-	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
-	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
-}
-
-// NewAppModule creates a new AppModule object
-func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
-	return AppModule{
-		AppModuleBasic: AppModuleBasic{cdc: cdc},
-		keeper:         keeper,
-		accountKeeper:  accountKeeper,
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
 	}
-}
 
-// Name returns the bank module's name.
-func (AppModule) Name() string { return types.ModuleName }
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
 
-// RegisterInvariants registers the bank module invariants.
-func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
-	keeper.RegisterInvariants(ir, am.keeper)
-}
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+		return err
+	}
 
-// Route returns the message routing key for the bank module.
-func (am AppModule) Route() sdk.Route {
-	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
-}
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
 
-// QuerierRoute returns the bank module's querier route name.
-func (AppModule) QuerierRoute() string { return types.RouterKey }
-
-// LegacyQuerierHandler returns the bank module sdk.Querier.
-func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
-	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
-}
-
-// InitGenesis performs genesis initialization for the bank module. It returns
-// no validator updates.
-func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
-	start := time.Now()
-	var genesisState types.GenesisState
-	cdc.MustUnmarshalJSON(data, &genesisState)
-	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
-
-	am.keeper.InitGenesis(ctx, &genesisState)
-	return []abci.ValidatorUpdate{}
-}
-
-// ExportGenesis returns the exported genesis state as raw bytes for the bank
-// module.
-func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
-	gs := am.keeper.ExportGenesis(ctx)
-	return cdc.MustMarshalJSON(gs)
-}
-
-func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
-	ch := make(chan json.RawMessage)
-	go func() {
-		ch <- am.ExportGenesis(ctx, cdc)
-		close(ch)
-	}()
-	return ch
-}
-
-// ConsensusVersion implements AppModule/ConsensusVersion.
-func (AppModule) ConsensusVersion() uint64 { return 2 }
-
-// AppModuleSimulation functions
-
-// GenerateGenesisState creates a randomized GenState of the bank module.
-func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
-	simulation.RandomizedGenState(simState)
-}
-
-// ProposalContents doesn't return any content functions for governance proposals.
-func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
+	s.Set(ctx, key, dest)
 	return nil
 }
-
-// RandomizedParams creates randomized bank param changes for the simulator.
-func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
-	return simulation.ParamChanges(r)
-}
-
-// RegisterStoreDecoder registers a decoder for supply module's types
-func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
-
-// WeightedOperations returns the all the gov module operations with their respective weights.
-func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
-	return simulation.WeightedOperations(
-		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
-	)
-}
 ```
 
-**File:** store/mem/store.go (L20-21)
+**File:** x/params/proposal_handler.go (L26-43)
 ```go
-// Store implements an in-memory only KVStore. Entries are persisted between
-// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
-```
-
-**File:** types/module/module.go (L647-649)
-```go
-		module, ok := m.Modules[moduleName].(EndBlockAppModule)
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
 		if !ok {
-			continue
-```
-
-**File:** store/rootmulti/store.go (L1003-1008)
-```go
-	case types.StoreTypeMemory:
-		if _, ok := key.(*types.MemoryStoreKey); !ok {
-			return nil, fmt.Errorf("unexpected key type for a MemoryStoreKey; got: %s", key.String())
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
 		}
 
-		return mem.NewStore(), nil
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
+
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		}
+	}
+
+	return nil
+}
 ```
 
-**File:** simapp/app.go (L264-266)
+**File:** x/distribution/types/genesis.go (L44-50)
 ```go
-	app.BankKeeper = bankkeeper.NewBaseKeeperWithDeferredCache(
-		appCodec, keys[banktypes.StoreKey], app.AccountKeeper, app.GetSubspace(banktypes.ModuleName), app.ModuleAccountAddrs(), memKeys[banktypes.DeferredCacheStoreKey],
+// ValidateGenesis validates the genesis state of distribution genesis input
+func ValidateGenesis(gs *GenesisState) error {
+	if err := gs.Params.ValidateBasic(); err != nil {
+		return err
+	}
+	return gs.FeePool.ValidateGenesis()
+}
+```
+
+**File:** x/distribution/abci.go (L29-31)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+```
+
+**File:** x/params/types/proposal/proposal.go (L101-109)
+```go
+		// We need to verify ConsensusParams since they are only validated once the proposal passes.
+		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
+		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
+		// Therefore, we validate when we get a param-change msg for ConsensusParams
+		if pc.Subspace == "baseapp" {
+			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
+				return err
+			}
+		}
+```
+
+**File:** x/distribution/keeper/allocation_test.go (L54-63)
+```go
+	testDistrParms := disttypes.Params{
+		CommunityTax:        sdk.NewDecWithPrec(2, 2), // 2%
+		BaseProposerReward:  sdk.NewDecWithPrec(1, 2), // 1%
+		BonusProposerReward: sdk.NewDecWithPrec(4, 2), // 4%
+		WithdrawAddrEnabled: true,
+	}
+	app.DistrKeeper.SetParams(
+		ctx,
+		testDistrParms,
 	)
 ```
 
-**File:** simapp/app.go (L538-540)
+**File:** x/distribution/types/params_test.go (L12-45)
 ```go
-	endBlockResp := app.EndBlock(ctx, abci.RequestEndBlock{
-		Height: req.Height,
-	})
-```
+func TestParams_ValidateBasic(t *testing.T) {
+	toDec := sdk.MustNewDecFromStr
 
-**File:** x/bank/keeper/invariants.go (L74-78)
-```go
-		// also iterate over deferred balances
-		k.IterateDeferredBalances(ctx, func(addr sdk.AccAddress, coin sdk.Coin) bool {
-			expectedTotal = expectedTotal.Add(coin)
-			return false
+	type fields struct {
+		CommunityTax        sdk.Dec
+		BaseProposerReward  sdk.Dec
+		BonusProposerReward sdk.Dec
+		WithdrawAddrEnabled bool
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		wantErr bool
+	}{
+		{"success", fields{toDec("0.1"), toDec("0.5"), toDec("0.4"), false}, false},
+		{"negative community tax", fields{toDec("-0.1"), toDec("0.5"), toDec("0.4"), false}, true},
+		{"negative base proposer reward", fields{toDec("0.1"), toDec("-0.5"), toDec("0.4"), false}, true},
+		{"negative bonus proposer reward", fields{toDec("0.1"), toDec("0.5"), toDec("-0.4"), false}, true},
+		{"total sum greater than 1", fields{toDec("0.2"), toDec("0.5"), toDec("0.4"), false}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := types.Params{
+				CommunityTax:        tt.fields.CommunityTax,
+				BaseProposerReward:  tt.fields.BaseProposerReward,
+				BonusProposerReward: tt.fields.BonusProposerReward,
+				WithdrawAddrEnabled: tt.fields.WithdrawAddrEnabled,
+			}
+			if err := p.ValidateBasic(); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateBasic() error = %v, wantErr %v", err, tt.wantErr)
+			}
 		})
-```
-
-**File:** x/auth/ante/fee_test.go (L138-194)
-```go
-func (suite *AnteTestSuite) TestLazySendToModuleAccount() {
-	suite.SetupTest(false) // setup
-	suite.txBuilder = suite.clientCtx.TxConfig.NewTxBuilder()
-
-	// keys and addresses
-	priv1, _, addr1 := testdata.KeyTestPubAddr()
-
-	// msg and signatures
-	msg := testdata.NewTestMsg(addr1)
-	feeAmount := testdata.NewTestFeeAmount()
-	gasLimit := testdata.NewTestGasLimit()
-	suite.Require().NoError(suite.txBuilder.SetMsgs(msg))
-	suite.txBuilder.SetFeeAmount(feeAmount)
-	suite.txBuilder.SetGasLimit(gasLimit)
-
-	privs, accNums, accSeqs := []cryptotypes.PrivKey{priv1}, []uint64{0}, []uint64{0}
-	tx, err := suite.CreateTestTx(privs, accNums, accSeqs, suite.ctx.ChainID())
-	suite.Require().NoError(err)
-
-	// Set account with insufficient funds
-	acc := suite.app.AccountKeeper.NewAccountWithAddress(suite.ctx, addr1)
-	suite.app.AccountKeeper.SetAccount(suite.ctx, acc)
-	err = simapp.FundAccount(suite.app.BankKeeper, suite.ctx, addr1, sdk.NewCoins(sdk.NewCoin("usei", sdk.NewInt(900))))
-	suite.Require().NoError(err)
-
-	feeCollectorAcc := suite.app.AccountKeeper.GetModuleAccount(suite.ctx, types.FeeCollectorName)
-	expectedFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
-
-	dfd := ante.NewDeductFeeDecorator(suite.app.AccountKeeper, suite.app.BankKeeper, nil, suite.app.ParamsKeeper, nil)
-	antehandler, _ := sdk.ChainAnteDecorators(dfd)
-
-	// Set account with sufficient funds
-	antehandler(suite.ctx, tx, false)
-	_, err = antehandler(suite.ctx, tx, false)
-
-	suite.Require().Nil(err, "Tx errored after account has been set with sufficient funds")
-
-	// Fee Collector actual account balance should not have increased
-	resultFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
-	suite.Assert().Equal(
-		expectedFeeCollectorBalance,
-		resultFeeCollectorBalance,
-	)
-
-	// Fee Collector actual account balance deposit coins into the fee collector account
-	suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
-
-	depositFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
-
-	expectedAtomFee := feeAmount.AmountOf("usei")
-
-	suite.Assert().Equal(
-		// Called antehandler twice, expect fees to be deducted twice
-		expectedFeeCollectorBalance.Add(sdk.NewCoin("usei", expectedAtomFee)).Add(sdk.NewCoin("usei", expectedAtomFee)),
-		depositFeeCollectorBalance,
-	)
+	}
 }
 ```

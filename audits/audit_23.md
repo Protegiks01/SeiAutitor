@@ -1,325 +1,194 @@
 # Audit Report
 
 ## Title
-Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
+Unbounded Storage Growth in TrackHistoricalInfo Due to Gap-Based Pruning Failure
 
 ## Summary
-The distribution module allows governance to set parameters where `baseProposerReward + bonusProposerReward + communityTax` exceeds 1.0 through individual parameter updates. This causes `voteMultiplier` to become negative in `AllocateTokens`, triggering a panic that halts the entire network during block processing.
+The `TrackHistoricalInfo` function in the staking module contains a pruning logic flaw where a break statement exits the pruning loop upon encountering the first missing historical entry. When governance sets `HistoricalEntries` to 0 temporarily (a valid parameter value), gaps are created in the historical entry sequence. Upon setting it back to a non-zero value, the pruning loop encounters these gaps first and immediately exits, leaving all old entries permanently orphaned in storage. This causes unbounded storage growth that compounds with every subsequent block.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:**
-- Vulnerability: `x/distribution/keeper/allocation.go` (voteMultiplier calculation) [1](#0-0) 
+**Location:** [1](#0-0) 
 
-- Panic trigger: `types/dec_coin.go` (Sub operation) [2](#0-1) 
+**Intended logic:** The function should maintain exactly `HistoricalEntries` number of recent historical info entries by pruning all entries older than `currentHeight - HistoricalEntries`. Storage should remain bounded to the configured parameter value, preventing resource exhaustion.
 
-- Validation gap: `x/distribution/types/params.go` (individual validators) [3](#0-2) 
-
-- Governance handler: `x/params/proposal_handler.go` [4](#0-3) 
-
-**Intended logic:**
-Distribution parameters must satisfy the invariant `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. This invariant is explicitly validated in `ValidateBasic()`: [5](#0-4) 
-
-**Actual logic:**
-When parameters are updated through governance proposals, the system only validates individual parameters (checking each is between 0 and 1.0) via `Subspace.Update()`, which calls individual validator functions. The `ValidateBasic()` method that checks the combined sum constraint is only called during genesis validation, not during governance parameter updates: [6](#0-5) 
-
-Genesis validation does check the constraint: [7](#0-6) 
-
-But governance updates bypass this validation.
+**Actual logic:** The pruning loop iterates downward from `currentHeight - HistoricalEntries` and breaks immediately upon encountering the first missing entry at [2](#0-1) . The code explicitly assumes entries form a "continuous range" as stated in the comment [3](#0-2) , but this assumption is violated when `HistoricalEntries` is temporarily set to 0.
 
 **Exploitation path:**
-1. Three governance proposals pass independently (each appears valid with 0 ≤ value ≤ 1.0):
-   - `baseProposerReward = 0.5`
-   - `bonusProposerReward = 0.5`
-   - `communityTax = 0.1`
-   - Combined sum: 1.1 > 1.0 (violates invariant)
+1. Network operates with `HistoricalEntries=100`, accumulating entries for blocks 1-100
+2. Governance proposal changes `HistoricalEntries` to 0 at block 101 (validated as acceptable by [4](#0-3) )
+3. During blocks 101-110, no new entries are saved due to early return [5](#0-4) , but existing entries 1-100 remain in storage
+4. Governance proposal changes `HistoricalEntries` to 5 at block 111
+5. At block 111, pruning loop starts at height 106 (111-5), finds no entry at height 106 (gap period), immediately breaks
+6. Old entries 1-100 are never deleted, new entry 111 is saved
+7. Each subsequent block adds a new entry without deleting old ones because the pruning loop always encounters the gap first
+8. Storage grows unboundedly: {1-100, 111, 112, 113, ...}
 
-2. During the next block's BeginBlock, `AllocateTokens` is called: [8](#0-7) 
-
-3. With high validator participation (e.g., 100%):
-   - `proposerMultiplier = 0.5 + 0.5 × 1.0 = 1.0`
-   - `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1` (negative!)
-   - `feeMultiplier` becomes negative
-   - Each validator receives negative reward tokens
-
-4. When `AllocateTokensToValidator` attempts `tokens.Sub(commission)` with negative tokens: [9](#0-8) 
-
-The Sub() operation panics with "negative coin amount", halting all nodes simultaneously.
-
-**Security guarantee broken:**
-The system fails to enforce its explicitly documented invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates.
+**Security guarantee broken:** The storage bound invariant is violated. The system should maintain exactly `HistoricalEntries` entries, but instead accumulates entries without bound. Once triggered, governance cannot recover from this state through any parameter change—only a hard fork can resolve it.
 
 ## Impact Explanation
 
-**Consequences:**
-- **Total network shutdown**: All validator nodes panic simultaneously when processing any block after the misconfigured parameters take effect
-- **Cannot process transactions**: Network consensus completely halts
-- **Unrecoverable without hard fork**: Emergency governance cannot fix parameters because the network is halted
-- **Requires coordinated manual intervention**: Validators must coordinate off-chain to reset parameters and restart
+Each `HistoricalInfo` entry contains a complete block header and full validator set [6](#0-5) , with a default of 35 validators [7](#0-6) . Each entry represents multiple kilobytes of data.
 
-**Precedent:**
-The developers explicitly recognized and fixed this exact pattern for ConsensusParams, acknowledging that parameter validation gaps "will cause a chain halt": [10](#0-9) 
+After vulnerability triggering:
+- Expected storage with `HistoricalEntries=5`: 5 entries
+- Actual storage after 24 hours (assuming 10-second blocks): 100 old entries + 8,640 new entries = 8,740 entries
+- Storage increase: 174,700%
 
-This confirms the severity of such validation gaps and that distribution parameters lack the same protection.
+This far exceeds the 30% threshold for Medium severity "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours." Over time, this leads to storage exhaustion, node crashes when disk space is exhausted, and network degradation as nodes run out of storage.
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Governance (requires proposals to pass democratic voting)
+**Who can trigger:** Any network participant through the standard governance process. The `HistoricalEntries` parameter is governance-controlled [8](#0-7) .
 
-**Realistic Scenario (Non-Malicious):**
-- Month 1: Proposal to increase proposer rewards (`baseProposerReward = 0.5`)
-- Month 2: Proposal to add voting bonuses (`bonusProposerReward = 0.5`)
-- Month 3: Proposal to fund community pool (`communityTax = 0.1`)
-- Each proposal reviewed individually, all appear valid (0 ≤ value ≤ 1.0)
-- No reviewer checks combined constraint across all parameters
-- Network halts inadvertently
+**Conditions required:**
+1. Governance proposal changes `HistoricalEntries` from non-zero to 0
+2. After several blocks, another proposal changes it back to a non-zero value
 
-**Likelihood:** Moderate - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint. The fact that each individual change appears valid makes this particularly dangerous.
+**Why realistic:**
+- The validation function explicitly allows `HistoricalEntries=0` as valid [4](#0-3) 
+- The simulation code confirms 0 is an intended valid value [9](#0-8) 
+- Documentation suggests non-IBC chains may legitimately set `HistoricalEntries=0` to save resources [10](#0-9) 
+- This is not a malicious attack but a legitimate governance operation triggering a code bug
+- Once triggered, the issue is **unrecoverable** without a hard fork—governance cannot remove orphaned entries through any parameter change
 
-While this requires governance action, it meets the "trusted role exception" because: (1) it can happen inadvertently without malicious intent, (2) it causes unrecoverable network failure beyond governance's intended authority, and (3) the system should enforce its own documented invariants.
+**Frequency:** Once triggered through normal governance operations, the effect compounds with every subsequent block via [11](#0-10) .
 
 ## Recommendation
 
-1. **Immediate Fix**: Add special validation for distribution parameters in the governance proposal handler, similar to ConsensusParams validation. When any distribution parameter is updated, retrieve all current distribution parameters, apply the change, and validate the complete `Params` struct using `ValidateBasic()`.
+Modify the pruning logic to delete all entries older than the retention threshold, regardless of gaps. Remove the break condition:
 
-2. **Alternative Approach**: Modify the individual validator functions to query current values of other distribution parameters and validate that the combined sum will not exceed 1.0 after the update.
+```go
+// Prune all entries older than retention height, regardless of gaps
+pruneHeight := ctx.BlockHeight() - int64(entryNum)
+for i := pruneHeight; i >= 0; i-- {
+    _, found := k.GetHistoricalInfo(ctx, i)
+    if found {
+        k.DeleteHistoricalInfo(ctx, i)
+    }
+    // Continue checking all heights - do not break on missing entries
+}
+```
 
-3. **Defensive Programming**: Add a safety check in `AllocateTokens` to detect negative `voteMultiplier` and handle gracefully (clamp to zero, emit error event) rather than allowing the panic to propagate.
-
-4. **Follow Existing Pattern**: Apply the same validation pattern used for ConsensusParams to distribution parameters.
+Alternatively, track the oldest and newest entry heights in state to enable efficient range-based deletion without relying on the "continuous range" assumption.
 
 ## Proof of Concept
 
-**Test File:** `x/distribution/keeper/allocation_test.go`
+**File:** `x/staking/keeper/historical_info_test.go`
+
+**Test Function:** `TestTrackHistoricalInfoUnboundedGrowth`
 
 **Setup:**
-- Initialize test application using `simapp.Setup(false)`
-- Create two validators with equal voting power
-- Set misconfigured parameters via `app.DistrKeeper.SetParams()` (bypassing validation):
-  ```
-  Params{
-    CommunityTax: sdk.NewDecWithPrec(10, 2),        // 0.1
-    BaseProposerReward: sdk.NewDecWithPrec(50, 2),  // 0.5
-    BonusProposerReward: sdk.NewDecWithPrec(50, 2), // 0.5
-  }
-  ```
-  Combined sum: 1.1 > 1.0
-- Fund fee collector module with tokens
+- Initialize staking keeper using `createTestInput()`
+- Set `HistoricalEntries=100` via `SetParams`
+- Create 100 blocks with historical entries by calling `TrackHistoricalInfo` with incrementing block heights (1-100)
+- Verify 100 entries exist using `GetAllHistoricalInfo`
 
 **Action:**
-- Call `app.DistrKeeper.AllocateTokens(ctx, 200, 200, proposerConsAddr, votes)` with 100% validator participation
-- This results in `voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1`
+1. Change `HistoricalEntries` to 0 via `SetParams`
+2. Generate 10 blocks (101-110) by calling `TrackHistoricalInfo` with updated block heights in context
+3. Verify no new entries created during this period (gap created)
+4. Change `HistoricalEntries` to 5 via `SetParams`
+5. Generate block 111 by calling `TrackHistoricalInfo` with height 111 in context
+6. Count total entries using `GetAllHistoricalInfo`
 
 **Result:**
-- Panic with message "negative coin amount" when `AllocateTokensToValidator` attempts `tokens.Sub(commission)` operation on negative token amounts
-- This panic would halt all nodes processing blocks with these parameters in production
-
-**Note:**
-Existing allocation tests use valid parameters with sum = 0.07 (2% + 1% + 4%): [11](#0-10) 
-
-The vulnerability test would follow the same structure but use invalid combined parameters.
+- Expected after block 111: 5 entries (heights 107-111)
+- Actual after block 111: 101 entries (heights 1-100 + 111)
+- This proves old entries are never pruned when gaps exist, violating the `HistoricalEntries` bound
 
 ## Notes
 
-This vulnerability is validated because it meets all acceptance criteria:
-1. The system has an explicit invariant (ValidateBasic checks sum ≤ 1.0) that is bypassed during governance updates
-2. Causes total network shutdown matching the impact category "Network not being able to confirm new transactions"
-3. BeginBlock has no panic recovery, confirmed by codebase analysis
-4. Developer precedent with ConsensusParams confirms this pattern requires explicit fixes
-5. While governance-controlled, meets the exception clause: inadvertent trigger causing unrecoverable failure beyond intended authority - the system should enforce its own invariants
+This vulnerability is called every block through `BeginBlocker`, making it production-critical. The flaw stems from an incorrect assumption that entries form a "continuous range," which is violated by legitimate governance operations that temporarily set `HistoricalEntries=0`. This is not a misconfiguration but a code bug triggered by explicitly supported parameter values, causing an unrecoverable security failure beyond governance's intended authority. While governance is trusted to change parameters, setting any valid parameter value should not cause permanent, unfixable storage issues that require a hard fork to resolve.
 
 ### Citations
 
-**File:** x/distribution/keeper/allocation.go (L82-84)
+**File:** x/staking/keeper/historical_info.go (L75-75)
 ```go
-	communityTax := k.GetCommunityTax(ctx)
-	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
-	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
+	// Since the entries to be deleted are always in a continuous range, we can iterate
 ```
 
-**File:** x/distribution/keeper/allocation.go (L111-114)
+**File:** x/staking/keeper/historical_info.go (L78-85)
 ```go
-func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
-	// split tokens between validator and delegators according to commission
-	commission := tokens.MulDec(val.GetCommission())
-	shared := tokens.Sub(commission)
-```
-
-**File:** types/dec_coin.go (L303-309)
-```go
-func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
-	diff, hasNeg := coins.SafeSub(coinsB)
-	if hasNeg {
-		panic("negative coin amount")
-	}
-
-	return diff
-```
-
-**File:** x/distribution/types/params.go (L67-71)
-```go
-	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
-		return fmt.Errorf(
-			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
-		)
+	for i := ctx.BlockHeight() - int64(entryNum); i >= 0; i-- {
+		_, found := k.GetHistoricalInfo(ctx, i)
+		if found {
+			k.DeleteHistoricalInfo(ctx, i)
+		} else {
+			break
+		}
 	}
 ```
 
-**File:** x/distribution/types/params.go (L76-131)
+**File:** x/staking/keeper/historical_info.go (L88-89)
 ```go
-func validateCommunityTax(i interface{}) error {
-	v, ok := i.(sdk.Dec)
+	if entryNum == 0 {
+		return
+```
+
+**File:** x/staking/types/params.go (L24-24)
+```go
+	DefaultMaxValidators uint32 = 35
+```
+
+**File:** x/staking/types/params.go (L29-32)
+```go
+	// DefaultHistorical entries is 10000. Apps that don't use IBC can ignore this
+	// value by not adding the staking module to the application module manager's
+	// SetOrderBeginBlockers.
+	DefaultHistoricalEntries uint32 = 10000
+```
+
+**File:** x/staking/types/params.go (L242-248)
+```go
+func validateHistoricalEntries(i interface{}) error {
+	_, ok := i.(uint32)
 	if !ok {
 		return fmt.Errorf("invalid parameter type: %T", i)
 	}
 
-	if v.IsNil() {
-		return fmt.Errorf("community tax must be not nil")
-	}
-	if v.IsNegative() {
-		return fmt.Errorf("community tax must be positive: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("community tax too large: %s", v)
-	}
-
 	return nil
-}
+```
 
-func validateBaseProposerReward(i interface{}) error {
-	v, ok := i.(sdk.Dec)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
+**File:** x/staking/types/historical_info.go (L15-27)
+```go
+// NewHistoricalInfo will create a historical information struct from header and valset
+// it will first sort valset before inclusion into historical info
+func NewHistoricalInfo(header tmproto.Header, valSet Validators, powerReduction sdk.Int) HistoricalInfo {
+	// Must sort in the same way that tendermint does
+	sort.SliceStable(valSet, func(i, j int) bool {
+		return ValidatorsByVotingPower(valSet).Less(i, j, powerReduction)
+	})
 
-	if v.IsNil() {
-		return fmt.Errorf("base proposer reward must be not nil")
+	return HistoricalInfo{
+		Header: header,
+		Valset: valSet,
 	}
-	if v.IsNegative() {
-		return fmt.Errorf("base proposer reward must be positive: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("base proposer reward too large: %s", v)
-	}
-
-	return nil
-}
-
-func validateBonusProposerReward(i interface{}) error {
-	v, ok := i.(sdk.Dec)
-	if !ok {
-		return fmt.Errorf("invalid parameter type: %T", i)
-	}
-
-	if v.IsNil() {
-		return fmt.Errorf("bonus proposer reward must be not nil")
-	}
-	if v.IsNegative() {
-		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
-	}
-	if v.GT(sdk.OneDec()) {
-		return fmt.Errorf("bonus proposer reward too large: %s", v)
-	}
-
-	return nil
 }
 ```
 
-**File:** x/params/proposal_handler.go (L26-43)
+**File:** x/staking/keeper/params.go (L82-84)
 ```go
-func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
-	for _, c := range p.Changes {
-		ss, ok := k.GetSubspace(c.Subspace)
-		if !ok {
-			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
-		}
+// set the params
+func (k Keeper) SetParams(ctx sdk.Context, params types.Params) {
+	k.paramstore.SetParamSet(ctx, &params)
+```
 
-		k.Logger(ctx).Info(
-			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
-		)
-
-		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
-			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
-		}
-	}
-
-	return nil
+**File:** x/staking/simulation/genesis.go (L34-37)
+```go
+// getHistEntries returns randomized HistoricalEntries between 0-100.
+func getHistEntries(r *rand.Rand) uint32 {
+	return uint32(r.Intn(int(types.DefaultHistoricalEntries + 1)))
 }
 ```
 
-**File:** x/params/types/subspace.go (L196-219)
+**File:** x/staking/abci.go (L15-18)
 ```go
-func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
-	attr, ok := s.table.m[string(key)]
-	if !ok {
-		panic(fmt.Sprintf("parameter %s not registered", string(key)))
-	}
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+	defer telemetry.ModuleMeasureSince(types.ModuleName, time.Now(), telemetry.MetricKeyBeginBlocker)
 
-	ty := attr.ty
-	dest := reflect.New(ty).Interface()
-	s.GetIfExists(ctx, key, dest)
-
-	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
-		return err
-	}
-
-	// destValue contains the dereferenced value of dest so validation function do
-	// not have to operate on pointers.
-	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
-	if err := s.Validate(ctx, key, destValue); err != nil {
-		return err
-	}
-
-	s.Set(ctx, key, dest)
-	return nil
-}
-```
-
-**File:** x/distribution/types/genesis.go (L44-50)
-```go
-// ValidateGenesis validates the genesis state of distribution genesis input
-func ValidateGenesis(gs *GenesisState) error {
-	if err := gs.Params.ValidateBasic(); err != nil {
-		return err
-	}
-	return gs.FeePool.ValidateGenesis()
-}
-```
-
-**File:** x/distribution/abci.go (L29-31)
-```go
-	if ctx.BlockHeight() > 1 {
-		previousProposer := k.GetPreviousProposerConsAddr(ctx)
-		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
-```
-
-**File:** x/params/types/proposal/proposal.go (L101-109)
-```go
-		// We need to verify ConsensusParams since they are only validated once the proposal passes.
-		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
-		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
-		// Therefore, we validate when we get a param-change msg for ConsensusParams
-		if pc.Subspace == "baseapp" {
-			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
-				return err
-			}
-		}
-```
-
-**File:** x/distribution/keeper/allocation_test.go (L54-63)
-```go
-	testDistrParms := disttypes.Params{
-		CommunityTax:        sdk.NewDecWithPrec(2, 2), // 2%
-		BaseProposerReward:  sdk.NewDecWithPrec(1, 2), // 1%
-		BonusProposerReward: sdk.NewDecWithPrec(4, 2), // 4%
-		WithdrawAddrEnabled: true,
-	}
-	app.DistrKeeper.SetParams(
-		ctx,
-		testDistrParms,
-	)
+	k.TrackHistoricalInfo(ctx)
 ```

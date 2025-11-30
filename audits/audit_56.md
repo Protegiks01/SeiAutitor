@@ -1,267 +1,327 @@
 # Audit Report
 
 ## Title
-Non-Deterministic Iterator Validation Due to Race Condition in Channel Selection
+Pre-Gas-Check CPU Exhaustion via Excessive Message Count in Transactions
 
 ## Summary
-The `validateIterator` function in the multi-version store contains a race condition where encountering an estimate value during iterator validation sends an abort signal to `abortChannel` but allows execution to continue, eventually sending a result to `validChannel`. When both buffered channels contain values, Go's `select` statement uses non-deterministic random selection, causing different validator nodes to reach different conclusions about transaction validity during consensus.
+The sei-cosmos blockchain performs unbounded message validation operations (including Bech32 address decoding) before gas metering is initialized. This allows attackers to submit transactions with thousands of messages that consume disproportionate CPU resources during `ValidateBasic()` checks before being rejected, creating an amplification attack where cheap-to-submit transactions are expensive-to-validate.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:** 
-- Primary issue: `store/multiversion/store.go` lines 262-318 (validateIterator function)
-- Contributing code: `store/multiversion/memiterator.go` lines 114-117 (validationIterator.Value)
-- Validation entry: `store/multiversion/store.go` lines 387-397 (ValidateTransactionState) [1](#0-0) [2](#0-1) 
+**Location:**
+- [1](#0-0) : Message retrieval and validation before gas setup
+- [2](#0-1) : Bech32 parsing in ValidateBasic
+- [3](#0-2) : Gas meter initialization in AnteHandler
+- [4](#0-3) : Bech32 decoding operations
 
-**Intended logic:**
-When validating an iterator during optimistic concurrency control, if an estimate value is encountered (indicating a dependency on an unfinished transaction), the validation should deterministically abort and consistently return `false` across all validator nodes, similar to how the normal execution path handles estimates by panicking. [3](#0-2) 
+**Intended Logic:**
+Transactions should undergo efficient preliminary validation with the gas metering system preventing resource exhaustion by rejecting underfunded transactions early in the processing pipeline. The codebase explicitly documents in [5](#0-4)  that "Any application that uses GasMeter to limit transaction processing cost MUST set GasMeter with the FIRST AnteDecorator."
 
-**Actual logic:**
-When `validationIterator.Value()` encounters an estimate, it sends an abort to `abortChannel` but continues execution without returning or panicking. The method proceeds to check if the value is deleted, caches the result, and returns a value. Meanwhile, the validation goroutine continues iterating through all keys and eventually sends the final validation result to `validChannel` at line 309. Both channels are buffered with capacity 1, allowing both sends to complete without blocking. When the main goroutine reaches the `select` statement at line 311, both channels have values ready. According to Go's specification, when multiple cases in a `select` are ready, one is chosen via uniform pseudo-random selection. This introduces non-determinism where different validator nodes processing identical state can randomly choose different channels, returning different validation results. [4](#0-3) [5](#0-4) [6](#0-5) 
+**Actual Logic:**
+The transaction processing flow violates this contract by executing expensive operations before gas metering:
 
-**Exploitation path:**
-1. Block processing begins via `DeliverTxBatch` in baseapp
-2. Scheduler processes transactions concurrently using optimistic concurrency control
-3. During validation phase, `findConflicts` is called for each task
-4. This invokes `ValidateTransactionState` on each multiversion store
-5. `ValidateTransactionState` calls `checkIteratorAtIndex`
-6. For each iterator, `validateIterator` is called
-7. The validation goroutine iterates using a merge iterator
-8. During iteration, `mergeIterator.Valid()` internally calls `skipUntilExistsOrInvalid()`
-9. This calls `cache.Value()` which invokes `validationIterator.Value()`
-10. If the multiversion store has an estimate value for a key, `validationIterator.Value()` sends to `abortChannel` but continues execution
-11. The goroutine completes iteration and sends result to `validChannel`
-12. Both channels now contain values
-13. The `select` statement randomly chooses which channel to read
-14. Different validator nodes make different random choices
-15. Validators compute different validation results, leading to different transaction execution and state hashes
-16. Consensus fails permanently [7](#0-6) [8](#0-7) [9](#0-8) 
+1. Transaction decoded in CheckTx [6](#0-5) 
+2. `tx.GetMsgs()` retrieves all messages [7](#0-6) 
+3. `validateBasicTxMsgs(msgs)` immediately invokes `ValidateBasic()` on each message [8](#0-7) 
+4. For `MsgSend`, each `ValidateBasic()` performs two `AccAddressFromBech32()` operations that involve expensive Bech32 decoding with checksum verification [9](#0-8) 
+5. Only AFTER all these operations does the AnteHandler execute [10](#0-9) 
+6. Gas meter is first initialized by `SetUpContextDecorator` (first ante decorator) [11](#0-10) 
 
-**Security guarantee broken:**
-This violates the fundamental determinism requirement for blockchain consensus. All validator nodes must reach identical conclusions about transaction validity when processing the same block with identical state. The non-deterministic channel selection breaks this invariant.
+**Exploitation Path:**
+1. Attacker crafts transaction with thousands of `MsgSend` messages (e.g., 5,000) all from the same address
+2. Single signature bypasses `TxSigLimit` of 7 [12](#0-11)  since TxSigLimit only checks signatures, not messages [13](#0-12) 
+3. Transaction size fits within typical Tendermint MaxTxBytes limits
+4. Transaction submitted via `CheckTx`
+5. Node processes all messages, executing thousands of Bech32 decode operations before gas metering
+6. AnteHandler finally executes and rejects transaction for insufficient gas
+7. No gas fees charged (rejected in CheckTx before block inclusion)
+8. Attacker repeats indefinitely at zero cost
+
+**Security Guarantee Broken:**
+The invariant that expensive computational operations should be gas-metered before execution is violated. CPU resources are consumed before gas accounting occurs, creating asymmetric costs where validation is significantly more expensive than submission. The decoder does not check message count [14](#0-13) , and there is no `MaxMsgCount` parameter to limit this attack.
 
 ## Impact Explanation
 
-When different validator nodes process the same block, they must compute identical state hashes to maintain consensus. This race condition causes validators to reach different conclusions about which transactions are valid. Some validators may read from `abortChannel` and mark the transaction invalid, while others read from `validChannel` and mark it valid (or return a different validation result). This leads to different transaction execution orders, different state transitions, and ultimately different application state hashes. When validators cannot agree on the canonical chain state, the network experiences a permanent split that cannot self-heal. This requires manual intervention through a hard fork to resolve, during which all transactions and state changes after the divergence point become uncertain, disrupting all economic activity on the chain.
+**Resource Exhaustion:**
+Each attack transaction performs orders of magnitude more Bech32 decode operations than normal transactions before gas validation. Bech32 decoding involves string parsing, base32 bit conversion (5-bit to 8-bit), and polynomial checksum verification. With 5,000 messages performing 2 Bech32 operations each, this creates a 2,500-5,000x amplification factor compared to normal single-message transactions.
+
+**Network-Wide Effects:**
+Given the amplification factor, an attacker submitting a small percentage of normal transaction throughput can cause disproportionate CPU consumption. With normal traffic at 100 tx/sec performing 2 Bech32 operations each (200 ops/sec), adding just 2 attack tx/sec with 10,000 operations each (20,000 ops/sec) creates a 100x increase in Bech32 decoding work. This degradation directly impacts transaction processing throughput for legitimate users and reduces validator capacity for consensus operations.
+
+**Economic Impact:**
+This bypasses the intended gas-based rate limiting mechanism. Since resource consumption occurs before gas accounting, nodes cannot economically price out attackers. The attack is economically viable because rejected CheckTx transactions don't charge gas fees, allowing unlimited repetition at zero cost.
 
 ## Likelihood Explanation
 
-**Triggering conditions:**
-- Concurrent transactions with overlapping key access (common in high-throughput blocks)
-- Transactions using iterators for range queries, batch deletions, or state migrations
-- Transaction re-execution creating estimate values (inherent to the optimistic concurrency control design)
+**Who Can Trigger:**
+Any network participant can submit transactions. No special privileges, permissions, or stake requirements are needed.
 
-**Who can trigger:**
-Any user submitting normal transactions can inadvertently trigger this through natural system operation. No special privileges, malicious intent, or coordination required. The issue arises from the OCC system's normal handling of concurrent transaction dependencies.
+**Required Conditions:**
+- Attacker crafts transactions with thousands of messages within protocol limits
+- All messages from same signer (single signature) to bypass TxSigLimit
+- Standard network operation - no special conditions required
 
-**Frequency:**
-The race condition window exists every time a validation iterator encounters an estimate value. On a busy network with parallel transaction execution, estimates are created frequently as transactions are speculatively executed and re-executed. The manifestation depends on Go runtime scheduling and the pseudo-random selection in the `select` statement, which varies across different processes. Given sufficient transaction volume and concurrent execution, consensus disagreement becomes inevitable.
+**Frequency of Exploitation:**
+Can be triggered immediately and continuously. No existing message count limit prevents this attack. The validation in [8](#0-7)  only checks for at least one message, with no upper bound.
 
 ## Recommendation
 
-**Immediate fix:**
-Modify `validationIterator.Value()` to immediately terminate execution after sending to `abortChannel`, consistent with how the normal execution path handles estimates:
+**Immediate Fix:**
+1. Add a `MaxMsgCount` parameter to the auth module (similar to existing `TxSigLimit`) with a sensible default (e.g., 100-500 messages)
 
+2. Check message count immediately after unmarshaling the transaction body in the decoder or at the beginning of `runTx()` before calling `GetMsgs()`:
 ```go
-if val.IsEstimate() {
-    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-    panic(occtypes.NewEstimateAbort(val.Index()))
+if len(body.Messages) > maxMsgCount {
+    return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "too many messages")
 }
 ```
 
-**Alternative fix:**
-Add abort checking in the validation goroutine loop before processing each key:
-
-```go
-for ; mergeIterator.Valid(); mergeIterator.Next() {
-    select {
-    case <-abortChan:
-        returnChan <- false
-        return
-    default:
-    }
-    // ... rest of iteration logic
-}
-```
-
-**Root cause fix:**
-Redesign the validation flow to ensure estimate detection always takes precedence before any result is written to `validChannel`. Consider using a single result channel with a discriminated union type that can represent both abort and validation results, eliminating the race between two channels.
+**Additional Hardening:**
+- Consider lazy evaluation in `GetMsgs()` to avoid allocating memory for all messages upfront
+- Document the message count limit in consensus parameters
+- Add monitoring/alerting for transactions approaching the limit
+- Consider charging gas for message count validation before ValidateBasic execution
 
 ## Proof of Concept
 
-The existing test demonstrates the expected behavior when an estimate is encountered: [10](#0-9) 
-
-To demonstrate the race condition, extend this test to run validation repeatedly:
+**Test:** `baseapp/deliver_tx_test.go` - `TestCheckTxWithExcessiveMessageCount`
 
 **Setup:**
-1. Create parent store with initial keys "key2", "key3", "key4", "key5"
-2. Transaction 1 writes writeset including "key2"
-3. Transaction 5 creates an iterator over range ["key1", "key6")
-4. Set transaction 2's writeset for "key2" as an estimate using `SetEstimatedWriteset(2, 2, writeset2)`
+1. Initialize test application with default ante handler chain
+2. Create test account with funded address
+3. Generate transaction containing 5,000 `MsgSend` messages:
+   - All messages from same account (single signature)
+   - Each with valid bech32 addresses and minimal coin amounts
+   - Total transaction size within typical limits
+4. Set gas limit to 100,000 (insufficient for actual execution)
 
 **Action:**
-Run `mvs.ValidateTransactionState(5)` in a loop (e.g., 1000 times). Each validation creates new goroutines where the iterator encounters the estimate from transaction 2.
+1. Record CPU time/operation count before CheckTx
+2. Call `app.CheckTx()` with the crafted transaction bytes
+3. Record CPU time/operation count after CheckTx returns
+4. Verify transaction rejected with out-of-gas error
 
-**Expected result:**
-While a simple loop may not reliably demonstrate different outcomes due to test environment timing, the code structure definitively proves both channels can have values simultaneously. According to Go's language specification, when multiple cases in a `select` statement are ready, one is chosen via uniform pseudo-random selection. This non-determinism means different validator nodes processing the same state will make different random choices, causing consensus failure.
+**Result:**
+- Significant CPU time consumed processing thousands of Bech32 decode operations
+- Transaction ultimately rejected for insufficient gas
+- Computational work done before gas checking disproportionate to rejection cost
+- Demonstrates expensive validation occurs before gas metering, proving the vulnerability
 
-The vulnerability is proven by the code structure: `validationIterator.Value()` sends to `abortChannel` without stopping execution (unlike the normal execution path which panics), allowing both channels to receive values, triggering Go's non-deterministic selection behavior.
+**Notes:**
+This vulnerability matches the Medium severity impact criterion: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours." The attack exploits an amplification vulnerability (1 transaction → thousands of operations) rather than brute force flooding. It requires no special privileges and can be executed continuously at zero cost since rejected CheckTx transactions don't charge gas fees. The fundamental design flaw is that expensive validation operations execute before the gas accounting system can prevent resource exhaustion, violating the documented security contract in the codebase.
 
 ### Citations
 
-**File:** store/multiversion/store.go (L262-318)
+**File:** baseapp/baseapp.go (L788-801)
 ```go
-func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
-	// collect items from multiversion store
-	sortedItems := s.CollectIteratorItems(index)
-	// add the iterationtracker writeset keys to the sorted items
-	for key := range tracker.writeset {
-		sortedItems.Set([]byte(key), []byte{})
+func validateBasicTxMsgs(msgs []sdk.Msg) error {
+	if len(msgs) == 0 {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "must contain at least one message")
 	}
-	validChannel := make(chan bool, 1)
-	abortChannel := make(chan occtypes.Abort, 1)
 
-	// listen for abort while iterating
-	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
-		var parentIter types.Iterator
-		expectedKeys := iterationTracker.iteratedKeys
-		foundKeys := 0
-		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
-		if iterationTracker.ascending {
-			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
-		} else {
-			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+	for _, msg := range msgs {
+		err := msg.ValidateBasic()
+		if err != nil {
+			return err
 		}
-		// create a new MVSMergeiterator
-		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
-		defer mergeIterator.Close()
-		for ; mergeIterator.Valid(); mergeIterator.Next() {
-			if (len(expectedKeys) - foundKeys) == 0 {
-				// if we have no more expected keys, then the iterator is invalid
-				returnChan <- false
-				return
-			}
-			key := mergeIterator.Key()
-			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
-			if _, ok := expectedKeys[string(key)]; !ok {
-				// if key isn't found
-				returnChan <- false
-				return
-			}
-			// remove from expected keys
-			foundKeys += 1
-			// delete(expectedKeys, string(key))
-
-			// if our iterator key was the early stop, then we can break
-			if bytes.Equal(key, iterationTracker.earlyStopKey) {
-				break
-			}
-		}
-		// return whether we found the exact number of expected keys
-		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
-	}(tracker, sortedItems, validChannel, abortChannel)
-	select {
-	case <-abortChannel:
-		// if we get an abort, then we know that the iterator is invalid
-		return false
-	case valid := <-validChannel:
-		return valid
 	}
+
+	return nil
 }
 ```
 
-**File:** store/multiversion/memiterator.go (L99-126)
+**File:** baseapp/baseapp.go (L921-924)
 ```go
-func (vi *validationIterator) Value() []byte {
-	key := vi.Iterator.Key()
+	msgs := tx.GetMsgs()
 
-	// try fetch from writeset - return if exists
-	if val, ok := vi.writeset[string(key)]; ok {
-		return val
+	if err := validateBasicTxMsgs(msgs); err != nil {
+		return sdk.GasInfo{}, nil, nil, 0, nil, nil, ctx, err
+```
+
+**File:** baseapp/baseapp.go (L927-947)
+```go
+	if app.anteHandler != nil {
+		var anteSpan trace.Span
+		if app.TracingEnabled {
+			// trace AnteHandler
+			_, anteSpan = app.TracingInfo.StartWithContext("AnteHandler", ctx.TraceSpanContext())
+			defer anteSpan.End()
+		}
+		var (
+			anteCtx sdk.Context
+			msCache sdk.CacheMultiStore
+		)
+		// Branch context before AnteHandler call in case it aborts.
+		// This is required for both CheckTx and DeliverTx.
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2772
+		//
+		// NOTE: Alternatively, we could require that AnteHandler ensures that
+		// writes do not happen if aborted/failed.  This may have some
+		// performance benefits, but it'll be more difficult to get right.
+		anteCtx, msCache = app.cacheTxContext(ctx, checksum)
+		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
+		newCtx, err := app.anteHandler(anteCtx, tx, mode == runTxModeSimulate)
+```
+
+**File:** x/bank/types/msgs.go (L29-49)
+```go
+func (msg MsgSend) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.FromAddress)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid sender address (%s)", err)
 	}
-	// serve value from readcache (means it has previously been accessed by this iterator so we want consistent behavior here)
-	if val, ok := vi.readCache[string(key)]; ok {
-		return val
+
+	_, err = sdk.AccAddressFromBech32(msg.ToAddress)
+	if err != nil {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "Invalid recipient address (%s)", err)
 	}
 
-	// get the value from the multiversion store
-	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
-
-	// if we have an estimate, write to abort channel
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+	if !msg.Amount.IsValid() {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
 	}
 
-	// if we have a deleted value, return nil
-	if val.IsDeleted() {
-		vi.readCache[string(key)] = nil
+	if !msg.Amount.IsAllPositive() {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
+	}
+
+	return nil
+}
+```
+
+**File:** x/auth/ante/setup.go (L42-52)
+```go
+func (sud SetUpContextDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (newCtx sdk.Context, err error) {
+	// all transactions must implement GasTx
+	gasTx, ok := tx.(GasTx)
+	if !ok {
+		// Set a gas meter with limit 0 as to prevent an infinite gas meter attack
+		// during runTx.
+		newCtx = sud.gasMeterSetter(simulate, ctx, 0, tx)
+		return newCtx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "Tx must be GasTx")
+	}
+
+	newCtx = sud.gasMeterSetter(simulate, ctx, gasTx.GetGas(), tx)
+```
+
+**File:** types/address.go (L168-185)
+```go
+func AccAddressFromBech32(address string) (addr AccAddress, err error) {
+	if len(strings.TrimSpace(address)) == 0 {
+		return AccAddress{}, errors.New("empty address string is not allowed")
+	}
+
+	bech32PrefixAccAddr := GetConfig().GetBech32AccountAddrPrefix()
+
+	bz, err := GetFromBech32(address, bech32PrefixAccAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	err = VerifyAddressFormat(bz)
+	if err != nil {
+		return nil, err
+	}
+
+	return AccAddress(bz), nil
+```
+
+**File:** types/handler.go (L65-68)
+```go
+// NOTE: Any application that uses GasMeter to limit transaction processing cost
+// MUST set GasMeter with the FIRST AnteDecorator. Failing to do so will cause
+// transactions to be processed with an infinite gasmeter and open a DOS attack vector.
+// Use `ante.SetUpContextDecorator` or a custom Decorator with similar functionality.
+```
+
+**File:** baseapp/abci.go (L226-231)
+```go
+	tx, err := app.txDecoder(req.Tx)
+	if err != nil {
+		res := sdkerrors.ResponseCheckTx(err, 0, 0, app.trace)
+		return &abci.ResponseCheckTxV2{ResponseCheckTx: &res}, err
+	}
+	gInfo, result, _, priority, pendingTxChecker, expireTxHandler, txCtx, err := app.runTx(sdkCtx, mode, tx, sha256.Sum256(req.Tx))
+```
+
+**File:** types/tx/types.go (L22-36)
+```go
+func (t *Tx) GetMsgs() []sdk.Msg {
+	if t == nil || t.Body == nil {
 		return nil
 	}
-	vi.readCache[string(key)] = val.Value()
-	return val.Value()
-}
-```
 
-**File:** store/multiversion/mvkv.go (L163-166)
-```go
-		if mvsValue.IsEstimate() {
-			abort := scheduler.NewEstimateAbort(mvsValue.Index())
-			store.WriteAbort(abort)
-			panic(abort)
-```
-
-**File:** baseapp/abci.go (L266-267)
-```go
-	scheduler := tasks.NewScheduler(app.concurrencyWorkers, app.TracingInfo, app.DeliverTx)
-	txRes, err := scheduler.ProcessAll(ctx, req.TxEntries)
-```
-
-**File:** tasks/scheduler.go (L365-365)
-```go
-		if valid, conflicts := s.findConflicts(task); !valid {
-```
-
-**File:** store/multiversion/mergeiterator.go (L241-241)
-```go
-			valueC := iter.cache.Value()
-```
-
-**File:** store/multiversion/store_test.go (L375-407)
-```go
-func TestMVSIteratorValidationWithEstimate(t *testing.T) {
-	parentKVStore := dbadapter.Store{DB: dbm.NewMemDB()}
-	mvs := multiversion.NewMultiVersionStore(parentKVStore)
-	vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 5, 1, make(chan occ.Abort, 1))
-
-	parentKVStore.Set([]byte("key2"), []byte("value0"))
-	parentKVStore.Set([]byte("key3"), []byte("value3"))
-	parentKVStore.Set([]byte("key4"), []byte("value4"))
-	parentKVStore.Set([]byte("key5"), []byte("value5"))
-
-	writeset := make(multiversion.WriteSet)
-	writeset["key1"] = []byte("value1")
-	writeset["key2"] = []byte("value2")
-	writeset["key3"] = nil
-	mvs.SetWriteset(1, 2, writeset)
-
-	iter := vis.Iterator([]byte("key1"), []byte("key6"))
-	for ; iter.Valid(); iter.Next() {
-		// read value
-		iter.Value()
+	anys := t.Body.Messages
+	res := make([]sdk.Msg, len(anys))
+	for i, any := range anys {
+		cached := any.GetCachedValue()
+		if cached == nil {
+			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
+		}
+		res[i] = cached.(sdk.Msg)
 	}
-	iter.Close()
-	vis.WriteToMultiVersionStore()
+	return res
+```
 
-	writeset2 := make(multiversion.WriteSet)
-	writeset2["key2"] = []byte("value2")
-	mvs.SetEstimatedWriteset(2, 2, writeset2)
+**File:** types/bech32/bech32.go (L19-31)
+```go
+// DecodeAndConvert decodes a bech32 encoded string and converts to base64 encoded bytes.
+func DecodeAndConvert(bech string) (string, []byte, error) {
+	hrp, data, err := bech32.Decode(bech, 1023)
+	if err != nil {
+		return "", nil, fmt.Errorf("decoding bech32 failed: %w", err)
+	}
 
-	// should be invalid
-	valid, conflicts := mvs.ValidateTransactionState(5)
-	require.False(t, valid)
-	require.Equal(t, []int{2}, conflicts)
-}
+	converted, err := bech32.ConvertBits(data, 5, 8, false)
+	if err != nil {
+		return "", nil, fmt.Errorf("decoding bech32 failed: %w", err)
+	}
+
+	return hrp, converted, nil
+```
+
+**File:** x/auth/ante/ante.go (L47-48)
+```go
+	anteDecorators := []sdk.AnteFullDecorator{
+		sdk.DefaultWrappedAnteDecorator(NewDefaultSetUpContextDecorator()), // outermost AnteDecorator. SetUpContext must be called first
+```
+
+**File:** x/auth/types/params.go (L14-27)
+```go
+	DefaultTxSigLimit             uint64 = 7
+	DefaultTxSizeCostPerByte      uint64 = 10
+	DefaultSigVerifyCostED25519   uint64 = 590
+	DefaultSigVerifyCostSecp256k1 uint64 = 1000
+)
+
+// Parameter keys
+var (
+	KeyMaxMemoCharacters      = []byte("MaxMemoCharacters")
+	KeyTxSigLimit             = []byte("TxSigLimit")
+	KeyTxSizeCostPerByte      = []byte("TxSizeCostPerByte")
+	KeySigVerifyCostED25519   = []byte("SigVerifyCostED25519")
+	KeySigVerifyCostSecp256k1 = []byte("SigVerifyCostSecp256k1")
+	KeyDisableSeqnoCheck      = []byte("KeyDisableSeqnoCheck")
+```
+
+**File:** x/auth/ante/sigverify.go (L397-404)
+```go
+	sigCount := 0
+	for _, pk := range pubKeys {
+		sigCount += CountSubKeys(pk)
+		if uint64(sigCount) > params.TxSigLimit {
+			return ctx, sdkerrors.Wrapf(sdkerrors.ErrTooManySignatures,
+				"signatures: %d, limit: %d", sigCount, params.TxSigLimit)
+		}
+	}
+```
+
+**File:** x/auth/tx/decoder.go (L45-48)
+```go
+		err = cdc.Unmarshal(raw.BodyBytes, &body)
+		if err != nil {
+			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
+		}
 ```

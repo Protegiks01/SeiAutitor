@@ -1,409 +1,238 @@
+Based on my thorough investigation of the codebase, I will validate this security claim.
+
+## Code Verification
+
+I've confirmed the following technical facts:
+
+1. **Missing nil check exists**: The voter reward allocation loop at lines 91-102 of `allocation.go` does NOT check if the validator is nil before calling `AllocateTokensToValidator`. [1](#0-0) 
+
+2. **Nil causes panic**: The `AllocateTokensToValidator` function immediately dereferences the validator interface at line 113, which will panic if nil. [2](#0-1) 
+
+3. **Proposer path has defensive nil check**: In contrast, the proposer reward allocation includes a nil check with detailed warning comments about this exact scenario. [3](#0-2) 
+
+4. **Validator removal confirmed**: When validators have zero delegator shares and are unbonded, they are removed including their consensus address mapping. [4](#0-3) [5](#0-4) 
+
+5. **ValidatorByConsAddr returns nil when not found**: [6](#0-5) 
+
+6. **Code explicitly supports instant unbonding**: The validation allows any positive unbonding duration, and comments explicitly acknowledge instant unbonding scenarios. [7](#0-6) [8](#0-7) 
+
+## Critical Analysis: Is Short Unbonding a "Privileged Misconfiguration"?
+
+While setting the unbonding period requires governance (a privileged action), this does NOT disqualify the vulnerability because:
+
+1. **The code is explicitly designed to support it**: Validation allows any positive value, and comments acknowledge instant unbonding as a supported scenario for tests
+2. **Inconsistent defensive programming proves it's a bug**: The proposer reward path includes nil checking for this exact scenario, while the voter path lacks it - this inconsistency indicates an oversight, not intentional design
+3. **Exceeds intended authority**: A governance decision to use short unbonding (for testnets/testing) causing total network shutdown goes far beyond the intended scope of that parameter change
+4. **Not a "misconfiguration"**: If the code is designed to support it, using it isn't a misconfiguration - the BUG is that the code fails to handle its own supported scenarios
+
+The platform exception clause applies: "unless even a trusted role inadvertently triggering it would cause an unrecoverable security failure beyond their intended authority."
+
+## Impact Classification Correction
+
+The report claims HIGH impact, but according to the provided impact categories, "Network not being able to confirm new transactions (total network shutdown)" is explicitly classified as **MEDIUM** impact, not HIGH.
+
 # Audit Report
 
 ## Title
-Deferred Fee Cache Never Flushed Leading to Permanent Loss of Transaction Fees
+Network Halt Due to Missing Nil Check in Validator Reward Allocation Loop
 
 ## Summary
-The bank module's deferred cache mechanism collects transaction fees but fails to flush them to module accounts because the bank module lacks an EndBlock implementation. All transaction fees are permanently lost as they remain trapped in the deferred cache, never reaching the fee collector account for validator distribution.
+The `AllocateTokens` function in `x/distribution/keeper/allocation.go` lacks a nil check when allocating rewards to validators who voted in the previous block. When a validator is removed from state between voting and reward distribution (possible with short unbonding periods that the code explicitly supports), the code attempts to dereference a nil validator interface, causing a deterministic panic that crashes all nodes simultaneously and halts the network.
 
 ## Impact
-High
+Medium
 
 ## Finding Description
 
-**Location:**
-- Primary issue: [1](#0-0) 
-- Fee deduction entry point: [2](#0-1) 
-- Cache storage: [3](#0-2) 
-- Unreachable flush function: [4](#0-3) 
+- **Location**: `x/distribution/keeper/allocation.go` lines 91-102
 
-**Intended Logic:**
-The code comment explicitly documents the intended behavior: [5](#0-4) 
+- **Intended logic**: The reward allocation loop should safely distribute fees to all validators who participated in consensus, handling edge cases where validators may have been removed from state between the voting phase and reward distribution phase.
 
-The intended flow:
-1. Transaction fees → `DeferredSendCoinsFromAccountToModule` deducts from user and stores in cache
-2. EndBlock → bank module calls `WriteDeferredBalances` to flush cache to module accounts
-3. BeginBlock → distribution module retrieves and distributes fees to validators
+- **Actual logic**: The code retrieves validators via `ValidatorByConsAddr` without checking for nil before passing them to `AllocateTokensToValidator`. When the validator is nil, the immediate call to `val.GetCommission()` causes a nil pointer dereference panic. [1](#0-0) [2](#0-1) 
 
-**Actual Logic:**
-1. Ante handler processes fees via `DeferredSendCoinsFromAccountToModule` [2](#0-1) 
-2. User balance immediately reduced, fees stored in deferred cache [6](#0-5) 
-3. Module manager skips bank module during EndBlock because it doesn't implement the `EndBlockAppModule` interface [7](#0-6) 
-4. Fees persist in memory store across blocks [8](#0-7) 
-5. Distribution module queries actual balances only, excluding deferred cache [9](#0-8)  and [10](#0-9) 
-6. Zero fees distributed to validators
+- **Exploitation path**:
+  1. Block N: A bonded validator participates in consensus and votes. All delegations are removed via `Undelegate` transactions, causing `DelegatorShares` to reach zero.
+  2. Block N EndBlock: With a short unbonding period (which the code explicitly supports), the staking module processes validator state changes - `ApplyAndReturnValidatorSetUpdates` transitions the validator from Bonded → Unbonding, then `UnbondAllMatureValidators` immediately transitions from Unbonding → Unbonded, and since `DelegatorShares.IsZero()`, `RemoveValidator` deletes the validator including its consensus address mapping. [9](#0-8) [4](#0-3) 
+  3. Block N+1 BeginBlock: Distribution module's `BeginBlocker` calls `AllocateTokens` with votes from block N. `ValidatorByConsAddr` returns nil for the removed validator, and the code calls `AllocateTokensToValidator(ctx, nil, reward)` without checking nil, causing immediate panic in BeginBlock. [10](#0-9) [6](#0-5) 
 
-**Exploitation Path:**
-No attacker action required - occurs automatically during normal operation:
-1. Any user submits a transaction with fees
-2. Ante handler deducts fees from user account
-3. Fees stored in deferred cache, user balance reduced
-4. EndBlock executes but bank module has no EndBlock method, so module manager skips it
-5. Distribution BeginBlock queries fee collector balance: returns 0
-6. Fees permanently inaccessible in deferred cache, never flushed to actual balances
-
-**Security Guarantee Broken:**
-Fundamental accounting invariant violated: `total_supply = sum(all_account_balances)`. User balances decrease but no account is credited, causing systemic fund loss equal to all accumulated transaction fees.
+- **Security guarantee broken**: Network liveness and availability. BeginBlock must complete successfully for consensus to proceed. The panic violates the invariant that all state transitions must be handled gracefully without crashing the system.
 
 ## Impact Explanation
 
-**Direct Loss of Funds:** Every transaction fee is deducted from user accounts but never credited to the fee collector module account. The fees remain trapped in the deferred cache, which is:
-- Not included in balance queries used by distribution module
-- Never flushed to actual balances (no EndBlock implementation to call `WriteDeferredBalances`)
-- Permanently inaccessible for distribution to validators
+This vulnerability causes complete network shutdown when triggered. Since BeginBlock execution is deterministic and consensus-critical, all validators process identical state and crash at the same block height. This results in:
+- Total network halt - no new blocks can be produced
+- Loss of transaction finality - all pending transactions remain unprocessed
+- Requires emergency intervention - manual coordination among validators to restart nodes, potentially requiring a coordinated upgrade
 
-**Cascading Effects:**
-- **Broken validator economics**: Validators receive no fee rewards, fundamentally undermining network security incentives
-- **Accounting corruption**: Total supply tracking becomes incorrect as fees vanish from observable circulation
-- **Cumulative damage**: Problem compounds with every transaction across every block, with losses growing continuously
-
-This qualifies as **direct loss of funds** and **permanent freezing of funds requiring hard fork to fix** per the impact criteria.
+According to the impact classification provided, this qualifies as **Medium** severity: "Network not being able to confirm new transactions (total network shutdown)."
 
 ## Likelihood Explanation
 
-**Probability:** 100% - Occurs automatically on every transaction that includes fees
+**Who can trigger**: Any network participant with delegations can submit `Undelegate` transactions.
 
-**Who Can Trigger:** Any network participant submitting transactions (normal usage, not an attack)
+**Conditions**:
+1. Unbonding period configured to a short duration (the code's validation explicitly allows any positive value, including 1 nanosecond) [7](#0-6) 
+2. A validator must have all delegations removed in a single block
+3. The validator must participate in consensus during that block
 
-**Conditions Required:** None - this is the default behavior during normal network operation with standard transactions
+**Critical Evidence**: The code explicitly acknowledges instant unbonding as a supported scenario for tests. [8](#0-7) 
 
-**Evidence from Tests:** Multiple test files explicitly demonstrate that `WriteDeferredBalances` must be manually called after using `DeferredSendCoinsFromAccountToModule`: [11](#0-10) , [12](#0-11) , and [13](#0-12) 
-
-The test in `fee_test.go` explicitly demonstrates:
-- Fee collector balance remains 0 after ante handler processes fees
-- Manual call to `WriteDeferredBalances` is required
-- Only after manual flush does the fee collector balance increase by the expected fee amount
+The proposer reward allocation path includes a nil check with detailed warnings about this exact scenario, while the voter reward path lacks this same protection, proving this is an oversight in defensive programming. [11](#0-10) 
 
 ## Recommendation
 
-**Immediate Fix:**
-Implement an EndBlock method in the bank module's `AppModule` struct to flush the deferred cache. Add to `x/bank/module.go`:
-
-```go
-func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.ValidatorUpdate {
-    am.keeper.WriteDeferredBalances(ctx)
-    return []abci.ValidatorUpdate{}
-}
-```
-
-This will:
-1. Satisfy the `EndBlockAppModule` interface [14](#0-13) 
-2. Ensure module manager calls bank's EndBlock instead of skipping it
-3. Flush deferred fees to module accounts before distribution BeginBlock executes
-
-**Additional Measures:**
-- Add invariant checks to detect balance discrepancies between deferred cache and actual balances
-- The bank module is already listed in `OrderEndBlockers` [15](#0-14)  but was being skipped - this fix activates that ordering
-- Requires coordinated network upgrade to deploy the fix
+Add a nil check in the vote allocation loop, mirroring the defensive approach used for proposer rewards. When a validator is removed, their allocated rewards should remain in the pool and be added to the community pool at function end, maintaining consistency with proposer reward behavior.
 
 ## Proof of Concept
 
-The existing test suite provides proof of this vulnerability:
+**Test Location**: `x/distribution/keeper/allocation_test.go`
 
-**Setup:**
-- Initialize user account with balance
-- Initialize fee collector module account
-- Standard blockchain configuration
+**Setup**:
+1. Initialize test app with 1-nanosecond unbonding period via staking params
+2. Create a validator with minimal delegation (e.g., 100 tokens)
+3. Fund the fee collector module account with distributable fees
+4. Include the validator in the vote list for block N
 
-**Action:**
-1. Call `DeferredSendCoinsFromAccountToModule` (as ante handler does during fee processing)
-2. Do NOT call `WriteDeferredBalances` (mimicking production behavior where bank module has no EndBlock)
+**Action**:
+1. Submit `Undelegate` messages removing all delegations from the validator
+2. Call `staking.EndBlocker(ctx)` to process validator state changes (validator transitions Bonded → Unbonding → Unbonded → Removed)
+3. Call `distribution.BeginBlocker(ctx, req)` with `req.LastCommitInfo.Votes` containing the removed validator
 
-**Result:**
-1. User balance decreased by fee amount ✓
-2. Fee collector actual balance remains 0 ✓ (fees stuck in deferred cache)
-3. `GetAllBalances(feeCollector)` returns 0 ✓ (bypasses deferred cache)
-4. Distribution module sees 0 balance to distribute ✓
-5. Accounting invariant broken: fees permanently lost ✓
-
-The test evidence in [12](#0-11)  clearly demonstrates that without the manual call to `WriteDeferredBalances`, fees remain in the deferred cache and never reach the fee collector's actual balance, confirming the vulnerability in production code where this manual call does not exist.
+**Result**: Panic with nil pointer dereference when `AllocateTokens` attempts to call `val.GetCommission()` on the nil interface, causing BeginBlock to fail and halting the network.
 
 ## Notes
 
-This vulnerability is particularly critical because:
-1. The code documentation explicitly states the intended behavior that was never implemented
-2. The deferred cache infrastructure exists and is actively used for fee collection
-3. The critical flush operation exists but is unreachable due to missing EndBlock
-4. Memory stores persist across blocks, so fees accumulate indefinitely in an inaccessible state
-5. This affects the core economic mechanism of the blockchain (validator fee rewards)
-6. Every transaction with fees triggers this issue - 100% reproduction rate with zero special conditions
+This is a valid vulnerability despite requiring a short unbonding period configuration because:
+1. The code explicitly supports instant unbonding (validation allows any positive value, comments acknowledge it)
+2. The inconsistency between proposer (has nil check) and voter (lacks nil check) paths proves this is an oversight
+3. Even though governance controls the parameter, causing total network shutdown exceeds the intended scope of that parameter change
+4. Testnets commonly use short unbonding periods and are real networks that matter
+
+The impact classification is **Medium** (not High as claimed in the original report), as "total network shutdown" is explicitly categorized as Medium severity in the provided impact list.
 
 ### Citations
 
-**File:** x/bank/module.go (L107-210)
+**File:** x/distribution/keeper/allocation.go (L57-79)
 ```go
-// AppModule implements an application module for the bank module.
-type AppModule struct {
-	AppModuleBasic
+	if proposerValidator != nil {
+		ctx.EventManager().EmitEvent(
+			sdk.NewEvent(
+				types.EventTypeProposerReward,
+				sdk.NewAttribute(sdk.AttributeKeyAmount, proposerReward.String()),
+				sdk.NewAttribute(types.AttributeKeyValidator, proposerValidator.GetOperator().String()),
+			),
+		)
 
-	keeper        keeper.Keeper
-	accountKeeper types.AccountKeeper
-}
-
-// RegisterServices registers module services.
-func (am AppModule) RegisterServices(cfg module.Configurator) {
-	types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
-	types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
-
-	m := keeper.NewMigrator(am.keeper.(keeper.BaseKeeper))
-	cfg.RegisterMigration(types.ModuleName, 1, m.Migrate1to2)
-}
-
-// NewAppModule creates a new AppModule object
-func NewAppModule(cdc codec.Codec, keeper keeper.Keeper, accountKeeper types.AccountKeeper) AppModule {
-	return AppModule{
-		AppModuleBasic: AppModuleBasic{cdc: cdc},
-		keeper:         keeper,
-		accountKeeper:  accountKeeper,
+		k.AllocateTokensToValidator(ctx, proposerValidator, proposerReward)
+		remaining = remaining.Sub(proposerReward)
+	} else {
+		// previous proposer can be unknown if say, the unbonding period is 1 block, so
+		// e.g. a validator undelegates at block X, it's removed entirely by
+		// block X+1's endblock, then X+2 we need to refer to the previous
+		// proposer for X+1, but we've forgotten about them.
+		logger.Error(fmt.Sprintf(
+			"WARNING: Attempt to allocate proposer rewards to unknown proposer %s. "+
+				"This should happen only if the proposer unbonded completely within a single block, "+
+				"which generally should not happen except in exceptional circumstances (or fuzz testing). "+
+				"We recommend you investigate immediately.",
+			previousProposer.String()))
 	}
-}
+```
 
-// Name returns the bank module's name.
-func (AppModule) Name() string { return types.ModuleName }
+**File:** x/distribution/keeper/allocation.go (L91-102)
+```go
+	for _, vote := range bondedVotes {
+		validator := k.stakingKeeper.ValidatorByConsAddr(ctx, vote.Validator.Address)
 
-// RegisterInvariants registers the bank module invariants.
-func (am AppModule) RegisterInvariants(ir sdk.InvariantRegistry) {
-	keeper.RegisterInvariants(ir, am.keeper)
-}
+		// TODO: Consider micro-slashing for missing votes.
+		//
+		// Ref: https://github.com/cosmos/cosmos-sdk/issues/2525#issuecomment-430838701
+		powerFraction := sdk.NewDec(vote.Validator.Power).QuoTruncate(sdk.NewDec(totalPreviousPower))
+		reward := feeMultiplier.MulDecTruncate(powerFraction)
 
-// Route returns the message routing key for the bank module.
-func (am AppModule) Route() sdk.Route {
-	return sdk.NewRoute(types.RouterKey, NewHandler(am.keeper))
-}
+		k.AllocateTokensToValidator(ctx, validator, reward)
+		remaining = remaining.Sub(reward)
+	}
+```
 
-// QuerierRoute returns the bank module's querier route name.
-func (AppModule) QuerierRoute() string { return types.RouterKey }
+**File:** x/distribution/keeper/allocation.go (L111-115)
+```go
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
 
-// LegacyQuerierHandler returns the bank module sdk.Querier.
-func (am AppModule) LegacyQuerierHandler(legacyQuerierCdc *codec.LegacyAmino) sdk.Querier {
-	return keeper.NewQuerier(am.keeper, legacyQuerierCdc)
-}
+```
 
-// InitGenesis performs genesis initialization for the bank module. It returns
-// no validator updates.
-func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.RawMessage) []abci.ValidatorUpdate {
-	start := time.Now()
-	var genesisState types.GenesisState
-	cdc.MustUnmarshalJSON(data, &genesisState)
-	telemetry.MeasureSince(start, "InitGenesis", "crisis", "unmarshal")
+**File:** x/staking/keeper/validator.go (L176-176)
+```go
+	store.Delete(types.GetValidatorByConsAddrKey(valConsAddr))
+```
 
-	am.keeper.InitGenesis(ctx, &genesisState)
-	return []abci.ValidatorUpdate{}
-}
+**File:** x/staking/keeper/validator.go (L441-444)
+```go
+				val = k.UnbondingToUnbonded(ctx, val)
+				if val.GetDelegatorShares().IsZero() {
+					k.RemoveValidator(ctx, val.GetOperator())
+				}
+```
 
-// ExportGenesis returns the exported genesis state as raw bytes for the bank
-// module.
-func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
-	gs := am.keeper.ExportGenesis(ctx)
-	return cdc.MustMarshalJSON(gs)
-}
+**File:** x/staking/keeper/alias_functions.go (L88-96)
+```go
+// ValidatorByConsAddr gets the validator interface for a particular pubkey
+func (k Keeper) ValidatorByConsAddr(ctx sdk.Context, addr sdk.ConsAddress) types.ValidatorI {
+	val, found := k.GetValidatorByConsAddr(ctx, addr)
+	if !found {
+		return nil
+	}
 
-func (am AppModule) ExportGenesisStream(ctx sdk.Context, cdc codec.JSONCodec) <-chan json.RawMessage {
-	ch := make(chan json.RawMessage)
-	go func() {
-		ch <- am.ExportGenesis(ctx, cdc)
-		close(ch)
-	}()
-	return ch
-}
-
-// ConsensusVersion implements AppModule/ConsensusVersion.
-func (AppModule) ConsensusVersion() uint64 { return 2 }
-
-// AppModuleSimulation functions
-
-// GenerateGenesisState creates a randomized GenState of the bank module.
-func (AppModule) GenerateGenesisState(simState *module.SimulationState) {
-	simulation.RandomizedGenState(simState)
-}
-
-// ProposalContents doesn't return any content functions for governance proposals.
-func (AppModule) ProposalContents(_ module.SimulationState) []simtypes.WeightedProposalContent {
-	return nil
-}
-
-// RandomizedParams creates randomized bank param changes for the simulator.
-func (AppModule) RandomizedParams(r *rand.Rand) []simtypes.ParamChange {
-	return simulation.ParamChanges(r)
-}
-
-// RegisterStoreDecoder registers a decoder for supply module's types
-func (am AppModule) RegisterStoreDecoder(_ sdk.StoreDecoderRegistry) {}
-
-// WeightedOperations returns the all the gov module operations with their respective weights.
-func (am AppModule) WeightedOperations(simState module.SimulationState) []simtypes.WeightedOperation {
-	return simulation.WeightedOperations(
-		simState.AppParams, simState.Cdc, am.accountKeeper, am.keeper,
-	)
+	return val
 }
 ```
 
-**File:** x/auth/ante/fee.go (L208-208)
+**File:** x/staking/types/params.go (L167-178)
 ```go
-	err := bankKeeper.DeferredSendCoinsFromAccountToModule(ctx, acc.GetAddress(), types.FeeCollectorName, fees)
-```
+func validateUnbondingTime(i interface{}) error {
+	v, ok := i.(time.Duration)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
 
-**File:** x/bank/keeper/keeper.go (L406-406)
-```go
-// In the EndBlocker, it will then perform one deposit for each module account.
-```
-
-**File:** x/bank/keeper/keeper.go (L408-432)
-```go
-func (k BaseKeeper) DeferredSendCoinsFromAccountToModule(
-	ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amount sdk.Coins,
-) error {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
-	}
-	// Deducts Fees from the Sender Account
-	err := k.SubUnlockedCoins(ctx, senderAddr, amount, true)
-	if err != nil {
-		return err
-	}
-	// get recipient module address
-	moduleAcc := k.ak.GetModuleAccount(ctx, recipientModule)
-	if moduleAcc == nil {
-		panic(sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "module account %s does not exist", recipientModule))
-	}
-	// get txIndex
-	txIndex := ctx.TxIndex()
-	err = k.deferredCache.UpsertBalances(ctx, moduleAcc.GetAddress(), uint64(txIndex), amount)
-	if err != nil {
-		return err
+	if v <= 0 {
+		return fmt.Errorf("unbonding time must be positive: %d", v)
 	}
 
 	return nil
 }
 ```
 
-**File:** x/bank/keeper/keeper.go (L434-483)
+**File:** x/staking/keeper/val_state_change.go (L22-26)
 ```go
-// WriteDeferredDepositsToModuleAccounts Iterates on all the deferred deposits and deposit them into the store
-func (k BaseKeeper) WriteDeferredBalances(ctx sdk.Context) []abci.Event {
-	if k.deferredCache == nil {
-		panic("bank keeper created without deferred cache")
-	}
-	ctx = ctx.WithEventManager(sdk.NewEventManager())
+	// This fixes a bug when the unbonding period is instant (is the case in
+	// some of the tests). The test expected the validator to be completely
+	// unbonded after the Endblocker (go from Bonded -> Unbonding during
+	// ApplyAndReturnValidatorSetUpdates and then Unbonding -> Unbonded during
+	// UnbondAllMatureValidatorQueue).
+```
 
-	// maps between bech32 stringified module account address and balance
-	moduleAddrBalanceMap := make(map[string]sdk.Coins)
-	// slice of modules to be sorted for consistent write order later
-	moduleList := []string{}
-
-	// iterate over deferred cache and accumulate totals per module
-	k.deferredCache.IterateDeferredBalances(ctx, func(moduleAddr sdk.AccAddress, amount sdk.Coin) bool {
-		currCoins, ok := moduleAddrBalanceMap[moduleAddr.String()]
-		if !ok {
-			// add to list of modules
-			moduleList = append(moduleList, moduleAddr.String())
-			// set the map value
-			moduleAddrBalanceMap[moduleAddr.String()] = sdk.NewCoins(amount)
-			return false
-		}
-		// add to currCoins
-		newCoins := currCoins.Add(amount)
-		// update map
-		moduleAddrBalanceMap[moduleAddr.String()] = newCoins
-		return false
-	})
-	// sort module list
-	sort.Strings(moduleList)
-
-	// iterate through module list and add the balance to module bank balances in sorted order
-	for _, moduleBech32Addr := range moduleList {
-		amount, ok := moduleAddrBalanceMap[moduleBech32Addr]
-		if !ok {
-			err := fmt.Errorf("Failed to get module balance for writing deferred balances for address=%s", moduleBech32Addr)
-			ctx.Logger().Error(err.Error())
-			panic(err)
-		}
-		err := k.AddCoins(ctx, sdk.MustAccAddressFromBech32(moduleBech32Addr), amount, true)
+**File:** x/staking/keeper/val_state_change.go (L190-199)
+```go
+	for _, valAddrBytes := range noLongerBonded {
+		validator := k.mustGetValidator(ctx, sdk.ValAddress(valAddrBytes))
+		validator, err = k.bondedToUnbonding(ctx, validator)
 		if err != nil {
-			ctx.Logger().Error(fmt.Sprintf("Failed to add coin=%s to module address=%s, error is: %s", amount, moduleBech32Addr, err))
-			panic(err)
+			return
 		}
+		amtFromBondedToNotBonded = amtFromBondedToNotBonded.Add(validator.GetTokens())
+		k.DeleteLastValidatorPower(ctx, validator.GetOperator())
+		updates = append(updates, validator.ABCIValidatorUpdateZero())
 	}
-
-	// clear deferred cache
-	k.deferredCache.Clear(ctx)
-	return ctx.EventManager().ABCIEvents()
-}
 ```
 
-**File:** types/module/module.go (L226-229)
+**File:** x/distribution/abci.go (L29-32)
 ```go
-type EndBlockAppModule interface {
-	AppModule
-	EndBlock(sdk.Context, abci.RequestEndBlock) []abci.ValidatorUpdate
-}
-```
-
-**File:** types/module/module.go (L647-650)
-```go
-		module, ok := m.Modules[moduleName].(EndBlockAppModule)
-		if !ok {
-			continue
-		}
-```
-
-**File:** store/mem/store.go (L20-21)
-```go
-// Store implements an in-memory only KVStore. Entries are persisted between
-// commits and thus between blocks. State in Memory store is not committed as part of app state but maintained privately by each node
-```
-
-**File:** x/bank/keeper/view.go (L64-72)
-```go
-func (k BaseViewKeeper) GetAllBalances(ctx sdk.Context, addr sdk.AccAddress) sdk.Coins {
-	balances := sdk.NewCoins()
-	k.IterateAccountBalances(ctx, addr, func(balance sdk.Coin) bool {
-		balances = append(balances, balance)
-		return false
-	})
-
-	return balances.Sort()
-}
-```
-
-**File:** x/distribution/keeper/allocation.go (L26-26)
-```go
-	feesCollectedInt := k.bankKeeper.GetAllBalances(ctx, feeCollector.GetAddress())
-```
-
-**File:** x/bank/keeper/keeper_test.go (L679-679)
-```go
-	app.BankKeeper.WriteDeferredBalances(ctx)
-```
-
-**File:** x/auth/ante/fee_test.go (L176-193)
-```go
-	resultFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
-	suite.Assert().Equal(
-		expectedFeeCollectorBalance,
-		resultFeeCollectorBalance,
-	)
-
-	// Fee Collector actual account balance deposit coins into the fee collector account
-	suite.app.BankKeeper.WriteDeferredBalances(suite.ctx)
-
-	depositFeeCollectorBalance := suite.app.BankKeeper.GetBalance(suite.ctx, feeCollectorAcc.GetAddress(), "usei")
-
-	expectedAtomFee := feeAmount.AmountOf("usei")
-
-	suite.Assert().Equal(
-		// Called antehandler twice, expect fees to be deducted twice
-		expectedFeeCollectorBalance.Add(sdk.NewCoin("usei", expectedAtomFee)).Add(sdk.NewCoin("usei", expectedAtomFee)),
-		depositFeeCollectorBalance,
-	)
-```
-
-**File:** x/bank/keeper/deferred_cache_test.go (L66-66)
-```go
-	app.BankKeeper.WriteDeferredBalances(ctx)
-```
-
-**File:** simapp/app.go (L374-374)
-```go
-		capabilitytypes.ModuleName, authtypes.ModuleName, banktypes.ModuleName, distrtypes.ModuleName,
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+	}
 ```

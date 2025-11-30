@@ -1,202 +1,219 @@
 # Audit Report
 
 ## Title
-AllowedMsgAllowance Bypass via Nested MsgExec Messages
+Nil Pointer Dereference in Validation Iterator Causes Node Crash During Concurrent Writeset Modifications
 
 ## Summary
-The `AllowedMsgAllowance` feegrant restriction mechanism can be completely bypassed by wrapping disallowed message types inside an authz `MsgExec`. The AnteHandler only validates top-level messages when checking feegrant allowances, while execution proceeds with nested messages that were never validated against the allowance restrictions.
+The `validationIterator.Value()` function contains a nil pointer dereference vulnerability that occurs when `GetLatestBeforeIndex()` returns nil due to concurrent writeset modifications during optimistic concurrency control (OCC) validation, causing unrecovered panics that crash validator nodes. [1](#0-0) 
 
 ## Impact
-Medium (Direct loss of funds)
+Low
 
 ## Finding Description
 
-**Location:** [1](#0-0) [2](#0-1) [3](#0-2) [4](#0-3) [5](#0-4) 
+- **location**: `store/multiversion/memiterator.go` lines 99-126, specifically line 112-115
 
-**Intended Logic:**
-When a granter creates an `AllowedMsgAllowance` with specific message type restrictions (e.g., only allowing `/cosmos.gov.v1beta1.MsgVote`), the system should validate ALL messages in a transaction - including nested messages within wrapper types like `MsgExec` - against the allowed list before deducting fees from the feegrant.
+- **intended logic**: The validation iterator should safely handle concurrent modifications to the multiversion store during transaction validation. When keys are accessed, the system should either find valid values or gracefully handle missing entries.
 
-**Actual Logic:**
-The `DeductFeeDecorator` only validates top-level messages obtained via `sdkTx.GetMsgs()`. [2](#0-1)  When a transaction contains `MsgExec`, only the `MsgExec` message type itself is checked, never the nested messages inside it. [4](#0-3)  During execution, the authz module's `DispatchActions` has implicit acceptance logic: if the message signer equals the MsgExec grantee, no authorization check occurs. [5](#0-4)  This creates a complete bypass of the feegrant message type restrictions.
+- **actual logic**: At line 112, `GetLatestBeforeIndex()` is called without nil checking. This method can return nil when a key doesn't exist in the multiVersionMap or when no value exists before the specified index [2](#0-1) . The code immediately calls `val.IsEstimate()` at line 115 without checking if `val` is nil, causing a nil pointer dereference panic.
 
-**Exploitation Path:**
-1. Granter creates `AllowedMsgAllowance` with: `["/cosmos.gov.v1beta1.MsgVote", "/cosmos.authz.v1beta1.MsgExec"]`
-2. Attacker (grantee) constructs transaction with top-level message: `MsgExec{Grantee: Self, Msgs: [MsgSend{From: Self, To: Victim, Amount: X}]}`
-3. AnteHandler phase: `UseGrantedFees` receives `[MsgExec]` from `GetMsgs()` [1](#0-0) , validates only `MsgExec` type (passes), deducts fee from granter's account
-4. Execution phase: `MsgExec.Exec` extracts nested `[MsgSend]`, calls `DispatchActions(Self, [MsgSend])` [6](#0-5) 
-5. In `DispatchActions`: signer=Self, grantee=Self → implicit acceptance without authorization check [5](#0-4) 
-6. `MsgSend` executes successfully using feegrant funds, despite not being in allowed messages list
+- **exploitation path**:
+  1. Transaction T0 at index 0 writes key K to multiversion store
+  2. Transaction T1 at index 1 creates an iterator observing key K and persists iterateset
+  3. T0 is re-executed with a new incarnation (normal OCC behavior)
+  4. `SetWriteset()` triggers `removeOldWriteset()` which removes key K from index 0 [3](#0-2) 
+  5. T1 validation begins via `validateIterator()` which collects items at line 264 and launches a validation goroutine at line 273 [4](#0-3) 
+  6. Race condition window: Between collecting items and goroutine execution, another thread modifies writesets
+  7. During validation iteration, `mergeIterator` calls `validationIterator.Value()` which calls `GetLatestBeforeIndex()` for removed key K
+  8. Method returns nil, line 115 calls `val.IsEstimate()` on nil → panic
+  9. No panic recovery in the goroutine → node process crashes
 
-**Security Guarantee Broken:**
-The fundamental security guarantee of `AllowedMsgAllowance` - that feegrant funds will ONLY be used for explicitly approved message types - is completely violated for nested messages within `MsgExec`.
+- **security guarantee broken**: Memory safety and node availability during concurrent transaction processing.
 
 ## Impact Explanation
 
-This vulnerability enables complete unauthorized drainage of feegrant balances for ANY transaction type, regardless of the granter's intended restrictions. A granter who allocates funds specifically for governance voting (believing their funds will only pay for vote transactions) can have their entire feegrant balance drained for token transfers, staking operations, or any other message type. This breaks the trust model of restricted feegrants and represents a direct financial loss of the allocated funds to the granter.
+This vulnerability causes validator nodes to crash during normal high-concurrency transaction processing. The crash occurs due to a Time-of-Check-Time-of-Use (TOCTOU) race condition between when iterator keys are collected and when the validation goroutine reads those keys. During this window, concurrent writeset modifications can remove keys, leading to nil pointer dereferences.
+
+A crashed validator node cannot process new transactions, cannot participate in consensus voting, and requires manual operator restart. While the race condition timing is node-specific and depends on internal thread scheduling, nodes under similar high-load conditions may experience this issue, potentially affecting more than 10% of network validators.
 
 ## Likelihood Explanation
 
-**Likelihood: High**
+**Triggering Conditions:**
+- No special privileges required - occurs during normal concurrent transaction execution with OCC enabled
+- More likely during high transaction load when concurrent validations and re-executions are frequent
+- Timing-dependent race condition between internal validation and execution threads
 
-This vulnerability is highly likely to be exploited because:
-1. Granters commonly and reasonably include `MsgExec` in allowed message lists to enable authz-based operations
-2. No special permissions or prior setup required - any grantee with a feegrant containing `MsgExec` can exploit
-3. The exploit is straightforward: wrap any message in MsgExec with yourself as grantee
-4. Granters are unlikely to understand that including `MsgExec` effectively removes all message type restrictions
-5. The implicit acceptance logic in DispatchActions [5](#0-4)  means no authz grant setup is needed
+**Race Condition Window:**
+The vulnerability exploits a TOCTOU race between line 264 (`CollectIteratorItems()` snapshots keys) and lines 273-310 (validation goroutine execution). During this window, `SetWriteset()` in another thread can trigger `removeOldWriteset()`, removing keys that the validation iterator expects to read.
+
+**Probability:** Medium-Low - While timing-dependent and occurring during normal operation, this is an internal race condition whose timing varies per node based on thread scheduling and system load.
 
 ## Recommendation
 
-Modify `x/feegrant/filtered_fee.go` to recursively validate nested messages:
+Add a nil check in `validationIterator.Value()` before accessing the returned value:
 
-1. In `allMsgTypesAllowed()`, detect when a message is of type `MsgExec`
-2. For each `MsgExec` message, call its `GetMessages()` method to extract nested messages
-3. Recursively validate all nested messages against the allowed messages list
-4. Reject the transaction if ANY nested message (at any depth) has a type not in the allowed list
+```go
+val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
 
-The implementation should add recursive validation logic that unwraps `MsgExec` messages and checks all nested messages against the allowed list before accepting the feegrant usage.
+if val == nil {
+    vi.readCache[string(key)] = nil
+    return nil
+}
+
+if val.IsEstimate() {
+    vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
+}
+// ... rest of existing logic
+```
+
+This pattern is already used correctly in other parts of the codebase [5](#0-4)  and [6](#0-5) .
 
 ## Proof of Concept
 
-**Test Location:** `x/feegrant/filtered_fee_test.go`
+The vulnerability can be reproduced by creating a test in `store/multiversion/store_test.go`:
 
 **Setup:**
-- Create feegrant with `AllowedMsgAllowance` allowing only `["/cosmos.gov.v1beta1.MsgVote", "/cosmos.authz.v1beta1.MsgExec"]`
-- Create `MsgSend` with sender = grantee
-- Create `MsgExec` with grantee = self, containing the `MsgSend` as nested message
+1. Create multiversion store with parent KV store
+2. Transaction T0 (index 0) writes key "test_key" via `SetWriteset(0, 1, map[string][]byte{"test_key": []byte("value")})`
+3. Transaction T1 (index 1) creates iterator observing "test_key", closes it, and calls `WriteToMultiVersionStore()` to persist iterateset
 
 **Action:**
-- Test 1: Attempt transaction with direct `MsgSend` → correctly rejected by [4](#0-3) 
-- Test 2: Attempt transaction with `MsgExec` wrapping `MsgSend` → bypass succeeds because validation only checks top-level messages [2](#0-1) 
+1. Call `SetWriteset(0, 2, map[string][]byte{})` with empty writeset (new incarnation) - this triggers `removeOldWriteset()` which removes "test_key"
+2. Call `ValidateTransactionState(1)` to trigger validation
 
-**Result:**
-The vulnerability is confirmed when Test 2 passes validation despite `MsgSend` not being in the allowed messages list. The feegrant message type restriction is completely bypassed for nested messages within `MsgExec`.
+**Expected Result:**
+```
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation]
+at github.com/cosmos/cosmos-sdk/store/multiversion.(*validationIterator).Value()
+```
 
 ## Notes
 
-This is a critical design flaw in the interaction between the feegrant and authz modules. The vulnerability exists because:
-1. Fee validation happens at the AnteHandler level with only top-level messages [1](#0-0) 
-2. Message execution happens later with full nested message extraction [6](#0-5) 
-3. The authz module's implicit acceptance logic (when signer == grantee) [5](#0-4)  requires no prior authorization setup
-
-The impact qualifies as "Direct loss of funds" because the feegrant balance can be completely drained for unauthorized purposes, representing a direct financial loss to the granter who allocated those funds with specific restrictions.
+The vulnerability affects the core OCC validation mechanism. The combination of no nil checking in `validationIterator.Value()`, no panic recovery in the validation goroutine, and concurrent execution creates a memory safety issue that compromises node availability during normal transaction processing. The fix is straightforward (add nil check as done elsewhere in the codebase), and the pattern for proper nil handling already exists in the code at multiple locations.
 
 ### Citations
 
-**File:** x/auth/ante/fee.go (L168-168)
+**File:** store/multiversion/memiterator.go (L112-115)
 ```go
-			err := dfd.feegrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, fee, sdkTx.GetMsgs())
+	val := vi.mvStore.GetLatestBeforeIndex(vi.index, key)
+
+	// if we have an estimate, write to abort channel
+	if val.IsEstimate() {
 ```
 
-**File:** types/tx/types.go (L22-36)
+**File:** store/multiversion/store.go (L82-97)
 ```go
-func (t *Tx) GetMsgs() []sdk.Msg {
-	if t == nil || t.Body == nil {
+// GetLatestBeforeIndex implements MultiVersionStore.
+func (s *Store) GetLatestBeforeIndex(index int, key []byte) (value MultiVersionValueItem) {
+	keyString := string(key)
+	mvVal, found := s.multiVersionMap.Load(keyString)
+	// if the key doesn't exist in the overall map, return nil
+	if !found {
 		return nil
 	}
-
-	anys := t.Body.Messages
-	res := make([]sdk.Msg, len(anys))
-	for i, any := range anys {
-		cached := any.GetCachedValue()
-		if cached == nil {
-			panic("Any cached value is nil. Transaction messages must be correctly packed Any values.")
-		}
-		res[i] = cached.(sdk.Msg)
+	val, found := mvVal.(MultiVersionValue).GetLatestBeforeIndex(index)
+	// otherwise, we may have found a value for that key, but its not written before the index passed in
+	if !found {
+		return nil
 	}
-	return res
-```
-
-**File:** x/feegrant/filtered_fee.go (L65-86)
-```go
-func (a *AllowedMsgAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
-	if !a.allMsgTypesAllowed(ctx, msgs) {
-		return false, sdkerrors.Wrap(ErrMessageNotAllowed, "message does not exist in allowed messages")
-	}
-
-	allowance, err := a.GetAllowance()
-	if err != nil {
-		return false, err
-	}
-
-	remove, err := allowance.Accept(ctx, fee, msgs)
-	if err != nil {
-		return false, err
-	}
-
-	a.Allowance, err = types.NewAnyWithValue(allowance.(proto.Message))
-	if err != nil {
-		return false, err
-	}
-
-    return remove, nil
+	// found a value prior to the passed in index, return that value (could be estimate OR deleted, but it is a definitive value)
+	return val
 }
 ```
 
-**File:** x/feegrant/filtered_fee.go (L98-109)
+**File:** store/multiversion/store.go (L112-138)
 ```go
-func (a *AllowedMsgAllowance) allMsgTypesAllowed(ctx sdk.Context, msgs []sdk.Msg) bool {
-	msgsMap := a.allowedMsgsToMap(ctx)
-
-	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
-		if !msgsMap[sdk.MsgTypeURL(msg)] {
-			return false
+func (s *Store) removeOldWriteset(index int, newWriteSet WriteSet) {
+	writeset := make(map[string][]byte)
+	if newWriteSet != nil {
+		// if non-nil writeset passed in, we can use that to optimize removals
+		writeset = newWriteSet
+	}
+	// if there is already a writeset existing, we should remove that fully
+	oldKeys, loaded := s.txWritesetKeys.LoadAndDelete(index)
+	if loaded {
+		keys := oldKeys.([]string)
+		// we need to delete all of the keys in the writeset from the multiversion store
+		for _, key := range keys {
+			// small optimization to check if the new writeset is going to write this key, if so, we can leave it behind
+			if _, ok := writeset[key]; ok {
+				// we don't need to remove this key because it will be overwritten anyways - saves the operation of removing + rebalancing underlying btree
+				continue
+			}
+			// remove from the appropriate item if present in multiVersionMap
+			mvVal, found := s.multiVersionMap.Load(key)
+			// if the key doesn't exist in the overall map, return nil
+			if !found {
+				continue
+			}
+			mvVal.(MultiVersionValue).Remove(index)
 		}
 	}
-
-	return true
 }
 ```
 
-**File:** x/authz/keeper/keeper.go (L87-111)
+**File:** store/multiversion/store.go (L262-310)
 ```go
-		// If granter != grantee then check authorization.Accept, otherwise we
-		// implicitly accept.
-		if !granter.Equals(grantee) {
-			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			if authorization == nil {
-				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
-			}
-			resp, err := authorization.Accept(ctx, msg)
-			if err != nil {
-				return nil, err
-			}
+func (s *Store) validateIterator(index int, tracker iterationTracker) bool {
+	// collect items from multiversion store
+	sortedItems := s.CollectIteratorItems(index)
+	// add the iterationtracker writeset keys to the sorted items
+	for key := range tracker.writeset {
+		sortedItems.Set([]byte(key), []byte{})
+	}
+	validChannel := make(chan bool, 1)
+	abortChannel := make(chan occtypes.Abort, 1)
 
-			if resp.Delete {
-				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
-			} else if resp.Updated != nil {
-				err = k.update(ctx, grantee, granter, resp.Updated)
+	// listen for abort while iterating
+	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
+		var parentIter types.Iterator
+		expectedKeys := iterationTracker.iteratedKeys
+		foundKeys := 0
+		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
+		if iterationTracker.ascending {
+			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
+		} else {
+			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
+		}
+		// create a new MVSMergeiterator
+		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
+		defer mergeIterator.Close()
+		for ; mergeIterator.Valid(); mergeIterator.Next() {
+			if (len(expectedKeys) - foundKeys) == 0 {
+				// if we have no more expected keys, then the iterator is invalid
+				returnChan <- false
+				return
 			}
-			if err != nil {
-				return nil, err
+			key := mergeIterator.Key()
+			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
+			if _, ok := expectedKeys[string(key)]; !ok {
+				// if key isn't found
+				returnChan <- false
+				return
 			}
+			// remove from expected keys
+			foundKeys += 1
+			// delete(expectedKeys, string(key))
 
-			if !resp.Accept {
-				return nil, sdkerrors.ErrUnauthorized
+			// if our iterator key was the early stop, then we can break
+			if bytes.Equal(key, iterationTracker.earlyStopKey) {
+				break
 			}
 		}
+		// return whether we found the exact number of expected keys
+		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
+	}(tracker, sortedItems, validChannel, abortChannel)
 ```
 
-**File:** x/authz/keeper/msg_server.go (L65-83)
+**File:** store/multiversion/store.go (L352-353)
 ```go
-func (k Keeper) Exec(goCtx context.Context, msg *authz.MsgExec) (*authz.MsgExecResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
-	if err != nil {
-		return nil, err
-	}
+		latestValue := s.GetLatestBeforeIndex(index, []byte(key))
+		if latestValue == nil {
+```
 
-	msgs, err := msg.GetMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	results, err := k.DispatchActions(ctx, grantee, msgs)
-	if err != nil {
-		return nil, err
-	}
-
-	return &authz.MsgExecResponse{Results: results}, nil
-}
+**File:** store/multiversion/mvkv.go (L161-162)
+```go
+	mvsValue := store.multiVersionStore.GetLatestBeforeIndex(store.transactionIndex, key)
+	if mvsValue != nil {
 ```

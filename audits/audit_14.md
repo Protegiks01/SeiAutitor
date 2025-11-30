@@ -1,258 +1,320 @@
-# Audit Report Validation
+# Audit Report
 
-After thorough analysis of the codebase and tracing the execution flow, I can confirm this is a **valid vulnerability**.
+## Title
+Network Halt Due to Negative Vote Multiplier from Unbounded Parameter Sum in Fee Allocation
 
-## Audit Report
+## Summary
+The distribution module allows governance to set parameters where `baseProposerReward + bonusProposerReward + communityTax` exceeds 1.0 through individual parameter updates. This causes `voteMultiplier` to become negative in `AllocateTokens`, triggering a panic that halts the entire network during block processing.
 
-### Title
-Scheduler Commits State Changes from Failed Transactions Due to Missing Response Code Validation
-
-### Summary
-The concurrent transaction scheduler in `tasks/scheduler.go` validates transactions only for Optimistic Concurrency Control (OCC) conflicts but fails to check transaction response codes. This allows transactions that fail access operation validation to have their state changes permanently committed to the blockchain, violating the fundamental invariant that failed transactions should not modify state. [1](#0-0) 
-
-### Impact
+## Impact
 Medium
 
-### Finding Description
+## Finding Description
 
-**Location:**
-- Primary vulnerability: `tasks/scheduler.go`, `shouldRerun` method (lines 354-390)
-- Unconditional write: `tasks/scheduler.go`, line 576
-- Final commitment: `tasks/scheduler.go`, line 345
+**Location:** [1](#0-0) [2](#0-1) 
 
 **Intended logic:**
-Only transactions that complete successfully should have their state changes committed to the blockchain. In normal sequential execution, when a transaction fails validation and returns an error, the cached state changes are not written to the parent store. [2](#0-1) 
+Distribution parameters must satisfy the invariant `baseProposerReward + bonusProposerReward + communityTax ≤ 1.0` to ensure `voteMultiplier` remains non-negative. This invariant is explicitly validated in ValidateBasic(): [3](#0-2) 
 
 **Actual logic:**
-In the OCC concurrent execution path:
-1. Transactions execute and can fail access operation validation, returning an error [3](#0-2) 
-2. Errors are converted to ResponseDeliverTx with non-zero code [4](#0-3) 
-3. `WriteToMultiVersionStore()` is called unconditionally after execution, persisting all writes regardless of response code [5](#0-4) 
-4. The `shouldRerun` method only checks for OCC conflicts via `findConflicts` and never examines `task.Response.Code`
-5. If no OCC conflicts are detected, the transaction is marked as "validated"
-6. `WriteLatestToStore()` commits all "validated" transactions' writes to the blockchain state [6](#0-5) 
+When parameters are updated through governance proposals, the system only validates individual parameters (checking each is between 0 and 1.0) via individual validator functions: [4](#0-3) 
+
+The governance handler calls Subspace.Update() which only invokes individual validators: [5](#0-4) [6](#0-5) 
+
+ValidateBasic() that checks the combined sum constraint is only called during genesis validation: [7](#0-6) 
 
 **Exploitation path:**
-1. User submits transaction T1 with incorrect access operation declarations (due to bugs in mappings or malicious WASM contracts)
-2. T1 executes and makes state modifications via VersionIndexedStore
-3. Access operation validation fails during execution, returning error
-4. `WriteToMultiVersionStore()` persists T1's writes to multiversion store unconditionally
-5. Scheduler's `shouldRerun(T1)` checks only for OCC conflicts, not response codes
-6. If no OCC conflicts detected, T1 marked as "validated"
-7. `WriteLatestToStore()` commits T1's writes to blockchain state despite validation failure
-8. Subsequent transactions read corrupted state
+1. Three governance proposals pass independently (each appears valid with 0 ≤ value ≤ 1.0): baseProposerReward=0.5, bonusProposerReward=0.5, communityTax=0.1 (sum=1.1)
+2. During BeginBlock, AllocateTokens is called: [8](#0-7) 
+3. With high validator participation, proposerMultiplier approaches 1.0, making voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1 (negative)
+4. Negative DecCoins flow to AllocateTokensToValidator, where tokens.Sub(commission) triggers panic: [9](#0-8) 
 
 **Security guarantee broken:**
-The fundamental blockchain invariant stated in the code that "State only gets persisted if all messages are valid and get executed successfully" is violated. [7](#0-6) 
+The system fails to enforce its explicitly documented invariant that distribution parameters must sum to ≤ 1.0 during governance parameter updates.
 
-### Impact Explanation
+## Impact Explanation
 
-This vulnerability results in permanent state corruption with cascading effects:
+**Consequences:**
+- **Total network shutdown**: All validator nodes panic simultaneously when processing blocks after misconfigured parameters take effect
+- **Cannot process transactions**: Network consensus completely halts
+- **Unrecoverable without hard fork**: Emergency governance cannot fix parameters because the network is halted
+- **Requires coordinated manual intervention**: Validators must coordinate off-chain to reset parameters and restart
 
-1. **State Corruption**: Transactions that fail access operation validation have writes permanently committed despite returning error codes
-2. **Cascading Effects**: Valid transactions reading corrupted state execute with incorrect data
-3. **Smart Contract Integrity**: Smart contracts relying on accurate state produce incorrect results
-4. **Detection Difficulty**: Failed transactions appear "validated" by scheduler, making corruption subtle
+**Developer precedent:**
+The developers explicitly recognized and fixed this exact pattern for ConsensusParams, acknowledging that parameter validation gaps "will cause a chain halt": [10](#0-9) 
 
-This matches the Medium severity impact category: "A bug in the respective layer 0/1/2 network code that results in unintended smart contract behavior with no concrete funds at direct risk."
+This confirms the severity of such validation gaps. Distribution parameters have the same risk but lack the same protection.
 
-### Likelihood Explanation
+## Likelihood Explanation
 
-**Who can trigger:**
-Any user submitting transactions when:
-- Access operation dependency mappings contain bugs
-- WASM contracts have incorrect dependency declarations
-- Dynamic dependency generator has bugs
+**Who Can Trigger:** Governance (requires proposals to pass democratic voting)
 
-**Conditions required:**
-- Transaction must have incomplete/incorrect access operation declarations
-- Transaction must fail `ValidateAccessOperations` during execution [8](#0-7) 
-- The multiversion store OCC validation must not detect a conflict
-- Concurrent transaction execution must be enabled (OCC mode)
+**Realistic Scenario (Non-Malicious):**
+- Month 1: Proposal to increase proposer rewards (baseProposerReward = 0.5)
+- Month 2: Proposal to add voting bonuses (bonusProposerReward = 0.5)
+- Month 3: Proposal to fund community pool (communityTax = 0.1)
+- Each proposal reviewed individually, all appear valid (0 ≤ value ≤ 1.0)
+- No reviewer checks combined constraint across all parameters
+- Network halts inadvertently
 
-**Frequency:**
-Can occur during normal block production if access operation mappings have bugs. More likely with complex WASM contracts where dependency tracking is difficult. Given the complexity of maintaining accurate access operation declarations, bugs are reasonably probable.
+**Likelihood:** Moderate - Parameter adjustments are routine governance activities. Multiple parameters adjusted independently over time could inadvertently violate the combined constraint. The fact that each individual change appears valid makes this particularly dangerous.
 
-### Recommendation
+While this requires governance action, it meets the "trusted role exception" because: (1) it can happen inadvertently without malicious intent, (2) it causes unrecoverable network failure beyond governance's intended authority, and (3) the system should enforce its own documented invariants.
 
-Modify the `shouldRerun` method in `tasks/scheduler.go` to check transaction response code before marking as validated:
+## Recommendation
 
-```go
-case statusExecuted, statusValidated:
-    // Check if response has an error code
-    if task.Response != nil && task.Response.Code != 0 {
-        s.invalidateTask(task)
-        task.Reset()
-        task.Increment()
-        return true
-    }
-    
-    // Existing OCC conflict check
-    if valid, conflicts := s.findConflicts(task); !valid {
-        // ... existing logic
-    }
-```
+1. **Immediate Fix**: Add special validation for distribution parameters in the governance proposal validation (similar to ConsensusParams). When any distribution parameter is proposed for update, retrieve all current distribution parameters, apply the change, and validate the complete Params struct using ValidateBasic().
 
-Alternatively, modify `executeTask` to conditionally call `WriteToMultiVersionStore()` only for successful transactions:
+2. **Alternative Approach**: Modify the individual validator functions to query current values of other distribution parameters and validate that the combined sum will not exceed 1.0 after the update.
 
-```go
-if resp.Code == 0 {
-    for _, v := range task.VersionStores {
-        v.WriteToMultiVersionStore()
-    }
-} else {
-    for _, v := range task.VersionStores {
-        v.WriteEstimatesToMultiVersionStore()
-    }
-}
-```
+3. **Defensive Programming**: Add a safety check in AllocateTokens to detect negative voteMultiplier and handle gracefully (clamp to zero, emit error event) rather than allowing the panic to propagate.
 
-### Proof of Concept
+4. **Follow Existing Pattern**: Apply the same validation pattern used for ConsensusParams to distribution parameters in ValidateChanges().
 
-The vulnerability is demonstrable through code analysis:
+## Proof of Concept
+
+**Test Structure** (following existing pattern at): [11](#0-10) 
 
 **Setup:**
-- Normal execution path: Cache writes only committed if `err == nil` [2](#0-1) 
+- Initialize test application using `simapp.Setup(false)`
+- Create two validators with equal voting power
+- Set misconfigured parameters via `app.DistrKeeper.SetParams()` bypassing validation:
+  - CommunityTax: 0.1 (10%)
+  - BaseProposerReward: 0.5 (50%)
+  - BonusProposerReward: 0.5 (50%)
+  - Combined sum: 1.1 > 1.0
+- Fund fee collector module with tokens
 
 **Action:**
-- OCC execution path: Writes committed unconditionally [9](#0-8) 
-- Validation only checks OCC conflicts, not response codes [10](#0-9) 
+- Call `app.DistrKeeper.AllocateTokens(ctx, 200, 200, proposerConsAddr, votes)` with 100% validator participation
+- This results in voteMultiplier = 1.0 - 1.0 - 0.1 = -0.1
 
 **Result:**
-- Failed transactions (response code != 0) have writes committed via `WriteLatestToStore()` because scheduler marks them "validated" based solely on absence of OCC conflicts
-- This breaks the documented invariant that state only persists for successful transactions
+- Panic with message "negative coin amount" when AllocateTokensToValidator attempts tokens.Sub(commission) operation on negative token amounts
+- This panic would halt all nodes processing blocks with these parameters in production
+- BeginBlock has no panic recovery mechanism: [12](#0-11) 
 
-### Notes
+## Notes
 
-The vulnerability is validated through comprehensive code analysis showing the scheduler bypasses response code validation that exists in normal sequential execution. The comment at line 162 in baseapp.go indicates this OCC validation system is still under development, suggesting this gap was likely unintentional. [11](#0-10)
+This vulnerability matches the impact category "Network not being able to confirm new transactions (total network shutdown)" classified as Medium severity. The system has an explicit invariant that can be bypassed during governance updates, leading to total network halt. Developer precedent with ConsensusParams confirms this pattern requires explicit protection.
 
 ### Citations
 
-**File:** tasks/scheduler.go (L344-346)
+**File:** x/distribution/keeper/allocation.go (L82-84)
 ```go
-	for _, mv := range s.multiVersionStores {
-		mv.WriteLatestToStore()
+	communityTax := k.GetCommunityTax(ctx)
+	voteMultiplier := sdk.OneDec().Sub(proposerMultiplier).Sub(communityTax)
+	feeMultiplier := feesCollected.MulDecTruncate(voteMultiplier)
+```
+
+**File:** x/distribution/keeper/allocation.go (L111-114)
+```go
+func (k Keeper) AllocateTokensToValidator(ctx sdk.Context, val stakingtypes.ValidatorI, tokens sdk.DecCoins) {
+	// split tokens between validator and delegators according to commission
+	commission := tokens.MulDec(val.GetCommission())
+	shared := tokens.Sub(commission)
+```
+
+**File:** x/distribution/types/params.go (L67-71)
+```go
+	if v := p.BaseProposerReward.Add(p.BonusProposerReward).Add(p.CommunityTax); v.GT(sdk.OneDec()) {
+		return fmt.Errorf(
+			"sum of base, bonus proposer rewards, and community tax cannot be greater than one: %s", v,
+		)
 	}
 ```
 
-**File:** tasks/scheduler.go (L354-390)
+**File:** x/distribution/types/params.go (L76-131)
 ```go
-func (s *scheduler) shouldRerun(task *deliverTxTask) bool {
-	switch task.Status {
-
-	case statusAborted, statusPending:
-		return true
-
-	// validated tasks can become unvalidated if an earlier re-run task now conflicts
-	case statusExecuted, statusValidated:
-		// With the current scheduler, we won't actually get to this step if a previous task has already been determined to be invalid,
-		// since we choose to fail fast and mark the subsequent tasks as invalid as well.
-		// TODO: in a future async scheduler that no longer exhaustively validates in order, we may need to carefully handle the `valid=true` with conflicts case
-		if valid, conflicts := s.findConflicts(task); !valid {
-			s.invalidateTask(task)
-			task.AppendDependencies(conflicts)
-
-			// if the conflicts are now validated, then rerun this task
-			if dependenciesValidated(s.allTasksMap, task.Dependencies) {
-				return true
-			} else {
-				// otherwise, wait for completion
-				task.SetStatus(statusWaiting)
-				return false
-			}
-		} else if len(conflicts) == 0 {
-			// mark as validated, which will avoid re-validating unless a lower-index re-validates
-			task.SetStatus(statusValidated)
-			return false
-		}
-		// conflicts and valid, so it'll validate next time
-		return false
-
-	case statusWaiting:
-		// if conflicts are done, then this task is ready to run again
-		return dependenciesValidated(s.allTasksMap, task.Dependencies)
+func validateCommunityTax(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
 	}
-	panic("unexpected status: " + task.Status)
+
+	if v.IsNil() {
+		return fmt.Errorf("community tax must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("community tax must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("community tax too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBaseProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("base proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("base proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("base proposer reward too large: %s", v)
+	}
+
+	return nil
+}
+
+func validateBonusProposerReward(i interface{}) error {
+	v, ok := i.(sdk.Dec)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	if v.IsNil() {
+		return fmt.Errorf("bonus proposer reward must be not nil")
+	}
+	if v.IsNegative() {
+		return fmt.Errorf("bonus proposer reward must be positive: %s", v)
+	}
+	if v.GT(sdk.OneDec()) {
+		return fmt.Errorf("bonus proposer reward too large: %s", v)
+	}
+
+	return nil
 }
 ```
 
-**File:** tasks/scheduler.go (L571-577)
+**File:** x/params/proposal_handler.go (L26-43)
 ```go
-	task.SetStatus(statusExecuted)
-	task.Response = &resp
+func handleParameterChangeProposal(ctx sdk.Context, k keeper.Keeper, p *proposal.ParameterChangeProposal) error {
+	for _, c := range p.Changes {
+		ss, ok := k.GetSubspace(c.Subspace)
+		if !ok {
+			return sdkerrors.Wrap(proposal.ErrUnknownSubspace, c.Subspace)
+		}
 
-	// write from version store to multiversion stores
-	for _, v := range task.VersionStores {
-		v.WriteToMultiVersionStore()
+		k.Logger(ctx).Info(
+			fmt.Sprintf("attempt to set new parameter value; key: %s, value: %s", c.Key, c.Value),
+		)
+
+		if err := ss.Update(ctx, []byte(c.Key), []byte(c.Value)); err != nil {
+			return sdkerrors.Wrapf(proposal.ErrSettingParameter, "key: %s, value: %s, err: %s", c.Key, c.Value, err.Error())
+		}
 	}
+
+	return nil
+}
 ```
 
-**File:** baseapp/baseapp.go (L978-992)
+**File:** x/params/types/subspace.go (L196-219)
 ```go
-		// Dont need to validate in checkTx mode
-		if ctx.MsgValidator() != nil && mode == runTxModeDeliver {
-			storeAccessOpEvents := msCache.GetEvents()
-			accessOps := ctx.TxMsgAccessOps()[acltypes.ANTE_MSG_INDEX]
-
-			// TODO: (occ) This is an example of where we do our current validation. Note that this validation operates on the declared dependencies for a TX / antehandler + the utilized dependencies, whereas the validation
-			missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
-			if len(missingAccessOps) != 0 {
-				for op := range missingAccessOps {
-					ctx.Logger().Info((fmt.Sprintf("Antehandler Missing Access Operation:%s ", op.String())))
-					op.EmitValidationFailMetrics()
-				}
-				errMessage := fmt.Sprintf("Invalid Concurrent Execution antehandler missing %d access operations", len(missingAccessOps))
-				return gInfo, nil, nil, 0, nil, nil, ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
-			}
-```
-
-**File:** baseapp/baseapp.go (L1015-1017)
-```go
-	if err == nil && mode == runTxModeDeliver {
-		msCache.Write()
+func (s Subspace) Update(ctx sdk.Context, key, value []byte) error {
+	attr, ok := s.table.m[string(key)]
+	if !ok {
+		panic(fmt.Sprintf("parameter %s not registered", string(key)))
 	}
+
+	ty := attr.ty
+	dest := reflect.New(ty).Interface()
+	s.GetIfExists(ctx, key, dest)
+
+	if err := s.legacyAmino.UnmarshalJSON(value, dest); err != nil {
+		return err
+	}
+
+	// destValue contains the dereferenced value of dest so validation function do
+	// not have to operate on pointers.
+	destValue := reflect.Indirect(reflect.ValueOf(dest)).Interface()
+	if err := s.Validate(ctx, key, destValue); err != nil {
+		return err
+	}
+
+	s.Set(ctx, key, dest)
+	return nil
+}
 ```
 
-**File:** baseapp/baseapp.go (L1155-1174)
+**File:** x/distribution/types/genesis.go (L44-50)
 ```go
-		if ctx.MsgValidator() == nil {
-			continue
-		}
-		storeAccessOpEvents := msgMsCache.GetEvents()
-		accessOps := ctx.TxMsgAccessOps()[i]
-		missingAccessOps := ctx.MsgValidator().ValidateAccessOperations(accessOps, storeAccessOpEvents)
-		// TODO: (occ) This is where we are currently validating our per message dependencies,
-		// whereas validation will be done holistically based on the mvkv for OCC approach
-		if len(missingAccessOps) != 0 {
-			for op := range missingAccessOps {
-				ctx.Logger().Info((fmt.Sprintf("eventMsgName=%s Missing Access Operation:%s ", eventMsgName, op.String())))
-				op.EmitValidationFailMetrics()
+// ValidateGenesis validates the genesis state of distribution genesis input
+func ValidateGenesis(gs *GenesisState) error {
+	if err := gs.Params.ValidateBasic(); err != nil {
+		return err
+	}
+	return gs.FeePool.ValidateGenesis()
+}
+```
+
+**File:** x/distribution/abci.go (L29-31)
+```go
+	if ctx.BlockHeight() > 1 {
+		previousProposer := k.GetPreviousProposerConsAddr(ctx)
+		k.AllocateTokens(ctx, sumPreviousPrecommitPower, previousTotalPower, previousProposer, req.LastCommitInfo.GetVotes())
+```
+
+**File:** types/dec_coin.go (L303-309)
+```go
+func (coins DecCoins) Sub(coinsB DecCoins) DecCoins {
+	diff, hasNeg := coins.SafeSub(coinsB)
+	if hasNeg {
+		panic("negative coin amount")
+	}
+
+	return diff
+```
+
+**File:** x/params/types/proposal/proposal.go (L101-109)
+```go
+		// We need to verify ConsensusParams since they are only validated once the proposal passes.
+		// If any of them are invalid at time of passing, this will cause a chain halt since validation is done during
+		// ApplyBlock: https://github.com/sei-protocol/sei-tendermint/blob/d426f1fe475eb0c406296770ff5e9f8869b3887e/internal/state/execution.go#L320
+		// Therefore, we validate when we get a param-change msg for ConsensusParams
+		if pc.Subspace == "baseapp" {
+			if err := verifyConsensusParamsUsingDefault(changes); err != nil {
+				return err
 			}
-			errMessage := fmt.Sprintf("Invalid Concurrent Execution messageIndex=%d, missing %d access operations", i, len(missingAccessOps))
-			// we need to bubble up the events for inspection
-			return &sdk.Result{
-				Log:    strings.TrimSpace(msgLogs.String()),
-				Events: events.ToABCIEvents(),
-			}, sdkerrors.Wrap(sdkerrors.ErrInvalidConcurrencyExecution, errMessage)
 		}
 ```
 
-**File:** baseapp/abci.go (L280-283)
+**File:** x/distribution/keeper/allocation_test.go (L54-63)
 ```go
-// State only gets persisted if all messages are valid and get executed successfully.
-// Otherwise, the ResponseDeliverTx will contain relevant error information.
-// Regardless of tx execution outcome, the ResponseDeliverTx will contain relevant
-// gas execution context.
+	testDistrParms := disttypes.Params{
+		CommunityTax:        sdk.NewDecWithPrec(2, 2), // 2%
+		BaseProposerReward:  sdk.NewDecWithPrec(1, 2), // 1%
+		BonusProposerReward: sdk.NewDecWithPrec(4, 2), // 4%
+		WithdrawAddrEnabled: true,
+	}
+	app.DistrKeeper.SetParams(
+		ctx,
+		testDistrParms,
+	)
 ```
 
-**File:** baseapp/abci.go (L304-311)
+**File:** baseapp/abci.go (L133-157)
 ```go
-	gInfo, result, anteEvents, _, _, _, resCtx, err := app.runTx(ctx.WithTxBytes(req.Tx).WithTxSum(checksum).WithVoteInfos(app.voteInfos), runTxModeDeliver, tx, checksum)
-	if err != nil {
-		resultStr = "failed"
-		// if we have a result, use those events instead of just the anteEvents
-		if result != nil {
-			return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(result.Events, app.indexEvents), app.trace)
+// BeginBlock implements the ABCI application interface.
+func (app *BaseApp) BeginBlock(ctx sdk.Context, req abci.RequestBeginBlock) (res abci.ResponseBeginBlock) {
+	defer telemetry.MeasureSince(time.Now(), "abci", "begin_block")
+
+	if !req.Simulate {
+		if err := app.validateHeight(req); err != nil {
+			panic(err)
 		}
-		return sdkerrors.ResponseDeliverTxWithEvents(err, gInfo.GasWanted, gInfo.GasUsed, sdk.MarkEventsToIndex(anteEvents, app.indexEvents), app.trace)
+	}
+
+	if app.beginBlocker != nil {
+		res = app.beginBlocker(ctx, req)
+		res.Events = sdk.MarkEventsToIndex(res.Events, app.indexEvents)
+	}
+
+	// call the streaming service hooks with the EndBlock messages
+	if !req.Simulate {
+		for _, streamingListener := range app.abciListeners {
+			if err := streamingListener.ListenBeginBlock(app.deliverState.ctx, req, res); err != nil {
+				app.logger.Error("EndBlock listening hook failed", "height", req.Header.Height, "err", err)
+			}
+		}
+	}
+	return res
+}
 ```

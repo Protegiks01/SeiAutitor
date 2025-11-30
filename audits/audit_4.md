@@ -1,176 +1,263 @@
-Based on my comprehensive investigation of the codebase, I can validate this security claim.
+Based on my thorough investigation of the codebase, I can confirm this is a **valid high-severity vulnerability**. Let me validate the technical claims step by step.
+
+## Code Flow Validation
+
+I've traced through the execution flow and confirmed:
+
+1. **MsgExec.GetSigners() returns the grantee field** [1](#0-0) 
+
+2. **DispatchActions uses msg.GetSigners()[0] as granter** [2](#0-1) 
+
+3. **Implicit accept logic bypasses authorization when granter==grantee** [3](#0-2) 
+
+4. **Exec handler calls DispatchActions with the grantee from MsgExec** [4](#0-3) 
+
+5. **MsgSend.GetSigners() returns FromAddress** [5](#0-4) 
+
+6. **No validation prevents granting MsgExec authorization** [6](#0-5) 
+
+7. **MsgExec.ValidateBasic() does not prevent nested MsgExec** [7](#0-6) 
+
+## Exploitation Path Confirmed
+
+The attack works as follows:
+- Alice grants Bob `GenericAuthorization` for `/cosmos.authz.v1beta1.MsgExec`
+- Bob constructs: `OuterMsgExec(grantee=Bob, msgs=[InnerMsgExec(grantee=Alice, msgs=[MsgSend(from=Alice, to=Bob)])])`
+- First DispatchActions (grantee=Bob): InnerMsgExec.GetSigners() returns [Alice], authorization check passes (Bob has MsgExec from Alice)
+- Inner MsgExec handler: Calls DispatchActions(ctx, Alice, [MsgSend])
+- Second DispatchActions (grantee=Alice): MsgSend.GetSigners() returns [Alice], check evaluates to Alice==Alice, implicit accept triggered
+- MsgSend executes **without SendAuthorization check**
 
 # Audit Report
 
 ## Title
-Unvalidated Pagination Limit Causing Resource Exhaustion in GranteeGrants Query
+Nested MsgExec Authorization Bypass Enables Complete Account Takeover and Fund Theft
 
 ## Summary
-The `GranteeGrants` gRPC query in the authz module allows unprivileged attackers to cause resource exhaustion through unbounded pagination limits combined with inefficient store iteration. The query iterates over ALL grants in the system with expensive unmarshaling operations before filtering, enabling a single query to force processing of the entire grant store.
+The `x/authz` module contains a critical vulnerability where a grantee with `GenericAuthorization` for `MsgExec` can execute arbitrary message types without proper authorization. By constructing nested MsgExec messages with the inner MsgExec's grantee set to the victim's address, an attacker exploits the implicit accept logic to bypass authorization checks entirely.
 
 ## Impact
-Medium
+High - Direct loss of funds
 
 ## Finding Description
 
-**Location:** `x/authz/keeper/grpc_query.go` lines 132-178 (GranteeGrants function) and `types/query/filtered_pagination.go` lines 130-254 (GenericFilteredPaginate function)
+**Location:**
+- `x/authz/keeper/keeper.go` lines 87-111 (implicit accept logic)
+- `x/authz/msgs.go` lines 212-218 (MsgExec.GetSigners implementation)
+- `x/authz/keeper/msg_server.go` lines 14-42 (no MsgExec grant validation)
 
-**Intended Logic:** The pagination mechanism should efficiently query only grants relevant to the specified grantee with reasonable resource limits enforced to prevent abuse.
+**Intended logic:**
+The authorization system should enforce that a grantee can only execute message types explicitly authorized by the granter. The `DispatchActions` function validates authorization when the message signer differs from the executing grantee. The implicit accept logic is intended to allow users to execute their own messages without self-authorization.
 
-**Actual Logic:** 
+**Actual logic:**
+The vulnerability arises from the interaction between three behaviors:
+1. `MsgExec.GetSigners()` returns the grantee field rather than the transaction signer
+2. `DispatchActions` uses `msg.GetSigners()[0]` as the granter for authorization lookups
+3. When granter==grantee, implicit accept bypasses all authorization checks
 
-The `GranteeGrants` function creates a prefix store using only `GrantKey` (0x01) which includes ALL grants in the system. [1](#0-0) 
+By nesting MsgExec with the inner MsgExec's grantee=victim, the second DispatchActions receives grantee=victim. When processing inner messages like MsgSend, GetSigners() returns victim's address, making granter=victim. Since granter==grantee, the implicit accept path executes the message without authorization.
 
-This occurs because the grant key structure places granter before grantee in the composite key. [2](#0-1) [3](#0-2) 
+**Exploitation path:**
+1. Alice grants Bob `GenericAuthorization` for `/cosmos.authz.v1beta1.MsgExec`
+2. Bob constructs nested MsgExec: `Outer(grantee=Bob, msgs=[Inner(grantee=Alice, msgs=[MsgSend(from=Alice, to=Bob, amount=all)])])`
+3. Bob signs and submits the transaction
+4. Outer MsgExec handler: `DispatchActions(ctx, Bob, [InnerMsgExec])`
+5. First DispatchActions: `InnerMsgExec.GetSigners()` returns `[Alice]`, authorization check passes (Bob has MsgExec from Alice)
+6. Inner MsgExec handler: `DispatchActions(ctx, Alice, [MsgSend])`
+7. Second DispatchActions: `MsgSend.GetSigners()` returns `[Alice]`, check `Alice==Alice` triggers implicit accept
+8. MsgSend executes without SendAuthorization, funds transferred from Alice to Bob
 
-The `GenericFilteredPaginate` function unmarshals every grant entry BEFORE applying the grantee filter in the callback. [4](#0-3) 
-
-The filtering happens in the `onResult` callback which returns nil for non-matching entries, but the expensive unmarshal has already occurred. [5](#0-4) 
-
-While `MaxLimit = math.MaxUint64` is defined, there is no enforcement preventing arbitrarily large limits. [6](#0-5)  The pagination logic only sets a default when limit is 0, accepting any non-zero value without validation. [7](#0-6) 
-
-Query contexts use infinite gas meters providing no resource protection. [8](#0-7) 
-
-**Exploitation Path:**
-1. Attacker calls publicly accessible `GranteeGrants` gRPC endpoint with any address
-2. Sets pagination `Limit` to very large value (e.g., 10,000,000)
-3. Node creates prefix store including entire grant store (all grants with 0x01 prefix)
-4. Pagination iterates through store, unmarshaling each grant via expensive protobuf deserialization
-5. After unmarshaling, filter checks if grantee matches and returns nil for non-matches
-6. Loop continues trying to find `limit` matching entries, processing entire store when insufficient matches exist
-7. Multiple concurrent queries amplify resource consumption
-
-**Security Guarantee Broken:** Resource limitation and DoS protection. The system fails to enforce reasonable bounds on query resource consumption, allowing unprivileged users to exhaust node resources.
+**Security guarantee broken:**
+The authorization invariant that grantees can only execute explicitly authorized message types is completely violated. A single MsgExec grant provides unlimited account access.
 
 ## Impact Explanation
 
-On a blockchain with substantial authz usage (thousands to millions of grants), this vulnerability allows attackers to force nodes to perform expensive protobuf unmarshaling operations on every grant in the system, allocate memory for each unmarshaled grant object, and consume significant CPU and memory resources per query. Multiple concurrent malicious queries amplify the effect, causing nodes to experience degraded performance and become unable to process legitimate transactions promptly. This meets the Medium severity threshold of "Increasing network processing node resource consumption by at least 30% without brute force actions" because a single query with large limit can force processing of the entire grant store through legitimate gRPC calls accessible to any network participant.
+This vulnerability enables complete account takeover and direct theft of funds. An attacker with only MsgExec authorization can:
+
+- **Drain all funds**: Execute `MsgSend` to transfer the victim's entire balance
+- **Manipulate staking**: Delegate, undelegate, or redelegate tokens  
+- **Control governance**: Vote on proposals on behalf of the victim
+- **Execute any message type**: The bypass works for all message types in the system
+
+All funds in accounts that have granted `GenericAuthorization` for `MsgExec` are at immediate risk of theft. The impact is critical because granting MsgExec authorization may appear reasonable for legitimate delegation workflows.
 
 ## Likelihood Explanation
 
-**Trigger Conditions:**
-- Any network participant with gRPC endpoint access (standard for public RPC nodes)
-- No authentication, authorization, or on-chain resources required
-- Authz module contains grants (normal operational state)
-- No special timing or race conditions needed
+**Who can trigger:** Any grantee who receives `GenericAuthorization` for `MsgExec` from another account.
 
-**Frequency:** Can be exploited continuously with multiple concurrent queries. The attack is trivial (single gRPC call with large limit parameter) and works against any public RPC endpoint. Likelihood is high in production environments where chains accumulate grants over time.
+**Conditions required:**
+- The granter must grant authorization for `/cosmos.authz.v1beta1.MsgExec` to the attacker
+- This is the ONLY authorization required - no authorization for the actual message types being executed is needed
+- No validation prevents granting MsgExec authorization
+
+**Frequency:**
+- Exploitable immediately upon receiving the authorization  
+- Works during normal network operation without special conditions
+- No privileged access, timing windows, or state coordination required
+- Highly likely if users grant MsgExec authorization for advanced delegation workflows
+
+The vulnerability is particularly dangerous because granting MsgExec authorization appears reasonable for nested delegation patterns, making exploitation highly probable.
 
 ## Recommendation
 
-**Immediate Fixes:**
+**Option 1 (Recommended):** Prevent granting authorization for MsgExec by adding validation in the Grant method:
 
-1. Add upper bound validation for pagination limits in `GranteeGrants` before calling `GenericFilteredPaginate`:
 ```go
-const MaxQueryLimit = 1000
-if req.Pagination != nil && req.Pagination.Limit > MaxQueryLimit {
-    req.Pagination.Limit = MaxQueryLimit
+t := authorization.MsgTypeURL()
+if t == sdk.MsgTypeURL(&authz.MsgExec{}) {
+    return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "cannot grant authorization for MsgExec")
 }
 ```
 
-2. Restructure grant key schema to enable efficient grantee-based lookups (store grantee before granter, similar to the feegrant module approach shown at [9](#0-8) ), or implement a secondary index for grantee queries.
+Add this check after line 31 in `x/authz/keeper/msg_server.go` before the handler validation.
 
-**Long-term Improvements:**
-- Implement rate limiting on expensive query endpoints at the gRPC server level
-- Add query gas metering for read operations
-- Consider caching mechanisms for frequently accessed grant data
-- Add monitoring and alerting for excessive query resource consumption
+**Option 2:** Track execution depth and disable implicit accept for nested executions by passing a context flag through DispatchActions to indicate when execution is within a MsgExec.
+
+**Option 3:** Modify the implicit accept logic to validate against the actual transaction signer rather than msg.GetSigners() result.
+
+Option 1 is the simplest and safest fix, as nested MsgExec creates complex authorization chains that are inherently difficult to reason about securely.
 
 ## Proof of Concept
 
-**Setup:** In `x/authz/keeper/grpc_query_test.go`, create test with 10,000 grants between various granter-grantee pairs to simulate populated authz store.
+**File:** `x/authz/keeper/keeper_test.go`
 
-**Action:** Call `GranteeGrants` with an address having zero grants and pagination limit of 1,000,000:
-```go
-queryClient.GranteeGrants(context.Background(), &authz.QueryGranteeGrantsRequest{
-    Grantee: victimAddr.String(),
-    Pagination: &query.PageRequest{Limit: 1000000},
-})
-```
+**Setup:**
+- Initialize test accounts: Alice (granter/victim), Bob (grantee/attacker)  
+- Fund Alice's account: `simapp.FundAccount(app.BankKeeper, ctx, aliceAddr, sdk.NewCoins(sdk.NewInt64Coin("stake", 10000)))`
+- Alice grants Bob MsgExec authorization: `app.AuthzKeeper.SaveGrant(ctx, bobAddr, aliceAddr, authz.NewGenericAuthorization(sdk.MsgTypeURL(&authz.MsgExec{})), now.Add(time.Hour))`
+- Verify Alice has NOT granted Bob SendAuthorization: `authorization, _ := app.AuthzKeeper.GetCleanAuthorization(ctx, bobAddr, aliceAddr, bankSendAuthMsgType)` returns nil
 
-**Result:** Despite returning zero grants (no matches), the query iterates through and unmarshals all 10,000 grants in the store. Profiling shows significant CPU time in protobuf unmarshaling. With millions of grants in production, this causes severe resource exhaustion affecting 30% or more of network processing node resources.
+**Action:**
+- Bob constructs nested MsgExec:
+  - `msgSend := banktypes.MsgSend{FromAddress: aliceAddr.String(), ToAddress: bobAddr.String(), Amount: sdk.NewCoins(sdk.NewInt64Coin("stake", 10000))}`
+  - `innerMsgExec := authz.NewMsgExec(aliceAddr, []sdk.Msg{&msgSend})`
+  - `outerMsgExec := authz.NewMsgExec(bobAddr, []sdk.Msg{&innerMsgExec})`
+- Extract and execute: `msgs, _ := outerMsgExec.GetMessages(); app.AuthzKeeper.DispatchActions(ctx, bobAddr, msgs)`
+
+**Result:**
+- The call succeeds without error (should fail due to lack of SendAuthorization)
+- Alice's balance drained to zero: `app.BankKeeper.GetBalance(ctx, aliceAddr, "stake").Amount.Equal(sdk.ZeroInt())`
+- Bob receives all 10,000 tokens: `app.BankKeeper.GetBalance(ctx, bobAddr, "stake").Amount.Equal(sdk.NewInt(10000))`
+- Authorization bypass confirmed - Bob executed MsgSend without SendAuthorization from Alice
 
 ## Notes
 
-The comparison with `GranterGrants` is instructive - it uses a granter-specific prefix enabling efficient queries. [10](#0-9)  In contrast, `GranteeGrants` cannot use a grantee-specific prefix due to the key structure, making grantee queries inherently inefficient. Combined with unbounded pagination limits and infinite gas meters for queries, this creates a significant DoS vector for unprivileged attackers targeting public RPC infrastructure. The gRPC server implementation provides no rate limiting or interceptors. [11](#0-10)
+The vulnerability fundamentally breaks the x/authz module's security model. The interaction between `MsgExec.GetSigners()` returning the grantee field and the implicit accept logic creates a complete authorization bypass. A single MsgExec grant effectively provides unlimited account access, undermining the entire purpose of the authorization system.
 
 ### Citations
 
-**File:** x/authz/keeper/grpc_query.go (L96-96)
+**File:** x/authz/msgs.go (L212-218)
 ```go
-	authzStore := prefix.NewStore(store, grantStoreKey(nil, granter, ""))
-```
-
-**File:** x/authz/keeper/grpc_query.go (L143-143)
-```go
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
-```
-
-**File:** x/authz/keeper/grpc_query.go (L151-154)
-```go
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
-		}
-```
-
-**File:** x/authz/keeper/keys.go (L22-22)
-```go
-// - 0x01<granterAddressLen (1 Byte)><granterAddress_Bytes><granteeAddressLen (1 Byte)><granteeAddress_Bytes><msgType_Bytes>: Grant
-```
-
-**File:** x/authz/keeper/keys.go (L30-32)
-```go
-	copy(key, GrantKey)
-	copy(key[1:], granter)
-	copy(key[1+len(granter):], grantee)
-```
-
-**File:** types/query/filtered_pagination.go (L153-158)
-```go
-	if limit == 0 {
-		limit = DefaultLimit
-
-		// count total results when the limit is zero/not supplied
-		countTotal = true
+func (msg MsgExec) GetSigners() []sdk.AccAddress {
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		panic(err)
 	}
+	return []sdk.AccAddress{grantee}
+}
 ```
 
-**File:** types/query/filtered_pagination.go (L217-227)
+**File:** x/authz/msgs.go (L220-232)
 ```go
-		protoMsg := constructor()
+// ValidateBasic implements Msg
+func (msg MsgExec) ValidateBasic() error {
+	_, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return sdkerrors.Wrap(sdkerrors.ErrInvalidAddress, "invalid grantee address")
+	}
 
-		err := cdc.Unmarshal(iterator.Value(), protoMsg)
-		if err != nil {
-			return nil, nil, err
+	if len(msg.Msgs) == 0 {
+		return sdkerrors.Wrapf(sdkerrors.ErrInvalidRequest, "messages cannot be empty")
+	}
+
+	return nil
+}
+```
+
+**File:** x/authz/keeper/keeper.go (L80-85)
+```go
+		signers := msg.GetSigners()
+		if len(signers) != 1 {
+			return nil, sdkerrors.ErrInvalidRequest.Wrap("authorization can be given to msg with only one signer")
 		}
 
-		val, err := onResult(iterator.Key(), protoMsg)
-		if err != nil {
-			return nil, nil, err
+		granter := signers[0]
+```
+
+**File:** x/authz/keeper/keeper.go (L87-111)
+```go
+		// If granter != grantee then check authorization.Accept, otherwise we
+		// implicitly accept.
+		if !granter.Equals(grantee) {
+			authorization, _ := k.GetCleanAuthorization(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			if authorization == nil {
+				return nil, sdkerrors.ErrUnauthorized.Wrap("authorization not found")
+			}
+			resp, err := authorization.Accept(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.Delete {
+				err = k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+			} else if resp.Updated != nil {
+				err = k.update(ctx, grantee, granter, resp.Updated)
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if !resp.Accept {
+				return nil, sdkerrors.ErrUnauthorized
+			}
 		}
 ```
 
-**File:** types/query/pagination.go (L18-20)
+**File:** x/authz/keeper/msg_server.go (L14-42)
 ```go
-// MaxLimit is the maximum limit the paginate function can handle
-// which equals the maximum value that can be stored in uint64
-const MaxLimit = math.MaxUint64
+func (k Keeper) Grant(goCtx context.Context, msg *authz.MsgGrant) (*authz.MsgGrantResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+	grantee, err := sdk.AccAddressFromBech32(msg.Grantee)
+	if err != nil {
+		return nil, err
+	}
+
+	granter, err := sdk.AccAddressFromBech32(msg.Granter)
+	if err != nil {
+		return nil, err
+	}
+
+	authorization := msg.GetAuthorization()
+	if authorization == nil {
+		return nil, sdkerrors.ErrUnpackAny.Wrap("Authorization is not present in the msg")
+	}
+
+	t := authorization.MsgTypeURL()
+	if k.router.HandlerByTypeURL(t) == nil {
+		return nil, sdkerrors.Wrapf(sdkerrors.ErrInvalidType, "%s doesn't exist.", t)
+	}
+
+	err = k.SaveGrant(ctx, grantee, granter, authorization, msg.Grant.Expiration)
+	if err != nil {
+		return nil, err
+	}
+
+	return &authz.MsgGrantResponse{}, nil
+}
 ```
 
-**File:** types/context.go (L272-272)
+**File:** x/authz/keeper/msg_server.go (L77-77)
 ```go
-		gasMeter:        NewInfiniteGasMeter(1, 1),
+	results, err := k.DispatchActions(ctx, grantee, msgs)
 ```
 
-**File:** x/feegrant/key.go (L29-31)
+**File:** x/bank/types/msgs.go (L57-63)
 ```go
-// We store by grantee first to allow searching by everyone who granted to you
-func FeeAllowanceKey(granter sdk.AccAddress, grantee sdk.AccAddress) []byte {
-	return append(FeeAllowancePrefixByGrantee(grantee), address.MustLengthPrefix(granter.Bytes())...)
-```
-
-**File:** server/grpc/server.go (L19-19)
-```go
-	grpcSrv := grpc.NewServer()
+func (msg MsgSend) GetSigners() []sdk.AccAddress {
+	from, err := sdk.AccAddressFromBech32(msg.FromAddress)
+	if err != nil {
+		panic(err)
+	}
+	return []sdk.AccAddress{from}
+}
 ```

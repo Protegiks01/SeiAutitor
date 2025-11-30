@@ -1,237 +1,178 @@
 # Audit Report
 
 ## Title
-GranteeGrants Query Causes O(N) Full Store Scan Leading to RPC Node Resource Exhaustion DoS
+Transaction Rollback Inconsistency in Capability Module Causes Node Panic
 
 ## Summary
-The `GranteeGrants` query in the x/authz module performs an inefficient O(N) full store scan where N equals the total number of grants in the entire system, rather than using indexed lookups for the specific grantee. This causes RPC node resource exhaustion as the system grows, leading to denial of service for all users.
+The capability module's `ReleaseCapability` function creates a state inconsistency when called within a failing transaction. The function deletes entries from both the transactional memStore and the non-transactional `capMap` Go map. When the transaction fails and rolls back, memStore deletions are reverted but `capMap` deletions persist, causing `GetCapability` to panic when it finds an index in memStore but nil in capMap.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-**Location:** [1](#0-0) 
+- **location**: `x/capability/keeper/keeper.go` lines 319-356 (`ReleaseCapability`) and lines 361-388 (`GetCapability`)
 
-**Intended Logic:**
-The query should efficiently retrieve grants where a specific address is the grantee, using indexed lookups similar to `GranterGrants` which uses a prefix store with the granter address for O(M) complexity where M = grants for that specific granter. [2](#0-1) 
+- **intended logic**: When a transaction fails, all state changes should be rolled back atomically. The capability module should maintain consistency between persistent store, memory store, and the in-memory `capMap`. Transaction rollback should restore all three storage layers to their pre-transaction state.
 
-**Actual Logic:**
-The implementation creates a prefix store using only `GrantKey` (0x01), which matches ALL grants in the entire system. The key structure stores grants as `GrantKey + Granter + Grantee + MsgType`, with granter appearing before grantee: [3](#0-2) 
+- **actual logic**: The `capMap` is a shared Go map that is NOT part of the transactional store system [1](#0-0) . When `ReleaseCapability` executes, it deletes from memStore [2](#0-1)  and from capMap [3](#0-2) . If the transaction fails, memStore deletions are rolled back (part of cached context), but capMap deletion persists (just a Go map operation).
 
-Since grantee appears after granter in the key structure, there is no efficient prefix for querying by grantee alone. The code must iterate through ALL grants and filter in memory. When `CountTotal=true` in the pagination request, the pagination function continues scanning the entire store even after collecting sufficient results: [4](#0-3) 
+- **exploitation path**:
+  1. A capability exists in both memStore and capMap with a single owner
+  2. A transaction creates a cached context [4](#0-3) 
+  3. `ReleaseCapability` is called within the cached context, deleting from both memStore and capMap
+  4. Transaction fails due to gas exhaustion, validation error, or any runtime error
+  5. The transaction execution framework does not write the cache [5](#0-4) 
+  6. MemStore deletions are reverted, but capMap deletion persists
+  7. Later `GetCapability` retrieves the index from memStore successfully [6](#0-5)  but finds `capMap[index]` returns nil, triggering panic [7](#0-6) 
 
-**Exploitation Path:**
-1. System naturally accumulates grants over time through normal usage (or attacker creates many grants via `MsgGrant` transactions)
-2. Any user queries the public RPC endpoint at `/cosmos/authz/v1beta1/grants/grantee/{grantee}`: [5](#0-4) 
-3. Query scans ALL grants in the system, unmarshaling each protobuf message and parsing each key
-4. Query executes without gas metering (query contexts have no resource limits)
-5. Normal query patterns cause cumulative resource exhaustion on RPC nodes
-
-**Security Guarantee Broken:**
-This violates the DoS protection property. RPC queries should have bounded resource consumption, but this query's cost grows linearly with total system grants (O(N)) rather than just the matching grants (O(M)). The codebase includes an explicit warning about this exact pattern: [6](#0-5) 
+- **security guarantee broken**: This violates transaction atomicity guarantees and node availability. The code acknowledges this class of issue with a TODO comment [8](#0-7)  but only handles the `NewCapability` case (extra entries in map), not the `ReleaseCapability` case (missing entries in map).
 
 ## Impact Explanation
 
-**Affected Resources:**
-- RPC node CPU: Unmarshaling grants, parsing keys, performing filtering comparisons
-- RPC node I/O: Reading entire grant store from disk  
-- RPC node memory: Maintaining iteration state across large datasets
-- Network availability: RPC services becoming slow or unresponsive affecting all users
+This vulnerability causes node panics leading to crashes. When a corrupted capability is accessed via `GetCapability`, the node immediately panics and terminates. Each failed transaction containing `ReleaseCapability` permanently corrupts one capability in the capMap until node restart.
 
-**Severity Assessment:**
-As the blockchain matures and grants accumulate (e.g., from 1,000 to 100,000 grants), each `GranteeGrants` query must scan 100x more entries. This represents:
-- 100x more disk reads
-- 100x more protobuf unmarshaling operations
-- 100x more key parsing and address extraction
-- 100x more filtering comparisons
+The impact includes:
+- **Node crashes**: The panic at line 384 immediately terminates the node process
+- **Validator impact**: If ≥30% of validators encounter this during normal operations (e.g., IBC channel management), consensus is degraded
+- **Persistent corruption**: The corrupted state persists until node restart, and can recur if the same transaction patterns repeat
+- **Non-deterministic failures**: Different nodes may have different capMap states based on their transaction execution history
 
-Even if `GranteeGrants` queries constitute only 10% of total query volume, a 100x increase in work for those queries translates to a 10x overall increase in resources for that query type, easily exceeding the 30% threshold when aggregated across normal daily operations.
-
-This matches the Medium severity impact: **"Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours."**
+This matches the Medium severity impact: "Shutdown of greater than or equal to 30% of network processing nodes without brute force actions, but does not shut down the network"
 
 ## Likelihood Explanation
 
-**Who Can Trigger:**
-Any network participant. Queries are publicly accessible via RPC endpoints and require no authentication or special permissions.
+This vulnerability has realistic exploitability during normal network operations:
 
-**Conditions Required:**
-- System accumulates grants over time through normal usage (no attack needed)
-- Users make legitimate queries to check their received grants
-- Standard network operation with no special conditions
-
-**Frequency:**
-This is not an attack that requires repeated malicious queries. Rather, it's a performance degradation that occurs naturally:
-- As the system grows, grants accumulate organically
-- Normal legitimate queries become progressively more expensive
-- The inefficiency compounds with system growth
-- Affects all RPC nodes processing these queries
-
-**Likelihood Assessment:**
-Extremely high likelihood because:
-1. No attack needed - affects normal operations
-2. Natural system growth triggers the issue
-3. Public blockchains routinely accumulate large amounts of state
-4. No protective mechanisms exist (no query limits, no secondary indexes)
-5. Even conservative estimates (10,000+ grants) cause significant degradation
+- **Trigger conditions**: Any transaction that calls `ReleaseCapability` and subsequently fails (e.g., IBC channel close with gas exhaustion, port unbinding with validation errors). The capability module is designed to be used by other modules (like IBC) for resource management.
+- **Who can trigger**: Any user submitting transactions; no special privileges required
+- **Frequency**: Transaction failures are routine in blockchain operations due to gas limits, state conflicts, or validation errors
+- **Cumulative effect**: Each failure corrupts one capability; over time, more capabilities become corrupted, increasing the probability of panics during normal operations
 
 ## Recommendation
 
-**Short-term Fix:**
-1. Add maximum iteration limit (e.g., 10,000 entries) with error on exceeded
-2. Disable `CountTotal` for this query endpoint
-3. Implement rate limiting at RPC infrastructure level
-4. Document the performance characteristics for node operators
+Implement transactional semantics for capMap operations:
 
-**Long-term Fix:**
-Create secondary index for grantee-based lookups, mirroring the `GranterGrants` pattern:
-1. Add new key prefix: `GranteeIndexKey + Grantee + Granter + MsgType → Grant`
-2. Maintain index in `SaveGrant` and `DeleteGrant` methods  
-3. Update `GranteeGrants` to use the grantee index for O(M) lookups where M = grants to specific grantee
-4. This provides efficient querying by grantee without full store scans
+1. **Deferred capMap Updates** (Recommended): Store pending capMap operations in the cached context and apply them only on successful commit:
+   - Extend the cached context to track pending capMap additions/deletions
+   - Implement a post-commit hook that applies these operations when `msCache.Write()` is called
+   - Discard pending operations if the cache is not written
+
+2. **Alternative - Defensive GetCapability**: Modify `GetCapability` to detect and recover from inconsistencies:
+   - If `capMap[index]` is nil but index exists in memStore, check if capability exists in persistent store
+   - If found in persistent store, recreate the capMap entry
+   - Only panic if the inconsistency cannot be resolved
 
 ## Proof of Concept
 
-**Conceptual Test:** `x/authz/keeper/grpc_query_test.go` - `TestGranteeGrantsPerformanceDoS`
+**File**: `x/capability/keeper/keeper_test.go`
 
-**Setup:**
-1. Initialize test app and context using existing TestSuite framework
-2. Create 1,000 grants from different granters to different grantees (simulating accumulated system state)
-3. Create only 1 grant where target address is the grantee
-4. Set up query client
+**Setup**: Create a capability in the original context, verify it exists in both memStore and capMap.
 
-**Action:**
-1. Call `GranteeGrants` with target grantee address
-2. Set `CountTotal=true` in pagination request to force full store scan
-3. Capture pagination response including total count
+**Action**: 
+1. Create a cached context via `CacheMultiStore()` [9](#0-8) 
+2. Call `ReleaseCapability` in the cached context (deletes from both stores)
+3. Do NOT call `msCache.Write()` (simulate transaction failure/rollback)
+4. Attempt to call `GetCapability` from the original context
 
-**Expected Result:**
-- Pagination response shows `Total=1000` (confirming ALL grants were scanned)
-- Response contains only 1 matching grant
-- Query iterated through 999 irrelevant grants to find 1 match
-- Demonstrates O(N) complexity where N = total system grants rather than O(M) where M = grants for the queried grantee
-
-This proves the query performance degrades linearly with total grants in the system. From reasoning alone, it is obvious that scanning 100,000 entries with full unmarshaling and key parsing consumes vastly more resources (100x) than scanning 1,000 entries, easily exceeding the 30% resource consumption threshold when aggregated across normal daily query patterns.
+**Result**: The test should panic with message "capability found in memstore is missing from map" because:
+- The index exists in memStore (deletion was rolled back)
+- But `capMap[index]` returns nil (deletion was NOT rolled back)
+- This triggers the panic at line 384
 
 ## Notes
 
-The vulnerability is confirmed by comparing the `GranteeGrants` implementation with `GranterGrants`, which uses an efficient prefix-based lookup. The key structure prevents efficient grantee-based queries without a secondary index. The codebase itself includes a warning comment acknowledging this pattern should not be used in query services without charging gas, yet `GranteeGrants` uses exactly this pattern in a public query endpoint without any gas metering or resource limits.
+The existing `TestRevertCapability` test [10](#0-9)  validates the opposite scenario (creating a capability in a cached context without committing), demonstrating that the test infrastructure exists to reproduce this vulnerability. The TODO comment in the code explicitly acknowledges awareness of transaction rollback issues with the capMap but only addresses one direction of the problem (extra entries from `NewCapability`), not the reverse direction (missing entries from `ReleaseCapability`).
 
 ### Citations
 
-**File:** x/authz/keeper/grpc_query.go (L84-96)
+**File:** x/capability/keeper/keeper.go (L33-33)
 ```go
-func (k Keeper) GranterGrants(c context.Context, req *authz.QueryGranterGrantsRequest) (*authz.QueryGranterGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
-	}
-
-	granter, err := sdk.AccAddressFromBech32(req.Granter)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx := sdk.UnwrapSDKContext(c)
-	store := ctx.KVStore(k.storeKey)
-	authzStore := prefix.NewStore(store, grantStoreKey(nil, granter, ""))
+		capMap        map[uint64]*types.Capability
 ```
 
-**File:** x/authz/keeper/grpc_query.go (L132-178)
+**File:** x/capability/keeper/keeper.go (L332-336)
 ```go
-func (k Keeper) GranteeGrants(c context.Context, req *authz.QueryGranteeGrantsRequest) (*authz.QueryGranteeGrantsResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "empty request")
+	memStore.Delete(types.FwdCapabilityKey(sk.module, cap))
+
+	// Delete the reverse mapping between the module and capability name and the
+	// index in the in-memory store.
+	memStore.Delete(types.RevCapabilityKey(sk.module, name))
+```
+
+**File:** x/capability/keeper/keeper.go (L349-349)
+```go
+		delete(sk.capMap, cap.GetIndex())
+```
+
+**File:** x/capability/keeper/keeper.go (L368-369)
+```go
+	indexBytes := memStore.Get(key)
+	index := sdk.BigEndianToUint64(indexBytes)
+```
+
+**File:** x/capability/keeper/keeper.go (L372-377)
+```go
+		// If a tx failed and NewCapability got reverted, it is possible
+		// to still have the capability in the go map since changes to
+		// go map do not automatically get reverted on tx failure,
+		// so we delete here to remove unnecessary values in map
+		// TODO: Delete index correctly from capMap by storing some reverse lookup
+		// in-memory map. Issue: https://github.com/cosmos/cosmos-sdk/issues/7805
+```
+
+**File:** x/capability/keeper/keeper.go (L382-384)
+```go
+	cap := sk.capMap[index]
+	if cap == nil {
+		panic("capability found in memstore is missing from map")
+```
+
+**File:** types/context.go (L589-592)
+```go
+func (c Context) CacheContext() (cc Context, writeCache func()) {
+	cms := c.MultiStore().CacheMultiStore()
+	cc = c.WithMultiStore(cms).WithEventManager(NewEventManager())
+	return cc, cms.Write
+```
+
+**File:** baseapp/baseapp.go (L1015-1017)
+```go
+	if err == nil && mode == runTxModeDeliver {
+		msCache.Write()
 	}
+```
 
-	grantee, err := sdk.AccAddressFromBech32(req.Grantee)
-	if err != nil {
-		return nil, err
-	}
+**File:** x/capability/keeper/keeper_test.go (L277-306)
+```go
+func (suite KeeperTestSuite) TestRevertCapability() {
+	sk := suite.keeper.ScopeToModule(banktypes.ModuleName)
 
-	ctx := sdk.UnwrapSDKContext(c)
-	store := prefix.NewStore(ctx.KVStore(k.storeKey), GrantKey)
+	ms := suite.ctx.MultiStore()
 
-	authorizations, pageRes, err := query.GenericFilteredPaginate(k.cdc, store, req.Pagination, func(key []byte, auth *authz.Grant) (*authz.GrantAuthorization, error) {
-		auth1 := auth.GetAuthorization()
-		if err != nil {
-			return nil, err
-		}
+	msCache := ms.CacheMultiStore()
+	cacheCtx := suite.ctx.WithMultiStore(msCache)
 
-		granter, g := addressesFromGrantStoreKey(append(GrantKey, key...))
-		if !g.Equals(grantee) {
-			return nil, nil
-		}
+	capName := "revert"
+	// Create capability on cached context
+	cap, err := sk.NewCapability(cacheCtx, capName)
+	suite.Require().NoError(err, "could not create capability")
 
-		authorizationAny, err := codectypes.NewAnyWithValue(auth1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
+	// Check that capability written in cached context
+	gotCache, ok := sk.GetCapability(cacheCtx, capName)
+	suite.Require().True(ok, "could not retrieve capability from cached context")
+	suite.Require().Equal(cap, gotCache, "did not get correct capability from cached context")
 
-		return &authz.GrantAuthorization{
-			Authorization: authorizationAny,
-			Expiration:    auth.Expiration,
-			Granter:       granter.String(),
-			Grantee:       grantee.String(),
-		}, nil
-	}, func() *authz.Grant {
-		return &authz.Grant{}
-	})
-	if err != nil {
-		return nil, err
-	}
+	// Check that capability is NOT written to original context
+	got, ok := sk.GetCapability(suite.ctx, capName)
+	suite.Require().False(ok, "retrieved capability from original context before write")
+	suite.Require().Nil(got, "capability not nil in original store")
 
-	return &authz.QueryGranteeGrantsResponse{
-		Grants:     authorizations,
-		Pagination: pageRes,
-	}, nil
+	// Write to underlying memKVStore
+	msCache.Write()
+
+	got, ok = sk.GetCapability(suite.ctx, capName)
+	suite.Require().True(ok, "could not retrieve capability from context")
+	suite.Require().Equal(cap, got, "did not get correct capability from context")
 }
-```
-
-**File:** x/authz/keeper/keys.go (L19-36)
-```go
-// grantStoreKey - return authorization store key
-// Items are stored with the following key: values
-//
-// - 0x01<granterAddressLen (1 Byte)><granterAddress_Bytes><granteeAddressLen (1 Byte)><granteeAddress_Bytes><msgType_Bytes>: Grant
-func grantStoreKey(grantee sdk.AccAddress, granter sdk.AccAddress, msgType string) []byte {
-	m := conv.UnsafeStrToBytes(msgType)
-	granter = address.MustLengthPrefix(granter)
-	grantee = address.MustLengthPrefix(grantee)
-
-	l := 1 + len(grantee) + len(granter) + len(m)
-	var key = make([]byte, l)
-	copy(key, GrantKey)
-	copy(key[1:], granter)
-	copy(key[1+len(granter):], grantee)
-	copy(key[l-len(m):], m)
-	//	fmt.Println(">>>> len", l, key)
-	return key
-}
-```
-
-**File:** types/query/filtered_pagination.go (L237-245)
-```go
-		if numHits == end+1 {
-			if nextKey == nil {
-				nextKey = iterator.Key()
-			}
-
-			if !countTotal {
-				break
-			}
-		}
-```
-
-**File:** proto/cosmos/authz/v1beta1/query.proto (L28-30)
-```text
-  rpc GranteeGrants(QueryGranteeGrantsRequest) returns (QueryGranteeGrantsResponse) {
-    option (google.api.http).get = "/cosmos/authz/v1beta1/grants/grantee/{grantee}";
-  }
-```
-
-**File:** x/authz/keeper/keeper.go (L209-211)
-```go
-// IterateGrants iterates over all authorization grants
-// This function should be used with caution because it can involve significant IO operations.
-// It should not be used in query or msg services without charging additional gas.
 ```

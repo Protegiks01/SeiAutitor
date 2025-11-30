@@ -1,180 +1,279 @@
+Based on my thorough analysis of the codebase, I can confirm this is a **valid vulnerability**. Let me provide the audit report:
+
 # Audit Report
 
 ## Title
-Goroutine Leak in validateIterator Due to Blocking Channel Send After Abort
+Division by Zero Panic in Governance Tally Causes Network Halt When Bonded Validator Has Zero Delegator Shares
 
 ## Summary
-The `validateIterator` function spawns a goroutine that permanently leaks when validation encounters multiple estimate values during iteration. The goroutine performs blocking channel sends to an abort channel without any return statement or cancellation mechanism, causing it to hang indefinitely when the main function has already returned after receiving the first abort signal.
+The governance module's `Tally()` function performs unguarded division by a validator's `DelegatorShares` without checking for zero. When a bonded validator with zero shares has voted on a proposal and the voting period ends, the tally function panics during EndBlocker execution, causing complete network shutdown across all validator nodes.
 
 ## Impact
 Medium
 
 ## Finding Description
 
-- **location**: [1](#0-0) 
+**Location:** [1](#0-0)  and [2](#0-1) 
 
-- **intended logic**: When a validation goroutine encounters an estimate during iteration, it should signal abort to the main function and terminate cleanly. The main function should receive the abort signal, return false, and both the goroutine and main function should complete without resource leaks.
+**Intended Logic:** The tally function should safely compute voting power for all bonded validators who have voted on proposals, handling edge cases where validators may have zero delegator shares gracefully.
 
-- **actual logic**: The validation goroutine performs a blocking send when encountering an estimate [1](#0-0) , but crucially does not return after sending. The method continues execution and returns a value (lines 119-125 of the same file). When multiple estimates exist in the iteration range: (1) First estimate triggers blocking send that succeeds due to buffer size 1, (2) Method returns normally and goroutine continues iterating, (3) Main function receives abort and returns [2](#0-1) , (4) Goroutine encounters second estimate while still in the iteration loop [3](#0-2) , (5) Second blocking send attempts but no receiver exists, (6) Goroutine blocks permanently.
+**Actual Logic:** The code performs division by `val.DelegatorShares` without checking if it equals zero. The `Dec.Quo()` method panics when the divisor is zero [3](#0-2) , causing immediate EndBlock failure.
 
-- **exploitation path**: 
-  1. Normal transaction execution with OCC enabled (standard configuration)
-  2. Multiple concurrent transactions create estimate values for overlapping keys (standard OCC behavior during contention)
-  3. Subsequent transaction performs iteration over key range containing these estimates
-  4. `ValidateTransactionState` is called during validation [4](#0-3) 
-  5. Validation goroutine iterates using merge iterator [5](#0-4) 
-  6. During iteration, `skipUntilExistsOrInvalid()` calls `cache.Value()` [6](#0-5)  or [7](#0-6) 
-  7. First estimate encountered, blocking send succeeds
-  8. Main function receives abort and returns false
-  9. Goroutine continues iterating and encounters second estimate
-  10. Second blocking send blocks permanently with no receiver
-  11. Goroutine leaked, consuming 2-8KB stack space plus heap allocations for iterator structures and MemDB
+**Exploitation Path:**
+1. A validator operates normally with delegations in bonded status
+2. The validator casts a vote on an active governance proposal using `AddVote()` [4](#0-3) 
+3. All delegators remove their delegations via standard `Undelegate` transactions
+4. After the final undelegation, the validator has both `Tokens = 0` and `DelegatorShares = 0` [5](#0-4) 
+5. The validator remains in bonded status because validators with zero shares are only removed if unbonded [6](#0-5) 
+6. The proposal's voting period ends, triggering EndBlock processing
+7. The governance EndBlocker executes before the staking EndBlocker [7](#0-6) 
+8. The governance EndBlocker calls `Tally()` [8](#0-7) 
+9. The tally function iterates over bonded validators using `IterateBondedValidatorsByPower()` [9](#0-8) , which only checks `IsBonded()` status [10](#0-9)  without verifying shares
+10. The zero-share validator with a recorded vote triggers the division calculation
+11. Division by zero occurs at line 80: `votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)`
+12. All validator nodes panic at the same block height, completely halting the chain
 
-- **security guarantee broken**: Resource management invariant violated - goroutines must have bounded lifecycle with proper cancellation mechanisms. The system fails to ensure goroutine termination when the parent context completes.
+**Security Guarantee Broken:** The network's availability and liveness guarantees are violated. The chain cannot progress past the problematic block, and consensus is permanently stalled until coordinated emergency action.
 
 ## Impact Explanation
 
-This vulnerability causes progressive resource exhaustion on validator nodes during normal operation. Each leaked goroutine consumes 2-8KB of stack space plus heap allocations for iterator structures, MemDB containing iteration range keys, and parent iterator references. With high transaction throughput and concurrent access to overlapping keys, multiple validations can trigger leaks per block. The accumulation over 24 hours leads to increased memory pressure that degrades node performance and responsiveness, potentially causing node crashes or requiring restarts.
+This vulnerability causes complete network shutdown. When the panic occurs during EndBlock execution:
 
-The impact directly matches the Medium severity category: "Increasing network processing node resource consumption by at least 30% without brute force actions, compared to the preceding 24 hours." During high-contention scenarios with frequent validations encountering multiple estimates, cumulative resource consumption can exceed 30% over 24-hour periods.
+- All validator nodes crash simultaneously at the same block height due to the unhandled panic
+- No new blocks can be produced or transactions processed
+- The entire network becomes unavailable to users
+- Recovery requires emergency coordination among validators to upgrade to a patched version
+
+This represents a critical denial-of-service vulnerability affecting the entire blockchain network, matching the impact category "Network not being able to confirm new transactions (total network shutdown)".
 
 ## Likelihood Explanation
 
-**Triggering Conditions:**
-- OCC-enabled transaction execution (standard production configuration)
-- Transactions performing iteration over key ranges (common in smart contract execution)
-- Multiple concurrent transactions accessing overlapping keys creating estimate values (frequent in high-throughput scenarios)
+**Triggering Actors:** Any network participants using standard, permissionless operations.
 
-**Frequency:** Can occur multiple times per block during high transaction volume, smart contract operations accessing shared state, or any scenario where the OCC scheduler creates estimates for pending transactions.
+**Required Conditions:**
+- An active governance proposal in voting period
+- A bonded validator that votes on the proposal
+- All delegators of that validator undelegate before voting period ends
+- Voting period ends, triggering automatic tally computation
 
-**Who Can Trigger:** Any network participant submitting legitimate transactions - no special privileges, admin access, or adversarial behavior required. This occurs during normal validation processes in production environments.
-
-The vulnerability is deterministic: whenever a goroutine encounters two or more estimates during iteration before the main function returns, the leak occurs. No unusual timing or adversarial manipulation required. The contrasting implementation in `WriteAbort` [8](#0-7)  shows the correct non-blocking pattern using select with default case, confirming this is an oversight rather than intentional design.
+**Likelihood Assessment:** This scenario is realistic and exploitable:
+- **Accidental trigger**: Could occur during market stress when mass undelegations happen, or with validators having few delegators who all exit
+- **Deliberate attack**: An attacker can trivially trigger this by operating their own validator with minimal self-delegation, voting on any proposal, then self-undelegating before the proposal's voting period ends
+- **No privileges required**: Uses only standard, permissionless blockchain operations
+- **Low cost**: Attacker only needs enough tokens to run a validator temporarily (tokens can be reclaimed after undelegating)
 
 ## Recommendation
 
-Implement proper goroutine cancellation using one of these approaches:
+Add a zero-check before performing division in the tally computation at [11](#0-10) :
 
-**Option 1 (Preferred):** Use context-based cancellation - pass a context to the goroutine, cancel it when main function returns, and check context cancellation in the iteration loop and before channel sends.
+```go
+// iterate over the validators again to tally their voting power
+for _, val := range currValidators {
+    if len(val.Vote) == 0 {
+        continue
+    }
+    
+    // Skip validators with zero delegator shares to avoid division by zero
+    if val.DelegatorShares.IsZero() {
+        continue
+    }
 
-**Option 2:** Change the blocking send to non-blocking pattern - modify the send at memiterator.go:116 to use `select` with `default` case, matching the pattern in `VersionIndexedStore.WriteAbort()` to prevent blocking when no receiver exists.
+    sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
+    votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
+    
+    for _, option := range val.Vote {
+        subPower := votingPower.Mul(option.Weight)
+        results[option.Option] = results[option.Option].Add(subPower)
+    }
+    totalVotingPower = totalVotingPower.Add(votingPower)
+}
+```
 
-**Option 3:** Add done channel - create a done channel that main function closes upon return, check it in the goroutine's iteration loop, and return immediately if closed.
+Similarly, add a check at line 57 where delegator voting power is calculated.
 
 ## Proof of Concept
 
-**Test Location:** `store/multiversion/store_test.go`
-
 **Setup:**
-1. Create parent KVStore with test keys (key1, key2, key3)
-2. Initialize multiversion store: `mvs := multiversion.NewMultiVersionStore(parentKVStore)`
-3. Set estimate at index 1 for key1: `mvs.SetEstimatedWriteset(1, 1, map[string][]byte{"key1": nil})`
-4. Set estimate at index 2 for key2: `mvs.SetEstimatedWriteset(2, 1, map[string][]byte{"key2": nil})`
-5. Create VersionIndexedStore for index 3: `vis := multiversion.NewVersionIndexedStore(parentKVStore, mvs, 3, 1, make(chan occ.Abort, 1))`
-6. Perform iteration covering keys: `iter := vis.Iterator([]byte("key1"), []byte("key4"))`
-7. Close iterator and register: `iter.Close(); vis.WriteToMultiVersionStore()`
+- Create a validator with initial delegation using `createValidators()` helper [12](#0-11) 
+- Create and activate a governance proposal in voting period using `SubmitProposal()`
+- Validator casts a vote on the proposal using `AddVote()`
 
 **Action:**
-1. Count goroutines before validation: `numBefore := runtime.NumGoroutine()`
-2. Call validation: `valid, _ := mvs.ValidateTransactionState(3)`
-3. Validation encounters first estimate (key1) → sends to abort channel
-4. Main function receives abort and returns false
-5. Goroutine continues iteration, encounters second estimate (key2)
-6. Goroutine attempts second send but no receiver exists → blocks forever
+- Retrieve the validator's delegation using `GetDelegation()`
+- Call `Undelegate()` to remove all shares from the validator
+- Verify the validator has `DelegatorShares.IsZero() == true` and `IsBonded() == true`
+- Call `Tally()` on the proposal
 
 **Result:**
-- Validation correctly returns false (estimate detected)
-- Goroutine count increases: `numAfter := runtime.NumGoroutine(); assert numAfter > numBefore`
-- Even after `runtime.GC()` and `time.Sleep()`, goroutine count remains elevated
-- Confirms permanent goroutine leak at the blocking send operation
+- The function will panic when `Tally()` attempts division by zero at line 80
+- The panic demonstrates that this vulnerability would cause chain halt during EndBlock execution in production
+
+## Notes
+
+The staking module's EndBlocker would eventually handle zero-power validators [13](#0-12) , but the critical issue is that the governance EndBlocker runs **before** the staking EndBlocker. This module ordering means the governance module encounters the zero-share validator before the staking module can transition it to unbonding state, creating the vulnerability window.
 
 ### Citations
 
-**File:** store/multiversion/memiterator.go (L115-116)
+**File:** x/gov/keeper/tally.go (L24-34)
 ```go
-	if val.IsEstimate() {
-		vi.abortChannel <- occtypes.NewEstimateAbort(val.Index())
-```
+	keeper.sk.IterateBondedValidatorsByPower(ctx, func(index int64, validator stakingtypes.ValidatorI) (stop bool) {
+		currValidators[validator.GetOperator().String()] = types.NewValidatorGovInfo(
+			validator.GetOperator(),
+			validator.GetBondedTokens(),
+			validator.GetDelegatorShares(),
+			sdk.ZeroDec(),
+			types.WeightedVoteOptions{},
+		)
 
-**File:** store/multiversion/store.go (L273-310)
-```go
-	go func(iterationTracker iterationTracker, items *db.MemDB, returnChan chan bool, abortChan chan occtypes.Abort) {
-		var parentIter types.Iterator
-		expectedKeys := iterationTracker.iteratedKeys
-		foundKeys := 0
-		iter := s.newMVSValidationIterator(index, iterationTracker.startKey, iterationTracker.endKey, items, iterationTracker.ascending, iterationTracker.writeset, abortChan)
-		if iterationTracker.ascending {
-			parentIter = s.parentStore.Iterator(iterationTracker.startKey, iterationTracker.endKey)
-		} else {
-			parentIter = s.parentStore.ReverseIterator(iterationTracker.startKey, iterationTracker.endKey)
-		}
-		// create a new MVSMergeiterator
-		mergeIterator := NewMVSMergeIterator(parentIter, iter, iterationTracker.ascending, NoOpHandler{})
-		defer mergeIterator.Close()
-		for ; mergeIterator.Valid(); mergeIterator.Next() {
-			if (len(expectedKeys) - foundKeys) == 0 {
-				// if we have no more expected keys, then the iterator is invalid
-				returnChan <- false
-				return
-			}
-			key := mergeIterator.Key()
-			// TODO: is this ok to not delete the key since we shouldnt have duplicate keys?
-			if _, ok := expectedKeys[string(key)]; !ok {
-				// if key isn't found
-				returnChan <- false
-				return
-			}
-			// remove from expected keys
-			foundKeys += 1
-			// delete(expectedKeys, string(key))
-
-			// if our iterator key was the early stop, then we can break
-			if bytes.Equal(key, iterationTracker.earlyStopKey) {
-				break
-			}
-		}
-		// return whether we found the exact number of expected keys
-		returnChan <- !((len(expectedKeys) - foundKeys) > 0)
-	}(tracker, sortedItems, validChannel, abortChannel)
-```
-
-**File:** store/multiversion/store.go (L311-314)
-```go
-	select {
-	case <-abortChannel:
-		// if we get an abort, then we know that the iterator is invalid
 		return false
+	})
 ```
 
-**File:** store/multiversion/store.go (L388-396)
+**File:** x/gov/keeper/tally.go (L57-57)
 ```go
-func (s *Store) ValidateTransactionState(index int) (bool, []int) {
-	// defer telemetry.MeasureSince(time.Now(), "store", "mvs", "validate")
-
-	// TODO: can we parallelize for all iterators?
-	iteratorValid := s.checkIteratorAtIndex(index)
-
-	readsetValid, conflictIndices := s.checkReadsetAtIndex(index)
-
-	return iteratorValid && readsetValid, conflictIndices
+				votingPower := delegation.GetShares().MulInt(val.BondedTokens).Quo(val.DelegatorShares)
 ```
 
-**File:** store/multiversion/mergeiterator.go (L241-241)
+**File:** x/gov/keeper/tally.go (L74-87)
 ```go
-			valueC := iter.cache.Value()
-```
+	for _, val := range currValidators {
+		if len(val.Vote) == 0 {
+			continue
+		}
 
-**File:** store/multiversion/mergeiterator.go (L253-253)
-```go
-			valueC := iter.cache.Value()
-```
+		sharesAfterDeductions := val.DelegatorShares.Sub(val.DelegatorDeductions)
+		votingPower := sharesAfterDeductions.MulInt(val.BondedTokens).Quo(val.DelegatorShares)
 
-**File:** store/multiversion/mvkv.go (L127-132)
-```go
-func (store *VersionIndexedStore) WriteAbort(abort scheduler.Abort) {
-	select {
-	case store.abortChannel <- abort:
-	default:
-		fmt.Println("WARN: abort channel full, discarding val")
+		for _, option := range val.Vote {
+			subPower := votingPower.Mul(option.Weight)
+			results[option.Option] = results[option.Option].Add(subPower)
+		}
+		totalVotingPower = totalVotingPower.Add(votingPower)
 	}
+```
+
+**File:** types/decimal_test.go (L238-239)
+```go
+		if tc.d2.IsZero() { // panic for divide by zero
+			s.Require().Panics(func() { tc.d1.Quo(tc.d2) })
+```
+
+**File:** x/gov/keeper/vote.go (L12-42)
+```go
+func (keeper Keeper) AddVote(ctx sdk.Context, proposalID uint64, voterAddr sdk.AccAddress, options types.WeightedVoteOptions) error {
+	proposal, ok := keeper.GetProposal(ctx, proposalID)
+	if !ok {
+		return sdkerrors.Wrapf(types.ErrUnknownProposal, "%d", proposalID)
+	}
+	if proposal.Status != types.StatusVotingPeriod {
+		return sdkerrors.Wrapf(types.ErrInactiveProposal, "%d", proposalID)
+	}
+
+	for _, option := range options {
+		if !types.ValidWeightedVoteOption(option) {
+			return sdkerrors.Wrap(types.ErrInvalidVote, option.String())
+		}
+	}
+
+	vote := types.NewVote(proposalID, voterAddr, options)
+	keeper.SetVote(ctx, vote)
+
+	// called after a vote on a proposal is cast
+	keeper.AfterProposalVote(ctx, proposalID, voterAddr)
+
+	ctx.EventManager().EmitEvent(
+		sdk.NewEvent(
+			types.EventTypeProposalVote,
+			sdk.NewAttribute(types.AttributeKeyOption, options.String()),
+			sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", proposalID)),
+		),
+	)
+
+	return nil
+}
+```
+
+**File:** x/staking/types/validator.go (L415-418)
+```go
+	if remainingShares.IsZero() {
+		// last delegation share gets any trimmings
+		issuedTokens = v.Tokens
+		v.Tokens = sdk.ZeroInt()
+```
+
+**File:** x/staking/keeper/delegation.go (L789-792)
+```go
+	if validator.DelegatorShares.IsZero() && validator.IsUnbonded() {
+		// if not unbonded, we must instead remove validator in EndBlocker once it finishes its unbonding period
+		k.RemoveValidator(ctx, validator.GetOperator())
+	}
+```
+
+**File:** simapp/app.go (L372-373)
+```go
+	app.mm.SetOrderEndBlockers(
+		crisistypes.ModuleName, govtypes.ModuleName, stakingtypes.ModuleName,
+```
+
+**File:** x/gov/abci.go (L48-51)
+```go
+	keeper.IterateActiveProposalsQueue(ctx, ctx.BlockHeader().Time, func(proposal types.Proposal) bool {
+		var tagValue, logMsg string
+
+		passes, burnDeposits, tallyResults := keeper.Tally(ctx, proposal)
+```
+
+**File:** x/staking/keeper/alias_functions.go (L45-46)
+```go
+		if validator.IsBonded() {
+			stop := fn(i, validator) // XXX is this safe will the validator unexposed fields be able to get written to?
+```
+
+**File:** x/gov/keeper/common_test.go (L21-58)
+```go
+func createValidators(t *testing.T, ctx sdk.Context, app *simapp.SimApp, powers []int64) ([]sdk.AccAddress, []sdk.ValAddress) {
+	addrs := simapp.AddTestAddrsIncremental(app, ctx, 5, sdk.NewInt(30000000))
+	valAddrs := simapp.ConvertAddrsToValAddrs(addrs)
+	pks := simapp.CreateTestPubKeys(5)
+	cdc := simapp.MakeTestEncodingConfig().Marshaler
+
+	app.StakingKeeper = stakingkeeper.NewKeeper(
+		cdc,
+		app.GetKey(stakingtypes.StoreKey),
+		app.AccountKeeper,
+		app.BankKeeper,
+		app.GetSubspace(stakingtypes.ModuleName),
+	)
+
+	val1, err := stakingtypes.NewValidator(valAddrs[0], pks[0], stakingtypes.Description{})
+	require.NoError(t, err)
+	val2, err := stakingtypes.NewValidator(valAddrs[1], pks[1], stakingtypes.Description{})
+	require.NoError(t, err)
+	val3, err := stakingtypes.NewValidator(valAddrs[2], pks[2], stakingtypes.Description{})
+	require.NoError(t, err)
+
+	app.StakingKeeper.SetValidator(ctx, val1)
+	app.StakingKeeper.SetValidator(ctx, val2)
+	app.StakingKeeper.SetValidator(ctx, val3)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val1)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val2)
+	app.StakingKeeper.SetValidatorByConsAddr(ctx, val3)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val1)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val2)
+	app.StakingKeeper.SetNewValidatorByPowerIndex(ctx, val3)
+
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[0], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[0]), stakingtypes.Unbonded, val1, true)
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[1], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[1]), stakingtypes.Unbonded, val2, true)
+	_, _ = app.StakingKeeper.Delegate(ctx, addrs[2], app.StakingKeeper.TokensFromConsensusPower(ctx, powers[2]), stakingtypes.Unbonded, val3, true)
+
+	_ = staking.EndBlocker(ctx, app.StakingKeeper)
+
+	return addrs, valAddrs
+```
+
+**File:** x/staking/keeper/val_state_change.go (L139-141)
+```go
+		if validator.PotentialConsensusPower(k.PowerReduction(ctx)) == 0 {
+			break
+		}
 ```
